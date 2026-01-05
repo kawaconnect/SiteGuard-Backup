@@ -1,0 +1,580 @@
+/* SiteGuard Backup Admin Styles */
+
+.sgbackup-wrap {
+	max-width: 960px;
+}
+
+.sgbackup-tabs {
+	margin-bottom: 20px;
+}
+
+.sgbackup-tab-content {
+	background: #fff;
+	border: 1px solid #ccd0d4;
+	border-top: none;
+	padding: 20px;
+}
+
+.sgbackup-section {
+	margin-bottom: 30px;
+}
+
+.sgbackup-section h2 {
+	font-size: 1.3em;
+	margin-bottom: 10px;
+	padding-bottom: 5px;
+	border-bottom: 1px solid #eee;
+}
+
+/* Schedule table */
+.sgbackup-schedule-table {
+	max-width: 600px;
+}
+.sgbackup-schedule-table td {
+	padding: 8px 12px;
+}
+
+/* Backups table */
+.sgbackup-backups-table th,
+.sgbackup-backups-table td {
+	padding: 8px 10px;
+	font-size: 13px;
+	vertical-align: middle;
+}
+
+.sgbackup-backups-table .sgbackup-actions {
+	white-space: nowrap;
+}
+
+.sgbackup-backups-table .sgbackup-actions .button {
+	margin-right: 3px;
+}
+
+.sgbackup-entity-info {
+	display: inline-block;
+	margin-right: 4px;
+}
+
+.sgbackup-exists {
+	color: #46b450;
+}
+
+.sgbackup-missing {
+	color: #dc3232;
+}
+
+.sgbackup-entity-none {
+	color: #999;
+}
+
+.sgbackup-download-link {
+	text-decoration: none;
+	font-size: 16px;
+	margin-left: 2px;
+}
+
+.sgbackup-badge {
+	display: inline-block;
+	font-size: 14px;
+	vertical-align: middle;
+	margin-left: 4px;
+}
+
+.sgbackup-badge-keep {
+	color: #f0ad4e;
+}
+
+/* Backup label badge */
+.sgbackup-backup-label {
+	display: inline-block;
+	font-size: 11px;
+	font-style: italic;
+	color: #666;
+	background: #f0f0f1;
+	border: 1px solid #dcdcde;
+	border-radius: 3px;
+	padding: 1px 6px;
+	margin-left: 4px;
+	vertical-align: middle;
+}
+
+/* Status messages */
+.sgbackup-status {
+	display: inline-block;
+	margin-left: 10px;
+	font-style: italic;
+	color: #666;
+}
+
+.sgbackup-status.success {
+	color: #46b450;
+	font-style: normal;
+}
+
+.sgbackup-status.error {
+	color: #dc3232;
+	font-style: normal;
+}
+
+/* Upload area */
+.sgbackup-upload-area {
+	padding: 15px;
+	background: #f9f9f9;
+	border: 2px dashed #ccc;
+	border-radius: 4px;
+	max-width: 500px;
+}
+
+.sgbackup-upload-area input[type="file"] {
+	margin-right: 10px;
+}
+
+/* Active jobs */
+.sgbackup-job {
+	background: #f0f6fc;
+	border: 1px solid #c3c4c7;
+	border-left: 4px solid #2271b1;
+	padding: 10px 15px;
+	margin-bottom: 8px;
+}
+
+.sgbackup-job .sgbackup-job-title {
+	font-weight: 600;
+	margin-bottom: 4px;
+}
+
+.sgbackup-job .sgbackup-job-progress {
+	color: #666;
+	font-size: 12px;
+}
+
+.sgbackup-job .sgbackup-abort-btn {
+	float: right;
+	color: #dc3232;
+	cursor: pointer;
+	background: none;
+	border: none;
+	text-decoration: underline;
+}
+
+/* Restore progress */
+#sgbackup-restore-log {
+	line-height: 1.6;
+}
+
+#sgbackup-restore-log .restore-error {
+	color: #dc3232;
+}
+
+#sgbackup-restore-log .restore-warning {
+	color: #f0ad4e;
+}
+
+#sgbackup-restore-log .restore-success {
+	color: #46b450;
+	font-weight: 600;
+}
+
+/* Loading states */
+.sgbackup-loading {
+	opacity: 0.6;
+	pointer-events: none;
+}
+
+.sgbackup-loading::after {
+	content: '';
+	display: inline-block;
+	width: 16px;
+	height: 16px;
+	border: 2px solid #f3f3f3;
+	border-top: 2px solid #2271b1;
+	border-radius: 50%;
+	animation: sgbackup-spin 0.8s linear infinite;
+	margin-left: 8px;
+	vertical-align: middle;
+}
+
+/* Settings form */
+.sgbackup-settings .form-table th {
+	width: 200px;
+}
+
+/* Modal overrides */
+.ui-dialog.ui-widget {
+	z-index: 100100 !important;
+}
+
+.ui-widget-overlay {
+	z-index: 100099 !important;
+}
+
+/* Spinner */
+.sgbackup-spinner {
+	display: inline-block;
+	width: 20px;
+	height: 20px;
+	border: 3px solid #f3f3f3;
+	border-top: 3px solid #2271b1;
+	border-radius: 50%;
+	animation: sgbackup-spin 1s linear infinite;
+	vertical-align: middle;
+	margin-left: 8px;
+}
+
+@keyframes sgbackup-spin {
+	0% { transform: rotate(0deg); }
+	100% { transform: rotate(360deg); }
+}
+
+/* Encrypted badge */
+.sgbackup-badge-encrypted {
+	color: #826eb4;
+	font-size: 13px;
+	cursor: help;
+}
+
+/* Verify result dialog */
+.sgbackup-verify-result h3 {
+	margin-top: 0;
+	margin-bottom: 10px;
+}
+
+.sgbackup-verify-result ul {
+	list-style: none;
+	margin: 0;
+	padding: 0;
+}
+
+.sgbackup-verify-result ul li {
+	padding: 4px 0;
+	border-bottom: 1px solid #f0f0f0;
+}
+
+.sgbackup-verify-pass {
+	color: #46b450;
+	font-weight: 600;
+}
+
+.sgbackup-verify-fail {
+	color: #dc3232;
+	font-weight: 600;
+}
+
+.sgbackup-verify-item-pass {
+	color: #46b450;
+}
+
+.sgbackup-verify-item-pass::before {
+	content: '\2713 ';
+}
+
+.sgbackup-verify-item-fail {
+	color: #dc3232;
+}
+
+.sgbackup-verify-item-fail::before {
+	content: '\2717 ';
+}
+
+/* Selective restore items */
+.sgbackup-selective-items {
+	max-height: 300px;
+	overflow-y: auto;
+	background: #f9f9f9;
+	border: 1px solid #ddd;
+	border-radius: 3px;
+	padding: 12px;
+	margin: 8px 0;
+}
+
+.sgbackup-selective-items h4 {
+	margin: 12px 0 6px;
+	font-size: 13px;
+	border-bottom: 1px solid #eee;
+	padding-bottom: 4px;
+}
+
+.sgbackup-selective-items h4:first-child {
+	margin-top: 0;
+}
+
+.sgbackup-selective-items label {
+	font-size: 12px;
+}
+
+.sgbackup-selective-group {
+	margin-left: 18px;
+	margin-bottom: 8px;
+}
+
+.sgbackup-select-all {
+	font-weight: 600;
+	font-size: 12px;
+}
+
+/* Storage method config panels */
+.sgbackup-method-config {
+	border: 1px solid #ccd0d4;
+	border-radius: 4px;
+	padding: 0 20px 15px;
+	margin-bottom: 15px;
+	background: #f9f9f9;
+}
+
+.sgbackup-method-config h3 {
+	margin-top: 15px;
+	padding-bottom: 5px;
+	border-bottom: 1px solid #eee;
+}
+
+/* Lock screen */
+.sgbackup-lock-screen {
+	max-width: 400px;
+	margin: 40px auto;
+	padding: 30px;
+	background: #fff;
+	border: 1px solid #ccd0d4;
+	border-radius: 4px;
+	text-align: center;
+}
+
+.sgbackup-lock-screen p {
+	margin-bottom: 15px;
+	color: #666;
+}
+
+.sgbackup-lock-screen input[type="password"] {
+	margin-right: 8px;
+}
+
+/* Multi-instance storage tabs */
+.sgbackup-instance-tabs {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 0;
+	border-bottom: 1px solid #ccd0d4;
+	margin-bottom: 0;
+	padding: 0;
+}
+
+.sgbackup-instance-tab {
+	display: inline-flex;
+	align-items: center;
+	gap: 4px;
+	padding: 8px 14px;
+	cursor: pointer;
+	background: #f0f0f1;
+	border: 1px solid #ccd0d4;
+	border-bottom: none;
+	border-radius: 4px 4px 0 0;
+	margin-right: 2px;
+	font-size: 13px;
+	line-height: 1.4;
+	user-select: none;
+}
+
+.sgbackup-instance-tab.active {
+	background: #fff;
+	border-bottom: 1px solid #fff;
+	margin-bottom: -1px;
+	font-weight: 600;
+}
+
+.sgbackup-instance-tab:hover {
+	background: #e8e8e8;
+}
+
+.sgbackup-instance-tab.active:hover {
+	background: #fff;
+}
+
+.sgbackup-instance-label {
+	outline: none;
+	min-width: 30px;
+}
+
+.sgbackup-instance-label:focus {
+	background: #fffbe6;
+	border-bottom: 1px dashed #999;
+}
+
+.sgbackup-delete-instance {
+	background: none;
+	border: none;
+	color: #a00;
+	cursor: pointer;
+	font-size: 16px;
+	line-height: 1;
+	padding: 0 2px;
+	margin-left: 4px;
+}
+
+.sgbackup-delete-instance:hover {
+	color: #dc3232;
+}
+
+.sgbackup-instance-panel {
+	border: 1px solid #ccd0d4;
+	border-top: none;
+	padding: 10px 15px;
+	background: #fff;
+	margin-bottom: 10px;
+}
+
+.sgbackup-add-instance {
+	display: inline-block;
+	margin: 8px 0 15px;
+	font-size: 13px;
+	text-decoration: none;
+}
+
+.sgbackup-add-instance:hover {
+	text-decoration: underline;
+}
+
+/* Retention rules */
+.sgbackup-retention-rules {
+	margin-bottom: 8px;
+}
+
+.sgbackup-retention-rule {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: center;
+	gap: 6px;
+	padding: 8px 12px;
+	margin-bottom: 6px;
+	background: #f9f9f9;
+	border: 1px solid #ddd;
+	border-radius: 3px;
+	font-size: 13px;
+	line-height: 2;
+}
+
+.sgbackup-retention-rule input[type="number"] {
+	width: 60px;
+}
+
+.sgbackup-retention-rule select {
+	min-width: 80px;
+}
+
+.sgbackup-retention-rule .button {
+	margin-left: auto;
+}
+
+.sgbackup-add-retention-rule {
+	display: inline-block;
+	margin: 4px 0 15px;
+	font-size: 13px;
+	text-decoration: none;
+}
+
+.sgbackup-add-retention-rule:hover {
+	text-decoration: underline;
+}
+
+/* Day selector inline styling */
+.sgbackup-day-of-week-select,
+.sgbackup-day-of-month-select {
+	margin-left: 4px;
+}
+
+/* Gap 35: Checkbox column */
+.sgbackup-check-col {
+	width: 30px;
+	text-align: center;
+}
+
+.sgbackup-check-col input[type="checkbox"] {
+	margin: 0;
+}
+
+/* Gap 35: Mass action bar */
+.sgbackup-table-actions {
+	display: flex;
+	justify-content: space-between;
+	align-items: center;
+	flex-wrap: wrap;
+	gap: 8px;
+}
+
+.sgbackup-mass-actions a {
+	text-decoration: none;
+	font-size: 13px;
+}
+
+.sgbackup-mass-actions a:hover {
+	text-decoration: underline;
+}
+
+/* Gap 36: Pagination - hidden rows */
+.sgbackup-row-hidden {
+	display: none;
+}
+
+.sgbackup-pagination {
+	font-size: 13px;
+}
+
+.sgbackup-pagination a {
+	text-decoration: none;
+}
+
+.sgbackup-pagination a:hover {
+	text-decoration: underline;
+}
+
+/* Gap 38: Rescan buttons */
+.sgbackup-rescan-buttons {
+	border-top: 1px solid #eee;
+	padding-top: 8px;
+}
+
+/* Gap 39/40: Size tables */
+#sgbackup-site-size-table,
+#sgbackup-db-size-table {
+	max-width: 700px;
+}
+
+#sgbackup-site-size-table th,
+#sgbackup-site-size-table td,
+#sgbackup-db-size-table th,
+#sgbackup-db-size-table td {
+	padding: 6px 10px;
+	font-size: 13px;
+}
+
+/* Gap 41: Cron events table */
+#sgbackup-cron-events-table th,
+#sgbackup-cron-events-table td {
+	padding: 6px 10px;
+	font-size: 13px;
+}
+
+/* Gap 42: Export/Import */
+#sgbackup-import-settings-file {
+	margin-right: 8px;
+}
+
+/* Responsive */
+@media screen and (max-width: 782px) {
+	.sgbackup-backups-table th,
+	.sgbackup-backups-table td {
+		padding: 6px 4px;
+		font-size: 12px;
+	}
+
+	.sgbackup-settings .form-table th {
+		width: auto;
+	}
+
+	.sgbackup-selective-items {
+		max-height: 200px;
+	}
+
+	.sgbackup-table-actions {
+		flex-direction: column;
+		align-items: flex-start;
+	}
+}
