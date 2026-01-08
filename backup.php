@@ -354,6 +354,12 @@ class SiteGuard_Backup_Engine {
 		// Resolve symlinks to get the real file
 		$resolved = is_link($file_path) ? readlink($file_path) : $file_path;
 		if (!file_exists($resolved) || !is_readable($resolved)) return false;
+		// Verify resolved symlink stays within ABSPATH to prevent directory escape
+		$real_resolved = realpath($resolved);
+		$real_abspath = realpath(ABSPATH);
+		if ($real_resolved && $real_abspath && strpos($real_resolved, $real_abspath) !== 0) {
+			return false;
+		}
 		$file_path = $resolved;
 
 		switch ($this->zip_method) {
@@ -406,7 +412,10 @@ class SiteGuard_Backup_Engine {
 
 		$output = array();
 		$return = -1;
-		@exec($cmd, $output, $return);
+		exec($cmd, $output, $return);
+		if (0 !== $return && 12 !== $return) {
+			SiteGuard_Backup::instance()->log("binzip exec failed (return code {$return}): " . implode("\n", $output), 'warning');
+		}
 
 		// Clean up temp file (but leave directory structure for reuse within same job)
 		@unlink($temp_path);
@@ -525,6 +534,11 @@ class SiteGuard_Backup_Engine {
 			$tables = array_diff($tables, $exclude_tables);
 		}
 		$tables = array_values($tables);
+
+		// Validate table names to prevent SQL injection
+		$tables = array_filter($tables, function($t) {
+			return preg_match('/^[a-zA-Z0-9_]+$/', $t);
+		});
 
 		$this->sgbackup->log("Found " . count($tables) . " tables to backup" . ($include_nonwp ? ' (including non-WP tables)' : ''));
 
@@ -826,6 +840,12 @@ class SiteGuard_Backup_Engine {
 	 */
 	private function remove_dir($dir) {
 		if (!is_dir($dir)) return;
+		// Validate directory is within backup directory to prevent accidental deletion
+		$real_dir = realpath($dir);
+		$real_backup = realpath($this->backup_dir);
+		if (!$real_dir || !$real_backup || strpos($real_dir, $real_backup) !== 0) {
+			return;
+		}
 		$iterator = new RecursiveIteratorIterator(
 			new RecursiveDirectoryIterator($dir, FilesystemIterator::SKIP_DOTS),
 			RecursiveIteratorIterator::CHILD_FIRST
