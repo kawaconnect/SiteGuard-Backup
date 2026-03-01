@@ -37,7 +37,7 @@ $entities_list = array(
 $sgbackup = SiteGuard_Backup::instance();
 // Only show methods that have a configuration panel in this template
 $configurable_methods = array('s3', 's3generic', 'googledrive', 'dropbox', 'ftp', 'sftp', 'azure', 'gcs', 'pcloud', 'openstack', 'email');
-$methods = array_intersect_key($sgbackup->backup_methods, array_flip($configurable_methods));
+$methods = array_intersect_key($sgbackup->get_backup_methods(), array_flip($configurable_methods));
 $current_services = $settings['service'];
 if (!is_array($current_services)) $current_services = array($current_services);
 
