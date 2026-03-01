@@ -75,7 +75,7 @@ if (empty($history)): ?>
 					</span>
 					<?php foreach ($files as $f): ?>
 						<?php if (file_exists($backup_dir . $f)): ?>
-							<a href="<?php echo esc_url(admin_url('admin-ajax.php') . '?action=sgbackup_download&file=' . urlencode($f) . '&_wpnonce=' . wp_create_nonce('sgbackup-ajax')); ?>"
+							<a href="<?php echo esc_url(admin_url('admin-ajax.php') . '?action=sgbackup_download&file=' . urlencode($f) . '&_wpnonce=' . wp_create_nonce('sgbackup-download')); ?>"
 							   class="sgbackup-download-link" title="<?php esc_attr_e('Download', 'siteguardbackup'); ?>">&#8615;</a>
 						<?php endif; ?>
 					<?php endforeach; ?>
