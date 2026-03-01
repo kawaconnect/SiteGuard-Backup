@@ -84,7 +84,9 @@ class SiteGuard_Backup_Method_Sftp extends SiteGuard_Backup_Module {
 		}
 
 		if (empty($server_fingerprint)) {
-			return true; // Cannot determine fingerprint, skip verification
+			$sgbackup = SiteGuard_Backup::instance();
+			$sgbackup->log("SFTP: could not determine server host key fingerprint. Fingerprint verification skipped.", 'warning');
+			return true;
 		}
 
 		$stored_fingerprint = isset($options['fingerprint']) ? strtolower(trim($options['fingerprint'])) : '';

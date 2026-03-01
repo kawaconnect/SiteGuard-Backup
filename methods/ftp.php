@@ -78,13 +78,19 @@ class SiteGuard_Backup_Method_Ftp extends SiteGuard_Backup_Module {
 			$port = 990;
 		}
 
+		$ssl_verify = !empty($options['ssl_verify']);
 		$context = stream_context_create(array(
 			'ssl' => array(
-				'verify_peer'      => false,
-				'verify_peer_name' => false,
-				'allow_self_signed' => true,
+				'verify_peer'      => $ssl_verify,
+				'verify_peer_name' => $ssl_verify,
+				'allow_self_signed' => !$ssl_verify,
 			),
 		));
+
+		if (!$ssl_verify) {
+			$sgbackup = SiteGuard_Backup::instance();
+			$sgbackup->log("FTP implicit SSL: certificate verification disabled. Enable ssl_verify in FTP settings for production use.", 'warning');
+		}
 
 		$stream = @stream_socket_client(
 			"ssl://{$options['host']}:{$port}",
