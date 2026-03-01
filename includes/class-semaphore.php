@@ -46,47 +46,30 @@ class SiteGuard_Backup_Semaphore {
 		$new_data = $lock_value . '|' . $now;
 		$expired_before = $now - $this->lock_timeout;
 
-		// Use the correct table for multisite vs single-site
-		$table = (is_multisite()) ? $wpdb->sitemeta : $wpdb->options;
-		$name_col = (is_multisite()) ? 'meta_key' : 'option_name';
-		$value_col = (is_multisite()) ? 'meta_value' : 'option_value';
-		$cache_group = (is_multisite()) ? 'site-options' : 'options';
+		// Use wp_options (which has a UNIQUE KEY on option_name) for the lock,
+		// even on multisite. wp_sitemeta lacks a UNIQUE KEY on (meta_key, site_id),
+		// so INSERT ON DUPLICATE KEY UPDATE never fires there.
+		$table = $wpdb->options;
+		$name_col = 'option_name';
+		$value_col = 'option_value';
 
-		if (is_multisite()) {
-			// sitemeta has a different schema (site_id, meta_key, meta_value)
-			$result = $wpdb->query($wpdb->prepare(
-				"INSERT INTO {$table} (site_id, {$name_col}, {$value_col})
-				 VALUES (%d, %s, %s)
-				 ON DUPLICATE KEY UPDATE
-				   {$value_col} = IF(
-				     CAST(SUBSTRING_INDEX({$value_col}, '|', -1) AS UNSIGNED) < %d,
-				     VALUES({$value_col}),
-				     {$value_col}
-				   )",
-				get_current_network_id(),
-				$option_name,
-				$new_data,
-				$expired_before
-			));
-		} else {
-			$result = $wpdb->query($wpdb->prepare(
-				"INSERT INTO {$table} ({$name_col}, {$value_col}, autoload)
-				 VALUES (%s, %s, 'no')
-				 ON DUPLICATE KEY UPDATE
-				   {$value_col} = IF(
-				     CAST(SUBSTRING_INDEX({$value_col}, '|', -1) AS UNSIGNED) < %d,
-				     VALUES({$value_col}),
-				     {$value_col}
-				   )",
-				$option_name,
-				$new_data,
-				$expired_before
-			));
-		}
+		$result = $wpdb->query($wpdb->prepare(
+			"INSERT INTO {$table} ({$name_col}, {$value_col}, autoload)
+			 VALUES (%s, %s, 'no')
+			 ON DUPLICATE KEY UPDATE
+			   {$value_col} = IF(
+			     CAST(SUBSTRING_INDEX({$value_col}, '|', -1) AS UNSIGNED) < %d,
+			     VALUES({$value_col}),
+			     {$value_col}
+			   )",
+			$option_name,
+			$new_data,
+			$expired_before
+		));
 
 		// Clear cache and verify we actually hold the lock
-		wp_cache_delete($option_name, $cache_group);
-		$check = is_multisite() ? get_site_option($option_name) : get_option($option_name);
+		wp_cache_delete($option_name, 'options');
+		$check = get_option($option_name);
 
 		// Parse pipe-delimited format: lock_value|timestamp
 		$check_lock_value = (is_string($check) && strpos($check, '|') !== false)
@@ -110,17 +93,13 @@ class SiteGuard_Backup_Semaphore {
 	public function unlock() {
 		if (!$this->locked) return false;
 		global $wpdb;
-		$table = (is_multisite()) ? $wpdb->sitemeta : $wpdb->options;
-		$name_col = (is_multisite()) ? 'meta_key' : 'option_name';
-		$value_col = (is_multisite()) ? 'meta_value' : 'option_value';
-		$cache_group = (is_multisite()) ? 'site-options' : 'options';
-		// Only delete the lock if we still own it (lock_value matches)
+		// Always use wp_options for locks (see lock() comment)
 		$wpdb->query($wpdb->prepare(
-			"DELETE FROM {$table} WHERE {$name_col} = %s AND {$value_col} LIKE %s",
+			"DELETE FROM {$wpdb->options} WHERE option_name = %s AND option_value LIKE %s",
 			$this->lock_name,
 			$wpdb->esc_like($this->lock_value) . '|%'
 		));
-		wp_cache_delete($this->lock_name, $cache_group);
+		wp_cache_delete($this->lock_name, 'options');
 		$this->locked = false;
 		$this->lock_value = '';
 		return true;
@@ -140,14 +119,12 @@ class SiteGuard_Backup_Semaphore {
 	 */
 	public function force_unlock() {
 		global $wpdb;
-		$table = (is_multisite()) ? $wpdb->sitemeta : $wpdb->options;
-		$name_col = (is_multisite()) ? 'meta_key' : 'option_name';
-		$cache_group = (is_multisite()) ? 'site-options' : 'options';
+		// Always use wp_options for locks (see lock() comment)
 		$wpdb->query($wpdb->prepare(
-			"DELETE FROM {$table} WHERE {$name_col} = %s",
+			"DELETE FROM {$wpdb->options} WHERE option_name = %s",
 			$this->lock_name
 		));
-		wp_cache_delete($this->lock_name, $cache_group);
+		wp_cache_delete($this->lock_name, 'options');
 		$this->locked = false;
 	}
 
@@ -157,7 +134,7 @@ class SiteGuard_Backup_Semaphore {
 	 * @return bool True if the lock is free.
 	 */
 	public function is_free() {
-		$check = is_multisite() ? get_site_option($this->lock_name) : get_option($this->lock_name);
+		$check = get_option($this->lock_name);
 		if (empty($check)) return true;
 		// Parse pipe-delimited format: lock_value|timestamp
 		if (!is_string($check) || strpos($check, '|') === false) return true;
