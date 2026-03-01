@@ -92,8 +92,8 @@ class SiteGuard_Backup_Encryption {
 
 		// Generate IV (12 bytes for GCM) and salt
 		$iv_length = 12; // GCM standard
-		$base_iv = openssl_random_pseudo_bytes($iv_length);
-		$salt = openssl_random_pseudo_bytes(32);
+		$base_iv = random_bytes($iv_length);
+		$salt = random_bytes(32);
 
 		// Derive key from passphrase using PBKDF2
 		$derived_key = self::derive_key($key, $salt);
@@ -104,7 +104,12 @@ class SiteGuard_Backup_Encryption {
 		$in = fopen($file, 'rb');
 		$out = fopen($encrypted_file, 'wb');
 
-		if (!$in || !$out) return false;
+		if (!$in || !$out) {
+			if ($in) fclose($in);
+			if ($out) fclose($out);
+			@unlink($encrypted_file);
+			return false;
+		}
 
 		// Write header: magic + version + salt + IV
 		$header = self::$magic_v2;          // 4 bytes
@@ -207,11 +212,14 @@ class SiteGuard_Backup_Encryption {
 	 * Decrypt SGK2 (AES-256-GCM) format.
 	 */
 	private static function decrypt_v2($file, $key) {
-		// Output filename: remove .crypt extension
-		$decrypted_file = preg_replace('/\.crypt$/', '', $file);
-		if ($decrypted_file === $file) {
-			$decrypted_file = $file . '.decrypted';
+		// Output filename: strip .crypt extension, ensure output stays in same directory
+		$dir = dirname($file) . '/';
+		$base = basename($file);
+		$decrypted_base = preg_replace('/\.crypt$/', '', $base);
+		if ($decrypted_base === $base) {
+			$decrypted_base = $base . '.decrypted';
 		}
+		$decrypted_file = $dir . $decrypted_base;
 
 		// Write to temp file first, rename on success
 		$tmp_file = $decrypted_file . '.tmp';
@@ -330,10 +338,14 @@ class SiteGuard_Backup_Encryption {
 		SiteGuard_Backup::instance()->log("WARNING: Decrypting legacy CBC-format file. Re-encrypt with current format for better security.", 'warning');
 		$legacy_cipher = 'aes-256-cbc';
 
-		$decrypted_file = preg_replace('/\.crypt$/', '', $file);
-		if ($decrypted_file === $file) {
-			$decrypted_file = $file . '.decrypted';
+		// Output filename: strip .crypt extension, ensure output stays in same directory
+		$dir = dirname($file) . '/';
+		$base = basename($file);
+		$decrypted_base = preg_replace('/\.crypt$/', '', $base);
+		if ($decrypted_base === $base) {
+			$decrypted_base = $base . '.decrypted';
 		}
+		$decrypted_file = $dir . $decrypted_base;
 
 		// Write to temp file first, rename on success
 		$tmp_file = $decrypted_file . '.tmp';

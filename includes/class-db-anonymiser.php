@@ -22,6 +22,9 @@ class SiteGuard_Backup_DB_Anonymiser {
 	/** @var array Cached staff user IDs for 'non_staff' mode */
 	private $staff_user_ids = null;
 
+	/** @var string HMAC key for deterministic anonymization */
+	private $hmac_key;
+
 	/**
 	 * @param string $mode            Anonymisation mode: 'all', 'non_staff', 'wc_orders'.
 	 * @param int    $current_user_id Current user ID to always exclude.
@@ -29,6 +32,7 @@ class SiteGuard_Backup_DB_Anonymiser {
 	public function __construct($mode, $current_user_id = 0) {
 		$this->mode = $mode;
 		$this->current_user_id = $current_user_id;
+		$this->hmac_key = defined('AUTH_SALT') ? AUTH_SALT : 'sgbackup-anon';
 	}
 
 	/**
@@ -39,13 +43,15 @@ class SiteGuard_Backup_DB_Anonymiser {
 	 * @return bool True if the row should be anonymised.
 	 */
 	public function should_anonymise_row($table, $row) {
+		global $wpdb;
+
 		// WooCommerce orders mode: only anonymise order meta and WC-specific tables
 		if ($this->mode === 'wc_orders') {
 			return $this->is_wc_anonymisable_table($table);
 		}
 
 		// Users table
-		if (strpos($table, '_users') !== false) {
+		if ($table === $wpdb->prefix . 'users') {
 			$user_id = isset($row['ID']) ? intval($row['ID']) : 0;
 
 			// Never anonymise the current user
@@ -62,7 +68,7 @@ class SiteGuard_Backup_DB_Anonymiser {
 		}
 
 		// User meta table
-		if (strpos($table, '_usermeta') !== false) {
+		if ($table === $wpdb->prefix . 'usermeta') {
 			$user_id = isset($row['user_id']) ? intval($row['user_id']) : 0;
 
 			if ($user_id === $this->current_user_id) {
@@ -77,23 +83,23 @@ class SiteGuard_Backup_DB_Anonymiser {
 		}
 
 		// WooCommerce order meta (postmeta for shop_order posts)
-		if (strpos($table, '_postmeta') !== false) {
+		if ($table === $wpdb->prefix . 'postmeta') {
 			$meta_key = isset($row['meta_key']) ? $row['meta_key'] : '';
 			return $this->is_wc_pii_meta_key($meta_key);
 		}
 
 		// WooCommerce HPOS orders table
-		if (strpos($table, '_wc_orders') !== false && strpos($table, '_meta') === false) {
+		if ($table === $wpdb->prefix . 'wc_orders') {
 			return true;
 		}
 
 		// WooCommerce HPOS order addresses
-		if (strpos($table, '_wc_order_addresses') !== false) {
+		if ($table === $wpdb->prefix . 'wc_order_addresses') {
 			return true;
 		}
 
 		// Comments table (anonymise comment author info)
-		if (strpos($table, '_comments') !== false) {
+		if ($table === $wpdb->prefix . 'comments') {
 			if ($this->mode === 'all') {
 				return true;
 			}
@@ -115,18 +121,18 @@ class SiteGuard_Backup_DB_Anonymiser {
 			case 'user_email':
 				return $this->hash_email($value);
 			case 'user_login':
-				return 'user_' . substr(md5($value), 0, 8);
+				return 'user_' . $this->anon_hash($value, 8);
 			case 'display_name':
 			case 'user_nicename':
-				return 'Anonymous ' . substr(md5($value), 0, 6);
+				return 'Anonymous ' . $this->anon_hash($value, 6);
 			case 'user_pass':
-				return '$P$BAnonymised' . substr(md5($value . microtime()), 0, 22);
+				return '$P$BAnonymised' . $this->anon_hash($value . microtime(), 22);
 			case 'user_url':
 				return '';
 
 			// Comment fields
 			case 'comment_author':
-				return 'Anonymous ' . substr(md5($value), 0, 6);
+				return 'Anonymous ' . $this->anon_hash($value, 6);
 			case 'comment_author_email':
 				return $this->hash_email($value);
 			case 'comment_author_url':
@@ -145,12 +151,12 @@ class SiteGuard_Backup_DB_Anonymiser {
 			case '_shipping_first_name':
 			case 'billing_first_name':
 			case 'shipping_first_name':
-				return 'Anon_' . substr(md5($value), 0, 6);
+				return 'Anon_' . $this->anon_hash($value, 6);
 			case '_billing_last_name':
 			case '_shipping_last_name':
 			case 'billing_last_name':
 			case 'shipping_last_name':
-				return 'Anon_' . substr(md5($value), 0, 6);
+				return 'Anon_' . $this->anon_hash($value, 6);
 			case '_billing_company':
 			case '_shipping_company':
 			case 'billing_company':
@@ -211,13 +217,13 @@ class SiteGuard_Backup_DB_Anonymiser {
 	 * @return bool
 	 */
 	private function is_wc_anonymisable_table($table) {
-		$wc_tables = array('_postmeta', '_wc_orders', '_wc_order_addresses');
-		foreach ($wc_tables as $suffix) {
-			if (strpos($table, $suffix) !== false) {
-				return true;
-			}
-		}
-		return false;
+		global $wpdb;
+		$wc_tables = array(
+			$wpdb->prefix . 'postmeta',
+			$wpdb->prefix . 'wc_orders',
+			$wpdb->prefix . 'wc_order_addresses',
+		);
+		return in_array($table, $wc_tables, true);
 	}
 
 	/**
@@ -260,12 +266,23 @@ class SiteGuard_Backup_DB_Anonymiser {
 	}
 
 	/**
+	 * Generate a deterministic HMAC-based hash for anonymization.
+	 *
+	 * @param string $value  The value to hash.
+	 * @param int    $length Number of hex characters to return (default 12).
+	 * @return string Truncated HMAC-SHA256 hex digest.
+	 */
+	private function anon_hash($value, $length = 12) {
+		return substr(hash_hmac('sha256', $value, $this->hmac_key), 0, $length);
+	}
+
+	/**
 	 * Generate a deterministic anonymised email.
 	 *
 	 * @param string $email The original email.
 	 * @return string The anonymised email.
 	 */
 	private function hash_email($email) {
-		return substr(md5($email), 0, 12) . '@example.com';
+		return $this->anon_hash($email) . '@example.com';
 	}
 }

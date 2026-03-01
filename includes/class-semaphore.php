@@ -12,6 +12,7 @@ class SiteGuard_Backup_Semaphore {
 	private $lock_name;
 	private $lock_timeout;
 	private $locked = false;
+	private $lock_value = '';
 
 	/**
 	 * @param string $lock_name    Unique identifier for the lock.
@@ -41,7 +42,8 @@ class SiteGuard_Backup_Semaphore {
 		$now = time();
 		$option_name = $this->lock_name;
 		$lock_value = wp_generate_password(16, false);
-		$new_data = json_encode(array('time' => $now, 'pid' => getmypid(), 'lock_value' => $lock_value));
+		// Pipe-delimited format: lock_value|timestamp (MySQL 5.6 compatible, no JSON_EXTRACT)
+		$new_data = $lock_value . '|' . $now;
 		$expired_before = $now - $this->lock_timeout;
 
 		// Use the correct table for multisite vs single-site
@@ -57,7 +59,7 @@ class SiteGuard_Backup_Semaphore {
 				 VALUES (%d, %s, %s)
 				 ON DUPLICATE KEY UPDATE
 				   {$value_col} = IF(
-				     CAST(JSON_EXTRACT({$value_col}, '$.time') AS UNSIGNED) < %d,
+				     CAST(SUBSTRING_INDEX({$value_col}, '|', -1) AS UNSIGNED) < %d,
 				     VALUES({$value_col}),
 				     {$value_col}
 				   )",
@@ -72,7 +74,7 @@ class SiteGuard_Backup_Semaphore {
 				 VALUES (%s, %s, 'no')
 				 ON DUPLICATE KEY UPDATE
 				   {$value_col} = IF(
-				     CAST(JSON_EXTRACT({$value_col}, '$.time') AS UNSIGNED) < %d,
+				     CAST(SUBSTRING_INDEX({$value_col}, '|', -1) AS UNSIGNED) < %d,
 				     VALUES({$value_col}),
 				     {$value_col}
 				   )",
@@ -85,13 +87,15 @@ class SiteGuard_Backup_Semaphore {
 		// Clear cache and verify we actually hold the lock
 		wp_cache_delete($option_name, $cache_group);
 		$check = is_multisite() ? get_site_option($option_name) : get_option($option_name);
-		$check_data = @json_decode($check, true);
 
-		if (is_array($check_data)
-			&& isset($check_data['lock_value'])
-			&& $check_data['lock_value'] === $lock_value
-		) {
+		// Parse pipe-delimited format: lock_value|timestamp
+		$check_lock_value = (is_string($check) && strpos($check, '|') !== false)
+			? substr($check, 0, strrpos($check, '|'))
+			: '';
+
+		if ($check_lock_value === $lock_value) {
 			$this->locked = true;
+			$this->lock_value = $lock_value;
 			return true;
 		}
 
@@ -108,13 +112,17 @@ class SiteGuard_Backup_Semaphore {
 		global $wpdb;
 		$table = (is_multisite()) ? $wpdb->sitemeta : $wpdb->options;
 		$name_col = (is_multisite()) ? 'meta_key' : 'option_name';
+		$value_col = (is_multisite()) ? 'meta_value' : 'option_value';
 		$cache_group = (is_multisite()) ? 'site-options' : 'options';
+		// Only delete the lock if we still own it (lock_value matches)
 		$wpdb->query($wpdb->prepare(
-			"DELETE FROM {$table} WHERE {$name_col} = %s",
-			$this->lock_name
+			"DELETE FROM {$table} WHERE {$name_col} = %s AND {$value_col} LIKE %s",
+			$this->lock_name,
+			$wpdb->esc_like($this->lock_value) . '|%'
 		));
 		wp_cache_delete($this->lock_name, $cache_group);
 		$this->locked = false;
+		$this->lock_value = '';
 		return true;
 	}
 
@@ -141,6 +149,22 @@ class SiteGuard_Backup_Semaphore {
 		));
 		wp_cache_delete($this->lock_name, $cache_group);
 		$this->locked = false;
+	}
+
+	/**
+	 * Check if the lock is currently free (not held by anyone).
+	 *
+	 * @return bool True if the lock is free.
+	 */
+	public function is_free() {
+		$check = is_multisite() ? get_site_option($this->lock_name) : get_option($this->lock_name);
+		if (empty($check)) return true;
+		// Parse pipe-delimited format: lock_value|timestamp
+		if (!is_string($check) || strpos($check, '|') === false) return true;
+		$lock_time = intval(substr($check, strrpos($check, '|') + 1));
+		if ($lock_time <= 0) return true;
+		// Check if expired
+		return (time() - $lock_time) > $this->lock_timeout;
 	}
 
 	public function __destruct() {

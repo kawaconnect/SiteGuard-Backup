@@ -123,7 +123,8 @@ class SiteGuard_Backup_Database_Utility {
 	 * Only allows alphanumeric, underscore, and dollar sign (MySQL standard).
 	 */
 	public static function sanitize_table_name($table) {
-		return preg_replace('/[^a-zA-Z0-9_$]/', '', $table);
+		$cleaned = preg_replace('/[^a-zA-Z0-9_$]/', '', $table);
+		return (strlen($cleaned) > 0) ? $cleaned : false;
 	}
 
 	/**

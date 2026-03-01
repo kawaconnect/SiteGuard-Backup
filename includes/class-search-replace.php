@@ -61,11 +61,12 @@ class SiteGuard_Backup_Search_Replace {
 	private function process_table($table, $search, $replace) {
 		global $wpdb;
 
-		// Sanitize table name
+		// Sanitize table name and escape backticks for SQL interpolation
 		$table = SiteGuard_Backup_Database_Utility::sanitize_table_name($table);
+		$escaped_table = str_replace('`', '``', $table);
 
 		// Get columns
-		$columns = $wpdb->get_results("DESCRIBE `{$table}`", ARRAY_A);
+		$columns = $wpdb->get_results("DESCRIBE `{$escaped_table}`", ARRAY_A);
 		if (empty($columns)) return;
 
 		// Find primary key and detect binary columns to skip
@@ -96,7 +97,7 @@ class SiteGuard_Backup_Search_Replace {
 
 		while ($has_more) {
 			$rows = $wpdb->get_results(
-				$wpdb->prepare("SELECT * FROM `{$table}` LIMIT %d OFFSET %d", $this->page_size, $offset),
+				$wpdb->prepare("SELECT * FROM `{$escaped_table}` LIMIT %d OFFSET %d", $this->page_size, $offset),
 				ARRAY_A
 			);
 
@@ -119,6 +120,8 @@ class SiteGuard_Backup_Search_Replace {
 
 		$this->report['rows']++;
 
+		// Escape backticks in table name for SQL interpolation
+		$escaped_table = str_replace('`', '``', $table);
 		$updates = array();
 		$stripped_table = preg_replace('/^' . preg_quote($wpdb->prefix, '/') . '/', '', $table);
 
@@ -161,12 +164,14 @@ class SiteGuard_Backup_Search_Replace {
 				$values = array();
 
 				foreach ($updates as $col => $val) {
-					$set_clauses[] = "`{$col}` = %s";
+					$escaped_col = str_replace('`', '``', $col);
+					$set_clauses[] = "`{$escaped_col}` = %s";
 					$values[] = $val;
 				}
 
 				$values[] = $row[$primary_key];
-				$sql = "UPDATE `{$table}` SET " . implode(', ', $set_clauses) . " WHERE `{$primary_key}` = %s LIMIT 1";
+				$escaped_pk = str_replace('`', '``', $primary_key);
+				$sql = "UPDATE `{$escaped_table}` SET " . implode(', ', $set_clauses) . " WHERE `{$escaped_pk}` = %s LIMIT 1";
 
 				$result = $wpdb->query($wpdb->prepare($sql, $values));
 
@@ -197,7 +202,11 @@ class SiteGuard_Backup_Search_Replace {
 		if (is_string($data)) {
 			// Check if it's serialized
 			if ($this->is_serialized($data)) {
-				$unserialized = @unserialize($data, array('allowed_classes' => false));
+				if (PHP_VERSION_ID >= 70000) {
+					$unserialized = @unserialize($data, array('allowed_classes' => false));
+				} else {
+					$unserialized = @unserialize($data);
+				}
 				if (false !== $unserialized || $data === 'b:0;') {
 					$replaced = $this->recursive_unserialize_replace($from, $to, $unserialized, true, $recursion_level + 1);
 					$data = serialize($replaced);

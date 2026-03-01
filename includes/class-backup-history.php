@@ -51,6 +51,8 @@ class SiteGuard_Backup_History {
 	 * @return array|false Backup set with 'timestamp' key added, or false.
 	 */
 	public static function get_backup_set_by_nonce($nonce) {
+		// Sanitize nonce to alphanumeric, underscore, hyphen only
+		$nonce = preg_replace('/[^a-zA-Z0-9_-]/', '', $nonce);
 		$history = self::get_history();
 		foreach ($history as $timestamp => $backup) {
 			if (isset($backup['nonce']) && $backup['nonce'] === $nonce) {
@@ -71,6 +73,9 @@ class SiteGuard_Backup_History {
 		$lock = new SiteGuard_Backup_Semaphore('history');
 		$lock->lock();
 		try {
+			// Flush cache to ensure fresh data inside the locked section
+			wp_cache_delete('sgbackup_backup_history', 'options');
+			wp_cache_delete('sgbackup_backup_history', 'site-options');
 			$history = self::get_history();
 			if (isset($history[$timestamp])) {
 				$history[$timestamp] = array_merge($history[$timestamp], $backup_data);
@@ -89,10 +94,19 @@ class SiteGuard_Backup_History {
 	 * @param int $timestamp
 	 */
 	public static function remove_backup($timestamp) {
-		$history = self::get_history();
-		if (isset($history[$timestamp])) {
-			unset($history[$timestamp]);
-			self::save_history($history);
+		$lock = new SiteGuard_Backup_Semaphore('history');
+		$lock->lock();
+		try {
+			// Flush cache to ensure fresh data inside the locked section
+			wp_cache_delete('sgbackup_backup_history', 'options');
+			wp_cache_delete('sgbackup_backup_history', 'site-options');
+			$history = self::get_history();
+			if (isset($history[$timestamp])) {
+				unset($history[$timestamp]);
+				self::save_history($history);
+			}
+		} finally {
+			$lock->unlock();
 		}
 	}
 
@@ -125,6 +139,8 @@ class SiteGuard_Backup_History {
 
 		// Delete log file
 		$nonce = isset($backup['nonce']) ? $backup['nonce'] : '';
+		// Sanitize nonce to prevent path traversal or injection
+		$nonce = preg_replace('/[^a-zA-Z0-9_-]/', '', $nonce);
 		if ($nonce) {
 			$logfile = $backup_dir . 'log.' . $nonce . '.txt';
 			if (file_exists($logfile)) {

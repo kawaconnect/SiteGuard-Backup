@@ -364,7 +364,8 @@ class SiteGuard_Backup_Restorer {
 			// Detect table prefix from CREATE TABLE statements
 			if (preg_match('/CREATE TABLE\s+`([a-zA-Z0-9_]+)options`/i', $line, $m)) {
 				$detected_prefix = str_replace('options', '', $m[1]);
-				if (!empty($detected_prefix)) {
+				// Validate prefix contains only safe characters
+				if (!empty($detected_prefix) && preg_match('/^[a-zA-Z0-9_]+$/', $detected_prefix)) {
 					$this->old_table_prefix = $detected_prefix;
 				}
 			}
