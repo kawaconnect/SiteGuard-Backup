@@ -771,25 +771,31 @@ class SiteGuard_Backup_Database_Utility {
 		// Atomic rename: swap temp tables with originals
 		if (!empty($tables_created) && $result['success']) {
 			$rename_parts = array();
+			$old_tables = array();
 			foreach ($tables_created as $original => $temp) {
 				$original = self::sanitize_table_name($original);
 				$temp = self::sanitize_table_name($temp);
-				// Drop original, rename temp to original
-				$wpdb->query("DROP TABLE IF EXISTS `{$original}`");
-				$rename_parts[] = "`{$temp}` TO `{$original}`";
+				$old_backup = '_sgb_old_' . substr($original, 0, 50);
+				// Rename original to backup and temp to original in one atomic statement
+				$rename_parts[] = "`{$original}` TO `{$old_backup}`, `{$temp}` TO `{$original}`";
+				$old_tables[] = $old_backup;
 			}
 
 			if (!empty($rename_parts)) {
 				$rename_sql = "RENAME TABLE " . implode(', ', $rename_parts);
 				$rename_result = $wpdb->query($rename_sql);
 				if (false === $rename_result) {
-					// Fallback: rename one by one
+					// Fallback: rename one by one (must drop original first in this path)
 					foreach ($tables_created as $original => $temp) {
 						$original = self::sanitize_table_name($original);
 						$temp = self::sanitize_table_name($temp);
 						$wpdb->query("DROP TABLE IF EXISTS `{$original}`");
 						$wpdb->query("RENAME TABLE `{$temp}` TO `{$original}`");
 					}
+				}
+				// Clean up old backup tables after successful rename
+				foreach ($old_tables as $old_tbl) {
+					$wpdb->query("DROP TABLE IF EXISTS `{$old_tbl}`");
 				}
 			}
 		} elseif (!empty($tables_created)) {
