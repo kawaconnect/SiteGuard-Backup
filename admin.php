@@ -115,6 +115,7 @@ class SiteGuard_Backup_Admin {
 				'export_settings'   => wp_create_nonce('sgbackup-export_settings'),
 				'migrate_send'      => wp_create_nonce('sgbackup-migrate_send'),
 				'searchreplace'     => wp_create_nonce('sgbackup-searchreplace'),
+				'test_webhook'      => wp_create_nonce('sgbackup-test_webhook'),
 			),
 			'max_upload_size' => wp_max_upload_size(),
 			'is_multisite' => is_multisite(),
