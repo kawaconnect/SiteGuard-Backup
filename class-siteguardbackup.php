@@ -711,6 +711,34 @@ class SiteGuard_Backup {
 			return;
 		}
 
+		// Infinite loop prevention: if multiple consecutive resumptions
+		// produced no useful work, abort to avoid looping forever.
+		$useful_checkins = $this->jobdata_get('useful_checkins', array());
+		$max_no_progress = apply_filters('sgbackup_max_resumptions_no_progress', 5);
+		if ($resumption_no >= $max_no_progress) {
+			$consecutive_idle = 0;
+			for ($r = $resumption_no - 1; $r >= 0 && $r >= $resumption_no - $max_no_progress; $r--) {
+				if (!isset($useful_checkins[$r])) {
+					$consecutive_idle++;
+				} else {
+					break;
+				}
+			}
+			if ($consecutive_idle >= $max_no_progress) {
+				$this->log("Aborting: {$consecutive_idle} consecutive resumptions with no progress (fail_on_resume). " .
+					"This indicates the backup is stuck in an infinite loop.", 'error');
+				$this->jobdata_set('jobstatus', 'error');
+				$this->jobdata_set('fail_reason', 'no_progress_loop');
+				SiteGuard_Backup_Job_Scheduler::clear_scheduled_events($this->nonce);
+				SiteGuard_Backup_Webhook::fire('backup_failed', array(
+					'nonce'   => $this->nonce,
+					'message' => "Backup aborted after {$consecutive_idle} resumptions with no progress",
+				));
+				$this->logfile_close();
+				return;
+			}
+		}
+
 		// Semaphore - prevent overlapping runs
 		$semaphore = new SiteGuard_Backup_Semaphore('sgbackup_sem_' . $bnonce);
 		if (!$semaphore->lock()) {
@@ -735,7 +763,6 @@ class SiteGuard_Backup {
 		}
 
 		// Auto-adjust batch size if previous resumption didn't check in
-		$useful_checkins = $this->jobdata_get('useful_checkins', array());
 		if ($resumption_no > 0 && !isset($useful_checkins[$resumption_no - 1])) {
 			$maxzipbatch = $this->jobdata_get('maxzipbatch', 26214400);
 			$new_batch = max(5242880, intval($maxzipbatch * 0.75)); // 75%, min 5MB
@@ -756,6 +783,26 @@ class SiteGuard_Backup {
 			$semaphore->unlock();
 			$this->logfile_close();
 			return;
+		}
+
+		// Runtime-based resume interval auto-tuning: if this resumption
+		// ran fast and made progress, reduce the interval for faster backups.
+		$run_time = microtime(true) - $this->job_time_ms;
+		$run_times = $this->jobdata_get('run_times', array());
+		$run_times[$resumption_no] = $run_time;
+		$this->jobdata_set('run_times', $run_times);
+
+		if ($this->something_useful_happened && count($run_times) >= 2) {
+			$recent = array_slice($run_times, -3, 3, true);
+			$avg_run = array_sum($recent) / count($recent);
+			$current_interval = $this->jobdata_get('resume_interval', 300);
+
+			// Set interval to 2x average runtime, clamped between 30s and 600s
+			$optimal = max(30, min(600, intval($avg_run * 2)));
+			if ($optimal < $current_interval && $optimal >= 30) {
+				$this->jobdata_set('resume_interval', $optimal);
+				$this->log("Auto-tuned resume interval: {$current_interval}s -> {$optimal}s (avg runtime: " . round($avg_run, 1) . "s)");
+			}
 		}
 
 		$semaphore->unlock();

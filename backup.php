@@ -45,6 +45,9 @@ class SiteGuard_Backup_Engine {
 	/** @var int Files added since last ZipArchive flush */
 	private $zipfiles_added_unflushed = 0;
 
+	/** @var bool Whether we've already logged a fallback warning */
+	private $zip_fallback_warned = false;
+
 	public function __construct($sgbackup) {
 		$this->sgbackup = $sgbackup;
 		$this->backup_dir = $sgbackup->get_backup_dir();
@@ -328,10 +331,15 @@ class SiteGuard_Backup_Engine {
 				$this->zipfiles_batched += $file['size'];
 			}
 
-			// Periodic check-in
+			// Periodic check-in and progress update
 			if ($this->zipfiles_added > 0 && $this->zipfiles_added % 500 === 0) {
 				SiteGuard_Backup_Job_Scheduler::something_useful_happened();
 				SiteGuard_Backup_Job_Scheduler::record_still_alive();
+			}
+			if ($this->zipfiles_added > 0 && $this->zipfiles_added % 100 === 0) {
+				$this->sgbackup->jobdata_set('files_added_count', ($this->sgbackup->jobdata_get('files_added_count', 0) + 100));
+				$this->sgbackup->jobdata_set('files_total_count', count($files));
+				$this->sgbackup->jobdata_set('last_activity', "Adding files to {$entity}: {$i}/" . count($files));
 			}
 		}
 
@@ -383,16 +391,30 @@ class SiteGuard_Backup_Engine {
 		}
 		$file_path = $resolved;
 
+		$result = false;
 		switch ($this->zip_method) {
 			case 'binzip':
-				return $this->add_to_zip_binzip($zip_path, $file_path, $archive_name);
+				$result = $this->add_to_zip_binzip($zip_path, $file_path, $archive_name);
+				break;
 			case 'ziparchive':
-				return $this->add_to_zip_ziparchive($zip_path, $file_path, $archive_name);
+				$result = $this->add_to_zip_ziparchive($zip_path, $file_path, $archive_name);
+				break;
 			case 'pclzip':
-				return $this->add_to_zip_pclzip($zip_path, $file_path, $archive_name);
-			default:
-				return false;
+				$result = $this->add_to_zip_pclzip($zip_path, $file_path, $archive_name);
+				break;
 		}
+
+		// Fallback: if primary method failed, try PclZip (unless already PclZip)
+		if (!$result && $this->zip_method !== 'pclzip') {
+			if (!$this->zip_fallback_warned) {
+				$this->sgbackup->log("Primary zip method '{$this->zip_method}' failed for {$archive_name}, falling back to PclZip", 'warning');
+				$this->zip_fallback_warned = true;
+			}
+			$this->close_ziparchive(); // Close any open ZipArchive handle
+			$result = $this->add_to_zip_pclzip($zip_path, $file_path, $archive_name);
+		}
+
+		return $result;
 	}
 
 	/**
@@ -681,6 +703,9 @@ class SiteGuard_Backup_Engine {
 			if ($success) {
 				$completed_tables[] = $table;
 				$this->sgbackup->jobdata_set('db_completed_tables', $completed_tables);
+				$this->sgbackup->jobdata_set('db_tables_done', count($completed_tables));
+				$this->sgbackup->jobdata_set('db_tables_total', count($tables));
+				$this->sgbackup->jobdata_set('last_activity', "DB: {$table} (" . count($completed_tables) . "/" . count($tables) . ")");
 				SiteGuard_Backup_Job_Scheduler::something_useful_happened();
 			} else {
 				$this->sgbackup->log("Failed to backup table: {$table}", 'error');
