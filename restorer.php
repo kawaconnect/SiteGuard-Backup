@@ -115,6 +115,7 @@ class SiteGuard_Backup_Restorer {
 		if (is_wp_error($files_result)) {
 			$result['success'] = false;
 			$result['errors'][] = $files_result->get_error_message();
+			$this->sgbackup->logfile_close();
 			return $result;
 		}
 
@@ -123,7 +124,6 @@ class SiteGuard_Backup_Restorer {
 		if (!empty($integrity_errors)) {
 			foreach ($integrity_errors as $err) {
 				$this->progress("Integrity warning: {$err}");
-				$result['messages'][] = "Integrity warning: {$err}";
 			}
 		}
 
@@ -139,8 +139,18 @@ class SiteGuard_Backup_Restorer {
 			$result['messages'][] = "Database: {$db_result['tables_restored']} tables restored";
 		}
 
-		// Restore file entities
-		foreach (array('plugins', 'themes', 'uploads', 'others', 'wpcore') as $entity) {
+		// Restore file entities (standard + extra directories)
+		$standard_entities = array('plugins', 'themes', 'uploads', 'others', 'wpcore');
+		$all_entities = $standard_entities;
+
+		// Include any extra directory entities from the backup set
+		foreach (array_keys($this->backup_set) as $key) {
+			if (strpos($key, 'extradir_') === 0 && !in_array($key, $all_entities, true)) {
+				$all_entities[] = $key;
+			}
+		}
+
+		foreach ($all_entities as $entity) {
 			if (empty($this->restore_options[$entity])) continue;
 			if (empty($this->backup_set[$entity])) continue;
 
@@ -190,7 +200,7 @@ class SiteGuard_Backup_Restorer {
 					$this->sgbackup->log("Missing file: {$file}", 'error');
 					// Try to download from remote
 					$downloaded = $this->download_from_remote($file, $backup_dir);
-					if (!$downloaded) {
+					if (!$downloaded || is_wp_error($downloaded)) {
 						return new WP_Error('missing_file', "Required backup file not found: {$file}");
 					}
 				}
@@ -476,8 +486,11 @@ class SiteGuard_Backup_Restorer {
 		$files = $this->backup_set[$entity];
 		if (is_string($files)) $files = array($files);
 
-		$entities_info = SiteGuard_Backup_Filesystem::get_backup_entities();
-		if (!isset($entities_info[$entity])) return false;
+		$entities_info = SiteGuard_Backup::instance()->get_backup_entities_with_extras();
+		if (!isset($entities_info[$entity])) {
+			$entities_info = SiteGuard_Backup_Filesystem::get_backup_entities();
+			if (!isset($entities_info[$entity])) return false;
+		}
 
 		$dest_dir = $entities_info[$entity]['path'];
 

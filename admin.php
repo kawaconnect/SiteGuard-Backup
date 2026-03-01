@@ -360,6 +360,7 @@ class SiteGuard_Backup_Admin {
 			'get_audit_log',
 			'toggle_audit_log',
 			'clear_audit_log',
+			'test_webhook',
 		);
 
 		if (!in_array($subaction, $allowed_commands, true)) {
@@ -372,12 +373,13 @@ class SiteGuard_Backup_Admin {
 			if (is_array($decoded)) $params = $decoded;
 		}
 
-		// Defense-in-depth: wp_unslash and sanitize all string values in the params array
+		// Unslash all string values; per-field sanitization is handled by each command handler.
+		// Do NOT apply sanitize_text_field() here - it strips newlines needed by SSH keys,
+		// file exclusion patterns, and other multiline fields.
 		if (is_array($params)) {
 			array_walk_recursive($params, function(&$val) {
 				if (is_string($val)) {
 					$val = wp_unslash($val);
-					$val = sanitize_text_field($val);
 				}
 			});
 		}
@@ -522,6 +524,12 @@ class SiteGuard_Backup_Admin {
 			array('timestamp' => $timestamp)
 		);
 
+		// Webhook notification
+		SiteGuard_Backup_Webhook::fire(
+			$result['success'] ? 'restore_complete' : 'restore_failed',
+			array('timestamp' => $timestamp, 'success' => $result['success'])
+		);
+
 		echo 'RINFO:' . json_encode(array(
 			'type'     => 'complete',
 			'success'  => $result['success'],
@@ -648,7 +656,7 @@ class SiteGuard_Backup_Admin {
 		}
 
 		// Validate state nonce to prevent CSRF on OAuth callback
-		if (!empty($state) && !wp_verify_nonce($state, 'sgbackup-oauth-' . $method)) {
+		if (empty($state) || !wp_verify_nonce($state, 'sgbackup-oauth-' . $method)) {
 			wp_die('Invalid OAuth state. Please try again.');
 		}
 

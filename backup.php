@@ -42,6 +42,9 @@ class SiteGuard_Backup_Engine {
 	/** @var string|null Path of the currently open ZipArchive */
 	private $ziparchive_path = null;
 
+	/** @var int Files added since last ZipArchive flush */
+	private $zipfiles_added_unflushed = 0;
+
 	public function __construct($sgbackup) {
 		$this->sgbackup = $sgbackup;
 		$this->backup_dir = $sgbackup->get_backup_dir();
@@ -178,11 +181,12 @@ class SiteGuard_Backup_Engine {
 			$result = $this->backup_entity($entity, $altered_since);
 
 			if ($result === 'needs_resumption') {
-				// Save progress
+				// Save progress. Re-read backup_files_array from jobdata because
+				// create_zips() may have already appended split files to it.
+				$backup_files_array = $this->sgbackup->jobdata_get('backup_files_array', array());
 				$entities[$entity]['index'] = $this->index;
 				$entities[$entity]['status'] = 'partial';
 				$this->sgbackup->jobdata_set('job_file_entities', $entities);
-				$this->sgbackup->jobdata_set('backup_files_array', $backup_files_array);
 				return 'needs_resumption';
 			}
 
@@ -299,13 +303,20 @@ class SiteGuard_Backup_Engine {
 				return 'needs_resumption';
 			}
 
-			// Check split threshold
-			if (file_exists($zip_path) && filesize($zip_path) >= $this->split_every) {
-				$created_files[] = $zip_filename;
-				$this->index++;
-				$zip_filename = $this->get_zip_filename($entity, $this->index);
-				$zip_path = $this->backup_dir . $zip_filename;
-				$this->sgbackup->log("Split threshold reached, new zip: {$zip_filename}");
+			// Check split threshold - flush ZipArchive first so filesize() is accurate
+			if (file_exists($zip_path)) {
+				if ($this->zip_method === 'ziparchive') {
+					$this->close_ziparchive();
+					$this->zipfiles_added_unflushed = 0;
+					clearstatcache(true, $zip_path);
+				}
+				if (filesize($zip_path) >= $this->split_every) {
+					$created_files[] = $zip_filename;
+					$this->index++;
+					$zip_filename = $this->get_zip_filename($entity, $this->index);
+					$zip_path = $this->backup_dir . $zip_filename;
+					$this->sgbackup->log("Split threshold reached, new zip: {$zip_filename}");
+				}
 			}
 
 			// Add file to zip
@@ -329,6 +340,14 @@ class SiteGuard_Backup_Engine {
 
 		// Clear progress tracker
 		$this->sgbackup->jobdata_set("entity_{$entity}_last_file_index", 0);
+
+		// Clean up binzip temp directory
+		if ($this->zip_method === 'binzip') {
+			$temp_base = $this->backup_dir . 'ziptemp_' . $this->sgbackup->nonce;
+			if (is_dir($temp_base)) {
+				$this->recursive_rmdir($temp_base);
+			}
+		}
 
 		return $created_files;
 	}
@@ -449,9 +468,11 @@ class SiteGuard_Backup_Engine {
 		}
 
 		// Flush periodically (every 200 files) to limit data loss on interruption
-		$this->zipfiles_added++;
-		if ($this->zipfiles_added % 200 === 0) {
+		// Note: zipfiles_added is incremented by the caller (create_zips), not here
+		$this->zipfiles_added_unflushed++;
+		if ($this->zipfiles_added_unflushed >= 200) {
 			$this->close_ziparchive();
+			$this->zipfiles_added_unflushed = 0;
 		}
 
 		return $result;
@@ -466,6 +487,18 @@ class SiteGuard_Backup_Engine {
 			$this->ziparchive_handle = null;
 			$this->ziparchive_path = null;
 		}
+	}
+
+	private function recursive_rmdir($dir) {
+		if (!is_dir($dir)) return;
+		$items = new RecursiveIteratorIterator(
+			new RecursiveDirectoryIterator($dir, FilesystemIterator::SKIP_DOTS),
+			RecursiveIteratorIterator::CHILD_FIRST
+		);
+		foreach ($items as $item) {
+			$item->isDir() ? @rmdir($item->getPathname()) : @unlink($item->getPathname());
+		}
+		@rmdir($dir);
 	}
 
 	public function __destruct() {

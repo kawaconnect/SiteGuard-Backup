@@ -104,6 +104,7 @@ function sgbackup_load_classes() {
 	require_once SGBACKUP_DIR . 'includes/class-database-utility.php';
 	require_once SGBACKUP_DIR . 'includes/class-semaphore.php';
 	require_once SGBACKUP_DIR . 'includes/class-audit-log.php';
+	require_once SGBACKUP_DIR . 'includes/class-webhook.php';
 }
 
 /**
@@ -117,6 +118,7 @@ function sgbackup_init() {
 	}
 
 	sgbackup_load_classes();
+	sgbackup_register_cron_hooks();
 
 	require_once SGBACKUP_DIR . 'class-siteguardbackup.php';
 	SiteGuard_Backup::instance();
@@ -133,6 +135,49 @@ function sgbackup_init() {
 	}
 }
 add_action('plugins_loaded', 'sgbackup_init', 1);
+
+/**
+ * Check for missed scheduled backups and fire webhook if overdue.
+ */
+function sgbackup_check_schedule_missed() {
+	if (!sgbackup_should_load()) {
+		return;
+	}
+
+	// Cooldown: only check once per 24 hours
+	$opts = SiteGuard_Backup_Options::instance();
+	$last_check = (int) $opts->get_option('sgbackup_schedule_missed_notified', 0);
+	if ($last_check && (time() - $last_check) < 86400) {
+		return;
+	}
+
+	// Check each backup cron hook for overdue scheduling
+	$hooks = array('sgbackup_backup', 'sgbackup_backup_database', 'sgbackup_backup_incremental');
+
+	foreach ($hooks as $hook) {
+		$event = wp_get_scheduled_event($hook);
+		if (!$event || empty($event->interval)) {
+			continue; // Not scheduled or single-fire event
+		}
+
+		$next = $event->timestamp;
+		$interval = (int) $event->interval;
+
+		// If overdue by more than 1.5x the interval, it's missed
+		$overdue = time() - $next;
+		if ($overdue > ($interval * 1.5)) {
+			SiteGuard_Backup_Webhook::fire('schedule_missed', array(
+				'hook'         => $hook,
+				'scheduled_at' => $next,
+				'overdue_by'   => $overdue,
+				'interval'     => $interval,
+			));
+			$opts->update_option('sgbackup_schedule_missed_notified', time());
+			return; // One notification per cooldown period
+		}
+	}
+}
+add_action('wp_loaded', 'sgbackup_check_schedule_missed');
 
 /**
  * Register cron action hooks (lightweight, always loaded).

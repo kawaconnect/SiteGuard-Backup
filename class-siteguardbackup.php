@@ -320,9 +320,12 @@ class SiteGuard_Backup {
 		$opts = SiteGuard_Backup_Options::instance();
 		$schedule_time = $opts->get_option('sgbackup_schedule_time', '');
 
-		$offset = get_option('gmt_offset', 0) * HOUR_IN_SECONDS;
 		$now = time();
-		$local_now = $now + $offset;
+
+		// Use wp_timezone() for correct local time (handles DST and half-hour offsets)
+		$tz = wp_timezone();
+		$now_dt = new DateTime('@' . $now);
+		$now_dt->setTimezone($tz);
 
 		// Determine hour and minute
 		$hour = null;
@@ -343,13 +346,15 @@ class SiteGuard_Backup {
 				$target_dow = 0;
 			}
 			// Find the next occurrence of that day of week
-			$current_dow = intval(gmdate('w', $local_now));
+			$current_dow = intval($now_dt->format('w'));
 			$days_ahead = $target_dow - $current_dow;
 			if ($days_ahead < 0) {
 				$days_ahead += 7;
 			}
-			$target_date = strtotime('today', $local_now) + ($days_ahead * DAY_IN_SECONDS);
-			$scheduled = $target_date + ($hour * 3600) + ($minute * 60) - $offset;
+			$target_dt = clone $now_dt;
+			$target_dt->modify("+{$days_ahead} days");
+			$target_dt->setTime($hour, $minute, 0);
+			$scheduled = $target_dt->getTimestamp();
 			// If this time already passed, advance by 7 days
 			if ($scheduled <= $now) {
 				$scheduled += 7 * DAY_IN_SECONDS;
@@ -363,27 +368,32 @@ class SiteGuard_Backup {
 				$target_dom = 1;
 			}
 			// Find the next occurrence of that day of month
-			$local_year = intval(gmdate('Y', $local_now));
-			$local_month = intval(gmdate('n', $local_now));
-			$local_day = intval(gmdate('j', $local_now));
+			$local_year = intval($now_dt->format('Y'));
+			$local_month = intval($now_dt->format('n'));
 
 			// Try current month first
-			$target_ts = gmmktime($hour, $minute, 0, $local_month, $target_dom, $local_year) - $offset;
-			if ($target_ts <= $now) {
+			$target_dt = new DateTime('now', $tz);
+			$target_dt->setDate($local_year, $local_month, $target_dom);
+			$target_dt->setTime($hour, $minute, 0);
+			$scheduled = $target_dt->getTimestamp();
+			if ($scheduled <= $now) {
 				// Move to next month
 				$local_month++;
 				if ($local_month > 12) {
 					$local_month = 1;
 					$local_year++;
 				}
-				$target_ts = gmmktime($hour, $minute, 0, $local_month, $target_dom, $local_year) - $offset;
+				$target_dt->setDate($local_year, $local_month, $target_dom);
+				$scheduled = $target_dt->getTimestamp();
 			}
-			return $target_ts;
+			return $scheduled;
 		}
 
 		// Default: use tomorrow at the specified time
-		$tomorrow = strtotime('tomorrow', $local_now) - $offset;
-		$scheduled = $tomorrow + ($hour * 3600) + ($minute * 60);
+		$target_dt = clone $now_dt;
+		$target_dt->modify('+1 day');
+		$target_dt->setTime($hour, $minute, 0);
+		$scheduled = $target_dt->getTimestamp();
 		if ($scheduled <= $now) {
 			$scheduled += DAY_IN_SECONDS;
 		}
@@ -427,8 +437,8 @@ class SiteGuard_Backup {
 	 * Manual/cron entry: backup everything.
 	 */
 	public function backup_all($options = array()) {
-		$backup_files = isset($options['nofiles']) ? false : true;
-		$backup_db = isset($options['nodb']) ? false : true;
+		$backup_files = !empty($options['nofiles']) ? false : true;
+		$backup_db = !empty($options['nodb']) ? false : true;
 		$this->boot_backup($backup_files, $backup_db, $options);
 	}
 
@@ -489,7 +499,7 @@ class SiteGuard_Backup {
 			error_log('SiteGuard Backup: Another backup is already being initialized');
 			return;
 		}
-		$sem->unlock();
+		try {
 
 		$opts = SiteGuard_Backup_Options::instance();
 
@@ -600,10 +610,15 @@ class SiteGuard_Backup {
 		$this->jobdata = $initial_jobdata;
 		$this->save_jobdata();
 
-		// Schedule first resumption
-		SiteGuard_Backup_Job_Scheduler::schedule_resumption(0, $this->nonce, 2);
+		} finally {
+			$sem->unlock();
+		}
 
-		$this->log("Boot complete. First resumption scheduled in 2s.");
+		// Schedule first resumption
+		$resume_secs = SiteGuard_Backup_Job_Scheduler::get_initial_resume_interval();
+		SiteGuard_Backup_Job_Scheduler::schedule_resumption(0, $this->nonce, $resume_secs);
+
+		$this->log("Boot complete. First resumption scheduled in {$resume_secs}s.");
 		$this->logfile_close();
 	}
 
@@ -687,6 +702,10 @@ class SiteGuard_Backup {
 		} catch (Exception $e) {
 			$this->jobdata_set('jobstatus', 'failed');
 			$this->log("Exception during backup: " . $e->getMessage(), 'error');
+			SiteGuard_Backup_Webhook::fire('backup_failed', array(
+				'nonce'   => $this->nonce,
+				'message' => $e->getMessage(),
+			));
 			$semaphore->unlock();
 			$this->logfile_close();
 			return;
@@ -953,6 +972,12 @@ class SiteGuard_Backup {
 
 			// Save to backup history
 			$this->save_to_history();
+
+			SiteGuard_Backup_Webhook::fire('backup_complete', array(
+				'nonce'    => $this->nonce,
+				'job_type' => $this->jobdata_get('job_type', 'full'),
+				'entities' => $this->jobdata_get('entities', array()),
+			));
 		}
 
 		// Clear scheduled resumptions
