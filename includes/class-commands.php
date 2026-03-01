@@ -223,7 +223,7 @@ class SiteGuard_Backup_Commands {
 		$timestamp = intval($params['timestamp']);
 		$always_keep = !empty($params['always_keep']);
 
-		$history = SiteGuard_Backup_History::get_history();
+		$history = SiteGuard_Backup_History::get_history_raw();
 		if (isset($history[$timestamp])) {
 			$history[$timestamp]['always_keep'] = $always_keep;
 			SiteGuard_Backup_History::save_history($history);
@@ -2004,12 +2004,16 @@ class SiteGuard_Backup_Commands {
 		$imported = 0;
 
 		foreach ($params['settings'] as $key => $value) {
+			// Sanitize key to alphanumeric and underscore only
+			if (!preg_match('/^[a-zA-Z0-9_]+$/', $key)) continue;
+
 			if (isset($defaults[$key])) {
 				if ($key === 'lock_admin_password') continue;
+				// Type-check against default value
+				if (gettype($value) !== gettype($defaults[$key])) continue;
 				$opts->update_option('sgbackup_' . $key, $value);
 				$imported++;
-			}
-			if (strpos($key, 'method_') === 0) {
+			} elseif (strpos($key, 'method_') === 0) {
 				$method = substr($key, 7);
 				if (in_array($method, self::$valid_methods, true) && is_array($value)) {
 					$opts->update_option('sgbackup_' . $method, $value);
