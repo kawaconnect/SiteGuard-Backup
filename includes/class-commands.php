@@ -366,6 +366,11 @@ class SiteGuard_Backup_Commands {
 			unset($params['webhook_events']);
 		}
 
+		// Checkbox arrays: default to empty when absent from POST (unchecked = not submitted)
+		if (!isset($params['include_entities'])) {
+			$params['include_entities'] = array();
+		}
+
 		foreach ($settings_keys as $key) {
 			// lock_admin_password is already handled above
 			if ($key === 'lock_admin_password') continue;

@@ -1161,6 +1161,14 @@ $period_labels = array(
 				if (is_array($email_recipients) && !empty($email_recipients)) {
 					if (isset($email_recipients[0]) && is_array($email_recipients[0])) {
 						$structured_recipients = $email_recipients;
+					} elseif (isset($email_recipients[0]) && is_string($email_recipients[0])) {
+						// Handle flat array of email strings
+						foreach ($email_recipients as $addr) {
+							$addr = trim($addr);
+							if (!empty($addr)) {
+								$structured_recipients[] = array('address' => $addr, 'warnings_only' => 0, 'send_backup' => 0, 'send_db_only' => 0);
+							}
+						}
 					}
 				} elseif (is_string($email_recipients) && !empty($email_recipients)) {
 					// Convert legacy comma-separated to structured
