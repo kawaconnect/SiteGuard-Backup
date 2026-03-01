@@ -242,11 +242,14 @@ class SiteGuard_Backup_Job_Scheduler {
 					if (count($args) >= 2) {
 						$resumption_no = $args[0];
 						$nonce = $args[1];
-						$jobs[$nonce] = array(
-							'resumption' => $resumption_no,
-							'next_scheduled' => $time,
-							'nonce' => $nonce,
-						);
+						// Keep the earliest (soonest) scheduled resumption per nonce
+						if (!isset($jobs[$nonce]) || $time < $jobs[$nonce]['next_scheduled']) {
+							$jobs[$nonce] = array(
+								'resumption' => $resumption_no,
+								'next_scheduled' => $time,
+								'nonce' => $nonce,
+							);
+						}
 					}
 				}
 			}

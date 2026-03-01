@@ -203,6 +203,8 @@ class SiteGuard_Backup_Engine {
 			}
 
 			$this->sgbackup->jobdata_set('job_file_entities', $entities);
+			// Persist after each entity so files aren't lost on resumption
+			$this->sgbackup->jobdata_set('backup_files_array', $backup_files_array);
 			SiteGuard_Backup_Job_Scheduler::something_useful_happened();
 		}
 
@@ -303,13 +305,12 @@ class SiteGuard_Backup_Engine {
 				return 'needs_resumption';
 			}
 
-			// Check split threshold - flush ZipArchive first so filesize() is accurate
-			if (file_exists($zip_path)) {
-				if ($this->zip_method === 'ziparchive') {
-					$this->close_ziparchive();
-					$this->zipfiles_added_unflushed = 0;
-					clearstatcache(true, $zip_path);
-				}
+			// Check split threshold
+			// For ZipArchive: only check after periodic flush (unflushed==0) to avoid O(n^2) reopens
+			$should_check_split = ($this->zip_method !== 'ziparchive')
+				|| ($this->zipfiles_added_unflushed === 0 && $this->zipfiles_added > 0);
+			if ($should_check_split && file_exists($zip_path)) {
+				clearstatcache(true, $zip_path);
 				if (filesize($zip_path) >= $this->split_every) {
 					$created_files[] = $zip_filename;
 					$this->index++;
@@ -371,7 +372,7 @@ class SiteGuard_Backup_Engine {
 	 */
 	private function add_to_zip($zip_path, $file_path, $archive_name, $file_size) {
 		// Resolve symlinks to get the real file
-		$resolved = is_link($file_path) ? readlink($file_path) : $file_path;
+		$resolved = is_link($file_path) ? realpath($file_path) : $file_path;
 		if (!file_exists($resolved) || !is_readable($resolved)) return false;
 		// Verify resolved symlink stays within ABSPATH to prevent directory escape
 		$real_resolved = realpath($resolved);

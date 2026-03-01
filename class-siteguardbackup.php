@@ -174,6 +174,7 @@ class SiteGuard_Backup {
 		$args = func_get_args();
 		if (count($args) % 2 !== 0) {
 			error_log('SiteGuard Backup: jobdata_set_multi called with odd number of arguments');
+			return; // Do not persist a partial update
 		}
 		for ($i = 0; $i < count($args); $i += 2) {
 			if (isset($args[$i + 1])) {
@@ -355,9 +356,10 @@ class SiteGuard_Backup {
 			$target_dt->modify("+{$days_ahead} days");
 			$target_dt->setTime($hour, $minute, 0);
 			$scheduled = $target_dt->getTimestamp();
-			// If this time already passed, advance by 7 days
+			// If this time already passed, advance by 7 days (use DateTime to avoid DST drift)
 			if ($scheduled <= $now) {
-				$scheduled += 7 * DAY_IN_SECONDS;
+				$target_dt->modify('+7 days');
+				$scheduled = $target_dt->getTimestamp();
 			}
 			return $scheduled;
 		}
@@ -395,7 +397,8 @@ class SiteGuard_Backup {
 		$target_dt->setTime($hour, $minute, 0);
 		$scheduled = $target_dt->getTimestamp();
 		if ($scheduled <= $now) {
-			$scheduled += DAY_IN_SECONDS;
+			$target_dt->modify('+1 day');
+			$scheduled = $target_dt->getTimestamp();
 		}
 		return $scheduled;
 	}
@@ -614,11 +617,10 @@ class SiteGuard_Backup {
 			$sem->unlock();
 		}
 
-		// Schedule first resumption
-		$resume_secs = SiteGuard_Backup_Job_Scheduler::get_initial_resume_interval();
-		SiteGuard_Backup_Job_Scheduler::schedule_resumption(0, $this->nonce, $resume_secs);
+		// Schedule first resumption (use $resume_interval computed above for jobdata)
+		SiteGuard_Backup_Job_Scheduler::schedule_resumption(0, $this->nonce, $resume_interval);
 
-		$this->log("Boot complete. First resumption scheduled in {$resume_secs}s.");
+		$this->log("Boot complete. First resumption scheduled in {$resume_interval}s.");
 		$this->logfile_close();
 	}
 
