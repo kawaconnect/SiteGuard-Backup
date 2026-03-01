@@ -1597,7 +1597,7 @@ class SiteGuard_Backup_Commands {
 	public function rescan_local($params) {
 		$opts = SiteGuard_Backup_Options::instance();
 		$backup_dir = $opts->get_backup_dir();
-		$history = SiteGuard_Backup_History::get_history();
+		$history = SiteGuard_Backup_History::get_history_raw();
 
 		$known_files = array();
 		foreach ($history as $ts => $backup) {
@@ -1696,7 +1696,7 @@ class SiteGuard_Backup_Commands {
 				continue;
 			}
 
-			$history = SiteGuard_Backup_History::get_history();
+			$history = SiteGuard_Backup_History::get_history_raw();
 			$known_files = array();
 			foreach ($history as $ts => $backup) {
 				$files = SiteGuard_Backup_History::get_all_files($backup);

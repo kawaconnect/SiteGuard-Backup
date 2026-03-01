@@ -580,42 +580,23 @@ class SiteGuard_Backup_Admin {
 			$timestamp = strtotime(str_replace('-', '', substr($m[1], 0, 10)) . ' ' . substr($m[1], 11, 2) . ':' . substr($m[1], 13, 2));
 			$nonce = $m[2];
 
-			$history = SiteGuard_Backup_History::get_history();
-			if (!isset($history[$timestamp])) {
-				// Determine entity type
-				$entity = 'unknown';
-				foreach (array('plugins', 'themes', 'uploads', 'others', 'db', 'wpcore') as $e) {
-					if (strpos($filename, "-{$e}") !== false) {
-						$entity = $e;
-						break;
-					}
+			// Determine entity type
+			$entity = 'unknown';
+			foreach (array('plugins', 'themes', 'uploads', 'others', 'db', 'wpcore') as $e) {
+				if (strpos($filename, "-{$e}") !== false) {
+					$entity = $e;
+					break;
 				}
-
-				$backup_data = array(
-					'nonce' => $nonce,
-					$entity => array($filename),
-					'service' => array('none'),
-					'size' => filesize($dest),
-				);
-				SiteGuard_Backup_History::add_backup($timestamp, $backup_data);
-			} else {
-				// Add to existing backup set
-				foreach (array('plugins', 'themes', 'uploads', 'others', 'db', 'wpcore') as $e) {
-					if (strpos($filename, "-{$e}") !== false) {
-						if (!isset($history[$timestamp][$e])) {
-							$history[$timestamp][$e] = array();
-						}
-						if (is_string($history[$timestamp][$e])) {
-							$history[$timestamp][$e] = array($history[$timestamp][$e]);
-						}
-						if (!in_array($filename, $history[$timestamp][$e])) {
-							$history[$timestamp][$e][] = $filename;
-						}
-						break;
-					}
-				}
-				SiteGuard_Backup_History::save_history($history);
 			}
+
+			$backup_data = array(
+				'nonce' => $nonce,
+				$entity => array($filename),
+				'service' => array('none'),
+				'size' => filesize($dest),
+			);
+			// Use add_backup() which handles locking, merging, and raw history correctly
+			SiteGuard_Backup_History::add_backup($timestamp, $backup_data);
 		}
 
 		// Audit log

@@ -400,7 +400,7 @@ class SiteGuard_Backup_Remote_Send {
 			}
 		}
 
-		$history = SiteGuard_Backup_History::get_history();
+		$history = SiteGuard_Backup_History::get_history_raw();
 
 		if (!isset($history[$timestamp])) {
 			$history[$timestamp] = array(

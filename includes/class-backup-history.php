@@ -304,7 +304,7 @@ class SiteGuard_Backup_History {
 
 		if ($retain < 1) return;
 
-		$history = self::get_history();
+		$history = self::get_history_raw();
 		$count = 0;
 		$to_delete = array();
 
