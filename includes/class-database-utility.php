@@ -197,14 +197,18 @@ class SiteGuard_Backup_Database_Utility {
 			$opts_content .= "host=" . addcslashes($host, "\\\"'\n") . "\n";
 			file_put_contents($opts_file, $opts_content);
 
+			// Capture stderr separately so warnings (e.g. MariaDB deprecation
+			// notices) don't pollute the SQL output file.
+			$stderr_file = $opts_file . '.err';
 			$cmd = sprintf(
-				'mysqldump --defaults-extra-file=%s --no-tablespaces --single-transaction --quick %s %s %s %s > %s 2>&1',
+				'mysqldump --defaults-extra-file=%s --no-tablespaces --single-transaction --quick --skip-lock-tables %s %s %s %s > %s 2>%s',
 				escapeshellarg($opts_file),
 				$port,
 				$socket,
 				escapeshellarg($db),
 				escapeshellarg($table),
-				escapeshellarg($outfile)
+				escapeshellarg($outfile),
+				escapeshellarg($stderr_file)
 			);
 
 			$output = array();
@@ -212,8 +216,10 @@ class SiteGuard_Backup_Database_Utility {
 			exec($cmd, $output, $return);
 
 			if (0 !== $return) {
-				error_log('SiteGuard Backup: mysqldump failed (return code ' . $return . '): ' . implode("\n", $output));
+				$stderr = file_exists($stderr_file) ? trim(file_get_contents($stderr_file)) : '';
+				error_log('SiteGuard Backup: mysqldump failed (return code ' . $return . '): ' . $stderr);
 			}
+			@unlink($stderr_file);
 
 			return (0 === $return && file_exists($outfile) && filesize($outfile) > 0);
 		} finally {
@@ -699,12 +705,22 @@ class SiteGuard_Backup_Database_Utility {
 				if (empty($trimmed)) {
 					continue;
 				}
-				if (empty($buffer) && (0 === strpos($trimmed, '--') || 0 === strpos($trimmed, '#') || 0 === strpos($trimmed, '/*'))) {
+				// Skip comments, MariaDB sandbox header, and mysqldump noise
+				if (empty($buffer) && (
+					0 === strpos($trimmed, '--') ||
+					0 === strpos($trimmed, '#') ||
+					0 === strpos($trimmed, '/*') ||
+					0 === strpos($trimmed, 'mysqldump:') ||
+					0 === strpos($trimmed, 'mariadb-dump:')
+				)) {
 					continue;
 				}
 				// Handle DELIMITER changes (for routines/views)
 				if (preg_match('/^DELIMITER\s+(\S+)/i', $trimmed, $dm)) {
-					// Skip DELIMITER statements - atomic restore handles table DDL/DML only
+					continue;
+				}
+				// Skip LOCK/UNLOCK TABLES - incompatible with atomic temp-table approach
+				if (preg_match('/^(LOCK\s+TABLES|UNLOCK\s+TABLES)/i', $trimmed)) {
 					continue;
 				}
 			}
@@ -732,6 +748,18 @@ class SiteGuard_Backup_Database_Utility {
 
 				if (empty($query)) continue;
 
+				// Skip SET/conditional statements that are just mysqldump housekeeping
+				if (preg_match('/^\/\*!?\d+\s/i', $query)) {
+					// MySQL conditional comment - execute it as-is (SET CHARACTER_SET etc.)
+					$wpdb->query($query);
+					continue;
+				}
+
+				// Skip LOCK/UNLOCK that may appear mid-buffer
+				if (preg_match('/^(LOCK\s+TABLES|UNLOCK\s+TABLES)/i', $query)) {
+					continue;
+				}
+
 				// Rewrite table names to use temp prefix
 				if (preg_match('/^(DROP TABLE\s+IF\s+EXISTS\s+)`([^`]+)`/i', $query, $m)) {
 					$original = $m[2];
@@ -750,10 +778,14 @@ class SiteGuard_Backup_Database_Utility {
 					}
 				}
 
+				if (self::is_dangerous_sql($query)) {
+					$result['errors'][] = "Blocked dangerous SQL on line {$line_count}";
+					continue;
+				}
+
 				$res = $wpdb->query($query);
 				if (false === $res) {
 					$result['errors'][] = "SQL error on line {$line_count}: " . $wpdb->last_error;
-					$result['success'] = false;
 				}
 
 				if (preg_match('/^CREATE\s+TABLE/i', $query)) {
