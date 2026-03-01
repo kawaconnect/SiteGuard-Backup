@@ -1275,14 +1275,10 @@ class SiteGuard_Backup_CLI_Command extends WP_CLI_Command {
 
         // 1. Clean stale jobdata options
         global $wpdb;
+        // Always query wp_options - jobdata is stored per-site, not in sitemeta
         $job_options = $wpdb->get_col(
             "SELECT option_name FROM {$wpdb->options} WHERE option_name LIKE 'sgbackup_jobdata_%'"
         );
-        if (is_multisite()) {
-            $job_options = $wpdb->get_col(
-                "SELECT meta_key FROM {$wpdb->sitemeta} WHERE meta_key LIKE 'sgbackup_jobdata_%'"
-            );
-        }
 
         $active_nonces = array_keys(SiteGuard_Backup_Job_Scheduler::get_active_jobs());
         foreach ($job_options as $opt) {
@@ -1345,20 +1341,16 @@ class SiteGuard_Backup_CLI_Command extends WP_CLI_Command {
         }
 
         // 4. Clear stale semaphore locks (older than 1 hour)
-        $lock_option = $opts->get_option('sgbackup_lock_backup', '');
-        if (!empty($lock_option)) {
-            $lock_data = maybe_unserialize($lock_option);
-            $lock_time = 0;
-            if (is_array($lock_data) && isset($lock_data['time'])) {
-                $lock_time = intval($lock_data['time']);
-            } elseif (is_numeric($lock_data)) {
-                $lock_time = intval($lock_data);
-            }
+        // Semaphore stores in wp_options as sgbackup_backup with format: lock_value|timestamp
+        $lock_option = get_option('sgbackup_backup', '');
+        if (!empty($lock_option) && is_string($lock_option) && strpos($lock_option, '|') !== false) {
+            $lock_time = intval(substr($lock_option, strrpos($lock_option, '|') + 1));
             if ($lock_time > 0 && (time() - $lock_time) > 3600) {
                 if ($dry_run) {
                     WP_CLI::log("  Would clear stale lock (held since " . gmdate('Y-m-d H:i', $lock_time) . " UTC)");
                 } else {
-                    $opts->delete_option('sgbackup_lock_backup');
+                    delete_option('sgbackup_backup');
+                    wp_cache_delete('sgbackup_backup', 'options');
                     WP_CLI::log("  Cleared stale semaphore lock");
                 }
                 $cleaned++;
@@ -1836,12 +1828,12 @@ class SiteGuard_Backup_CLI_Command extends WP_CLI_Command {
             WP_CLI::log('Backup lock: FREE');
         } else {
             WP_CLI::log('Backup lock: HELD');
-            $opts = SiteGuard_Backup_Options::instance();
-            $lock_data = $opts->get_option('sgbackup_lock_backup', '');
-            if (!empty($lock_data)) {
-                $data = maybe_unserialize($lock_data);
-                if (is_array($data) && isset($data['time'])) {
-                    $held_for = $this->format_duration(time() - intval($data['time']));
+            // Semaphore format: lock_value|timestamp in wp_options
+            $lock_data = get_option('sgbackup_backup', '');
+            if (!empty($lock_data) && is_string($lock_data) && strpos($lock_data, '|') !== false) {
+                $lock_time = intval(substr($lock_data, strrpos($lock_data, '|') + 1));
+                if ($lock_time > 0) {
+                    $held_for = $this->format_duration(time() - $lock_time);
                     WP_CLI::log("  Held for: {$held_for}");
                 }
             }
