@@ -107,6 +107,21 @@ class SiteGuard_Backup_Options {
 			}
 		}
 
+		// Re-validate resolved path after directory exists (catches symlink attacks)
+		$real_resolved = realpath($dir);
+		$real_content = realpath(WP_CONTENT_DIR);
+		$real_abspath = realpath(ABSPATH);
+		if ($real_resolved && $real_content && $real_abspath
+			&& strpos($real_resolved, $real_content) !== 0
+			&& strpos($real_resolved, $real_abspath) !== 0) {
+			error_log('SiteGuard Backup: Resolved backup directory is outside WordPress installation, using default');
+			$dir = WP_CONTENT_DIR . '/sgbackup';
+			if (!file_exists($dir)) {
+				wp_mkdir_p($dir);
+				$this->protect_backup_dir($dir);
+			}
+		}
+
 		return trailingslashit($dir);
 	}
 
