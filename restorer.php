@@ -329,7 +329,8 @@ class SiteGuard_Backup_Restorer {
 					}
 				);
 			} else {
-				$import_result = SiteGuard_Backup_Database_Utility::execute_sql_file(
+				// Use atomic restore (temp table → RENAME) for crash safety
+				$import_result = SiteGuard_Backup_Database_Utility::execute_sql_file_atomic(
 					$file_path,
 					function($lines_done) {
 						$this->progress("Database import: {$lines_done} lines processed");
