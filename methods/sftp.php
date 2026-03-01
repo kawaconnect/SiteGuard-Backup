@@ -379,31 +379,6 @@ class SiteGuard_Backup_Method_Sftp extends SiteGuard_Backup_Module {
 		$conn = $this->connect();
 		if (is_wp_error($conn)) return $conn;
 
-		// Retrieve and report fingerprint
-		$fingerprint = '';
-		if ($conn['type'] === 'ssh2' && isset($conn['conn'])) {
-			$fp = @ssh2_fingerprint($conn['conn'], SSH2_FINGERPRINT_MD5 | SSH2_FINGERPRINT_HEX);
-			if ($fp) {
-				$fingerprint = strtolower($fp);
-			}
-		} elseif ($conn['type'] === 'phpseclib' && isset($conn['sftp'])) {
-			$sftp_obj = $conn['sftp'];
-			if (method_exists($sftp_obj, 'getServerPublicHostKey')) {
-				$hostkey = $sftp_obj->getServerPublicHostKey();
-				if ($hostkey) {
-					$fingerprint = strtolower(md5($hostkey));
-				}
-			}
-		}
-
-		$options = $this->get_options();
-		$protocol = isset($options['protocol']) ? $options['protocol'] : 'sftp';
-		$result = array('success' => true);
-		$result['message'] = strtoupper($protocol) . ' connection successful.';
-		if (!empty($fingerprint)) {
-			$result['message'] .= ' Host fingerprint: ' . $fingerprint;
-		}
-
-		return $result;
+		return true;
 	}
 }

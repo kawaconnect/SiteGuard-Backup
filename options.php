@@ -229,6 +229,8 @@ class SiteGuard_Backup_Options {
 			'auto_update'        => false,
 			'data_optional_tables' => '',
 			'zip_nocompress'     => '',
+			'webhook_url'        => '',
+			'webhook_events'     => array(),
 		);
 	}
 }

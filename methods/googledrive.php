@@ -137,8 +137,8 @@ class SiteGuard_Backup_Method_Googledrive extends SiteGuard_Backup_Module {
 
 		$folder_name = $options['folder_name'] ?: 'SiteGuard Backups';
 
-		// Escape single quotes for Google Drive API query string
-		$folder_name_escaped = str_replace("'", "\\'", $folder_name);
+		// Escape single quotes and backslashes for Google Drive API query string
+		$folder_name_escaped = str_replace(array('\\', "'"), array('\\\\', "\\'"), $folder_name);
 
 		// Search for existing folder
 		$response = wp_remote_get($this->api_url . '/files?' . http_build_query(array(

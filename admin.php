@@ -38,6 +38,10 @@ class SiteGuard_Backup_Admin {
 		add_action('admin_bar_menu', array($this, 'admin_bar_menu'), 100);
 		add_action('admin_head', array($this, 'admin_bar_css'));
 		add_action('wp_head', array($this, 'admin_bar_css'));
+		add_action('wp_dashboard_setup', array($this, 'dashboard_widget_setup'));
+		if (is_multisite()) {
+			add_action('wp_network_dashboard_setup', array($this, 'dashboard_widget_setup'));
+		}
 	}
 
 	/**
@@ -704,6 +708,122 @@ class SiteGuard_Backup_Admin {
 	public function admin_bar_css() {
 		if (!$this->user_can_manage()) return;
 		echo '<style>#wpadminbar #wp-admin-bar-sgbackup .ab-icon:before{content:"\f332";top:2px;}</style>';
+	}
+
+	/**
+	 * Dashboard Widget: Register the backup health widget.
+	 *
+	 * Optional, opt-in widget that shows backup health at a glance on the
+	 * WordPress admin dashboard. Shows: last backup time, backup count,
+	 * disk usage, and any warnings (stale backups, low disk space).
+	 *
+	 * Only visible to users with manage_options (or manage_network_options
+	 * on multisite). Does not run any backups or modify any data.
+	 */
+	public function dashboard_widget_setup() {
+		if (!$this->user_can_manage()) return;
+
+		wp_add_dashboard_widget(
+			'sgbackup_dashboard_widget',
+			__('SiteGuard Backup', 'siteguardbackup'),
+			array($this, 'dashboard_widget_render')
+		);
+	}
+
+	/**
+	 * Dashboard Widget: Render the backup health summary.
+	 */
+	public function dashboard_widget_render() {
+		$opts = SiteGuard_Backup_Options::instance();
+		$history = SiteGuard_Backup_History::get_history();
+		$backup_dir = $opts->get_backup_dir();
+		$disk = SiteGuard_Backup_Filesystem::check_disk_space($backup_dir);
+
+		// Last backup
+		$latest = SiteGuard_Backup_History::get_latest();
+		$warnings = array();
+
+		echo '<div style="line-height:1.8;">';
+
+		if ($latest) {
+			$age = time() - $latest['timestamp'];
+			$age_text = human_time_diff($latest['timestamp']);
+			$age_color = ($age > 86400 * 7) ? '#d63638' : (($age > 86400 * 2) ? '#dba617' : '#00a32a');
+			echo '<p><strong>' . esc_html__('Last Backup:', 'siteguardbackup') . '</strong> ';
+			echo '<span style="color:' . $age_color . ';">' . esc_html($age_text) . ' ' . esc_html__('ago', 'siteguardbackup') . '</span>';
+			echo ' <small>(' . esc_html(gmdate('M j, H:i', $latest['timestamp'])) . ' UTC)</small></p>';
+
+			if ($age > 86400 * 7) {
+				$warnings[] = __('Last backup is over 7 days old.', 'siteguardbackup');
+			}
+		} else {
+			echo '<p><strong>' . esc_html__('Last Backup:', 'siteguardbackup') . '</strong> <span style="color:#d63638;">' . esc_html__('Never', 'siteguardbackup') . '</span></p>';
+			$warnings[] = __('No backups found. Create your first backup.', 'siteguardbackup');
+		}
+
+		// Backup count & size
+		$total_count = count($history);
+		$total_size = 0;
+		foreach ($history as $backup) {
+			if (isset($backup['size'])) {
+				$total_size += intval($backup['size']);
+			}
+		}
+		echo '<p><strong>' . esc_html__('Backups:', 'siteguardbackup') . '</strong> ';
+		echo esc_html($total_count) . ' ' . esc_html__('sets', 'siteguardbackup');
+		if ($total_size > 0) {
+			echo ' (' . esc_html(SiteGuard_Backup_Filesystem::format_bytes($total_size)) . ')';
+		}
+		echo '</p>';
+
+		// Disk space
+		if ($disk) {
+			$free_pct = ($disk['total'] > 0) ? round(($disk['free'] / $disk['total']) * 100) : 0;
+			$disk_color = ($free_pct < 5) ? '#d63638' : (($free_pct < 15) ? '#dba617' : '#00a32a');
+			echo '<p><strong>' . esc_html__('Disk:', 'siteguardbackup') . '</strong> ';
+			echo esc_html(SiteGuard_Backup_Filesystem::format_bytes($disk['free'])) . ' ' . esc_html__('free', 'siteguardbackup');
+			echo ' <span style="color:' . $disk_color . ';">(' . $free_pct . '%)</span></p>';
+
+			if ($free_pct < 5) {
+				$warnings[] = __('Disk space critically low!', 'siteguardbackup');
+			}
+		}
+
+		// Schedule info
+		$file_interval = $opts->get_option('sgbackup_interval', 'manual');
+		$db_interval = $opts->get_option('sgbackup_interval_database', 'manual');
+		echo '<p><strong>' . esc_html__('Schedule:', 'siteguardbackup') . '</strong> ';
+		echo esc_html__('Files', 'siteguardbackup') . ': ' . esc_html($file_interval);
+		echo ' &middot; ' . esc_html__('DB', 'siteguardbackup') . ': ' . esc_html($db_interval);
+		echo '</p>';
+
+		// Next scheduled
+		$next_file = wp_next_scheduled('sgbackup_backup');
+		$next_db = wp_next_scheduled('sgbackup_backup_database');
+		$next = false;
+		if ($next_file && $next_db) {
+			$next = min($next_file, $next_db);
+		} elseif ($next_file) {
+			$next = $next_file;
+		} elseif ($next_db) {
+			$next = $next_db;
+		}
+		if ($next) {
+			echo '<p><strong>' . esc_html__('Next:', 'siteguardbackup') . '</strong> ';
+			echo esc_html(human_time_diff(time(), $next)) . ' (' . esc_html(gmdate('M j, H:i', $next)) . ' UTC)</p>';
+		}
+
+		// Warnings
+		if (!empty($warnings)) {
+			echo '<div style="background:#fcf0f1;border-left:4px solid #d63638;padding:6px 10px;margin-top:8px;">';
+			foreach ($warnings as $w) {
+				echo '<p style="margin:2px 0;">' . esc_html($w) . '</p>';
+			}
+			echo '</div>';
+		}
+
+		echo '</div>';
+		echo '<p style="margin-top:10px;"><a href="' . esc_url(admin_url('admin.php?page=siteguardbackup')) . '" class="button">' . esc_html__('Open SiteGuard Backup', 'siteguardbackup') . '</a></p>';
 	}
 
 	/**

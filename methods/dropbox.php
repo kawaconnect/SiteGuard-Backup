@@ -60,7 +60,8 @@ class SiteGuard_Backup_Method_Dropbox extends SiteGuard_Backup_Module {
 
 		$body = json_decode(wp_remote_retrieve_body($response), true);
 		if (isset($body['error'])) {
-			return new WP_Error('dropbox_auth', $body['error_summary'] ?? $body['error']);
+			$err_msg = isset($body['error_summary']) ? $body['error_summary'] : (is_string($body['error']) ? $body['error'] : 'Unknown error');
+			return new WP_Error('dropbox_auth', $err_msg);
 		}
 
 		$options['token'] = $body;

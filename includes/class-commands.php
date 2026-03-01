@@ -258,6 +258,8 @@ class SiteGuard_Backup_Commands {
 			'auto_update',
 			'data_optional_tables',
 			'zip_nocompress',
+			'webhook_url',
+			'webhook_events',
 		);
 
 		// H5: Handle password protection settings specially before the main loop
@@ -345,6 +347,25 @@ class SiteGuard_Backup_Commands {
 			unset($params['lock_admin_support_url']);
 		}
 
+		// Handle webhook_url: sanitize as URL
+		if (isset($params['webhook_url'])) {
+			$webhook_url = trim($params['webhook_url']);
+			if (!empty($webhook_url)) {
+				$webhook_url = esc_url_raw($webhook_url, array('https', 'http'));
+			}
+			$opts->update_option('sgbackup_webhook_url', $webhook_url);
+			unset($params['webhook_url']);
+		}
+
+		// Handle webhook_events: validate against known event list
+		if (isset($params['webhook_events'])) {
+			$valid_events = array('backup_complete', 'backup_failed', 'restore_complete', 'restore_failed', 'schedule_missed');
+			$events = is_array($params['webhook_events']) ? $params['webhook_events'] : array();
+			$events = array_values(array_intersect($events, $valid_events));
+			$opts->update_option('sgbackup_webhook_events', $events);
+			unset($params['webhook_events']);
+		}
+
 		foreach ($settings_keys as $key) {
 			// lock_admin_password is already handled above
 			if ($key === 'lock_admin_password') continue;
@@ -356,6 +377,8 @@ class SiteGuard_Backup_Commands {
 			if ($key === 'lock_admin_support_url') continue;
 			// encryption_key is handled above (empty = keep existing)
 			if ($key === 'encryption_key') continue;
+			// webhook_url and webhook_events are handled above
+			if ($key === 'webhook_url' || $key === 'webhook_events') continue;
 
 			if (isset($params[$key])) {
 				$value = $params[$key];
