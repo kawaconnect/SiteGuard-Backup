@@ -45,6 +45,9 @@ class SiteGuard_Backup_Encryption {
 	 * @return string 12-byte IV unique to this chunk.
 	 */
 	private static function chunk_iv($base_iv, $chunk_index) {
+		if ($chunk_index > 0xFFFFFFFF) {
+			throw new \RuntimeException('Chunk index overflow: encryption IV would repeat');
+		}
 		// XOR the last 4 bytes with the chunk counter
 		$iv = $base_iv;
 		$counter = pack('N', $chunk_index);
@@ -210,10 +213,16 @@ class SiteGuard_Backup_Encryption {
 			$decrypted_file = $file . '.decrypted';
 		}
 
-		$in = fopen($file, 'rb');
-		$out = fopen($decrypted_file, 'wb');
+		// Write to temp file first, rename on success
+		$tmp_file = $decrypted_file . '.tmp';
 
-		if (!$in || !$out) return false;
+		$in = fopen($file, 'rb');
+		$out = fopen($tmp_file, 'wb');
+
+		if (!$in || !$out) {
+			@unlink($tmp_file);
+			return false;
+		}
 
 		// Read header
 		$magic = fread($in, 4); // SGK2
@@ -224,7 +233,7 @@ class SiteGuard_Backup_Encryption {
 		if (strlen($salt) < 32 || strlen($base_iv) < 12) {
 			fclose($in);
 			fclose($out);
-			@unlink($decrypted_file);
+			@unlink($tmp_file);
 			return false;
 		}
 
@@ -257,7 +266,7 @@ class SiteGuard_Backup_Encryption {
 		if (!hash_equals($computed_hmac, $stored_hmac)) {
 			fclose($in);
 			fclose($out);
-			@unlink($decrypted_file);
+			@unlink($tmp_file);
 			SiteGuard_Backup::instance()->log("HMAC verification failed - file may be tampered", 'error');
 			return false;
 		}
@@ -274,7 +283,7 @@ class SiteGuard_Backup_Encryption {
 			$len = unpack('N', substr($chunk_header, 0, 4))[1];
 			$tag = substr($chunk_header, 4, self::$tag_length);
 
-			if ($len <= 0 || $len > 1048576) break; // Max 1MB per chunk
+			if ($len <= 0 || $len > 131072) break; // Max 128KB per chunk
 
 			$encrypted = fread($in, $len);
 			if (false === $encrypted || strlen($encrypted) < $len) break;
@@ -293,7 +302,7 @@ class SiteGuard_Backup_Encryption {
 			if (false === $decrypted) {
 				fclose($in);
 				fclose($out);
-				@unlink($decrypted_file);
+				@unlink($tmp_file);
 				SiteGuard_Backup::instance()->log("GCM decryption failed at chunk {$chunk_index} - wrong key or corrupted data", 'error');
 				return false;
 			}
@@ -305,6 +314,12 @@ class SiteGuard_Backup_Encryption {
 		fclose($in);
 		fclose($out);
 
+		// Rename temp file to final path on success
+		if (!rename($tmp_file, $decrypted_file)) {
+			@unlink($tmp_file);
+			return false;
+		}
+
 		return $decrypted_file;
 	}
 
@@ -312,6 +327,7 @@ class SiteGuard_Backup_Encryption {
 	 * Decrypt legacy SGBK (AES-256-CBC) format - backward compatibility only.
 	 */
 	private static function decrypt_v1_cbc($file, $key) {
+		SiteGuard_Backup::instance()->log("WARNING: Decrypting legacy CBC-format file. Re-encrypt with current format for better security.", 'warning');
 		$legacy_cipher = 'aes-256-cbc';
 
 		$decrypted_file = preg_replace('/\.crypt$/', '', $file);
@@ -319,12 +335,18 @@ class SiteGuard_Backup_Encryption {
 			$decrypted_file = $file . '.decrypted';
 		}
 
+		// Write to temp file first, rename on success
+		$tmp_file = $decrypted_file . '.tmp';
+
 		$iv_length = openssl_cipher_iv_length($legacy_cipher);
 
 		$in = fopen($file, 'rb');
-		$out = fopen($decrypted_file, 'wb');
+		$out = fopen($tmp_file, 'wb');
 
-		if (!$in || !$out) return false;
+		if (!$in || !$out) {
+			@unlink($tmp_file);
+			return false;
+		}
 
 		// Read header to detect format
 		$magic = fread($in, 4);
@@ -337,7 +359,7 @@ class SiteGuard_Backup_Encryption {
 			// Very old format (no magic header) - insecure key derivation, reject
 			fclose($in);
 			fclose($out);
-			@unlink($decrypted_file);
+			@unlink($tmp_file);
 			SiteGuard_Backup::instance()->log("Refusing to decrypt unknown format (no SGBK/SGK2 magic header)", 'error');
 			return false;
 		}
@@ -345,7 +367,7 @@ class SiteGuard_Backup_Encryption {
 		if (strlen($iv) < $iv_length) {
 			fclose($in);
 			fclose($out);
-			@unlink($decrypted_file);
+			@unlink($tmp_file);
 			return false;
 		}
 
@@ -356,7 +378,7 @@ class SiteGuard_Backup_Encryption {
 			if (false === $len_data || strlen($len_data) < 4) break;
 
 			$len = unpack('N', $len_data)[1];
-			if ($len <= 0 || $len > 1048576) break;
+			if ($len <= 0 || $len > 131072) break;
 
 			$encrypted = fread($in, $len);
 			if (false === $encrypted || strlen($encrypted) < $len) break;
@@ -365,7 +387,7 @@ class SiteGuard_Backup_Encryption {
 			if (false === $decrypted) {
 				fclose($in);
 				fclose($out);
-				@unlink($decrypted_file);
+				@unlink($tmp_file);
 				SiteGuard_Backup::instance()->log("Legacy decryption failed - wrong key?", 'error');
 				return false;
 			}
@@ -379,6 +401,12 @@ class SiteGuard_Backup_Encryption {
 
 		fclose($in);
 		fclose($out);
+
+		// Rename temp file to final path on success
+		if (!rename($tmp_file, $decrypted_file)) {
+			@unlink($tmp_file);
+			return false;
+		}
 
 		return $decrypted_file;
 	}

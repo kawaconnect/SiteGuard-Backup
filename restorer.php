@@ -210,6 +210,12 @@ class SiteGuard_Backup_Restorer {
 		foreach ($services as $service) {
 			if ('none' === $service) continue;
 
+			// Validate service against registered backup methods whitelist
+			$registered_methods = SiteGuard_Backup::instance()->backup_methods;
+			if (!array_key_exists($service, $registered_methods)) {
+				return new WP_Error('invalid_remote_service', "Unknown remote storage service: {$service}");
+			}
+
 			$method_file = SGBACKUP_DIR . 'methods/' . $service . '.php';
 			if (!file_exists($method_file)) continue;
 
@@ -642,23 +648,44 @@ class SiteGuard_Backup_Restorer {
 				// Validate all entries for path traversal (Zip Slip prevention)
 				for ($i = 0; $i < $zip->numFiles; $i++) {
 					$entry_name = $zip->getNameIndex($i);
-					// Reject entries with path traversal or absolute paths
-					if (strpos($entry_name, '..') !== false || $entry_name[0] === '/' || $entry_name[0] === '\\') {
-						$this->progress("SECURITY: Rejected malicious zip entry: {$entry_name}");
+
+					// Skip empty entry names
+					if (empty($entry_name)) continue;
+
+					// Reject null bytes (poison byte attack)
+					if (strpos($entry_name, "\0") !== false) {
+						$this->progress("SECURITY: Rejected zip entry with null byte: " . bin2hex($entry_name));
 						$zip->close();
 						return false;
 					}
-					// Verify resolved path stays within destination
-					// Normalize path without requiring existence (realpath fails for non-existent dirs)
-					$full_path = $dest . $entry_name;
-					$nparts = explode('/', str_replace('\\', '/', $full_path));
-					$norm = array();
-					foreach ($nparts as $p) {
-						if ($p === '..') { array_pop($norm); }
-						elseif ($p !== '' && $p !== '.') { $norm[] = $p; }
+
+					// Reject absolute paths (Unix or Windows)
+					if ($entry_name[0] === '/' || $entry_name[0] === '\\' || preg_match('/^[A-Za-z]:/', $entry_name)) {
+						$this->progress("SECURITY: Rejected zip entry with absolute path: {$entry_name}");
+						$zip->close();
+						return false;
 					}
-					$resolved = '/' . implode('/', $norm);
-					$safe_dest = rtrim($dest, '/');
+
+					// Normalize the entry path: resolve .. components in pure string
+					$parts = explode('/', str_replace('\\', '/', $entry_name));
+					$normalized = array();
+					foreach ($parts as $p) {
+						if ($p === '..') {
+							if (empty($normalized)) {
+								// Traversal above root - reject
+								$this->progress("SECURITY: Rejected zip entry with path traversal: {$entry_name}");
+								$zip->close();
+								return false;
+							}
+							array_pop($normalized);
+						} elseif ($p !== '' && $p !== '.') {
+							$normalized[] = $p;
+						}
+					}
+
+					// Verify resolved path stays within destination using string comparison
+					$resolved = rtrim($dest, '/') . '/' . implode('/', $normalized);
+					$safe_dest = rtrim($dest, '/') . '/';
 					if (strpos($resolved, $safe_dest) !== 0) {
 						$this->progress("SECURITY: Zip entry escapes destination: {$entry_name}");
 						$zip->close();
@@ -732,7 +759,7 @@ class SiteGuard_Backup_Restorer {
 		);
 
 		foreach ($iterator as $item) {
-			$relative = str_replace($source, '', $item->getPathname());
+			$relative = substr($item->getPathname(), strlen($source));
 			$target = $dest . $relative;
 
 			if ($item->isDir()) {
@@ -774,6 +801,16 @@ class SiteGuard_Backup_Restorer {
 	 */
 	private function remove_temp_dir($dir) {
 		if (!is_dir($dir)) return;
+
+		// Boundary check: only allow removal within the backup directory
+		$backup_dir = SiteGuard_Backup_Options::instance()->get_backup_dir();
+		$real_dir = realpath($dir);
+		$real_backup = realpath($backup_dir);
+		if (false === $real_dir || false === $real_backup || strpos($real_dir, $real_backup) !== 0) {
+			$this->sgbackup->log("SECURITY: Refusing to remove directory outside backup path: {$dir}", 'error');
+			return;
+		}
+
 		$iterator = new RecursiveIteratorIterator(
 			new RecursiveDirectoryIterator($dir, FilesystemIterator::SKIP_DOTS),
 			RecursiveIteratorIterator::CHILD_FIRST
@@ -945,24 +982,10 @@ class SiteGuard_Backup_Restorer {
 			global $wpdb;
 			$tables = SiteGuard_Backup_Database_Utility::get_tables($wpdb->prefix);
 
-			// Dump each table to its own temp file, then stitch together
-			$temp_files = array();
-			$temp_dir = $backup_dir . 'dbtemp_prerestore_' . $nonce . '/';
-			if (!is_dir($temp_dir)) wp_mkdir_p($temp_dir);
-
-			foreach ($tables as $table) {
-				$table_file = $temp_dir . $table . '.sql.gz';
-				$result = SiteGuard_Backup_Database_Utility::php_dump_table($table, $table_file);
-				if ($result && file_exists($table_file) && filesize($table_file) > 0) {
-					$temp_files[] = $table_file;
-				}
-			}
-
-			// Stitch all per-table files into the final backup
+			// Dump all tables directly into a single gz file
 			$fh = @gzopen($db_path, 'wb9');
 			if (!$fh) {
 				$this->progress("Warning: Could not create pre-restore backup file");
-				SiteGuard_Backup_Filesystem::rmdir_recursive($temp_dir);
 				return;
 			}
 
@@ -970,22 +993,35 @@ class SiteGuard_Backup_Restorer {
 			gzwrite($fh, "-- Generated: " . gmdate('Y-m-d H:i:s') . " UTC\n");
 			gzwrite($fh, "SET FOREIGN_KEY_CHECKS = 0;\n\n");
 
-			foreach ($temp_files as $tf) {
-				$tfh = @gzopen($tf, 'rb');
-				if ($tfh) {
-					while (!gzeof($tfh)) {
-						$chunk = gzread($tfh, 65536);
-						if (false !== $chunk && strlen($chunk) > 0) {
-							gzwrite($fh, $chunk);
-						}
-					}
-					gzclose($tfh);
+			$temp_dir = $backup_dir . 'dbtemp_prerestore_' . $nonce . '/';
+			if (!is_dir($temp_dir)) wp_mkdir_p($temp_dir);
+
+			foreach ($tables as $table) {
+				$table_file = $temp_dir . $table . '.sql.gz';
+				$result = SiteGuard_Backup_Database_Utility::php_dump_table($table, $table_file);
+				if (!$result || !file_exists($table_file) || filesize($table_file) === 0) {
+					$this->sgbackup->log("Pre-restore backup: skipping table {$table} (dump failed)", 'warning');
+					@unlink($table_file);
+					continue;
 				}
-				@unlink($tf);
+
+				$tfh = @gzopen($table_file, 'rb');
+				if (!$tfh) {
+					$this->sgbackup->log("Pre-restore backup: could not read dump for {$table}", 'warning');
+					@unlink($table_file);
+					continue;
+				}
+				while (!gzeof($tfh)) {
+					$chunk = gzread($tfh, 65536);
+					if (false === $chunk || strlen($chunk) === 0) break;
+					gzwrite($fh, $chunk);
+				}
+				gzclose($tfh);
+				@unlink($table_file);
 			}
 
 			gzwrite($fh, "\nSET FOREIGN_KEY_CHECKS = 1;\n");
-			@gzclose($fh);
+			gzclose($fh);
 
 			// Clean up temp dir
 			SiteGuard_Backup_Filesystem::rmdir_recursive($temp_dir);

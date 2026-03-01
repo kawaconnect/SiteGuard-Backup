@@ -108,17 +108,32 @@ class SiteGuard_Backup_Filesystem {
 
 		$path = trailingslashit($path);
 
+		$abspath_real = defined('ABSPATH') ? realpath(ABSPATH) : false;
+
 		try {
 			$iterator = new RecursiveIteratorIterator(
-				new RecursiveDirectoryIterator($path, FilesystemIterator::SKIP_DOTS | FilesystemIterator::FOLLOW_SYMLINKS),
+				new RecursiveDirectoryIterator($path, FilesystemIterator::SKIP_DOTS | 0),
 				RecursiveIteratorIterator::SELF_FIRST
 			);
 			$iterator->setMaxDepth(32); // Prevent infinite loops from circular symlinks
 
 			foreach ($iterator as $item) {
-				if (!$item->isFile()) continue;
+				if (!$item->isFile() && !$item->isLink()) continue;
 
 				$full_path = $item->getPathname();
+
+				// Resolve symlinks and verify they stay within ABSPATH
+				if ($item->isLink()) {
+					$real = realpath($full_path);
+					if (false === $real) continue; // Broken symlink
+					if ($abspath_real && strpos($real, $abspath_real . DIRECTORY_SEPARATOR) !== 0 && $real !== $abspath_real) {
+						continue; // Symlink target outside ABSPATH boundary
+					}
+					if (!is_file($real)) continue; // Symlink to directory - skip, we only want files
+					$full_path = $real;
+				}
+
+				if (!$item->isFile() && !is_file($full_path)) continue;
 				$relative = str_replace($path, '', $full_path);
 
 				// Check exclusions (supports exact prefix match and glob-style wildcards via fnmatch)
@@ -202,6 +217,21 @@ class SiteGuard_Backup_Filesystem {
 	 */
 	public static function rmdir_recursive($dir) {
 		if (!is_dir($dir)) return;
+
+		// Validate real path exists and is within allowed boundaries
+		$real_dir = realpath($dir);
+		if (false === $real_dir) return;
+
+		if (defined('ABSPATH')) {
+			$abspath_real = realpath(ABSPATH);
+			$wpcontent_real = defined('WP_CONTENT_DIR') ? realpath(WP_CONTENT_DIR) : false;
+			$within_abspath = ($abspath_real && strpos($real_dir, $abspath_real . DIRECTORY_SEPARATOR) === 0);
+			$within_wpcontent = ($wpcontent_real && strpos($real_dir, $wpcontent_real . DIRECTORY_SEPARATOR) === 0);
+			if (!$within_abspath && !$within_wpcontent) {
+				return; // Refuse to delete outside ABSPATH and WP_CONTENT_DIR
+			}
+		}
+
 		$items = new RecursiveIteratorIterator(
 			new RecursiveDirectoryIterator($dir, FilesystemIterator::SKIP_DOTS),
 			RecursiveIteratorIterator::CHILD_FIRST
