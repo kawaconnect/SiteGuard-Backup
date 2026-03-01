@@ -142,6 +142,38 @@ class SiteGuard_Backup {
 	}
 
 	/**
+	 * Close the browser connection while allowing PHP to continue running.
+	 * Sends the provided text as the response body, then flushes and detaches.
+	 *
+	 * @param string $txt Response body to send before closing.
+	 */
+	public function close_browser_connection($txt = '') {
+		// Close any sessions to prevent session locking
+		if (function_exists('session_id') && session_id()) {
+			session_write_close();
+		}
+
+		$txt = (string) $txt;
+		header('Content-Length: ' . strlen($txt));
+		header('Connection: close');
+		header('Content-Type: application/json');
+
+		echo $txt;
+
+		// Flush all output buffers
+		$ob_level = ob_get_level();
+		while ($ob_level > 0) {
+			ob_end_flush();
+			$ob_level--;
+		}
+		flush();
+
+		if (function_exists('fastcgi_finish_request')) {
+			fastcgi_finish_request();
+		}
+	}
+
+	/**
 	 * Get log file path for a nonce.
 	 */
 	public function get_logfile_name($nonce) {
@@ -563,6 +595,9 @@ class SiteGuard_Backup {
 			'run_times'        => array(),
 			'errors'           => array(),
 			'always_keep'      => !empty($options['always_keep']),
+			'backup_files_array'   => array(),
+			'db_backup_files'      => array(),
+			'db_completed_tables'  => array(),
 		);
 
 		// Incremental-specific data
@@ -766,6 +801,8 @@ class SiteGuard_Backup {
 					return;
 				} else {
 					$this->log("File backup failed: " . print_r($result, true), 'error');
+					$this->jobdata_set('jobstatus', 'error');
+					return;
 				}
 			}
 		}
@@ -788,6 +825,8 @@ class SiteGuard_Backup {
 					return;
 				} else {
 					$this->log("Database backup failed: " . print_r($result, true), 'error');
+					$this->jobdata_set('jobstatus', 'error');
+					return;
 				}
 			}
 		}
@@ -869,6 +908,22 @@ class SiteGuard_Backup {
 				}
 			}
 			$this->jobdata_set('upload_phase_complete', true);
+		}
+
+		// Validate that the backup actually produced files
+		$backup_array = $this->jobdata_get('backup_files_array', array());
+		$db_files = $this->jobdata_get('db_backup_files', array());
+		if (empty($backup_array) && empty($db_files)) {
+			$wanted_files = ($this->jobdata_get('backup_files') === 'yes');
+			$wanted_db = ($this->jobdata_get('backup_database') === 'yes');
+			if ($wanted_files || $wanted_db) {
+				$this->log("Backup produced no output files despite requesting " .
+					($wanted_files ? 'files' : '') . ($wanted_files && $wanted_db ? '+' : '') .
+					($wanted_db ? 'database' : '') . " - marking as failed", 'error');
+				$this->jobdata_set('jobstatus', 'error');
+				SiteGuard_Backup_Job_Scheduler::clear_scheduled_events($this->nonce);
+				return;
+			}
 		}
 
 		// All phases complete

@@ -83,21 +83,18 @@ class SiteGuard_Backup_Commands {
 			'type' => !empty($options['job_type']) ? $options['job_type'] : 'full',
 		));
 
-		// Schedule immediate execution after the AJAX response is sent.
-		// In DISABLE_WP_CRON environments, spawn_cron() does nothing and the
-		// backup would sit idle until the external cron runner fires (minutes).
-		// Using a shutdown function + fastcgi_finish_request sends the JSON response
-		// to the browser immediately, then runs the backup in the same process.
 		$nonce = $sgbackup->nonce;
-		register_shutdown_function(function() use ($nonce) {
-			if (function_exists('fastcgi_finish_request')) {
-				fastcgi_finish_request();
-			}
-			$sgbackup = SiteGuard_Backup::instance();
-			$sgbackup->backup_resume(0, $nonce);
-		});
 
-		return array('nonce' => $sgbackup->nonce);
+		// Close the browser connection immediately so the UI gets a response,
+		// then run the first backup resumption in this same PHP process.
+		// This is the standard close-the-browser-connection pattern and works
+		// in DISABLE_WP_CRON environments where spawn_cron() does nothing.
+		$response = json_encode(array('success' => true, 'data' => array('nonce' => $nonce)));
+		$sgbackup->close_browser_connection($response);
+
+		// Run backup directly - connection is already closed
+		$sgbackup->backup_resume(0, $nonce);
+		die;
 	}
 
 	/**
