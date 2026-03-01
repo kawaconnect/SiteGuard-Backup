@@ -1233,8 +1233,25 @@ $period_labels = array(
 		<tr>
 			<th><?php esc_html_e('Encryption key', 'siteguardbackup'); ?></th>
 			<td>
-				<input type="password" name="encryption_key" value="<?php echo esc_attr($settings['encryption_key']); ?>" class="regular-text" autocomplete="off" />
-				<p class="description"><?php esc_html_e('Database backups will be encrypted with this key. Leave empty to disable.', 'siteguardbackup'); ?></p>
+				<?php
+				$enc_key_stored = !empty($settings['encryption_key']);
+				if ($enc_key_stored) {
+					$enc_key_raw = $settings['encryption_key'];
+					$enc_key_len = strlen($enc_key_raw);
+					if ($enc_key_len > 8) {
+						$enc_key_masked = substr($enc_key_raw, 0, 4) . str_repeat('*', $enc_key_len - 8) . substr($enc_key_raw, -4);
+					} else {
+						$enc_key_masked = str_repeat('*', $enc_key_len);
+					}
+				}
+				?>
+				<?php if ($enc_key_stored): ?>
+					<p><code><?php echo esc_html($enc_key_masked); ?></code> - <?php esc_html_e('Encryption key is set.', 'siteguardbackup'); ?></p>
+					<input type="password" name="encryption_key" value="" class="regular-text" autocomplete="off" placeholder="<?php esc_attr_e('Enter new key to change, or leave empty to keep', 'siteguardbackup'); ?>" />
+				<?php else: ?>
+					<input type="password" name="encryption_key" value="" class="regular-text" autocomplete="off" />
+				<?php endif; ?>
+				<p class="description"><?php esc_html_e('Encryption key for backup files. Leave empty to keep the current key (or to disable if none is set).', 'siteguardbackup'); ?></p>
 			</td>
 		</tr>
 	</table>

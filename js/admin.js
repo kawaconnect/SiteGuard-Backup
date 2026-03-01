@@ -14,6 +14,18 @@
 			return div.innerHTML;
 		},
 
+		// Fallback copy using deprecated execCommand for older browsers
+		fallbackCopy: function(text) {
+			var textarea = document.createElement('textarea');
+			textarea.value = text;
+			textarea.style.position = 'fixed';
+			textarea.style.opacity = '0';
+			document.body.appendChild(textarea);
+			textarea.select();
+			try { document.execCommand('copy'); } catch (e) { /* ignore */ }
+			document.body.removeChild(textarea);
+		},
+
 		init: function() {
 			this.bindTabs();
 			this.bindBackupNow();
@@ -38,6 +50,10 @@
 			this.bindCronEvents();
 			this.bindExportImportSettings();
 			this.pollActiveJobs();
+
+			$(window).on('beforeunload', function() {
+				if (SGB.pollTimer) { clearTimeout(SGB.pollTimer); SGB.pollTimer = null; }
+			});
 		},
 
 		// ===== AJAX Helper =====
@@ -48,7 +64,7 @@
 				data: {
 					action: 'sgbackup_ajax',
 					subaction: subaction,
-					nonce: sgbackup_settings.nonce,
+					nonce: (sgbackup_settings.nonces && sgbackup_settings.nonces[subaction]) || sgbackup_settings.nonce,
 					data: JSON.stringify(data || {})
 				},
 				success: function(response) {
@@ -281,6 +297,12 @@
 				// Show the Next button again, hide it if dialog buttons are used
 				$('.sgbackup-restore-next-btn').show();
 			});
+
+			// Close button after restore completes
+			$(document).on('click', '#sgbackup-restore-close', function() {
+				$('#sgbackup-restore-modal').dialog('close');
+				$('#sgbackup-restore-done').hide();
+			});
 		},
 
 		/**
@@ -446,6 +468,8 @@
 										}
 									}
 								}
+								// Show the close button
+								$('#sgbackup-restore-done').show();
 							}
 						} catch (e) { /* skip invalid JSON */ }
 					}
@@ -454,6 +478,7 @@
 
 			xhr.onerror = function() {
 				$('#sgbackup-restore-log').append('<div class="restore-error">Connection error during restore.</div>');
+				$('#sgbackup-restore-done').show();
 			};
 
 			xhr.onload = function() {
@@ -773,12 +798,16 @@
 					}
 				});
 
+					var $saveBtn = $('#sgbackup-save-settings');
+				$saveBtn.prop('disabled', true);
 				$('#sgbackup-settings-status').text('Saving...').removeClass('success error');
 
 				self.ajax('savesettings', params, function() {
+					$saveBtn.prop('disabled', false);
 					$('#sgbackup-settings-status').text('Settings saved!').addClass('success');
 					setTimeout(function() { $('#sgbackup-settings-status').text(''); }, 3000);
 				}, function(msg) {
+					$saveBtn.prop('disabled', false);
 					$('#sgbackup-settings-status').text('Error: ' + msg).addClass('error');
 				});
 			});
@@ -863,10 +892,23 @@
 
 			// Copy key
 			$('#sgbackup-copy-key').on('click', function() {
-				$('#sgbackup-key-bundle').select();
-				document.execCommand('copy');
-				$(this).text('Copied!');
-				setTimeout(function() { $('#sgbackup-copy-key').text('Copy to Clipboard'); }, 2000);
+				var text = $('#sgbackup-key-bundle').val();
+				var $btn = $(this);
+				var showCopied = function() {
+					$btn.text('Copied!');
+					setTimeout(function() { $btn.text('Copy to Clipboard'); }, 2000);
+				};
+				if (navigator.clipboard && navigator.clipboard.writeText) {
+					navigator.clipboard.writeText(text).then(function() {
+						showCopied();
+					}).catch(function() {
+						self.fallbackCopy(text);
+						showCopied();
+					});
+				} else {
+					self.fallbackCopy(text);
+					showCopied();
+				}
 			});
 
 			// Add site
@@ -1285,6 +1327,13 @@
 					});
 					$('#sgbackup-jobs-list').html(html);
 				});
+			});
+
+			// WP-CLI Reference toggle
+			$('#sgbackup-cli-ref-toggle').on('click', function() {
+				var $ref = $('#sgbackup-cli-reference');
+				$ref.toggle();
+				$(this).text($ref.is(':visible') ? 'Hide Command Reference' : 'Show Command Reference');
 			});
 
 			// Wipe settings

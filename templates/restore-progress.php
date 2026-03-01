@@ -77,5 +77,10 @@
 	<div id="sgbackup-restore-progress" style="display:none;">
 		<h3><?php esc_html_e('Restore Progress', 'siteguardbackup'); ?></h3>
 		<div id="sgbackup-restore-log" style="height:300px;overflow-y:auto;background:#f1f1f1;padding:10px;font-family:monospace;font-size:12px;border:1px solid #ccc;"></div>
+		<p id="sgbackup-restore-done" style="display:none;margin-top:12px;">
+			<button type="button" class="button button-primary" id="sgbackup-restore-close">
+				<?php esc_html_e('Close', 'siteguardbackup'); ?>
+			</button>
+		</p>
 	</div>
 </div>

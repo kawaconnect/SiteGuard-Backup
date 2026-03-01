@@ -21,7 +21,7 @@
 
 			var formData = new FormData();
 			formData.append('action', 'sgbackup_restore');
-			formData.append('nonce', sgbackup_settings.nonce);
+			formData.append('nonce', (sgbackup_settings.nonces && sgbackup_settings.nonces.restore) || sgbackup_settings.nonce);
 			formData.append('timestamp', timestamp);
 
 			if (options.db) formData.append('restore_db', '1');
@@ -123,7 +123,7 @@
 			switch (type) {
 				case 'error': cls = 'restore-error'; break;
 				case 'success': cls = 'restore-success'; break;
-				case 'warning': cls = 'restore-error'; break;
+				case 'warning': cls = 'restore-warning'; break;
 			}
 
 			var time = new Date().toLocaleTimeString();
