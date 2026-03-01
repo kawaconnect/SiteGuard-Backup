@@ -38,9 +38,9 @@ abstract class SiteGuard_Backup_Module {
 	 * Get the display name.
 	 */
 	public function get_description() {
-		$sgbackup = SiteGuard_Backup::instance();
-		return isset($sgbackup->backup_methods[$this->method_id])
-			? $sgbackup->backup_methods[$this->method_id]
+		$methods = SiteGuard_Backup::instance()->get_backup_methods();
+		return isset($methods[$this->method_id])
+			? $methods[$this->method_id]
 			: ucfirst($this->method_id);
 	}
 

@@ -227,7 +227,7 @@ class SiteGuard_Backup_Restorer {
 			if ('none' === $service) continue;
 
 			// Validate service against registered backup methods whitelist
-			$registered_methods = SiteGuard_Backup::instance()->backup_methods;
+			$registered_methods = SiteGuard_Backup::instance()->get_backup_methods();
 			if (!array_key_exists($service, $registered_methods)) {
 				return new WP_Error('invalid_remote_service', "Unknown remote storage service: {$service}");
 			}
