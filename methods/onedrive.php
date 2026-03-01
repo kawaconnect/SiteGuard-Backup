@@ -131,7 +131,7 @@ class SiteGuard_Backup_Method_Onedrive extends SiteGuard_Backup_Module {
             }
         }
 
-        // Create folder
+        // Create folder - use 'fail' conflict behavior to avoid silently creating duplicates
         $response = wp_remote_post($this->graph_url . '/me/drive/root/children', array(
             'headers' => array(
                 'Authorization' => "Bearer {$token}",
@@ -140,13 +140,30 @@ class SiteGuard_Backup_Method_Onedrive extends SiteGuard_Backup_Module {
             'body' => json_encode(array(
                 'name'   => $folder_name,
                 'folder' => new \stdClass(),
-                '@microsoft.graph.conflictBehavior' => 'rename',
+                '@microsoft.graph.conflictBehavior' => 'fail',
             )),
         ));
 
         if (is_wp_error($response)) return $response;
 
+        $code = wp_remote_retrieve_response_code($response);
         $body = json_decode(wp_remote_retrieve_body($response), true);
+
+        // 409 Conflict means the folder already exists - re-fetch its ID
+        if ($code === 409) {
+            $retry = wp_remote_get(
+                $this->graph_url . '/me/drive/root:/' . rawurlencode($folder_name),
+                array('headers' => array('Authorization' => "Bearer {$token}"))
+            );
+            if (!is_wp_error($retry) && wp_remote_retrieve_response_code($retry) === 200) {
+                $retry_body = json_decode(wp_remote_retrieve_body($retry), true);
+                if (isset($retry_body['id'])) {
+                    return $retry_body['id'];
+                }
+            }
+            return new WP_Error('onedrive_folder', 'Folder already exists but could not retrieve its ID.');
+        }
+
         return isset($body['id']) ? $body['id'] : new WP_Error('onedrive_folder', 'Could not create folder.');
     }
 
@@ -246,15 +263,27 @@ class SiteGuard_Backup_Method_Onedrive extends SiteGuard_Backup_Module {
         $options = $this->get_options();
         $folder_name = $options['folder'] ?: 'SiteGuard Backups';
         $path = '/me/drive/root:/' . rawurlencode($folder_name) . '/' . rawurlencode($file) . ':/content';
+        $local_path = trailingslashit($dest_dir) . $file;
 
         $response = wp_remote_get($this->graph_url . $path, array(
             'headers'  => array('Authorization' => "Bearer {$token}"),
             'timeout'  => 300,
             'stream'   => true,
-            'filename' => trailingslashit($dest_dir) . $file,
+            'filename' => $local_path,
         ));
 
-        return is_wp_error($response) ? $response : true;
+        if (is_wp_error($response)) {
+            @unlink($local_path);
+            return $response;
+        }
+
+        $code = wp_remote_retrieve_response_code($response);
+        if ($code >= 400) {
+            @unlink($local_path);
+            return new WP_Error('onedrive_download', "OneDrive download failed (HTTP {$code})");
+        }
+
+        return true;
     }
 
     public function delete($files) {
@@ -265,13 +294,31 @@ class SiteGuard_Backup_Method_Onedrive extends SiteGuard_Backup_Module {
         $folder_name = $options['folder'] ?: 'SiteGuard Backups';
 
         if (!is_array($files)) $files = array($files);
+        $errors = array();
 
         foreach ($files as $file) {
             $path = '/me/drive/root:/' . rawurlencode($folder_name) . '/' . rawurlencode($file);
-            wp_remote_request($this->graph_url . $path, array(
+            $response = wp_remote_request($this->graph_url . $path, array(
                 'method'  => 'DELETE',
                 'headers' => array('Authorization' => "Bearer {$token}"),
             ));
+
+            if (is_wp_error($response)) {
+                $errors[] = $file . ': ' . $response->get_error_message();
+                continue;
+            }
+
+            $code = wp_remote_retrieve_response_code($response);
+            // OneDrive returns 204 No Content on successful delete
+            if ($code >= 400) {
+                $body = json_decode(wp_remote_retrieve_body($response), true);
+                $err_msg = isset($body['error']['message']) ? $body['error']['message'] : "HTTP {$code}";
+                $errors[] = $file . ': ' . $err_msg;
+            }
+        }
+
+        if (!empty($errors)) {
+            return new WP_Error('onedrive_delete_failed', 'Failed to delete file(s): ' . implode('; ', $errors));
         }
 
         return true;

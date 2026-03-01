@@ -167,7 +167,7 @@ class SiteGuard_Backup_Method_Azure extends SiteGuard_Backup_Module {
 	/**
 	 * Upload a backup file to Azure Blob Storage.
 	 *
-	 * Uses Put Blob for files under 256MB, Block Blob (chunked) for larger files.
+	 * Uses Put Blob for files under 50MB, Block Blob (chunked) for larger files.
 	 *
 	 * @param string $file Full path to the file to upload.
 	 * @return bool|WP_Error
@@ -178,8 +178,8 @@ class SiteGuard_Backup_Method_Azure extends SiteGuard_Backup_Module {
 		$uri = '/' . $options['container'] . '/' . $blob_name;
 		$filesize = filesize($file);
 
-		// For files under 256MB, use simple Put Blob
-		if ($filesize < 268435456) {
+		// For files under 50MB, use simple Put Blob
+		if ($filesize < 52428800) {
 			$body = file_get_contents($file);
 			$result = $this->request('PUT', $uri, $body, array(
 				'Content-Type'    => 'application/octet-stream',
@@ -295,11 +295,19 @@ class SiteGuard_Backup_Method_Azure extends SiteGuard_Backup_Module {
 		if (!is_array($files)) $files = array($files);
 
 		$options = $this->get_options();
+		$errors = array();
 
 		foreach ($files as $file) {
 			$blob_name = $this->get_blob_path($file);
 			$uri = '/' . $options['container'] . '/' . $blob_name;
-			$this->request('DELETE', $uri);
+			$result = $this->request('DELETE', $uri);
+			if (is_wp_error($result)) {
+				$errors[] = $file . ': ' . $result->get_error_message();
+			}
+		}
+
+		if (!empty($errors)) {
+			return new WP_Error('azure_delete_failed', 'Failed to delete file(s): ' . implode('; ', $errors));
 		}
 
 		return true;

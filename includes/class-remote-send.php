@@ -36,17 +36,17 @@ class SiteGuard_Backup_Remote_Send {
 	 * receiver's private key can decrypt - this provides authentication.
 	 */
 	public function handle_rpc_message() {
+		if (!current_user_can('manage_options')) {
+			wp_send_json_error(array('message' => 'Insufficient permissions.'));
+			return;
+		}
+
 		if (empty($_POST['subaction']) || $_POST['subaction'] !== 'rpc_message') return;
 
 		// Verify required RPC header is present
 		if (empty($_SERVER['HTTP_X_SGBACKUP_RPC'])) return;
 
 		if (empty($_POST['encrypted']) || empty($_POST['key'])) return;
-
-		// For authenticated users, require manage_options capability
-		if (is_user_logged_in() && !current_user_can('manage_options')) {
-			wp_send_json_error(array('message' => 'Insufficient permissions.'));
-		}
 
 		// Rate limiting: max 60 requests per minute per IP
 		// Use CF-Connecting-IP behind Cloudflare, fall back to REMOTE_ADDR
@@ -116,6 +116,7 @@ class SiteGuard_Backup_Remote_Send {
 		// Require HMAC pre-check header to be present
 		if (empty($_SERVER['HTTP_X_SGBACKUP_HMAC'])) {
 			wp_send_json_error(array('message' => 'Missing HMAC pre-check header.'));
+			return;
 		}
 
 		// Validate that migration keys exist before processing anything
@@ -198,6 +199,11 @@ class SiteGuard_Backup_Remote_Send {
 		}
 		$is_last = !empty($data['last_chunk']);
 
+		// Enforce maximum filename length
+		if (strlen($filename) > 255) {
+			return new WP_Error('filename_too_long', 'Filename exceeds maximum length.');
+		}
+
 		// Validate filename pattern - strict whitelist
 		if (!preg_match('/^backup_[\w\-]+\.(zip|gz|sql|sql\.gz|sql\.bz2|tar|tar\.gz|tar\.bz2|txt)$/', $filename)) {
 			return new WP_Error('invalid_filename', 'Invalid backup filename format.');
@@ -220,6 +226,16 @@ class SiteGuard_Backup_Remote_Send {
 			fclose($fh);
 			return new WP_Error('file_lock', 'Cannot lock temp file for writing.');
 		}
+
+		// Track expected next offset to reject out-of-sequence writes
+		$expected_offset = filesize($tmp_file);
+		if ($expected_offset === false) $expected_offset = 0;
+		if ($start !== $expected_offset) {
+			flock($fh, LOCK_UN);
+			fclose($fh);
+			return new WP_Error('out_of_sequence', sprintf('Out-of-sequence write: expected offset %d but got %d.', $expected_offset, $start));
+		}
+
 		fseek($fh, $start);
 		$written = fwrite($fh, $chunk_data);
 		flock($fh, LOCK_UN);

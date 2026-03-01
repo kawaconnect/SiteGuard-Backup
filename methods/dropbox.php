@@ -291,15 +291,32 @@ class SiteGuard_Backup_Method_Dropbox extends SiteGuard_Backup_Module {
 		$folder = rtrim($options['folder'] ?: '/SiteGuard Backups', '/');
 
 		if (!is_array($files)) $files = array($files);
+		$errors = array();
 
 		foreach ($files as $file) {
-			wp_remote_post($this->api_url . '/files/delete_v2', array(
+			$response = wp_remote_post($this->api_url . '/files/delete_v2', array(
 				'headers' => array(
 					'Authorization' => "Bearer {$token}",
 					'Content-Type'  => 'application/json',
 				),
 				'body' => json_encode(array('path' => $folder . '/' . $file)),
 			));
+
+			if (is_wp_error($response)) {
+				$errors[] = $file . ': ' . $response->get_error_message();
+				continue;
+			}
+
+			$code = wp_remote_retrieve_response_code($response);
+			if ($code !== 200) {
+				$body = json_decode(wp_remote_retrieve_body($response), true);
+				$err_msg = isset($body['error_summary']) ? $body['error_summary'] : "HTTP {$code}";
+				$errors[] = $file . ': ' . $err_msg;
+			}
+		}
+
+		if (!empty($errors)) {
+			return new WP_Error('dropbox_delete_failed', 'Failed to delete file(s): ' . implode('; ', $errors));
 		}
 
 		return true;

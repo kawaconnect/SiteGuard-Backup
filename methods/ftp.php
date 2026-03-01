@@ -39,22 +39,22 @@ class SiteGuard_Backup_Method_Ftp extends SiteGuard_Backup_Module {
 		}
 
 		if ($ftps_mode === 'explicit' && function_exists('ftp_ssl_connect')) {
-			$conn = @ftp_ssl_connect($options['host'], $port, 30);
+			$conn = ftp_ssl_connect($options['host'], $port, 30);
 		} else {
-			$conn = @ftp_connect($options['host'], $port, 30);
+			$conn = ftp_connect($options['host'], $port, 30);
 		}
 
 		if (!$conn) {
 			return new WP_Error('ftp_connect_failed', "Could not connect to FTP server: {$options['host']}:{$port}");
 		}
 
-		if (!@ftp_login($conn, $options['user'], $options['pass'])) {
+		if (!ftp_login($conn, $options['user'], $options['pass'])) {
 			@ftp_close($conn);
 			return new WP_Error('ftp_login_failed', 'FTP login failed.');
 		}
 
 		if (!empty($options['passive'])) {
-			@ftp_pasv($conn, true);
+			ftp_pasv($conn, true);
 		}
 
 		return $conn;
@@ -104,18 +104,18 @@ class SiteGuard_Backup_Method_Ftp extends SiteGuard_Backup_Module {
 			return new WP_Error('ftp_no_ssl', 'ftp_ssl_connect function not available. PHP OpenSSL extension required.');
 		}
 
-		$conn = @ftp_ssl_connect($options['host'], $port, 30);
+		$conn = ftp_ssl_connect($options['host'], $port, 30);
 		if (!$conn) {
 			return new WP_Error('ftp_implicit_failed', "Could not establish implicit FTPS connection: {$options['host']}:{$port}");
 		}
 
-		if (!@ftp_login($conn, $options['user'], $options['pass'])) {
+		if (!ftp_login($conn, $options['user'], $options['pass'])) {
 			@ftp_close($conn);
 			return new WP_Error('ftp_login_failed', 'FTP login failed (implicit FTPS).');
 		}
 
 		if (!empty($options['passive'])) {
-			@ftp_pasv($conn, true);
+			ftp_pasv($conn, true);
 		}
 
 		return $conn;
@@ -128,7 +128,7 @@ class SiteGuard_Backup_Method_Ftp extends SiteGuard_Backup_Module {
 		$options = $this->get_options();
 		$remote_path = trailingslashit($options['path']) . basename($file);
 
-		$result = @ftp_put($conn, $remote_path, $file, FTP_BINARY);
+		$result = ftp_put($conn, $remote_path, $file, FTP_BINARY);
 		@ftp_close($conn);
 
 		if (!$result) {
@@ -146,7 +146,7 @@ class SiteGuard_Backup_Method_Ftp extends SiteGuard_Backup_Module {
 		$remote_path = trailingslashit($options['path']) . $file;
 		$local_path = trailingslashit($dest_dir) . $file;
 
-		$result = @ftp_get($conn, $local_path, $remote_path, FTP_BINARY);
+		$result = ftp_get($conn, $local_path, $remote_path, FTP_BINARY);
 		@ftp_close($conn);
 
 		return $result ? true : new WP_Error('ftp_download_failed', "Failed to download from FTP: {$remote_path}");
@@ -158,13 +158,21 @@ class SiteGuard_Backup_Method_Ftp extends SiteGuard_Backup_Module {
 
 		$options = $this->get_options();
 		if (!is_array($files)) $files = array($files);
+		$errors = array();
 
 		foreach ($files as $file) {
 			$remote_path = trailingslashit($options['path']) . $file;
-			@ftp_delete($conn, $remote_path);
+			if (!ftp_delete($conn, $remote_path)) {
+				$errors[] = $remote_path;
+			}
 		}
 
 		@ftp_close($conn);
+
+		if (!empty($errors)) {
+			return new WP_Error('ftp_delete_failed', 'Failed to delete file(s): ' . implode(', ', $errors));
+		}
+
 		return true;
 	}
 
@@ -173,7 +181,7 @@ class SiteGuard_Backup_Method_Ftp extends SiteGuard_Backup_Module {
 		if (is_wp_error($conn)) return array();
 
 		$options = $this->get_options();
-		$list = @ftp_nlist($conn, $options['path']);
+		$list = ftp_nlist($conn, $options['path']);
 		@ftp_close($conn);
 
 		return is_array($list) ? array_map('basename', $list) : array();
@@ -184,7 +192,7 @@ class SiteGuard_Backup_Method_Ftp extends SiteGuard_Backup_Module {
 		if (is_wp_error($conn)) return $conn;
 
 		$options = $this->get_options();
-		$pwd = @ftp_pwd($conn);
+		$pwd = ftp_pwd($conn);
 		@ftp_close($conn);
 
 		return $pwd ? true : new WP_Error('ftp_test_failed', 'Connected but could not determine working directory.');

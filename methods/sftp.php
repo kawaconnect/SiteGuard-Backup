@@ -323,14 +323,23 @@ class SiteGuard_Backup_Method_Sftp extends SiteGuard_Backup_Module {
 
 		$options = $this->get_options();
 		if (!is_array($files)) $files = array($files);
+		$errors = array();
 
 		foreach ($files as $file) {
 			$remote_path = trailingslashit($options['path']) . $file;
 			if ($conn['type'] === 'ssh2') {
-				@ssh2_sftp_unlink($conn['sftp'], $remote_path);
+				if (!@ssh2_sftp_unlink($conn['sftp'], $remote_path)) {
+					$errors[] = $remote_path;
+				}
 			} else {
-				$conn['sftp']->delete($remote_path);
+				if (!$conn['sftp']->delete($remote_path)) {
+					$errors[] = $remote_path;
+				}
 			}
+		}
+
+		if (!empty($errors)) {
+			return new WP_Error('sftp_delete_failed', 'Failed to delete file(s): ' . implode(', ', $errors));
 		}
 
 		return true;
