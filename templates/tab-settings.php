@@ -35,7 +35,9 @@ $entities_list = array(
 );
 
 $sgbackup = SiteGuard_Backup::instance();
-$methods = $sgbackup->backup_methods;
+// Only show methods that have a configuration panel in this template
+$configurable_methods = array('s3', 's3generic', 'googledrive', 'dropbox', 'ftp', 'sftp', 'azure', 'gcs', 'pcloud', 'openstack', 'email');
+$methods = array_intersect_key($sgbackup->backup_methods, array_flip($configurable_methods));
 $current_services = $settings['service'];
 if (!is_array($current_services)) $current_services = array($current_services);
 
@@ -1348,6 +1350,44 @@ $period_labels = array(
 			<td>
 				<input type="text" name="zip_nocompress" value="<?php echo esc_attr(isset($settings['zip_nocompress']) ? $settings['zip_nocompress'] : ''); ?>" class="regular-text" />
 				<p class="description"><?php esc_html_e('Comma-separated list of extensions (e.g. .jpg,.png,.mp4). Leave empty to use the built-in default list. These file types are stored in zip archives without compression, saving CPU time.', 'siteguardbackup'); ?></p>
+			</td>
+		</tr>
+	</table>
+
+	<h2><?php esc_html_e('Webhook Notifications', 'siteguardbackup'); ?></h2>
+	<table class="form-table">
+		<tr>
+			<th><?php esc_html_e('Webhook URL', 'siteguardbackup'); ?></th>
+			<td>
+				<input type="url" name="webhook_url" value="<?php echo esc_attr(isset($settings['webhook_url']) ? $settings['webhook_url'] : ''); ?>" class="regular-text" placeholder="https://example.com/webhook" />
+				<p class="description"><?php esc_html_e('URL to receive POST notifications with JSON payload: { event, site_url, timestamp, data }. Includes X-SiteGuard-Event and X-SiteGuard-Signature headers.', 'siteguardbackup'); ?></p>
+			</td>
+		</tr>
+		<tr>
+			<th><?php esc_html_e('Events', 'siteguardbackup'); ?></th>
+			<td>
+				<?php
+				$webhook_events = isset($settings['webhook_events']) ? (array) $settings['webhook_events'] : array();
+				$event_labels = array(
+					'backup_complete'  => __('Backup complete', 'siteguardbackup'),
+					'backup_failed'    => __('Backup failed', 'siteguardbackup'),
+					'restore_complete' => __('Restore complete', 'siteguardbackup'),
+					'restore_failed'   => __('Restore failed', 'siteguardbackup'),
+					'schedule_missed'  => __('Scheduled backup missed', 'siteguardbackup'),
+				);
+				foreach ($event_labels as $value => $label) : ?>
+					<label style="display:block; margin-bottom:4px;">
+						<input type="checkbox" name="webhook_events[]" value="<?php echo esc_attr($value); ?>" <?php checked(in_array($value, $webhook_events, true)); ?> />
+						<?php echo esc_html($label); ?>
+					</label>
+				<?php endforeach; ?>
+			</td>
+		</tr>
+		<tr>
+			<th><?php esc_html_e('Test', 'siteguardbackup'); ?></th>
+			<td>
+				<button type="button" class="button sgbackup-test-webhook"><?php esc_html_e('Send Test Webhook', 'siteguardbackup'); ?></button>
+				<span class="sgbackup-test-result sgbackup-status"></span>
 			</td>
 		</tr>
 	</table>

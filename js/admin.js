@@ -49,6 +49,7 @@
 			this.bindDbSize();
 			this.bindCronEvents();
 			this.bindExportImportSettings();
+			this.bindWebhook();
 			this.pollActiveJobs();
 
 			$(window).on('beforeunload', function() {
@@ -1808,6 +1809,36 @@
 					});
 				};
 				reader.readAsText(file);
+			});
+		},
+
+		// ===== Webhook Test =====
+		bindWebhook: function() {
+			var self = this;
+
+			$('.sgbackup-test-webhook').on('click', function() {
+				var url = $('input[name="webhook_url"]').val();
+				if (!url) {
+					$('.sgbackup-test-result').text('Enter a webhook URL first.').removeClass('success').addClass('error');
+					return;
+				}
+				var $btn = $(this);
+				var $result = $('.sgbackup-test-result');
+				$btn.prop('disabled', true);
+				$result.text('Sending...').removeClass('success error');
+
+				self.ajax('test_webhook', { url: url }, function(data) {
+					$btn.prop('disabled', false);
+					var text = data.message + (data.http_code ? ' (HTTP ' + data.http_code + ')' : '');
+					if (data.success) {
+						$result.text(text).addClass('success').removeClass('error');
+					} else {
+						$result.text(text).addClass('error').removeClass('success');
+					}
+				}, function(msg) {
+					$btn.prop('disabled', false);
+					$result.text('Error: ' + msg).addClass('error').removeClass('success');
+				});
 			});
 		},
 
