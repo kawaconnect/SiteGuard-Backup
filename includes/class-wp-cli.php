@@ -924,7 +924,7 @@ class SiteGuard_Backup_CLI_Command extends WP_CLI_Command {
                 if ($method_id === 'none') continue;
 
                 // Validate method against whitelist
-                if (!array_key_exists($method_id, SiteGuard_Backup::instance()->backup_methods)) {
+                if (!array_key_exists($method_id, SiteGuard_Backup::instance()->get_backup_methods())) {
                     WP_CLI::warning("Unknown storage method: {$method_id}");
                     continue;
                 }
