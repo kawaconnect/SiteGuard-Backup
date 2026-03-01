@@ -296,11 +296,8 @@ class SiteGuard_Backup_Restorer {
 			$selected_tables = array_map('sanitize_text_field', $this->restore_options['restore_tables']);
 			$this->sgbackup->log("Selective table restore: " . count($selected_tables) . " tables selected");
 
-			// Gap 25: If include_unspecified_tables is true, pass null to restore all tables
-			// (unspecified tables are included by default, only explicitly deselected are skipped)
 			if ($this->include_unspecified_tables) {
-				$this->sgbackup->log("Include unspecified tables: enabled - all tables in backup will be restored");
-				$selected_tables = null;
+				$this->sgbackup->log("Include unspecified tables: enabled - selected tables will be restored, others kept as-is");
 			}
 		}
 
