@@ -90,9 +90,6 @@ function sgbackup_should_load() {
 	if (defined('DOING_AJAX') && DOING_AJAX) return true;
 	if (defined('XMLRPC_REQUEST') && XMLRPC_REQUEST) return true;
 
-	// Migration listeners need to load on plugins_loaded (REST/RPC requests)
-	if (!empty($_SERVER['HTTP_X_SGBACKUP_RPC'])) return true;
-
 	return false;
 }
 
@@ -193,6 +190,7 @@ register_activation_hook(__FILE__, 'sgbackup_activate');
 function sgbackup_deactivate() {
 	wp_clear_scheduled_hook('sgbackup_backup');
 	wp_clear_scheduled_hook('sgbackup_backup_database');
+	wp_clear_scheduled_hook('sgbackup_backup_all');
 	wp_clear_scheduled_hook('sgbackup_backup_incremental');
 	// Don't clear sgbackup_backup_resume - let running jobs finish
 }
@@ -299,6 +297,11 @@ function sgbackup_upgrader_pre_install($return, $hook_extra) {
 	sgbackup_load_classes();
 	$opts = SiteGuard_Backup_Options::instance();
 	if (!$opts->get_option('sgbackup_autobackup_default', true)) return $return;
+
+	// Validate type if present
+	if (!empty($hook_extra['type']) && !in_array($hook_extra['type'], array('plugin', 'theme', 'core'), true)) {
+		return $return;
+	}
 
 	$entity = 'plugins';
 	if (!empty($hook_extra['type'])) {

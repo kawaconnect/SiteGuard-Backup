@@ -10,10 +10,16 @@ if (!defined('WP_UNINSTALL_PLUGIN')) die('No direct access.');
 
 // Remove all sgbackup_* options
 global $wpdb;
-$wpdb->query("DELETE FROM {$wpdb->options} WHERE option_name LIKE 'sgbackup_%'");
+$wpdb->query($wpdb->prepare(
+	"DELETE FROM {$wpdb->options} WHERE option_name LIKE %s",
+	$wpdb->esc_like('sgbackup_') . '%'
+));
 
 if (is_multisite()) {
-	$wpdb->query("DELETE FROM {$wpdb->sitemeta} WHERE meta_key LIKE 'sgbackup_%'");
+	$wpdb->query($wpdb->prepare(
+		"DELETE FROM {$wpdb->sitemeta} WHERE meta_key LIKE %s",
+		$wpdb->esc_like('sgbackup_') . '%'
+	));
 }
 
 // Clear scheduled events (including parameterized resume events)
@@ -36,8 +42,18 @@ if (is_array($crons)) {
 }
 
 // Remove transients
-$wpdb->query("DELETE FROM {$wpdb->options} WHERE option_name LIKE '%_transient_sgbackup_%'");
+$wpdb->query($wpdb->prepare(
+	"DELETE FROM {$wpdb->options} WHERE option_name LIKE %s",
+	'%' . $wpdb->esc_like('_transient_sgbackup_') . '%'
+));
 
 if (is_multisite()) {
-	$wpdb->query("DELETE FROM {$wpdb->sitemeta} WHERE meta_key LIKE '%_transient_sgbackup_%'");
+	$wpdb->query($wpdb->prepare(
+		"DELETE FROM {$wpdb->sitemeta} WHERE meta_key LIKE %s",
+		'%' . $wpdb->esc_like('_transient_sgbackup_') . '%'
+	));
+	$wpdb->query($wpdb->prepare(
+		"DELETE FROM {$wpdb->sitemeta} WHERE meta_key LIKE %s",
+		$wpdb->esc_like('_site_transient_sgbackup_') . '%'
+	));
 }
