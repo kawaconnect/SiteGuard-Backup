@@ -207,7 +207,7 @@ class SiteGuard_Backup_Method_Googledrive extends SiteGuard_Backup_Module {
 		if (is_wp_error($response)) return $response;
 
 		$code = wp_remote_retrieve_response_code($response);
-		if ($code !== 200) {
+		if ($code !== 200 && $code !== 201) {
 			return new WP_Error('gdrive_init_upload', 'Failed to initiate upload (HTTP ' . $code . ')');
 		}
 
@@ -314,6 +314,7 @@ class SiteGuard_Backup_Method_Googledrive extends SiteGuard_Backup_Module {
 		if (is_wp_error($folder_id)) return $folder_id;
 
 		if (!is_array($files)) $files = array($files);
+		$errors = array();
 
 		foreach ($files as $file) {
 			// Escape single quotes for Google Drive API query string
@@ -325,17 +326,34 @@ class SiteGuard_Backup_Method_Googledrive extends SiteGuard_Backup_Module {
 				'headers' => array('Authorization' => "Bearer {$token}"),
 			));
 
-			if (is_wp_error($response)) continue;
+			if (is_wp_error($response)) {
+				$errors[] = $file . ': ' . $response->get_error_message();
+				continue;
+			}
 
 			$body = json_decode(wp_remote_retrieve_body($response), true);
 			if (!empty($body['files'])) {
 				foreach ($body['files'] as $f) {
-					wp_remote_request($this->api_url . '/files/' . $f['id'], array(
+					$del_response = wp_remote_request($this->api_url . '/files/' . $f['id'], array(
 						'method'  => 'DELETE',
 						'headers' => array('Authorization' => "Bearer {$token}"),
 					));
+
+					if (is_wp_error($del_response)) {
+						$errors[] = $file . ': ' . $del_response->get_error_message();
+					} else {
+						$del_code = wp_remote_retrieve_response_code($del_response);
+						// Google Drive returns 204 No Content on successful delete
+						if ($del_code >= 400) {
+							$errors[] = $file . ": HTTP {$del_code}";
+						}
+					}
 				}
 			}
+		}
+
+		if (!empty($errors)) {
+			return new WP_Error('gdrive_delete_failed', 'Failed to delete file(s): ' . implode('; ', $errors));
 		}
 
 		return true;
