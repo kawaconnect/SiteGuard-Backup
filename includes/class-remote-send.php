@@ -112,6 +112,7 @@ class SiteGuard_Backup_Remote_Send {
 
 		if (is_wp_error($result)) {
 			wp_send_json_error(array('message' => $result->get_error_message()));
+			return;
 		}
 
 		wp_send_json_success($result);
@@ -193,6 +194,7 @@ class SiteGuard_Backup_Remote_Send {
 
 		if (is_wp_error($result)) {
 			wp_send_json_error(array('message' => $result->get_error_message()));
+			return;
 		}
 
 		wp_send_json_success($result);
@@ -325,7 +327,9 @@ class SiteGuard_Backup_Remote_Send {
 			if (file_exists($final_file)) {
 				@unlink($final_file);
 			}
-			rename($tmp_file, $final_file);
+			if (!rename($tmp_file, $final_file)) {
+				return new WP_Error('rename_failed', 'Failed to finalize uploaded file: rename from .tmp failed.');
+			}
 
 			$result['status'] = 1; // 1 = complete
 			$result['size'] = filesize($final_file);
@@ -346,6 +350,11 @@ class SiteGuard_Backup_Remote_Send {
 		}
 
 		$filename = sanitize_file_name(basename($data['file']));
+
+		// Validate filename pattern (same whitelist as cmd_send_chunk)
+		if (!preg_match('/^backup_[\w\-]+\.(zip|gz|sql|sql\.gz|sql\.bz2|tar|tar\.gz|tar\.bz2|txt)$/', $filename)) {
+			return new WP_Error('invalid_filename', 'Invalid backup filename format.');
+		}
 		$opts = SiteGuard_Backup_Options::instance();
 		$backup_dir = $opts->get_backup_dir();
 
@@ -377,6 +386,7 @@ class SiteGuard_Backup_Remote_Send {
 	private function register_received_file($filename) {
 		// Parse filename: backup_{date}_{site}_{nonce}-{entity}.{ext}
 		if (!preg_match('/^backup_(\d{4}-\d{2}-\d{2}-\d{4})_([^_]+)_([a-zA-Z0-9]+)/', $filename, $m)) {
+			error_log("SiteGuard Backup: Failed to register received file (filename doesn't match pattern): {$filename}");
 			return;
 		}
 
