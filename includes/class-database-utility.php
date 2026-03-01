@@ -184,31 +184,36 @@ class SiteGuard_Backup_Database_Utility {
 		$opts_file = tempnam(sys_get_temp_dir(), 'sgbk_');
 		if (!$opts_file) return false;
 
-		$opts_content = "[client]\n";
-		$opts_content .= "user=" . addcslashes($user, "\\\"'\n") . "\n";
-		if (!empty($pass)) {
-			$opts_content .= "password=" . addcslashes($pass, "\\\"'\n") . "\n";
+		// Restrict permissions immediately before writing sensitive content
+		chmod($opts_file, 0600);
+
+		try {
+			$opts_content = "[client]\n";
+			$opts_content .= "user=" . addcslashes($user, "\\\"'\n") . "\n";
+			if (!empty($pass)) {
+				$opts_content .= "password=" . addcslashes($pass, "\\\"'\n") . "\n";
+			}
+			$opts_content .= "host=" . addcslashes($host, "\\\"'\n") . "\n";
+			file_put_contents($opts_file, $opts_content);
+
+			$cmd = sprintf(
+				'mysqldump --defaults-extra-file=%s --no-tablespaces --single-transaction --quick %s %s %s %s > %s 2>&1',
+				escapeshellarg($opts_file),
+				$port,
+				$socket,
+				escapeshellarg($db),
+				escapeshellarg($table),
+				escapeshellarg($outfile)
+			);
+
+			$output = array();
+			$return = -1;
+			@exec($cmd, $output, $return);
+
+			return (0 === $return && file_exists($outfile) && filesize($outfile) > 0);
+		} finally {
+			@unlink($opts_file);
 		}
-		$opts_content .= "host=" . addcslashes($host, "\\\"'\n") . "\n";
-		file_put_contents($opts_file, $opts_content);
-		@chmod($opts_file, 0600);
-
-		$cmd = sprintf(
-			'mysqldump --defaults-extra-file=%s --no-tablespaces --single-transaction --quick %s %s %s %s > %s 2>&1',
-			escapeshellarg($opts_file),
-			$port,
-			$socket,
-			escapeshellarg($db),
-			escapeshellarg($table),
-			escapeshellarg($outfile)
-		);
-
-		$output = array();
-		$return = -1;
-		@exec($cmd, $output, $return);
-		@unlink($opts_file);
-
-		return (0 === $return && file_exists($outfile) && filesize($outfile) > 0);
 	}
 
 	/**
@@ -530,7 +535,10 @@ class SiteGuard_Backup_Database_Utility {
 			$trimmed = trim($line);
 
 			if (!$in_string) {
-				if (empty($trimmed) || 0 === strpos($trimmed, '--') || 0 === strpos($trimmed, '#') || 0 === strpos($trimmed, '/*')) {
+				if (empty($trimmed)) {
+					continue;
+				}
+				if (empty($buffer) && (0 === strpos($trimmed, '--') || 0 === strpos($trimmed, '#') || 0 === strpos($trimmed, '/*'))) {
 					continue;
 				}
 
@@ -667,8 +675,13 @@ class SiteGuard_Backup_Database_Utility {
 			$line_count++;
 			$trimmed = trim($line);
 
-			if (!$in_string && (empty($trimmed) || 0 === strpos($trimmed, '--') || 0 === strpos($trimmed, '#') || 0 === strpos($trimmed, '/*'))) {
-				continue;
+			if (!$in_string) {
+				if (empty($trimmed)) {
+					continue;
+				}
+				if (empty($buffer) && (0 === strpos($trimmed, '--') || 0 === strpos($trimmed, '#') || 0 === strpos($trimmed, '/*'))) {
+					continue;
+				}
 			}
 
 			$buffer .= $line;
@@ -808,8 +821,12 @@ class SiteGuard_Backup_Database_Utility {
 			$trimmed = trim($line);
 
 			// Skip empty lines and comments only when not inside a quoted string
+			// and only skip comment lines when the SQL buffer is empty (not mid-statement)
 			if (!$in_string) {
-				if (empty($trimmed) || 0 === strpos($trimmed, '--') || 0 === strpos($trimmed, '#') || 0 === strpos($trimmed, '/*')) {
+				if (empty($trimmed)) {
+					continue;
+				}
+				if (empty($buffer) && (0 === strpos($trimmed, '--') || 0 === strpos($trimmed, '#') || 0 === strpos($trimmed, '/*'))) {
 					continue;
 				}
 
@@ -923,6 +940,13 @@ class SiteGuard_Backup_Database_Utility {
 			'/\bLOAD\s+DATA\b/i',
 			'/^\s*SOURCE\s/i',
 			'/^\s*SYSTEM\s/i',
+			'/^\s*CREATE\s+TRIGGER\b/i',
+			'/^\s*CREATE\s+EVENT\b/i',
+			'/\bSET\s+GLOBAL\b/i',
+			'/^\s*CALL\s/i',
+			'/^\s*EXECUTE\s/i',
+			'/^\s*CREATE\s+PROCEDURE\b/i',
+			'/^\s*CREATE\s+FUNCTION\b/i',
 		);
 
 		foreach ($dangerous_patterns as $pattern) {

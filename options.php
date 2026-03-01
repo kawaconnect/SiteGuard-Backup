@@ -35,7 +35,7 @@ class SiteGuard_Backup_Options {
 		if (is_multisite()) {
 			return update_site_option($key, $value);
 		}
-		return update_option($key, $value, $use_cache ? 'yes' : 'no');
+		return update_option($key, $value, false);
 	}
 
 	/**
@@ -83,6 +83,18 @@ class SiteGuard_Backup_Options {
 	 */
 	public function get_backup_dir() {
 		$dir = $this->get_option('sgbackup_dir', '');
+
+		// Validate custom dir is within WordPress installation
+		if (!empty($dir)) {
+			$real_dir = realpath(dirname($dir));
+			$real_content = realpath(WP_CONTENT_DIR);
+			$real_abspath = realpath(ABSPATH);
+			if ($real_dir && $real_content && strpos($real_dir, $real_content) !== 0 && strpos($real_dir, $real_abspath) !== 0) {
+				error_log('SiteGuard Backup: Custom backup directory is outside WordPress installation, using default');
+				$dir = '';
+			}
+		}
+
 		if (empty($dir)) {
 			$dir = WP_CONTENT_DIR . '/sgbackup';
 		}
@@ -105,35 +117,59 @@ class SiteGuard_Backup_Options {
 		// .htaccess
 		$htaccess = $dir . '/.htaccess';
 		if (!file_exists($htaccess)) {
-			@file_put_contents($htaccess, "<IfModule mod_authz_core.c>\nRequire all denied\n</IfModule>\n<IfModule !mod_authz_core.c>\nOrder deny,allow\nDeny from all\n</IfModule>\n");
+			$result = file_put_contents($htaccess, "<IfModule mod_authz_core.c>\nRequire all denied\n</IfModule>\n<IfModule !mod_authz_core.c>\nOrder deny,allow\nDeny from all\n</IfModule>\n");
+			if (false === $result) {
+				error_log('SiteGuard Backup: Failed to write .htaccess to ' . $dir);
+			}
 		}
 		@chmod($htaccess, 0600);
 
 		// .user.ini - disable PHP execution (CGI/FastCGI environments)
 		$userini = $dir . '/.user.ini';
 		if (!file_exists($userini)) {
-			@file_put_contents($userini, "auto_prepend_file = none\nengine = off\n");
+			$result = file_put_contents($userini, "auto_prepend_file = none\nengine = off\n");
+			if (false === $result) {
+				error_log('SiteGuard Backup: Failed to write .user.ini to ' . $dir);
+			}
 		}
 		@chmod($userini, 0600);
 
 		// index.php - block direct PHP access with die()
 		$index_php = $dir . '/index.php';
 		if (!file_exists($index_php)) {
-			@file_put_contents($index_php, "<?php\n// Silence is golden.\ndie('Access denied.');\n");
+			$result = file_put_contents($index_php, "<?php\n// Silence is golden.\ndie('Access denied.');\n");
+			if (false === $result) {
+				error_log('SiteGuard Backup: Failed to write index.php to ' . $dir);
+			}
 		}
 
 		// index.html
 		$index = $dir . '/index.html';
 		if (!file_exists($index)) {
-			@file_put_contents($index, "<html><body><p>Forbidden</p></body></html>\n");
+			$result = file_put_contents($index, "<html><body><p>Forbidden</p></body></html>\n");
+			if (false === $result) {
+				error_log('SiteGuard Backup: Failed to write index.html to ' . $dir);
+			}
 		}
 
 		// web.config for IIS
 		$webconfig = $dir . '/web.config';
 		if (!file_exists($webconfig)) {
-			@file_put_contents($webconfig, "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<configuration>\n<system.webServer>\n<authorization>\n<deny users=\"*\" />\n</authorization>\n</system.webServer>\n</configuration>\n");
+			$result = file_put_contents($webconfig, "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<configuration>\n<system.webServer>\n<authorization>\n<deny users=\"*\" />\n</authorization>\n</system.webServer>\n</configuration>\n");
+			if (false === $result) {
+				error_log('SiteGuard Backup: Failed to write web.config to ' . $dir);
+			}
 		}
 		@chmod($webconfig, 0600);
+
+		// .nginx-deny - Nginx protection snippet
+		$nginx_deny = $dir . '/.nginx-deny';
+		if (!file_exists($nginx_deny)) {
+			$result = file_put_contents($nginx_deny, "# Include this file in your Nginx server block for backup directory protection\n# location ~ /sgbackup { deny all; return 404; }\n");
+			if (false === $result) {
+				error_log('SiteGuard Backup: Failed to write .nginx-deny to ' . $dir);
+			}
+		}
 	}
 
 	/**
