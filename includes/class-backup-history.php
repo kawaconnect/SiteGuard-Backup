@@ -71,7 +71,13 @@ class SiteGuard_Backup_History {
 	 */
 	public static function add_backup($timestamp, $backup_data) {
 		$lock = new SiteGuard_Backup_Semaphore('history');
-		$lock->lock();
+		if (!$lock->lock()) {
+			error_log('SiteGuard Backup: Could not acquire history lock - retrying once');
+			usleep(500000); // 500ms
+			if (!$lock->lock()) {
+				error_log('SiteGuard Backup: History lock failed, proceeding without lock');
+			}
+		}
 		try {
 			// Flush cache to ensure fresh data inside the locked section
 			wp_cache_delete('sgbackup_backup_history', 'options');
@@ -95,7 +101,10 @@ class SiteGuard_Backup_History {
 	 */
 	public static function remove_backup($timestamp) {
 		$lock = new SiteGuard_Backup_Semaphore('history');
-		$lock->lock();
+		if (!$lock->lock()) {
+			usleep(500000);
+			$lock->lock();
+		}
 		try {
 			// Flush cache to ensure fresh data inside the locked section
 			wp_cache_delete('sgbackup_backup_history', 'options');

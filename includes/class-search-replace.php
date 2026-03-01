@@ -203,7 +203,7 @@ class SiteGuard_Backup_Search_Replace {
 			// Check if it's serialized
 			if ($this->is_serialized($data)) {
 				if (PHP_VERSION_ID >= 70000) {
-					$unserialized = @unserialize($data, array('allowed_classes' => false));
+					$unserialized = @unserialize($data, array('allowed_classes' => true));
 				} else {
 					$unserialized = @unserialize($data);
 				}

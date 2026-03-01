@@ -121,6 +121,7 @@ class SiteGuard_Backup_Filesystem {
 				if (!$item->isFile() && !$item->isLink()) continue;
 
 				$full_path = $item->getPathname();
+				$original_path = $full_path;
 
 				// Resolve symlinks and verify they stay within ABSPATH
 				if ($item->isLink()) {
@@ -134,7 +135,8 @@ class SiteGuard_Backup_Filesystem {
 				}
 
 				if (!$item->isFile() && !is_file($full_path)) continue;
-				$relative = str_replace($path, '', $full_path);
+				// Use original (pre-symlink-resolution) path for relative path computation
+				$relative = str_replace($path, '', $original_path);
 
 				// Check exclusions (supports exact prefix match and glob-style wildcards via fnmatch)
 				$skip = false;

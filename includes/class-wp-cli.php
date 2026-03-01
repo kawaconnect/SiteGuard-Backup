@@ -76,8 +76,29 @@ class SiteGuard_Backup_CLI_Command extends WP_CLI_Command {
 
         WP_CLI::log('Starting backup...');
         $sgbackup->backup_all($options);
-        WP_CLI::success('Backup initiated. Job nonce: ' . $sgbackup->nonce);
-        WP_CLI::log('Monitor with: wp siteguardbackup status');
+
+        // Run backup synchronously via resume loop (cron doesn't run in CLI)
+        $nonce = $sgbackup->nonce;
+        $max_resumptions = 50;
+        for ($i = 0; $i < $max_resumptions; $i++) {
+            $jobdata = $sgbackup->jobdata_getarray($nonce);
+            $status = isset($jobdata['jobstatus']) ? $jobdata['jobstatus'] : '';
+            if ($status === 'finished' || $status === 'error') break;
+
+            $sgbackup->backup_resume($i, $nonce);
+
+            $jobdata = $sgbackup->jobdata_getarray($nonce);
+            $status = isset($jobdata['jobstatus']) ? $jobdata['jobstatus'] : '';
+            if ($status === 'finished' || $status === 'error') break;
+        }
+
+        $jobdata = $sgbackup->jobdata_getarray($nonce);
+        $status = isset($jobdata['jobstatus']) ? $jobdata['jobstatus'] : '';
+        if ($status === 'finished') {
+            WP_CLI::success('Backup complete. Job nonce: ' . $nonce);
+        } else {
+            WP_CLI::error('Backup did not complete (status: ' . $status . '). Check logs.');
+        }
     }
 
     /**
@@ -1672,6 +1693,7 @@ class SiteGuard_Backup_CLI_Command extends WP_CLI_Command {
 
             if (!empty($search)) {
                 require_once SGBACKUP_DIR . 'includes/class-search-replace.php';
+                require_once SGBACKUP_DIR . 'includes/class-database-utility.php';
                 $tables = SiteGuard_Backup_Database_Utility::get_tables($wpdb->prefix);
                 $sr = new SiteGuard_Backup_Search_Replace();
                 $report = $sr->run($search, $replace, $tables);

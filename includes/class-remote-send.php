@@ -144,8 +144,58 @@ class SiteGuard_Backup_Remote_Send {
 			return;
 		}
 
-		// Delegate to the shared handler
-		$this->handle_rpc_message();
+		// Process the RPC message directly (skip current_user_can check since
+		// authentication is done via RSA key encryption, not WordPress sessions)
+		if (empty($_POST['subaction']) || $_POST['subaction'] !== 'rpc_message') return;
+		if (empty($_SERVER['HTTP_X_SGBACKUP_RPC'])) return;
+		if (empty($_POST['encrypted']) || empty($_POST['key'])) return;
+
+		// Rate limiting
+		$ip = isset($_SERVER['HTTP_CF_CONNECTING_IP'])
+			? sanitize_text_field($_SERVER['HTTP_CF_CONNECTING_IP'])
+			: (isset($_SERVER['REMOTE_ADDR']) ? sanitize_text_field($_SERVER['REMOTE_ADDR']) : 'unknown');
+		$rate_key = 'sgbackup_rpc_rate_' . md5($ip);
+		$rate_count = (int) get_transient($rate_key);
+		if ($rate_count >= 60) {
+			wp_send_json_error(array('message' => 'Rate limit exceeded. Try again later.'));
+			return;
+		}
+		set_transient($rate_key, $rate_count + 1, 60);
+
+		$key_data = $local_keys[$name_hash];
+
+		if (empty($key_data['private_key']) || !is_string($key_data['private_key'])) {
+			wp_send_json_error(array('message' => 'Migration key data is corrupted.'));
+			return;
+		}
+
+		require_once SGBACKUP_DIR . 'includes/class-remote-communications.php';
+		$rpc = new SiteGuard_Backup_Remote_Communications();
+
+		$encrypted = isset($_POST['encrypted']) ? $_POST['encrypted'] : '';
+		$enc_key = isset($_POST['key']) ? $_POST['key'] : '';
+		if (!is_string($encrypted) || !is_string($enc_key) || !preg_match('/^[A-Za-z0-9+\/=\s]+$/', $encrypted) || !preg_match('/^[A-Za-z0-9+\/=\s]+$/', $enc_key)) {
+			wp_send_json_error(array('message' => 'Invalid data format.'));
+			return;
+		}
+
+		$payload = $rpc->decrypt_message($encrypted, $enc_key, $key_data['private_key']);
+
+		if (is_wp_error($payload)) {
+			wp_send_json_error(array('message' => 'Authentication failed.'));
+			return;
+		}
+
+		$command = isset($payload['command']) ? $payload['command'] : '';
+		$data = isset($payload['data']) ? $payload['data'] : array();
+
+		$result = $this->dispatch_command($command, $data, $name_hash, $key_data);
+
+		if (is_wp_error($result)) {
+			wp_send_json_error(array('message' => $result->get_error_message()));
+		}
+
+		wp_send_json_success($result);
 	}
 
 	/**

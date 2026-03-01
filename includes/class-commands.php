@@ -409,6 +409,13 @@ class SiteGuard_Backup_Commands {
 					} else {
 						$value = array();
 					}
+				} elseif ($key === 'exclude_files') {
+					// Textarea value: split newline-separated string into array
+					if (is_string($value)) {
+						$value = array_values(array_filter(array_map('trim', explode("\n", $value))));
+					}
+					if (!is_array($value)) $value = array();
+					$value = array_map('sanitize_text_field', $value);
 				} elseif (is_string($value)) {
 					$value = sanitize_text_field($value);
 				}
@@ -503,6 +510,7 @@ class SiteGuard_Backup_Commands {
 				if (!is_array($extdb)) continue;
 				$sanitized_extradbs[] = array(
 					'host'   => isset($extdb['host']) ? sanitize_text_field($extdb['host']) : '',
+					'port'   => isset($extdb['port']) ? intval($extdb['port']) : 3306,
 					'user'   => isset($extdb['user']) ? sanitize_text_field($extdb['user']) : '',
 					'pass'   => isset($extdb['pass']) ? sanitize_text_field($extdb['pass']) : '',
 					'name'   => isset($extdb['name']) ? sanitize_text_field($extdb['name']) : '',
@@ -661,7 +669,7 @@ class SiteGuard_Backup_Commands {
 		// Save destination
 		$opts = SiteGuard_Backup_Options::instance();
 		$sites = $opts->get_option('sgbackup_remotesites', array());
-		$site_id = count($sites);
+		$site_id = empty($sites) ? 0 : max(array_keys($sites)) + 1;
 		$sites[$site_id] = $result;
 		$opts->update_option('sgbackup_remotesites', $sites);
 
@@ -930,16 +938,16 @@ class SiteGuard_Backup_Commands {
 	 * Wipe all plugin settings.
 	 */
 	public function wipe_settings() {
+		// Audit log before wiping since the log setting and entries will be wiped
+		$audit = SiteGuard_Backup_Audit_Log::instance();
+		$audit->log('settings_wiped', 'All plugin settings reset to defaults.');
+
 		$opts = SiteGuard_Backup_Options::instance();
 		$defaults = $opts->get_defaults();
 
 		foreach ($defaults as $key => $default) {
 			$opts->delete_option('sgbackup_' . $key);
 		}
-
-		// Audit log (log before wiping since the log setting itself will be wiped)
-		$audit = SiteGuard_Backup_Audit_Log::instance();
-		$audit->log('settings_wiped', 'All plugin settings reset to defaults.');
 
 		// Also clear schedules
 		wp_clear_scheduled_hook('sgbackup_backup');
@@ -964,7 +972,7 @@ class SiteGuard_Backup_Commands {
 
 		// Verify state nonce
 		$state = isset($params['state']) ? $params['state'] : '';
-		if (!wp_verify_nonce($state, 'sgbackup-gdrive-auth')) {
+		if (!wp_verify_nonce($state, 'sgbackup-oauth-googledrive')) {
 			return new WP_Error('invalid_state', 'Invalid OAuth state. Please try again.');
 		}
 
@@ -994,7 +1002,7 @@ class SiteGuard_Backup_Commands {
 
 		// Verify state nonce
 		$state = isset($params['state']) ? $params['state'] : '';
-		if (!wp_verify_nonce($state, 'sgbackup-dropbox-auth')) {
+		if (!wp_verify_nonce($state, 'sgbackup-oauth-dropbox')) {
 			return new WP_Error('invalid_state', 'Invalid OAuth state. Please try again.');
 		}
 
@@ -1024,7 +1032,7 @@ class SiteGuard_Backup_Commands {
 
 		// Verify state nonce
 		$state = isset($params['state']) ? $params['state'] : '';
-		if (!wp_verify_nonce($state, 'sgbackup-onedrive-auth')) {
+		if (!wp_verify_nonce($state, 'sgbackup-oauth-onedrive')) {
 			return new WP_Error('invalid_state', 'Invalid OAuth state. Please try again.');
 		}
 
@@ -2067,5 +2075,25 @@ class SiteGuard_Backup_Commands {
 		$audit->clear();
 
 		return array('success' => true);
+	}
+
+	/**
+	 * Send a test webhook.
+	 */
+	public function test_webhook($params) {
+		$url = '';
+		if (!empty($params['url'])) {
+			$url = trim($params['url']);
+		}
+		if (empty($url)) {
+			$opts = SiteGuard_Backup_Options::instance();
+			$url = $opts->get_option('sgbackup_webhook_url', '');
+		}
+
+		if (empty($url)) {
+			return new WP_Error('missing_url', 'No webhook URL provided.');
+		}
+
+		return SiteGuard_Backup_Webhook::send_test($url);
 	}
 }

@@ -548,6 +548,12 @@ class SiteGuard_Backup_Database_Utility {
 					continue;
 				}
 
+				// Handle DELIMITER changes (for routines/views)
+				if (preg_match('/^DELIMITER\s+(\S+)/i', $trimmed, $dm)) {
+					$delimiter = $dm[1];
+					continue;
+				}
+
 				// Track current table for filtering
 				if (preg_match('/^(?:DROP TABLE|CREATE TABLE)\s+(?:IF\s+(?:NOT\s+)?EXISTS\s+)?`([^`]+)`/i', $trimmed, $m)) {
 					$current_table = $m[1];
@@ -563,6 +569,8 @@ class SiteGuard_Backup_Database_Utility {
 					$current_table = $m[1];
 					if ($selected_tables !== null && !in_array($current_table, $selected_tables)) {
 						$skipping_table = true;
+					} else {
+						$skipping_table = false;
 					}
 				}
 			}
@@ -688,6 +696,11 @@ class SiteGuard_Backup_Database_Utility {
 				if (empty($buffer) && (0 === strpos($trimmed, '--') || 0 === strpos($trimmed, '#') || 0 === strpos($trimmed, '/*'))) {
 					continue;
 				}
+				// Handle DELIMITER changes (for routines/views)
+				if (preg_match('/^DELIMITER\s+(\S+)/i', $trimmed, $dm)) {
+					// Skip DELIMITER statements - atomic restore handles table DDL/DML only
+					continue;
+				}
 			}
 
 			$buffer .= $line;
@@ -734,6 +747,7 @@ class SiteGuard_Backup_Database_Utility {
 				$res = $wpdb->query($query);
 				if (false === $res) {
 					$result['errors'][] = "SQL error on line {$line_count}: " . $wpdb->last_error;
+					$result['success'] = false;
 				}
 
 				if (preg_match('/^CREATE\s+TABLE/i', $query)) {
