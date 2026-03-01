@@ -295,7 +295,8 @@ class SiteGuard_Backup_Engine {
 				$this->sgbackup->log("Batch limit reached at file {$i}/" . count($files) .
 					" (" . SiteGuard_Backup_Filesystem::format_bytes($this->zipfiles_batched) . ")");
 
-				// Close current zip if we've written to it
+				// Close current zip before returning for resumption
+				$this->close_ziparchive();
 				if ($this->zipfiles_added > 0) {
 					$created_files[] = $zip_filename;
 				}

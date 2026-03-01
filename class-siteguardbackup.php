@@ -182,7 +182,7 @@ class SiteGuard_Backup {
 			return; // Do not persist a partial update
 		}
 		for ($i = 0; $i < count($args); $i += 2) {
-			if (isset($args[$i + 1])) {
+			if (array_key_exists($i + 1, $args)) {
 				$this->jobdata[$args[$i]] = $args[$i + 1];
 			}
 		}
@@ -987,8 +987,8 @@ class SiteGuard_Backup {
 
 			SiteGuard_Backup_Webhook::fire('backup_complete', array(
 				'nonce'    => $this->nonce,
-				'job_type' => $this->jobdata_get('job_type', 'full'),
-				'entities' => $this->jobdata_get('entities', array()),
+				'job_type' => $this->jobdata_get('job_type', 'backup'),
+				'entities' => array_keys($this->jobdata_get('job_file_entities', array())),
 			));
 		}
 
