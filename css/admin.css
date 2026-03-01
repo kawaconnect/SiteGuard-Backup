@@ -134,26 +134,18 @@
 	background: #f0f6fc;
 	border: 1px solid #c3c4c7;
 	border-left: 4px solid #2271b1;
-	padding: 12px 15px;
+	padding: 10px 15px;
 	margin-bottom: 8px;
-	position: relative;
 }
 
 .sgbackup-job .sgbackup-job-title {
 	font-weight: 600;
-	margin-bottom: 8px;
-	font-size: 13px;
+	margin-bottom: 4px;
 }
 
-.sgbackup-job .sgbackup-job-title small {
-	font-weight: normal;
-	color: #888;
-}
-
-.sgbackup-job .sgbackup-job-entities {
-	color: #555;
+.sgbackup-job .sgbackup-job-progress {
+	color: #666;
 	font-size: 12px;
-	margin-top: 6px;
 }
 
 .sgbackup-job .sgbackup-abort-btn {
@@ -161,59 +153,45 @@
 	color: #dc3232;
 	cursor: pointer;
 	background: none;
-	border: 1px solid #dc3232;
-	border-radius: 3px;
+	border: none;
+	text-decoration: underline;
+}
+
+.sgbackup-job .sgbackup-job-phase {
+	color: #2271b1;
+	font-weight: 500;
+	margin-bottom: 4px;
+}
+
+.sgbackup-job .sgbackup-job-steps {
+	margin: 6px 0;
+	font-size: 12px;
+}
+
+.sgbackup-job .sgbackup-job-steps span {
 	padding: 2px 8px;
-	font-size: 12px;
+	border-radius: 3px;
+	display: inline-block;
+	margin-right: 2px;
 }
 
-.sgbackup-job .sgbackup-abort-btn:hover {
-	background: #dc3232;
-	color: #fff;
+.sgbackup-phase-done {
+	color: #00a32a;
 }
 
-/* Progress bar */
-.sgbackup-progress-bar-wrap {
-	position: relative;
-	height: 24px;
-	background: #ddd;
-	border-radius: 4px;
-	overflow: hidden;
-}
-
-.sgbackup-progress-bar {
-	height: 100%;
-	background: linear-gradient(90deg, #2271b1, #135e96);
-	border-radius: 4px;
-	transition: width 0.5s ease;
-	min-width: 0;
-}
-
-.sgbackup-progress-text {
-	position: absolute;
-	top: 0;
-	left: 0;
-	right: 0;
-	text-align: center;
-	line-height: 24px;
-	font-size: 12px;
+.sgbackup-phase-active {
+	color: #2271b1;
 	font-weight: 600;
-	color: #333;
-	text-shadow: 0 0 2px rgba(255,255,255,0.8);
 }
 
-/* Migration send progress */
-.sgbackup-send-progress {
-	margin-top: 10px;
+.sgbackup-phase-pending {
+	color: #999;
 }
 
-.sgbackup-send-progress .sgbackup-progress-bar-wrap {
-	height: 20px;
-}
-
-.sgbackup-send-progress .sgbackup-progress-text {
-	line-height: 20px;
+.sgbackup-job .sgbackup-job-entities {
 	font-size: 11px;
+	color: #666;
+	margin-top: 4px;
 }
 
 /* Restore progress */

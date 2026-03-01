@@ -83,6 +83,20 @@ class SiteGuard_Backup_Commands {
 			'type' => !empty($options['job_type']) ? $options['job_type'] : 'full',
 		));
 
+		// Schedule immediate execution after the AJAX response is sent.
+		// In DISABLE_WP_CRON environments, spawn_cron() does nothing and the
+		// backup would sit idle until the external cron runner fires (minutes).
+		// Using a shutdown function + fastcgi_finish_request sends the JSON response
+		// to the browser immediately, then runs the backup in the same process.
+		$nonce = $sgbackup->nonce;
+		register_shutdown_function(function() use ($nonce) {
+			if (function_exists('fastcgi_finish_request')) {
+				fastcgi_finish_request();
+			}
+			$sgbackup = SiteGuard_Backup::instance();
+			$sgbackup->backup_resume(0, $nonce);
+		});
+
 		return array('nonce' => $sgbackup->nonce);
 	}
 
@@ -97,54 +111,36 @@ class SiteGuard_Backup_Commands {
 		foreach ($jobs as $nonce => $job_info) {
 			$jobdata = $sgbackup->jobdata_getarray($nonce);
 
-			// Calculate progress percentage
-			$total_phases = 0;
-			$completed_phases = 0;
-			$current_phase = '';
-
-			$has_files = isset($jobdata['backup_files']) && $jobdata['backup_files'] === 'yes';
-			$has_db = isset($jobdata['backup_database']) && $jobdata['backup_database'] === 'yes';
-			$services = isset($jobdata['service']) ? $jobdata['service'] : array('none');
-			$has_remote = false;
-			foreach ($services as $svc) {
-				if ('none' !== $svc) { $has_remote = true; break; }
-			}
-
-			if ($has_files) $total_phases++;
-			if ($has_db) $total_phases++;
-			if ($has_remote) $total_phases++;
-			if ($total_phases === 0) $total_phases = 1;
-
-			if ($has_files && !empty($jobdata['files_phase_complete'])) $completed_phases++;
-			if ($has_db && !empty($jobdata['db_phase_complete'])) $completed_phases++;
-			if ($has_remote && !empty($jobdata['upload_phase_complete'])) $completed_phases++;
-
-			// Determine current phase
-			if ($has_files && empty($jobdata['files_phase_complete'])) {
-				$current_phase = 'files';
-			} elseif ($has_db && empty($jobdata['db_phase_complete'])) {
-				$current_phase = 'database';
-			} elseif ($has_remote && empty($jobdata['upload_phase_complete'])) {
-				$current_phase = 'uploading';
-			} else {
-				$current_phase = 'finishing';
-			}
-
-			// Entity-level progress for files
+			// Build entity progress detail
+			$entities = isset($jobdata['job_file_entities']) ? $jobdata['job_file_entities'] : array();
 			$entity_progress = array();
-			if ($has_files && isset($jobdata['job_file_entities']) && is_array($jobdata['job_file_entities'])) {
-				foreach ($jobdata['job_file_entities'] as $entity => $info) {
-					$entity_progress[$entity] = isset($info['status']) ? $info['status'] : 'pending';
+			foreach ($entities as $entity => $info) {
+				$status = isset($info['status']) ? $info['status'] : 'pending';
+				$entity_progress[$entity] = $status;
+			}
+
+			// Determine current phase description
+			$phase = 'Initializing';
+			$files_done = !empty($jobdata['files_phase_complete']);
+			$db_done = !empty($jobdata['db_phase_complete']);
+			$upload_done = !empty($jobdata['upload_phase_complete']);
+			if ($upload_done) {
+				$phase = 'Finalizing';
+			} elseif ($db_done) {
+				$phase = 'Uploading to remote';
+			} elseif ($files_done) {
+				$phase = 'Backing up database';
+			} elseif (!empty($entity_progress)) {
+				foreach ($entity_progress as $ent => $st) {
+					if ($st !== 'complete' && $st !== 'pending') {
+						$phase = 'Backing up ' . $ent;
+						break;
+					}
+				}
+				if ($phase === 'Initializing' && array_filter($entity_progress, function($s) { return $s === 'complete'; })) {
+					$phase = 'Backing up files';
 				}
 			}
-
-			// DB table progress
-			$db_tables_done = 0;
-			if ($has_db && isset($jobdata['db_completed_tables'])) {
-				$db_tables_done = count($jobdata['db_completed_tables']);
-			}
-
-			$progress_pct = ($total_phases > 0) ? round(($completed_phases / $total_phases) * 100) : 0;
 
 			$result[$nonce] = array(
 				'resumption'  => $job_info['resumption'],
@@ -152,18 +148,13 @@ class SiteGuard_Backup_Commands {
 				'jobstatus'   => isset($jobdata['jobstatus']) ? $jobdata['jobstatus'] : 'unknown',
 				'backup_files' => isset($jobdata['backup_files']) ? $jobdata['backup_files'] : 'no',
 				'backup_database' => isset($jobdata['backup_database']) ? $jobdata['backup_database'] : 'no',
-				'files_phase_complete' => !empty($jobdata['files_phase_complete']),
-				'db_phase_complete' => !empty($jobdata['db_phase_complete']),
-				'upload_phase_complete' => !empty($jobdata['upload_phase_complete']),
-				'encryption_phase_complete' => !empty($jobdata['encryption_phase_complete']),
-				'manifest_phase_complete' => !empty($jobdata['manifest_phase_complete']),
+				'files_phase_complete' => $files_done,
+				'db_phase_complete' => $db_done,
+				'upload_phase_complete' => $upload_done,
 				'job_type'    => isset($jobdata['job_type']) ? $jobdata['job_type'] : 'backup',
-				'label'       => isset($jobdata['label']) ? $jobdata['label'] : '',
-				'progress_pct' => $progress_pct,
-				'current_phase' => $current_phase,
+				'phase'       => $phase,
 				'entity_progress' => $entity_progress,
-				'db_tables_done' => $db_tables_done,
-				'service'     => $services,
+				'elapsed'     => isset($jobdata['backup_time']) ? (time() - $jobdata['backup_time']) : 0,
 			);
 		}
 
@@ -782,44 +773,22 @@ class SiteGuard_Backup_Commands {
 			return new WP_Error('not_found', 'Backup not found');
 		}
 
-		// Verify remote site exists
-		$opts = SiteGuard_Backup_Options::instance();
-		$sites = $opts->get_option('sgbackup_remotesites', array());
-		if (!isset($sites[$site_id])) {
-			return new WP_Error('not_found', 'Destination site not found');
-		}
-
-		// Verify backup files actually exist on disk
-		$backup_files = SiteGuard_Backup_History::get_all_files($backup_set);
-		$backup_dir = $opts->get_backup_dir();
-		$valid_files = array();
-		foreach ($backup_files as $file) {
-			if (file_exists($backup_dir . $file)) {
-				$valid_files[] = $file;
-			}
-		}
-		if (empty($valid_files)) {
-			return new WP_Error('no_files', 'No backup files found on disk. The backup may have been deleted.');
-		}
-
 		// Start the send as a backup job (use remotesend method)
 		// Pre-set all phase-complete flags and file arrays so they're included
 		// in the initial jobdata BEFORE the cron resumption is scheduled.
-		// Use fast_start to reduce initial delay.
+		$backup_files = SiteGuard_Backup_History::get_all_files($backup_set);
 		$options = array(
 			'service'                => array("remotesend/{$site_id}"),
 			'nofiles'                => true,
 			'nodb'                   => true,
-			'label'                  => 'Send to ' . (isset($sites[$site_id]['name']) ? $sites[$site_id]['name'] : 'remote'),
 			'initial_jobdata_extra'  => array(
-				'backup_files_array'       => $valid_files,
+				'backup_files_array'       => $backup_files,
 				'db_backup_files'          => array(),
 				'files_phase_complete'     => true,
 				'db_phase_complete'        => true,
 				'encryption_phase_complete' => true,
 				'manifest_phase_complete'  => true,
 			),
-			'fast_start'             => true,
 		);
 
 		$sgbackup->backup_all($options);
@@ -2184,117 +2153,5 @@ class SiteGuard_Backup_Commands {
 		}
 
 		return SiteGuard_Backup_Webhook::send_test($url);
-	}
-
-	/**
-	 * Get multisite subsites info for the restore/migration UI.
-	 */
-	public function get_multisite_info() {
-		if (!is_multisite()) {
-			return array('is_multisite' => false, 'sites' => array());
-		}
-
-		$sites = get_sites(array('number' => 100));
-		$result = array();
-		foreach ($sites as $site) {
-			$details = get_blog_details($site->blog_id);
-			$result[] = array(
-				'blog_id'  => intval($site->blog_id),
-				'domain'   => $site->domain,
-				'path'     => $site->path,
-				'blogname' => $details ? $details->blogname : '',
-				'siteurl'  => get_blog_option($site->blog_id, 'siteurl'),
-				'home'     => get_blog_option($site->blog_id, 'home'),
-			);
-		}
-
-		return array(
-			'is_multisite'      => true,
-			'subdomain_install' => defined('SUBDOMAIN_INSTALL') && SUBDOMAIN_INSTALL,
-			'current_site'      => array(
-				'domain' => defined('DOMAIN_CURRENT_SITE') ? DOMAIN_CURRENT_SITE : '',
-				'path'   => defined('PATH_CURRENT_SITE') ? PATH_CURRENT_SITE : '/',
-			),
-			'sites'             => $result,
-		);
-	}
-
-	/**
-	 * Get subsites from a multisite backup's database dump.
-	 */
-	public function get_backup_subsites($params) {
-		if (empty($params['timestamp'])) {
-			return new WP_Error('missing_param', 'Missing timestamp');
-		}
-
-		$timestamp = intval($params['timestamp']);
-		$backup_set = SiteGuard_Backup_History::get_history($timestamp);
-		if (empty($backup_set)) {
-			return new WP_Error('not_found', 'Backup not found');
-		}
-
-		$opts = SiteGuard_Backup_Options::instance();
-		$backup_dir = $opts->get_backup_dir();
-		$subsites = array();
-
-		// Try to extract subsite info from the DB backup
-		if (!empty($backup_set['db'])) {
-			$db_files = is_array($backup_set['db']) ? $backup_set['db'] : array($backup_set['db']);
-			foreach ($db_files as $db_file) {
-				$file_path = $backup_dir . $db_file;
-				if (!file_exists($file_path)) continue;
-
-				// Read the gzipped SQL looking for the blogs table
-				$fh = @gzopen($file_path, 'rb');
-				if (!$fh) continue;
-
-				$content = '';
-				$found_blogs = false;
-				while (!gzeof($fh)) {
-					$line = gzgets($fh, 65536);
-					if (false === $line) break;
-
-					// Look for INSERT INTO wp_blogs or similar
-					if (preg_match('/INSERT\s+INTO\s+[`\'"]?(\w+_blogs)[`\'"]?\s+VALUES/i', $line)) {
-						$found_blogs = true;
-						$content .= $line;
-						// Read a few more lines in case the INSERT spans multiple lines
-						for ($i = 0; $i < 50 && !gzeof($fh); $i++) {
-							$next = gzgets($fh, 65536);
-							if (false === $next) break;
-							$content .= $next;
-							if (strpos($next, ';') !== false) break;
-						}
-						break;
-					}
-
-					// Also check for CREATE TABLE to identify blogs table
-					if (preg_match('/CREATE TABLE.*?_blogs/i', $line)) {
-						$found_blogs = true;
-					}
-				}
-				gzclose($fh);
-
-				if ($found_blogs && !empty($content)) {
-					// Parse the INSERT VALUES to extract blog entries
-					// Format: (blog_id, site_id, domain, path, registered, last_updated, public, archived, mature, spam, deleted, lang_id)
-					if (preg_match_all('/\((\d+),\s*(\d+),\s*\'([^\']*)\',\s*\'([^\']*)\'/i', $content, $matches, PREG_SET_ORDER)) {
-						foreach ($matches as $match) {
-							$subsites[] = array(
-								'blog_id' => intval($match[1]),
-								'site_id' => intval($match[2]),
-								'domain'  => $match[3],
-								'path'    => $match[4],
-							);
-						}
-					}
-				}
-			}
-		}
-
-		return array(
-			'subsites'     => $subsites,
-			'is_multisite' => !empty($subsites),
-		);
 	}
 }

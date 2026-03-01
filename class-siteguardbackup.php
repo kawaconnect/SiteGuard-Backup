@@ -541,8 +541,7 @@ class SiteGuard_Backup {
 		}
 
 		$job_type = isset($options['job_type']) ? $options['job_type'] : 'backup';
-		// fast_start: use 5s interval for send/migration jobs so they execute quickly
-		$resume_interval = !empty($options['fast_start']) ? 5 : SiteGuard_Backup_Job_Scheduler::get_initial_resume_interval();
+		$resume_interval = SiteGuard_Backup_Job_Scheduler::get_initial_resume_interval();
 
 		// Build initial job data
 		$initial_jobdata = array(
@@ -623,24 +622,16 @@ class SiteGuard_Backup {
 			$sem->unlock();
 		}
 
-		// Schedule first resumption (use $resume_interval computed above for jobdata)
-		SiteGuard_Backup_Job_Scheduler::schedule_resumption(0, $this->nonce, $resume_interval);
+		// Schedule first resumption nearly immediately (5s) so the backup starts fast.
+		// The $resume_interval (300s) is stored in jobdata for subsequent resumptions as insurance.
+		$initial_delay = 5;
+		SiteGuard_Backup_Job_Scheduler::schedule_resumption(0, $this->nonce, $initial_delay);
 
-		$this->log("Boot complete. First resumption scheduled in {$resume_interval}s.");
+		$this->log("Boot complete. First resumption scheduled in {$initial_delay}s.");
 		$this->logfile_close();
 
-		// For fast_start jobs (migration sends), execute the first resumption immediately
-		// instead of waiting for wp-cron (which may be disabled or run infrequently)
-		if (!empty($options['fast_start'])) {
-			$saved_nonce = $this->nonce;
-			// Spawn a non-blocking loopback request to trigger the cron
-			$cron_url = site_url('wp-cron.php?doing_wp_cron=' . microtime(true));
-			wp_remote_post($cron_url, array(
-				'timeout'   => 0.01,
-				'blocking'  => false,
-				'sslverify' => false,
-			));
-		}
+		// Trigger WP-Cron to fire the scheduled event promptly
+		spawn_cron();
 	}
 
 	// ==========================================

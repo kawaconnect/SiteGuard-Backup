@@ -56,7 +56,7 @@ class SiteGuard_Backup_Job_Scheduler {
 	 * @param int    $interval      Seconds from now.
 	 */
 	public static function schedule_resumption($resumption_no, $nonce, $interval) {
-		$interval = max(5, $interval);
+		$interval = max(1, intval($interval));
 		$time = time() + $interval;
 
 		// Clear any existing scheduled resumption for this resumption_no
@@ -164,31 +164,32 @@ class SiteGuard_Backup_Job_Scheduler {
 	 * Clear all scheduled events for a backup job.
 	 */
 	public static function clear_scheduled_events($nonce) {
+		// Directly scan cron array and remove ALL events matching this nonce,
+		// regardless of resumption number. This avoids type mismatch issues
+		// and the consecutive-miss heuristic that leaves orphan events.
 		$crons = _get_cron_array();
-		$consecutive_misses = 0;
-		for ($i = 0; $i <= 100; $i++) {
-			$found = false;
-			if (!empty($crons)) {
-				foreach ($crons as $time => $hooks) {
-					if (isset($hooks['sgbackup_backup_resume'])) {
-						foreach ($hooks['sgbackup_backup_resume'] as $hash => $event) {
-							if (isset($event['args']) && $event['args'] === array($i, $nonce)) {
-								$found = true;
-								break 2;
-							}
-						}
-					}
+		if (empty($crons)) return;
+
+		$modified = false;
+		foreach ($crons as $time => $hooks) {
+			if (!isset($hooks['sgbackup_backup_resume'])) continue;
+			foreach ($hooks['sgbackup_backup_resume'] as $hash => $event) {
+				if (isset($event['args'][1]) && (string) $event['args'][1] === (string) $nonce) {
+					unset($crons[$time]['sgbackup_backup_resume'][$hash]);
+					$modified = true;
 				}
 			}
-			if ($found) {
-				wp_clear_scheduled_hook('sgbackup_backup_resume', array($i, $nonce));
-				$consecutive_misses = 0;
-			} else {
-				$consecutive_misses++;
-				if ($consecutive_misses >= 5) {
-					break;
-				}
+			// Clean up empty hook arrays
+			if (isset($crons[$time]['sgbackup_backup_resume']) && empty($crons[$time]['sgbackup_backup_resume'])) {
+				unset($crons[$time]['sgbackup_backup_resume']);
 			}
+			if (empty($crons[$time])) {
+				unset($crons[$time]);
+			}
+		}
+
+		if ($modified) {
+			_set_cron_array($crons);
 		}
 	}
 

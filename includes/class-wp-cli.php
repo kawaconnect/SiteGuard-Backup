@@ -83,18 +83,18 @@ class SiteGuard_Backup_CLI_Command extends WP_CLI_Command {
         for ($i = 0; $i < $max_resumptions; $i++) {
             $jobdata = $sgbackup->jobdata_getarray($nonce);
             $status = isset($jobdata['jobstatus']) ? $jobdata['jobstatus'] : '';
-            if ($status === 'finished' || $status === 'error') break;
+            if (in_array($status, array('complete', 'finished', 'error', 'aborted', 'failed'), true)) break;
 
             $sgbackup->backup_resume($i, $nonce);
 
             $jobdata = $sgbackup->jobdata_getarray($nonce);
             $status = isset($jobdata['jobstatus']) ? $jobdata['jobstatus'] : '';
-            if ($status === 'finished' || $status === 'error') break;
+            if (in_array($status, array('complete', 'finished', 'error', 'aborted', 'failed'), true)) break;
         }
 
         $jobdata = $sgbackup->jobdata_getarray($nonce);
         $status = isset($jobdata['jobstatus']) ? $jobdata['jobstatus'] : '';
-        if ($status === 'finished') {
+        if ($status === 'complete' || $status === 'finished') {
             WP_CLI::success('Backup complete. Job nonce: ' . $nonce);
         } else {
             WP_CLI::error('Backup did not complete (status: ' . $status . '). Check logs.');

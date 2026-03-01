@@ -274,47 +274,51 @@
 			$('#sgbackup-active-jobs').show();
 			var html = '';
 			$.each(data, function(nonce, job) {
-				var pct = job.progress_pct || 0;
-				var label = job.label ? ' - ' + SGB.esc(job.label) : '';
-				var phaseLabel = '';
-				switch (job.current_phase) {
-					case 'files': phaseLabel = 'Backing up files'; break;
-					case 'database': phaseLabel = 'Backing up database'; break;
-					case 'uploading': phaseLabel = 'Uploading to remote'; break;
-					case 'finishing': phaseLabel = 'Finishing up'; break;
-					default: phaseLabel = SGB.esc(job.jobstatus);
+				// Build progress bar sections
+				var steps = [];
+				if (job.backup_files === 'yes') {
+					var filesIcon = job.files_phase_complete ? '&#10003;' : '&#9679;';
+					var filesClass = job.files_phase_complete ? 'sgbackup-phase-done' : 'sgbackup-phase-active';
+					steps.push('<span class="' + filesClass + '">' + filesIcon + ' Files</span>');
+				}
+				if (job.backup_database === 'yes') {
+					var dbDone = job.db_phase_complete;
+					var dbActive = !dbDone && job.files_phase_complete;
+					var dbIcon = dbDone ? '&#10003;' : (dbActive ? '&#9679;' : '&#9675;');
+					var dbClass = dbDone ? 'sgbackup-phase-done' : (dbActive ? 'sgbackup-phase-active' : 'sgbackup-phase-pending');
+					steps.push('<span class="' + dbClass + '">' + dbIcon + ' Database</span>');
+				}
+				if (job.upload_phase_complete) {
+					steps.push('<span class="sgbackup-phase-done">&#10003; Upload</span>');
 				}
 
-				// Build entity detail
+				// Entity-level detail
 				var entityDetail = '';
 				if (job.entity_progress) {
 					var parts = [];
-					$.each(job.entity_progress, function(ent, status) {
-						var icon = status === 'complete' ? '&#10003;' : (status === 'partial' ? '&#8987;' : '&#9679;');
+					$.each(job.entity_progress, function(ent, st) {
+						var icon = (st === 'complete') ? '&#10003;' : ((st === 'pending') ? '&#9675;' : '&#9679;');
 						parts.push(icon + ' ' + SGB.esc(ent));
 					});
-					if (parts.length) entityDetail = parts.join(' &nbsp; ');
-				}
-				if (job.db_tables_done > 0) {
-					entityDetail += (entityDetail ? ' &nbsp; ' : '') + '&#10003; ' + job.db_tables_done + ' tables';
+					if (parts.length) {
+						entityDetail = '<div class="sgbackup-job-entities">' + parts.join(' &nbsp; ') + '</div>';
+					}
 				}
 
-				// Is this a migration/send job?
-				var isMigration = false;
-				if (job.service) {
-					$.each(job.service, function(_, s) {
-						if (s.indexOf('remotesend') === 0) isMigration = true;
-					});
+				// Elapsed time
+				var elapsed = '';
+				if (job.elapsed > 0) {
+					var mins = Math.floor(job.elapsed / 60);
+					var secs = job.elapsed % 60;
+					elapsed = mins > 0 ? (mins + 'm ' + secs + 's') : (secs + 's');
 				}
-				var typeLabel = isMigration ? 'Migration' : (SGB.esc(job.job_type) + ' backup');
 
 				html += '<div class="sgbackup-job">';
-				html += '<button type="button" class="sgbackup-abort-btn" data-nonce="' + SGB.esc(nonce) + '">&times; Abort</button>';
-				html += '<div class="sgbackup-job-title">' + typeLabel + label + ' <small>[' + SGB.esc(nonce) + ']</small></div>';
-				html += '<div class="sgbackup-progress-bar-wrap"><div class="sgbackup-progress-bar" style="width:' + pct + '%;"></div><span class="sgbackup-progress-text">' + pct + '% - ' + phaseLabel + '</span></div>';
-				if (entityDetail) {
-					html += '<div class="sgbackup-job-entities">' + entityDetail + '</div>';
-				}
+				html += '<button type="button" class="sgbackup-abort-btn" data-nonce="' + SGB.esc(nonce) + '">Abort</button>';
+				html += '<div class="sgbackup-job-title">' + SGB.esc(job.job_type) + ' backup [' + SGB.esc(nonce) + ']</div>';
+				html += '<div class="sgbackup-job-phase">' + SGB.esc(job.phase || job.jobstatus) + (elapsed ? ' (' + elapsed + ')' : '') + '</div>';
+				html += '<div class="sgbackup-job-steps">' + steps.join(' &rarr; ') + '</div>';
+				html += entityDetail;
 				html += '</div>';
 			});
 			$('#sgbackup-active-jobs-list').html(html);
@@ -1040,22 +1044,6 @@
 			$(document).on('click', '.sgbackup-send-site', function() {
 				var siteId = $(this).data('site-id');
 				$('#sgbackup-send-options').show().data('site-id', siteId);
-				// Populate existing backups dropdown
-				self.ajax('get_existing_backups', {}, function(data) {
-					var $sel = $('#sgbackup-send-existing-select');
-					$sel.empty().append('<option value="">Select backup...</option>');
-					if (data && data.length) {
-						$.each(data, function(i, b) {
-							var hasFiles = false;
-							$.each(['plugins','themes','uploads','others','wpcore','db'], function(_, e) {
-								if (b[e] && b[e].exists) hasFiles = true;
-							});
-							if (hasFiles) {
-								$sel.append('<option value="' + SGB.esc(String(b.timestamp)) + '">' + SGB.esc(b.date) + ' (' + SGB.esc(b.nonce) + ')</option>');
-							}
-						});
-					}
-				});
 			});
 
 			// M6: Clone to site (backup + send in one step)
@@ -1096,100 +1084,27 @@
 				});
 			});
 
-			// Load multisite info
-			if (sgbackup_settings.is_multisite) {
-				self.ajax('get_multisite_info', {}, function(data) {
-					if (data && data.sites && data.sites.length) {
-						var html = '';
-						$.each(data.sites, function(i, site) {
-							html += '<tr>';
-							html += '<td>' + SGB.esc(String(site.blog_id)) + '</td>';
-							html += '<td>' + SGB.esc(site.domain) + '</td>';
-							html += '<td>' + SGB.esc(site.path) + '</td>';
-							html += '<td>' + SGB.esc(site.blogname) + '</td>';
-							html += '</tr>';
-						});
-						$('#sgbackup-current-subsites-body').html(html);
-					}
-				});
-
-				// Populate backup selector for subsite inspection
-				self.ajax('get_existing_backups', {}, function(data) {
-					var $sel = $('#sgbackup-subsite-backup-select');
-					$sel.empty().append('<option value="">Select a backup to inspect...</option>');
-					if (data && data.length) {
-						$.each(data, function(i, b) {
-							if (b.db && b.db.exists) {
-								$sel.append('<option value="' + SGB.esc(String(b.timestamp)) + '">' + SGB.esc(b.date) + ' (' + SGB.esc(b.nonce) + ')</option>');
-							}
-						});
-					}
-				});
-			}
-
-			// Inspect subsites in a backup
-			$('#sgbackup-inspect-subsites-btn').on('click', function() {
-				var ts = $('#sgbackup-subsite-backup-select').val();
-				if (!ts) return;
-
-				self.ajax('get_backup_subsites', { timestamp: ts }, function(data) {
-					if (data && data.subsites && data.subsites.length) {
-						var html = '';
-						$.each(data.subsites, function(i, site) {
-							html += '<tr>';
-							html += '<td><input type="checkbox" class="sgbackup-subsite-check" data-blog-id="' + site.blog_id + '" checked /></td>';
-							html += '<td>' + SGB.esc(String(site.blog_id)) + '</td>';
-							html += '<td>' + SGB.esc(site.domain + site.path) + '</td>';
-							html += '<td><input type="text" class="regular-text sgbackup-subsite-remap" data-blog-id="' + site.blog_id + '" placeholder="' + SGB.esc(site.domain) + '" value="" /></td>';
-							html += '</tr>';
-						});
-						$('#sgbackup-backup-subsites-body').html(html);
-						$('#sgbackup-backup-subsites-panel').show();
-					} else {
-						$('#sgbackup-backup-subsites-body').html('<tr><td colspan="4">No multisite subsites found in this backup (may be a single-site backup).</td></tr>');
-						$('#sgbackup-backup-subsites-panel').show();
-					}
-				});
-			});
-
-			// Select all subsites toggle
-			$('#sgbackup-select-all-subsites').on('change', function() {
-				$('.sgbackup-subsite-check').prop('checked', $(this).is(':checked'));
-			});
-
 			// Actual send
 			$('#sgbackup-send-btn').on('click', function() {
 				var siteId = $('#sgbackup-send-options').data('site-id');
 				var sendType = $('input[name="sgbackup_send_type"]:checked').val();
-				var $btn = $(this);
 
-				$btn.prop('disabled', true);
 				$('#sgbackup-send-status').text('Sending...').removeClass('success error');
-				$('#sgbackup-send-progress').show();
-
-				var onSuccess = function(data) {
-					$btn.prop('disabled', false);
-					$('#sgbackup-send-status').text('Job started: ' + (data.nonce || '')).addClass('success');
-					self.pollActiveJobs();
-				};
-				var onError = function(msg) {
-					$btn.prop('disabled', false);
-					$('#sgbackup-send-status').text('Error: ' + msg).addClass('error');
-					$('#sgbackup-send-progress').hide();
-				};
 
 				if (sendType === 'existing') {
 					var timestamp = $('#sgbackup-send-existing-select').val();
 					if (!timestamp) {
-						$btn.prop('disabled', false);
 						$('#sgbackup-send-status').text('Select a backup first').addClass('error');
-						$('#sgbackup-send-progress').hide();
 						return;
 					}
-					self.ajax('migrate_send', { site_id: siteId, timestamp: timestamp }, onSuccess, onError);
+					self.ajax('migrate_send', { site_id: siteId, timestamp: timestamp }, function(data) {
+						$('#sgbackup-send-status').text('Send started! Job: ' + data.nonce).addClass('success');
+					});
 				} else {
 					// Create new backup and send
-					self.ajax('backupnow', { service: ['remotesend/' + siteId] }, onSuccess, onError);
+					self.ajax('backupnow', { service: ['remotesend/' + siteId] }, function(data) {
+						$('#sgbackup-send-status').text('Backup + send started! Job: ' + data.nonce).addClass('success');
+					});
 				}
 			});
 		},
