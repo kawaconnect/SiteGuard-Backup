@@ -25,13 +25,27 @@ class SiteGuard_Backup_History {
 		// Sort newest first
 		krsort($history);
 
-		// Merge incremental sets
-		$history = self::build_incremental_sets($history);
+		// Merge incremental sets into a COPY for display purposes.
+		// Do NOT merge in-place - callers that save_history() back would
+		// persist the merged data, causing unbounded duplicate file entries.
+		$merged = self::build_incremental_sets_copy($history);
 
 		if (false !== $timestamp) {
-			return isset($history[$timestamp]) ? $history[$timestamp] : array();
+			return isset($merged[$timestamp]) ? $merged[$timestamp] : array();
 		}
 
+		return $merged;
+	}
+
+	/**
+	 * Get raw (unmerged) history for read-modify-write operations.
+	 * Callers that intend to save_history() should use this method.
+	 */
+	public static function get_history_raw() {
+		$opts = SiteGuard_Backup_Options::instance();
+		$history = $opts->get_option('sgbackup_backup_history', array());
+		if (!is_array($history)) $history = array();
+		krsort($history);
 		return $history;
 	}
 
@@ -82,7 +96,7 @@ class SiteGuard_Backup_History {
 			// Flush cache to ensure fresh data inside the locked section
 			wp_cache_delete('sgbackup_backup_history', 'options');
 			wp_cache_delete('sgbackup_backup_history', 'site-options');
-			$history = self::get_history();
+			$history = self::get_history_raw();
 			if (isset($history[$timestamp])) {
 				$history[$timestamp] = array_merge($history[$timestamp], $backup_data);
 			} else {
@@ -103,13 +117,15 @@ class SiteGuard_Backup_History {
 		$lock = new SiteGuard_Backup_Semaphore('history');
 		if (!$lock->lock()) {
 			usleep(500000);
-			$lock->lock();
+			if (!$lock->lock()) {
+				error_log('SiteGuard Backup: History lock failed in remove_backup');
+			}
 		}
 		try {
 			// Flush cache to ensure fresh data inside the locked section
 			wp_cache_delete('sgbackup_backup_history', 'options');
 			wp_cache_delete('sgbackup_backup_history', 'site-options');
-			$history = self::get_history();
+			$history = self::get_history_raw();
 			if (isset($history[$timestamp])) {
 				unset($history[$timestamp]);
 				self::save_history($history);
@@ -202,6 +218,16 @@ class SiteGuard_Backup_History {
 			}
 		}
 
+		// Include extradir_* entity files (extra directory backups)
+		foreach ($backup as $key => $value) {
+			if (strpos($key, 'extradir_') === 0 && !empty($value)) {
+				$entity_files = is_string($value) ? array($value) : $value;
+				if (is_array($entity_files)) {
+					$files = array_merge($files, $entity_files);
+				}
+			}
+		}
+
 		// Include manifest file if tracked
 		if (!empty($backup['manifest'])) {
 			$files[] = $backup['manifest'];
@@ -211,48 +237,58 @@ class SiteGuard_Backup_History {
 	}
 
 	/**
-	 * Build incremental sets - merge incremental backups into their parent.
+	 * Build incremental sets - merge incremental backups into a DEEP COPY of the parent.
+	 * Returns a new array; the original $history is NOT modified.
 	 */
-	private static function build_incremental_sets($history) {
-		foreach ($history as $timestamp => &$backup) {
+	private static function build_incremental_sets_copy($history) {
+		$merged = array();
+		foreach ($history as $timestamp => $backup) {
+			$merged[$timestamp] = $backup; // shallow copy of this entry
 			if (empty($backup['incremental_sets'])) continue;
 
 			foreach ($backup['incremental_sets'] as $inc_timestamp => $inc_data) {
-				// Merge incremental file lists into main backup
 				foreach (array('plugins', 'themes', 'uploads', 'others', 'wpcore') as $entity) {
 					if (!empty($inc_data[$entity])) {
-						if (!isset($backup[$entity])) {
-							$backup[$entity] = array();
+						if (!isset($merged[$timestamp][$entity])) {
+							$merged[$timestamp][$entity] = array();
 						}
-						if (is_string($backup[$entity])) {
-							$backup[$entity] = array($backup[$entity]);
+						if (is_string($merged[$timestamp][$entity])) {
+							$merged[$timestamp][$entity] = array($merged[$timestamp][$entity]);
 						}
 						$inc_files = is_array($inc_data[$entity]) ? $inc_data[$entity] : array($inc_data[$entity]);
-						$backup[$entity] = array_merge($backup[$entity], $inc_files);
+						$merged[$timestamp][$entity] = array_merge($merged[$timestamp][$entity], $inc_files);
 					}
 				}
 			}
 		}
-
-		return $history;
+		return $merged;
 	}
 
 	/**
 	 * Merge an incremental backup into an existing backup set.
 	 */
 	public static function merge_incremental($parent_timestamp, $incremental_data) {
-		$history = self::get_history();
-		if (!isset($history[$parent_timestamp])) return false;
-
-		$inc_timestamp = time();
-		if (!isset($history[$parent_timestamp]['incremental_sets'])) {
-			$history[$parent_timestamp]['incremental_sets'] = array();
+		$lock = new SiteGuard_Backup_Semaphore('history');
+		if (!$lock->lock()) {
+			usleep(500000);
+			$lock->lock();
 		}
+		try {
+			$history = self::get_history_raw();
+			if (!isset($history[$parent_timestamp])) return false;
 
-		$history[$parent_timestamp]['incremental_sets'][$inc_timestamp] = $incremental_data;
-		self::save_history($history);
+			$inc_timestamp = time();
+			if (!isset($history[$parent_timestamp]['incremental_sets'])) {
+				$history[$parent_timestamp]['incremental_sets'] = array();
+			}
 
-		return $inc_timestamp;
+			$history[$parent_timestamp]['incremental_sets'][$inc_timestamp] = $incremental_data;
+			self::save_history($history);
+
+			return $inc_timestamp;
+		} finally {
+			$lock->unlock();
+		}
 	}
 
 	/**
