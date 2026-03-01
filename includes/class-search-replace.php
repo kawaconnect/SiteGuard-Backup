@@ -22,6 +22,9 @@ class SiteGuard_Backup_Search_Replace {
 	/** @var bool Dry run mode - count changes without writing */
 	private $dry_run = false;
 
+	/** @var array Object hash tracking for circular reference detection */
+	private $object_hashes = array();
+
 	/**
 	 * Run search-replace on specified tables.
 	 *
@@ -119,6 +122,7 @@ class SiteGuard_Backup_Search_Replace {
 		global $wpdb;
 
 		$this->report['rows']++;
+		$this->object_hashes = array(); // Reset circular ref tracking per row
 
 		// Escape backticks in table name for SQL interpolation
 		$escaped_table = str_replace('`', '``', $table);
@@ -199,52 +203,76 @@ class SiteGuard_Backup_Search_Replace {
 			return $data;
 		}
 
-		if (is_string($data)) {
-			// Check if it's serialized
-			if ($this->is_serialized($data)) {
-				if (PHP_VERSION_ID >= 70000) {
-					$unserialized = @unserialize($data, array('allowed_classes' => true));
-				} else {
-					$unserialized = @unserialize($data);
+		try {
+			if (is_string($data)) {
+				// Check if it's serialized
+				if ($this->is_serialized($data)) {
+					if (PHP_VERSION_ID >= 70000) {
+						$unserialized = @unserialize($data, array('allowed_classes' => true));
+					} else {
+						$unserialized = @unserialize($data);
+					}
+					if (false !== $unserialized || $data === 'b:0;') {
+						$replaced = $this->recursive_unserialize_replace($from, $to, $unserialized, true, $recursion_level + 1);
+						$data = serialize($replaced);
+						return $data;
+					}
 				}
-				if (false !== $unserialized || $data === 'b:0;') {
-					$replaced = $this->recursive_unserialize_replace($from, $to, $unserialized, true, $recursion_level + 1);
-					$data = serialize($replaced);
-					return $data;
+
+				// Check if it's JSON
+				if ($this->is_json($data)) {
+					$decoded = @json_decode($data, true);
+					if (is_array($decoded)) {
+						$replaced = $this->recursive_unserialize_replace($from, $to, $decoded, false, $recursion_level + 1);
+						$re_encoded = json_encode($replaced, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+						if (false !== $re_encoded) {
+							$data = $re_encoded;
+						}
+						return $data;
+					}
 				}
-			}
 
-			// Check if it's JSON
-			if ($this->is_json($data)) {
-				$decoded = @json_decode($data, true);
-				if (is_array($decoded)) {
-					$replaced = $this->recursive_unserialize_replace($from, $to, $decoded, false, $recursion_level + 1);
-					$data = json_encode($replaced, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
-					return $data;
+				// Plain string replacement - always case-sensitive
+				// Case-insensitive replacement can corrupt serialized string lengths
+				// and cause data integrity issues
+				$data = str_replace($from, $to, $data);
+
+			} elseif (is_array($data)) {
+				$new_data = array();
+				foreach ($data as $key => $value) {
+					// Process both key and value
+					$new_key = $this->recursive_unserialize_replace($from, $to, $key, false, $recursion_level + 1);
+					$new_data[$new_key] = $this->recursive_unserialize_replace($from, $to, $value, false, $recursion_level + 1);
 				}
-			}
+				$data = $new_data;
 
-			// Plain string replacement - always case-sensitive
-			// Case-insensitive replacement can corrupt serialized string lengths
-			// and cause data integrity issues
-			$data = str_replace($from, $to, $data);
+			} elseif (is_object($data)) {
+				// Circular reference detection via object hash
+				$hash = spl_object_hash($data);
+				if (isset($this->object_hashes[$hash])) {
+					return $data; // Already processing this object
+				}
+				$this->object_hashes[$hash] = true;
 
-		} elseif (is_array($data)) {
-			$new_data = array();
-			foreach ($data as $key => $value) {
-				// Process both key and value
-				$new_key = $this->recursive_unserialize_replace($from, $to, $key, false, $recursion_level + 1);
-				$new_data[$new_key] = $this->recursive_unserialize_replace($from, $to, $value, false, $recursion_level + 1);
-			}
-			$data = $new_data;
+				$props = get_object_vars($data);
+				$new_data = clone $data;
+				foreach ($props as $key => $value) {
+					$new_data->$key = $this->recursive_unserialize_replace($from, $to, $value, false, $recursion_level + 1);
+				}
 
-		} elseif (is_object($data)) {
-			$props = get_object_vars($data);
-			$new_data = clone $data;
-			foreach ($props as $key => $value) {
-				$new_data->$key = $this->recursive_unserialize_replace($from, $to, $value, false, $recursion_level + 1);
+				unset($this->object_hashes[$hash]);
+				$data = $new_data;
 			}
-			$data = $new_data;
+		} catch (\Exception $e) {
+			// Return data unchanged if processing fails
+			if (!empty($this->report)) {
+				$this->report['errors'][] = "Search-replace exception at depth {$recursion_level}: " . $e->getMessage();
+			}
+		} catch (\Error $e) {
+			// Catch PHP 7+ fatal errors (e.g., unserialize failures)
+			if (!empty($this->report)) {
+				$this->report['errors'][] = "Search-replace error at depth {$recursion_level}: " . $e->getMessage();
+			}
 		}
 
 		return $data;
