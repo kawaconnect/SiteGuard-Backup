@@ -78,7 +78,15 @@ class SiteGuard_Backup_Method_Sftp extends SiteGuard_Backup_Module {
 			if (method_exists($sftp_obj, 'getServerPublicHostKey')) {
 				$hostkey = $sftp_obj->getServerPublicHostKey();
 				if ($hostkey) {
-					$server_fingerprint = strtolower(md5($hostkey));
+					// Extract raw key bytes to match ssh2_fingerprint behavior
+					// phpseclib returns "ssh-rsa AAAA..." format
+					$parts = explode(' ', $hostkey, 3);
+					if (isset($parts[1])) {
+						$raw_key = base64_decode($parts[1]);
+						$server_fingerprint = strtolower(md5($raw_key, false));
+					} else {
+						$server_fingerprint = strtolower(md5($hostkey));
+					}
 				}
 			}
 		}
