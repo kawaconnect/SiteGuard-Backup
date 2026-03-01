@@ -686,17 +686,19 @@ class SiteGuard_Backup_Admin {
 	public function admin_bar_menu($wp_admin_bar) {
 		if (!$this->user_can_manage()) return;
 
+		$page_url = is_multisite() ? network_admin_url('admin.php?page=siteguardbackup') : admin_url('admin.php?page=siteguardbackup');
+
 		$wp_admin_bar->add_node(array(
 			'id'    => 'sgbackup',
 			'title' => '<span class="ab-icon dashicons dashicons-shield"></span> SiteGuard Backup',
-			'href'  => admin_url('admin.php?page=siteguardbackup'),
+			'href'  => $page_url,
 		));
 
 		$wp_admin_bar->add_node(array(
 			'parent' => 'sgbackup',
 			'id'     => 'sgbackup-backup-now',
 			'title'  => 'Backup Now',
-			'href'   => admin_url('admin.php?page=siteguardbackup&action=backupnow'),
+			'href'   => $page_url . '&action=backupnow',
 		));
 
 		// Show last backup status
@@ -706,7 +708,7 @@ class SiteGuard_Backup_Admin {
 				'parent' => 'sgbackup',
 				'id'     => 'sgbackup-last-backup',
 				'title'  => 'Last: ' . human_time_diff($last_backup['timestamp']) . ' ago',
-				'href'   => admin_url('admin.php?page=siteguardbackup'),
+				'href'   => $page_url,
 			));
 		}
 	}
@@ -832,7 +834,8 @@ class SiteGuard_Backup_Admin {
 		}
 
 		echo '</div>';
-		echo '<p style="margin-top:10px;"><a href="' . esc_url(admin_url('admin.php?page=siteguardbackup')) . '" class="button">' . esc_html__('Open SiteGuard Backup', 'siteguardbackup') . '</a></p>';
+		$page_url = is_multisite() ? network_admin_url('admin.php?page=siteguardbackup') : admin_url('admin.php?page=siteguardbackup');
+		echo '<p style="margin-top:10px;"><a href="' . esc_url($page_url) . '" class="button">' . esc_html__('Open SiteGuard Backup', 'siteguardbackup') . '</a></p>';
 	}
 
 	/**
