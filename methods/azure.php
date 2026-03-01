@@ -228,9 +228,10 @@ class SiteGuard_Backup_Method_Azure extends SiteGuard_Backup_Module {
 				return $result;
 			}
 
+			$offset += strlen($chunk);
 			$block_index++;
 			$sgbackup->log("Azure: Uploaded block {$block_index} (" .
-				SiteGuard_Backup_Filesystem::format_bytes($block_index * $chunk_size) . ")");
+				SiteGuard_Backup_Filesystem::format_bytes($offset) . ")");
 			SiteGuard_Backup_Job_Scheduler::something_useful_happened();
 		}
 		fclose($fh);
@@ -336,7 +337,7 @@ class SiteGuard_Backup_Method_Azure extends SiteGuard_Backup_Module {
 		$files = array();
 
 		// Parse XML response for blob names
-		if (preg_match_all('/<Name>([^<]+)<\/Name>/', $body, $matches)) {
+		if (preg_match_all('/<Blob>\s*<Name>([^<]+)<\/Name>/s', $body, $matches)) {
 			foreach ($matches[1] as $name) {
 				// Strip path prefix to return just filenames
 				if (!empty($path) && strpos($name, $path) === 0) {
