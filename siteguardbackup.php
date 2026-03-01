@@ -329,6 +329,8 @@ function sgbackup_autobackup_core() {
 	global $sgbackup_already_backed_up;
 	if (isset($sgbackup_already_backed_up['core'])) return;
 	$sgbackup_already_backed_up['core'] = true;
+	$sgbackup_already_backed_up['plugins'] = true;
+	$sgbackup_already_backed_up['themes'] = true;
 
 	require_once SGBACKUP_DIR . 'class-siteguardbackup.php';
 	SiteGuard_Backup::instance()->backup_all(array(
