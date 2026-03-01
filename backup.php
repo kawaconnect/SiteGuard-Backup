@@ -492,6 +492,12 @@ class SiteGuard_Backup_Engine {
 
 	private function recursive_rmdir($dir) {
 		if (!is_dir($dir)) return;
+		// Ensure directory is within backup_dir to prevent accidental deletion
+		$real_dir = realpath($dir);
+		$real_backup = realpath($this->backup_dir);
+		if (!$real_dir || !$real_backup || strpos($real_dir, $real_backup) !== 0) {
+			return;
+		}
 		$items = new RecursiveIteratorIterator(
 			new RecursiveDirectoryIterator($dir, FilesystemIterator::SKIP_DOTS),
 			RecursiveIteratorIterator::CHILD_FIRST
