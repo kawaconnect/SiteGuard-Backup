@@ -103,6 +103,7 @@ function sgbackup_load_classes() {
 	require_once SGBACKUP_DIR . 'includes/class-filesystem-functions.php';
 	require_once SGBACKUP_DIR . 'includes/class-database-utility.php';
 	require_once SGBACKUP_DIR . 'includes/class-semaphore.php';
+	require_once SGBACKUP_DIR . 'includes/class-audit-log.php';
 }
 
 /**

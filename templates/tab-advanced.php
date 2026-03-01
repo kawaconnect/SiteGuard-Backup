@@ -111,6 +111,37 @@ $opts = SiteGuard_Backup_Options::instance();
 </div>
 
 <div class="sgbackup-section">
+	<h2><?php esc_html_e('Security Audit Log', 'siteguardbackup'); ?></h2>
+	<p><?php esc_html_e('Optional security feature that records who performed what action and when. Tracks backups, restores, deletions, settings changes, file downloads, and unlock attempts with user identity, IP address, and timestamps.', 'siteguardbackup'); ?></p>
+	<p class="description"><?php esc_html_e('The audit log is completely opt-in. When disabled, no events are recorded and no data is collected. Enable it below to start tracking administrative actions for security compliance.', 'siteguardbackup'); ?></p>
+	<?php $audit_enabled = SiteGuard_Backup_Audit_Log::instance()->is_enabled(); ?>
+	<p>
+		<label>
+			<input type="checkbox" id="sgbackup-audit-log-toggle" <?php checked($audit_enabled); ?> />
+			<?php esc_html_e('Enable security audit logging', 'siteguardbackup'); ?>
+		</label>
+		<span id="sgbackup-audit-log-status" class="sgbackup-status"></span>
+	</p>
+	<div id="sgbackup-audit-log-section" style="<?php echo $audit_enabled ? '' : 'display:none;'; ?>margin-top:10px;">
+		<button type="button" class="button" id="sgbackup-audit-log-load"><?php esc_html_e('Load Recent Events', 'siteguardbackup'); ?></button>
+		<button type="button" class="button" id="sgbackup-audit-log-clear" style="margin-left:5px;color:#a00;"><?php esc_html_e('Clear Log', 'siteguardbackup'); ?></button>
+		<span id="sgbackup-audit-log-count" style="margin-left:10px;"></span>
+		<div id="sgbackup-audit-log-result" style="display:none;margin-top:10px;">
+			<table class="widefat" id="sgbackup-audit-log-table">
+				<thead><tr>
+					<th><?php esc_html_e('Date', 'siteguardbackup'); ?></th>
+					<th><?php esc_html_e('Action', 'siteguardbackup'); ?></th>
+					<th><?php esc_html_e('User', 'siteguardbackup'); ?></th>
+					<th><?php esc_html_e('IP Address', 'siteguardbackup'); ?></th>
+					<th><?php esc_html_e('Details', 'siteguardbackup'); ?></th>
+				</tr></thead>
+				<tbody></tbody>
+			</table>
+		</div>
+	</div>
+</div>
+
+<div class="sgbackup-section">
 	<h2><?php esc_html_e('WP-CLI Commands Reference', 'siteguardbackup'); ?></h2>
 	<p><?php esc_html_e('SiteGuard Backup includes WP-CLI commands for automation, scripting, and server management. All commands are optional and only run when you explicitly invoke them.', 'siteguardbackup'); ?></p>
 	<button type="button" class="button" id="sgbackup-cli-ref-toggle"><?php esc_html_e('Show Command Reference', 'siteguardbackup'); ?></button>
@@ -153,6 +184,7 @@ $opts = SiteGuard_Backup_Options::instance();
 				<tr><td><code>wp siteguardbackup prune</code></td><td><?php esc_html_e('Manually enforce the backup retention policy (oldest backups beyond the retention count are deleted). Use --type=full|db|all to target specific types, --dry-run to preview.', 'siteguardbackup'); ?></td></tr>
 				<tr><td><code>wp siteguardbackup lock</code></td><td><?php esc_html_e('View or manage backup semaphore locks. "lock status" shows if a lock is held and for how long. "lock clear" force-releases all locks (use if a backup got stuck).', 'siteguardbackup'); ?></td></tr>
 				<tr><td><code>wp siteguardbackup sites</code></td><td><?php esc_html_e('List all sites in the multisite network with ID, domain, path, name, status (active/archived/spam), last updated date, and published post count.', 'siteguardbackup'); ?></td></tr>
+				<tr><td><code>wp siteguardbackup audit_log</code></td><td><?php esc_html_e('View or manage the security audit log. Subcommands: show (default), enable, disable, clear, export. Filter by --action=backup_started, limit with --limit=50. Use --format=json for structured output.', 'siteguardbackup'); ?></td></tr>
 			</tbody>
 		</table>
 

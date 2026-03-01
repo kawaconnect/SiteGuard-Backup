@@ -1336,6 +1336,53 @@
 				$(this).text($ref.is(':visible') ? 'Hide Command Reference' : 'Show Command Reference');
 			});
 
+			// Security Audit Log toggle
+			$('#sgbackup-audit-log-toggle').on('change', function() {
+				var enabled = $(this).is(':checked');
+				$('#sgbackup-audit-log-status').text('Saving...');
+				self.ajax('toggle_audit_log', { enabled: enabled ? 1 : 0 }, function() {
+					$('#sgbackup-audit-log-status').text(enabled ? 'Enabled' : 'Disabled').addClass('success');
+					$('#sgbackup-audit-log-section').toggle(enabled);
+					setTimeout(function() { $('#sgbackup-audit-log-status').text(''); }, 2000);
+				}, function(msg) {
+					$('#sgbackup-audit-log-status').text('Error: ' + msg).addClass('error');
+				});
+			});
+
+			// Load audit log entries
+			$('#sgbackup-audit-log-load').on('click', function() {
+				self.ajax('get_audit_log', { limit: 50 }, function(data) {
+					$('#sgbackup-audit-log-count').text(data.total + ' total entries');
+					var $tbody = $('#sgbackup-audit-log-table tbody');
+					$tbody.empty();
+					if (!data.entries || data.entries.length === 0) {
+						$tbody.append('<tr><td colspan="5"><em>No audit log entries.</em></td></tr>');
+					} else {
+						$.each(data.entries, function(i, entry) {
+							$tbody.append(
+								'<tr>' +
+								'<td>' + SGB.esc(entry.date) + '</td>' +
+								'<td>' + SGB.esc(entry.action_label) + '</td>' +
+								'<td>' + SGB.esc(entry.user_login) + '</td>' +
+								'<td>' + SGB.esc(entry.ip) + '</td>' +
+								'<td>' + SGB.esc(entry.details) + '</td>' +
+								'</tr>'
+							);
+						});
+					}
+					$('#sgbackup-audit-log-result').show();
+				});
+			});
+
+			// Clear audit log
+			$('#sgbackup-audit-log-clear').on('click', function() {
+				if (!confirm('Clear all audit log entries? This cannot be undone.')) return;
+				self.ajax('clear_audit_log', {}, function() {
+					$('#sgbackup-audit-log-table tbody').html('<tr><td colspan="5"><em>Log cleared.</em></td></tr>');
+					$('#sgbackup-audit-log-count').text('0 total entries');
+				});
+			});
+
 			// Wipe settings
 			$('#sgbackup-wipe-settings-btn').on('click', function() {
 				if (!confirm('Reset all SiteGuard Backup settings to defaults?')) return;

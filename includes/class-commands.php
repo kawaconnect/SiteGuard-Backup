@@ -75,6 +75,14 @@ class SiteGuard_Backup_Commands {
 
 		$sgbackup->backup_all($options);
 
+		// Audit log
+		$audit = SiteGuard_Backup_Audit_Log::instance();
+		$entities = isset($options['entities']) ? implode(', ', $options['entities']) : 'all';
+		$audit->log('backup_started', 'Backup initiated: entities=' . $entities, array(
+			'nonce' => $sgbackup->nonce,
+			'type' => !empty($options['job_type']) ? $options['job_type'] : 'full',
+		));
+
 		return array('nonce' => $sgbackup->nonce);
 	}
 
@@ -117,6 +125,14 @@ class SiteGuard_Backup_Commands {
 
 		$deleted = SiteGuard_Backup_History::delete_backup_set($timestamp, $delete_remote);
 
+		// Audit log
+		$audit = SiteGuard_Backup_Audit_Log::instance();
+		$audit->log('delete_backup', 'Deleted backup set from ' . gmdate('Y-m-d H:i', $timestamp), array(
+			'timestamp' => $timestamp,
+			'files_deleted' => count($deleted),
+			'remote_deleted' => $delete_remote ? 'yes' : 'no',
+		));
+
 		return array(
 			'deleted'   => $deleted,
 			'count'     => count($deleted),
@@ -149,7 +165,7 @@ class SiteGuard_Backup_Commands {
 		foreach ($history as $timestamp => $backup) {
 			$entry = array(
 				'timestamp' => $timestamp,
-				'date'      => date('Y-m-d H:i:s', $timestamp),
+				'date'      => gmdate('Y-m-d H:i:s', $timestamp),
 				'nonce'     => isset($backup['nonce']) ? $backup['nonce'] : '',
 				'service'   => isset($backup['service']) ? $backup['service'] : array('none'),
 				'always_keep' => !empty($backup['always_keep']),
@@ -496,6 +512,15 @@ class SiteGuard_Backup_Commands {
 			$opts->update_option('sgbackup_extra_dirs', $sanitized_dirs);
 		}
 
+		// Audit log
+		$audit = SiteGuard_Backup_Audit_Log::instance();
+		$changed = array();
+		if (isset($params['interval'])) $changed[] = 'schedule';
+		if (isset($params['encryption_enabled'])) $changed[] = 'encryption';
+		if (isset($params['lock_admin'])) $changed[] = 'admin_lock';
+		if (isset($params['service'])) $changed[] = 'remote_storage';
+		$audit->log('settings_saved', 'Settings updated: ' . (!empty($changed) ? implode(', ', $changed) : 'general'));
+
 		return array('success' => true, 'saved' => $settings_keys);
 	}
 
@@ -764,7 +789,7 @@ class SiteGuard_Backup_Commands {
 		$sgbackup = SiteGuard_Backup::instance();
 		$options = array(
 			'service' => array("remotesend/{$site_id}"),
-			'label'   => 'Migration clone ' . date('Y-m-d H:i'),
+			'label'   => 'Migration clone ' . gmdate('Y-m-d H:i'),
 		);
 		$sgbackup->backup_all($options);
 
@@ -869,6 +894,12 @@ class SiteGuard_Backup_Commands {
 		$sr = new SiteGuard_Backup_Search_Replace();
 		$report = $sr->run($search, $replace, $tables, $dry_run);
 
+		// Audit log
+		$audit = SiteGuard_Backup_Audit_Log::instance();
+		$audit->log('search_replace', ($dry_run ? 'Dry-run' : 'Applied') . ' search-replace: "' . $params['search'] . '" -> "' . (isset($params['replace']) ? $params['replace'] : '') . '"', array(
+			'dry_run' => $dry_run ? 'yes' : 'no',
+		));
+
 		return $report;
 	}
 
@@ -882,6 +913,10 @@ class SiteGuard_Backup_Commands {
 		foreach ($defaults as $key => $default) {
 			$opts->delete_option('sgbackup_' . $key);
 		}
+
+		// Audit log (log before wiping since the log setting itself will be wiped)
+		$audit = SiteGuard_Backup_Audit_Log::instance();
+		$audit->log('settings_wiped', 'All plugin settings reset to defaults.');
 
 		// Also clear schedules
 		wp_clear_scheduled_hook('sgbackup_backup');
@@ -1375,7 +1410,7 @@ class SiteGuard_Backup_Commands {
 
 		if (in_array($ext, array('sql', 'gz'), true)) {
 			// SQL dump - register as DB backup
-			$new_name = 'backup_' . date('Y-m-d-Hi') . '_imported_' . $nonce . '-db.' . $ext;
+			$new_name = 'backup_' . gmdate('Y-m-d-Hi') . '_imported_' . $nonce . '-db.' . $ext;
 			if (!rename($path, $backup_dir . $new_name)) {
 				return new WP_Error('rename_failed', 'Failed to rename file');
 			}
@@ -1399,7 +1434,7 @@ class SiteGuard_Backup_Commands {
 					}
 				}
 			}
-			$new_name = 'backup_' . date('Y-m-d-Hi') . '_imported_' . $nonce . '-' . $entity . '.zip';
+			$new_name = 'backup_' . gmdate('Y-m-d-Hi') . '_imported_' . $nonce . '-' . $entity . '.zip';
 			if (!rename($path, $backup_dir . $new_name)) {
 				return new WP_Error('rename_failed', 'Failed to rename file');
 			}
@@ -1873,7 +1908,7 @@ class SiteGuard_Backup_Commands {
 					$events[] = array(
 						'hook'      => $hook,
 						'next_run'  => $timestamp,
-						'next_run_date' => date('Y-m-d H:i:s', $timestamp),
+						'next_run_date' => gmdate('Y-m-d H:i:s', $timestamp),
 						'schedule'  => $schedule ? $schedule : 'none',
 						'interval'  => $interval,
 						'args'      => isset($event['args']) ? $event['args'] : array(),
@@ -1908,9 +1943,13 @@ class SiteGuard_Backup_Commands {
 			}
 		}
 
+		// Audit log
+		$audit = SiteGuard_Backup_Audit_Log::instance();
+		$audit->log('settings_exported', 'Plugin settings exported.');
+
 		return array(
 			'settings' => $settings,
-			'exported' => date('Y-m-d H:i:s'),
+			'exported' => gmdate('Y-m-d H:i:s'),
 			'site_url' => get_site_url(),
 			'version'  => SGBACKUP_VERSION,
 		);
@@ -1943,6 +1982,67 @@ class SiteGuard_Backup_Commands {
 			}
 		}
 
+		// Audit log
+		$audit = SiteGuard_Backup_Audit_Log::instance();
+		$audit->log('settings_imported', 'Imported ' . $imported . ' settings.');
+
 		return array('success' => true, 'imported' => $imported);
+	}
+
+	/**
+	 * Get audit log entries for the admin UI.
+	 */
+	public function get_audit_log($params) {
+		$audit = SiteGuard_Backup_Audit_Log::instance();
+
+		$filters = array();
+		if (!empty($params['action'])) {
+			$filters['action'] = sanitize_key($params['action']);
+		}
+		if (!empty($params['limit'])) {
+			$filters['limit'] = intval($params['limit']);
+		} else {
+			$filters['limit'] = 50;
+		}
+
+		$entries = $audit->get_entries($filters);
+
+		// Add human-readable labels
+		foreach ($entries as &$entry) {
+			$entry['action_label'] = SiteGuard_Backup_Audit_Log::get_action_label($entry['action']);
+			$entry['date'] = gmdate('Y-m-d H:i:s', $entry['timestamp']);
+		}
+
+		return array(
+			'entries' => $entries,
+			'total'   => $audit->count(),
+			'enabled' => $audit->is_enabled(),
+		);
+	}
+
+	/**
+	 * Toggle audit log enabled state.
+	 */
+	public function toggle_audit_log($params) {
+		$audit = SiteGuard_Backup_Audit_Log::instance();
+		$enable = !empty($params['enabled']);
+
+		if (!$enable && $audit->is_enabled()) {
+			$audit->log('audit_log_disabled', 'Security audit logging has been disabled.');
+		}
+
+		$audit->set_enabled($enable);
+
+		return array('enabled' => $audit->is_enabled());
+	}
+
+	/**
+	 * Clear audit log.
+	 */
+	public function clear_audit_log($params) {
+		$audit = SiteGuard_Backup_Audit_Log::instance();
+		$audit->clear();
+
+		return array('success' => true);
 	}
 }

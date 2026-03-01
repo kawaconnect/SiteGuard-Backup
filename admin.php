@@ -235,6 +235,9 @@ class SiteGuard_Backup_Admin {
 			require_once ABSPATH . WPINC . '/pluggable.php';
 		}
 		if (!wp_check_password($password, $stored_hash)) {
+			// Audit log failed attempt
+			$audit = SiteGuard_Backup_Audit_Log::instance();
+			$audit->log('unlock_failed', 'Failed unlock attempt (incorrect password).');
 			wp_send_json_error(array('message' => 'Incorrect password'));
 		}
 
@@ -247,6 +250,10 @@ class SiteGuard_Backup_Admin {
 		$session_length = intval($opts->get_option('sgbackup_lock_admin_session_length', 3600));
 
 		setcookie('sgbackup_unlock', $cookie_value, time() + $session_length, ADMIN_COOKIE_PATH, COOKIE_DOMAIN, is_ssl(), true);
+
+		// Audit log
+		$audit = SiteGuard_Backup_Audit_Log::instance();
+		$audit->log('unlock_success', 'Settings unlocked successfully.');
 
 		wp_send_json_success(array('message' => 'Unlocked'));
 	}
@@ -272,8 +279,31 @@ class SiteGuard_Backup_Admin {
 			wp_send_json_error(array('message' => 'Invalid security token. Please reload the page.'));
 		}
 
+		// Rate limiting on sensitive destructive/mutating endpoints
+		$rate_limits = array(
+			'wipe_settings'  => array('limit' => 2,  'window' => 60),   // 2 per minute
+			'searchreplace'  => array('limit' => 5,  'window' => 60),   // 5 per minute
+			'delete_backup'  => array('limit' => 15, 'window' => 60),   // 15 per minute
+			'migrate_send'   => array('limit' => 5,  'window' => 60),   // 5 per minute
+			'import_settings' => array('limit' => 3, 'window' => 60),   // 3 per minute
+			'clear_audit_log' => array('limit' => 2, 'window' => 60),   // 2 per minute
+		);
+		if (isset($rate_limits[$subaction])) {
+			$rl = $rate_limits[$subaction];
+			$user_id = get_current_user_id();
+			$transient_key = 'sgbackup_rl_' . $subaction . '_' . $user_id;
+			$attempts = (int) get_transient($transient_key);
+			if ($attempts >= $rl['limit']) {
+				// Audit log rate limit hits
+				$audit = SiteGuard_Backup_Audit_Log::instance();
+				$audit->log('rate_limit_hit', 'Rate limit exceeded for action: ' . $subaction);
+				wp_send_json_error(array('message' => 'Too many requests. Please wait before trying again.'));
+			}
+			set_transient($transient_key, $attempts + 1, $rl['window']);
+		}
+
 		// Enforce settings lock on all mutating commands except activejobs_list (read-only status check)
-		$read_only_commands = array('activejobs_list', 'get_existing_backups', 'get_log', 'get_settings', 'get_sysinfo', 'get_remotesites', 'get_migrator_keys', 'get_backup_contents', 'get_database_tables');
+		$read_only_commands = array('activejobs_list', 'get_existing_backups', 'get_log', 'get_settings', 'get_sysinfo', 'get_remotesites', 'get_migrator_keys', 'get_backup_contents', 'get_database_tables', 'get_audit_log');
 		if (!in_array($subaction, $read_only_commands, true) && $this->is_settings_locked()) {
 			wp_send_json_error(array('message' => 'Settings are locked. Please unlock first.'));
 		}
@@ -323,6 +353,9 @@ class SiteGuard_Backup_Admin {
 			'get_cron_events',
 			'export_settings',
 			'import_settings',
+			'get_audit_log',
+			'toggle_audit_log',
+			'clear_audit_log',
 		);
 
 		if (!in_array($subaction, $allowed_commands, true)) {
@@ -379,6 +412,13 @@ class SiteGuard_Backup_Admin {
 
 		// Only allow downloading actual backup files (not .htaccess, index.php, etc.)
 		if (!preg_match('/\.(zip|gz|sql|crypt|json|txt)$/', $file)) wp_die('Invalid file type');
+
+		// Audit log
+		$audit = SiteGuard_Backup_Audit_Log::instance();
+		$audit->log('download_backup', 'Downloaded backup file: ' . $file, array(
+			'file' => $file,
+			'size' => filesize($path),
+		));
 
 		// Clear output buffers for streaming
 		while (ob_get_level()) ob_end_clean();
@@ -457,9 +497,26 @@ class SiteGuard_Backup_Admin {
 			$restore_options['include_unspecified_themes'] = true;
 		}
 
+		// Audit log
+		$audit = SiteGuard_Backup_Audit_Log::instance();
+		$restore_entities = array_keys(array_filter($restore_options, function($v, $k) {
+			return $v && in_array($k, array('db', 'plugins', 'themes', 'uploads', 'others', 'wpcore'));
+		}, ARRAY_FILTER_USE_BOTH));
+		$audit->log('restore_started', 'Restore initiated from ' . gmdate('Y-m-d H:i', $timestamp) . ' backup', array(
+			'timestamp' => $timestamp,
+			'entities' => implode(', ', $restore_entities),
+		));
+
 		require_once SGBACKUP_DIR . 'restorer.php';
 		$restorer = new SiteGuard_Backup_Restorer($backup_set, $restore_options);
 		$result = $restorer->perform_restore();
+
+		// Audit log restore completion
+		$audit->log(
+			$result['success'] ? 'restore_completed' : 'restore_failed',
+			($result['success'] ? 'Restore completed successfully' : 'Restore failed') . ' from ' . gmdate('Y-m-d H:i', $timestamp),
+			array('timestamp' => $timestamp)
+		);
 
 		echo 'RINFO:' . json_encode(array(
 			'type'     => 'complete',
@@ -547,6 +604,13 @@ class SiteGuard_Backup_Admin {
 				SiteGuard_Backup_History::save_history($history);
 			}
 		}
+
+		// Audit log
+		$audit = SiteGuard_Backup_Audit_Log::instance();
+		$audit->log('upload_backup', 'Uploaded backup file: ' . $filename, array(
+			'filename' => $filename,
+			'size' => filesize($dest),
+		));
 
 		wp_send_json_success(array(
 			'filename' => $filename,

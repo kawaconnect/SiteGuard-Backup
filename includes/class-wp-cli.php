@@ -5,7 +5,7 @@
  * Commands: backup, list, restore, status, verify, export, import, prefailover,
  * healthcheck, cleanup, sites, schedule, postfailover, prune, lock,
  * backup_progress, get_latest_full_backup, rescan_storage, create_migration_key,
- * search_replace, get_most_recently_modified_log
+ * search_replace, get_most_recently_modified_log, audit_log
  */
 
 if (!defined('ABSPATH')) die('No direct access.');
@@ -52,9 +52,9 @@ class SiteGuard_Backup_CLI_Command extends WP_CLI_Command {
         }
 
         if (isset($assoc_args['include-files'])) {
-            $entities = array_map('trim', explode(',', $assoc_args['include-files']));
+            $entities = array_filter(array_map('trim', explode(',', $assoc_args['include-files'])), 'strlen');
             $valid = array('plugins', 'themes', 'uploads', 'others', 'wpcore');
-            $options['entities'] = array_intersect($entities, $valid);
+            $options['entities'] = array_values(array_intersect($entities, $valid));
             if (empty($options['entities'])) {
                 WP_CLI::error('No valid entities specified. Valid: ' . implode(', ', $valid));
             }
@@ -127,7 +127,7 @@ class SiteGuard_Backup_CLI_Command extends WP_CLI_Command {
             }
 
             $items[] = array(
-                'date'     => date('Y-m-d H:i', $timestamp),
+                'date'     => gmdate('Y-m-d H:i', $timestamp),
                 'nonce'    => $nonce,
                 'size'     => SiteGuard_Backup_Filesystem::format_bytes($size),
                 'entities' => implode(',', $entities),
@@ -251,11 +251,11 @@ class SiteGuard_Backup_CLI_Command extends WP_CLI_Command {
         WP_CLI::log('');
         WP_CLI::log('Schedules:');
         WP_CLI::log("  Files:       {$schedule['interval']}" .
-            ($schedule['next_files'] ? ' (next: ' . date('Y-m-d H:i', $schedule['next_files']) . ')' : ''));
+            ($schedule['next_files'] ? ' (next: ' . gmdate('Y-m-d H:i', $schedule['next_files']) . ' UTC)' : ''));
         WP_CLI::log("  Database:    {$schedule['interval_database']}" .
-            ($schedule['next_database'] ? ' (next: ' . date('Y-m-d H:i', $schedule['next_database']) . ')' : ''));
+            ($schedule['next_database'] ? ' (next: ' . gmdate('Y-m-d H:i', $schedule['next_database']) . ' UTC)' : ''));
         WP_CLI::log("  Incremental: {$schedule['interval_incremental']}" .
-            ($schedule['next_incremental'] ? ' (next: ' . date('Y-m-d H:i', $schedule['next_incremental']) . ')' : ''));
+            ($schedule['next_incremental'] ? ' (next: ' . gmdate('Y-m-d H:i', $schedule['next_incremental']) . ' UTC)' : ''));
 
         // Total backup size
         $total = SiteGuard_Backup_History::get_total_backup_size();
@@ -782,7 +782,7 @@ class SiteGuard_Backup_CLI_Command extends WP_CLI_Command {
         if ($format === 'json') {
             $output = array(
                 'timestamp'  => $timestamp,
-                'date'       => date('Y-m-d H:i:s', $timestamp),
+                'date'       => gmdate('Y-m-d H:i:s', $timestamp),
                 'nonce'      => isset($latest['nonce']) ? $latest['nonce'] : '',
                 'entities'   => $entities,
                 'file_sizes' => $file_sizes,
@@ -792,7 +792,7 @@ class SiteGuard_Backup_CLI_Command extends WP_CLI_Command {
         } else {
             WP_CLI::log("Latest backup:");
             WP_CLI::log("  Timestamp: {$timestamp}");
-            WP_CLI::log("  Date:      " . date('Y-m-d H:i:s', $timestamp));
+            WP_CLI::log("  Date:      " . gmdate('Y-m-d H:i:s', $timestamp) . " UTC");
             WP_CLI::log("  Nonce:     " . (isset($latest['nonce']) ? $latest['nonce'] : 'n/a'));
             WP_CLI::log("  Entities:  " . implode(', ', $entities));
             foreach ($file_sizes as $entity => $size) {
@@ -891,7 +891,7 @@ class SiteGuard_Backup_CLI_Command extends WP_CLI_Command {
                 unset($backup_data['timestamp']);
                 SiteGuard_Backup_History::add_backup($ts, $backup_data);
                 $discovered++;
-                WP_CLI::log("Discovered: {$nonce} (" . date('Y-m-d H:i', $ts) . ")");
+                WP_CLI::log("Discovered: {$nonce} (" . gmdate('Y-m-d H:i', $ts) . " UTC)");
             }
         } else {
             // Remote: iterate configured storage methods
@@ -901,6 +901,12 @@ class SiteGuard_Backup_CLI_Command extends WP_CLI_Command {
 
             foreach ($service as $method_id) {
                 if ($method_id === 'none') continue;
+
+                // Validate method against whitelist
+                if (!array_key_exists($method_id, SiteGuard_Backup::instance()->backup_methods)) {
+                    WP_CLI::warning("Unknown storage method: {$method_id}");
+                    continue;
+                }
 
                 // Attempt to load the method
                 $method_file = SGBACKUP_DIR . 'methods/' . $method_id . '.php';
@@ -1866,7 +1872,7 @@ class SiteGuard_Backup_CLI_Command extends WP_CLI_Command {
 
         $full_path = $backup_dir . $latest_file;
         WP_CLI::log($full_path);
-        WP_CLI::log("Modified: " . date('Y-m-d H:i:s', $latest_mtime));
+        WP_CLI::log("Modified: " . gmdate('Y-m-d H:i:s', $latest_mtime) . " UTC");
 
         if (isset($assoc_args['display'])) {
             WP_CLI::log('');
@@ -1926,5 +1932,131 @@ class SiteGuard_Backup_CLI_Command extends WP_CLI_Command {
         $count = (int) wp_count_posts()->publish;
         restore_current_blog();
         return $count;
+    }
+
+    /**
+     * View or manage the security audit log.
+     *
+     * The audit log tracks administrative actions (backups, restores, deletions,
+     * settings changes, downloads, unlock attempts) with user identity, IP address,
+     * and timestamps. This is an optional, opt-in security feature - nothing is
+     * logged unless you enable it first.
+     *
+     * ## OPTIONS
+     *
+     * [<subcommand>]
+     * : Action to perform: show (default), enable, disable, clear, export.
+     *
+     * [--action=<action>]
+     * : Filter entries by action type (e.g., backup_started, restore_completed, delete_backup).
+     *
+     * [--limit=<limit>]
+     * : Number of entries to show. Default: 25.
+     *
+     * [--format=<format>]
+     * : Output format: table or json. Default: table.
+     *
+     * ## EXAMPLES
+     *
+     *     # Show recent audit events
+     *     wp siteguardbackup audit_log
+     *
+     *     # Enable audit logging
+     *     wp siteguardbackup audit_log enable
+     *
+     *     # Show only backup-related events
+     *     wp siteguardbackup audit_log show --action=backup_started --limit=10
+     *
+     *     # Export full log as JSON
+     *     wp siteguardbackup audit_log export
+     *
+     *     # Clear all log entries
+     *     wp siteguardbackup audit_log clear
+     *
+     * @subcommand audit_log
+     */
+    public function audit_log($args, $assoc_args) {
+        $audit = SiteGuard_Backup_Audit_Log::instance();
+        $subcmd = isset($args[0]) ? $args[0] : 'show';
+
+        switch ($subcmd) {
+            case 'enable':
+                $audit->set_enabled(true);
+                WP_CLI::success('Security audit logging enabled.');
+                return;
+
+            case 'disable':
+                $audit->log('audit_log_disabled', 'Audit logging disabled via CLI.');
+                $audit->set_enabled(false);
+                WP_CLI::success('Security audit logging disabled.');
+                return;
+
+            case 'clear':
+                $count = $audit->count();
+                $audit->clear();
+                WP_CLI::success("Cleared {$count} audit log entries.");
+                return;
+
+            case 'export':
+                $entries = $audit->get_entries();
+                WP_CLI::line(json_encode(array(
+                    'entries'   => $entries,
+                    'total'     => count($entries),
+                    'exported'  => gmdate('Y-m-d H:i:s'),
+                    'site_url'  => get_site_url(),
+                ), JSON_PRETTY_PRINT));
+                return;
+
+            case 'show':
+                break;
+
+            default:
+                WP_CLI::error("Unknown subcommand: {$subcmd}. Use: show, enable, disable, clear, export.");
+                return;
+        }
+
+        // Show status
+        $enabled = $audit->is_enabled();
+        WP_CLI::line('Audit logging: ' . ($enabled ? 'ENABLED' : 'DISABLED'));
+        WP_CLI::line('Total entries: ' . $audit->count());
+        WP_CLI::line('');
+
+        if (!$enabled) {
+            WP_CLI::line('Enable with: wp siteguardbackup audit_log enable');
+            return;
+        }
+
+        $filters = array();
+        if (isset($assoc_args['action'])) {
+            $filters['action'] = $assoc_args['action'];
+        }
+        $filters['limit'] = isset($assoc_args['limit']) ? intval($assoc_args['limit']) : 25;
+
+        $entries = $audit->get_entries($filters);
+
+        if (empty($entries)) {
+            WP_CLI::line('No audit log entries found.');
+            return;
+        }
+
+        $format = isset($assoc_args['format']) ? $assoc_args['format'] : 'table';
+
+        if ($format === 'json') {
+            WP_CLI::line(json_encode($entries, JSON_PRETTY_PRINT));
+            return;
+        }
+
+        $table_data = array();
+        foreach ($entries as $entry) {
+            $table_data[] = array(
+                'Date'   => gmdate('Y-m-d H:i:s', $entry['timestamp']),
+                'Action' => SiteGuard_Backup_Audit_Log::get_action_label($entry['action']),
+                'User'   => $entry['user_login'],
+                'IP'     => $entry['ip'],
+                'Details' => substr($entry['details'], 0, 60),
+            );
+        }
+
+        WP_CLI\Utils\format_items('table', $table_data, array('Date', 'Action', 'User', 'IP', 'Details'));
     }
 }
