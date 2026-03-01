@@ -201,7 +201,7 @@ class SiteGuard_Backup_Database_Utility {
 			// notices) don't pollute the SQL output file.
 			$stderr_file = $opts_file . '.err';
 			$cmd = sprintf(
-				'mysqldump --defaults-extra-file=%s --no-tablespaces --single-transaction --quick --skip-lock-tables %s %s %s %s > %s 2>%s',
+				'mysqldump --defaults-extra-file=%s --no-tablespaces --single-transaction --quick --skip-lock-tables --skip-add-locks %s %s %s %s > %s 2>%s',
 				escapeshellarg($opts_file),
 				$port,
 				$socket,
