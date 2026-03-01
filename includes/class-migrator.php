@@ -220,14 +220,27 @@ class SiteGuard_Backup_Migrator {
 	}
 
 	/**
-	 * Update siteurl and home to current values after migration.
+	 * Update siteurl and home to specified values after migration.
+	 *
+	 * After a DB import, site_url()/home_url() return the OLD values from
+	 * the imported backup. The caller MUST pass the desired new URLs.
+	 *
+	 * @param string $new_siteurl The desired siteurl (pass value saved before DB import).
+	 * @param string $new_home    The desired home URL (pass value saved before DB import).
 	 */
-	public function fix_site_options() {
-		$current_siteurl = site_url();
-		$current_home = home_url();
+	public function fix_site_options($new_siteurl = '', $new_home = '') {
+		// Fallback: use the old_siteurl recorded before import if caller doesn't pass values.
+		// But warn - the caller should always pass explicit values.
+		if (empty($new_siteurl)) {
+			error_log('SiteGuard Backup: fix_site_options called without new_siteurl - cannot fix options from overwritten DB');
+			return;
+		}
+		if (empty($new_home)) {
+			$new_home = $new_siteurl;
+		}
 
-		update_option('siteurl', $current_siteurl);
-		update_option('home', $current_home);
+		update_option('siteurl', $new_siteurl);
+		update_option('home', $new_home);
 
 		// Clear any cached values
 		wp_cache_delete('alloptions', 'options');

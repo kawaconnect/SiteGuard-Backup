@@ -485,13 +485,13 @@ class SiteGuard_Backup_Admin {
 
 		// Selective restore items
 		if (!empty($_POST['restore_tables']) && is_array($_POST['restore_tables'])) {
-			$restore_options['selective_tables'] = array_map('sanitize_text_field', $_POST['restore_tables']);
+			$restore_options['restore_tables'] = array_map('sanitize_text_field', $_POST['restore_tables']);
 		}
 		if (!empty($_POST['restore_plugins_items']) && is_array($_POST['restore_plugins_items'])) {
-			$restore_options['selective_plugins'] = array_map('sanitize_text_field', $_POST['restore_plugins_items']);
+			$restore_options['restore_plugins_items'] = array_map('sanitize_text_field', $_POST['restore_plugins_items']);
 		}
 		if (!empty($_POST['restore_themes_items']) && is_array($_POST['restore_themes_items'])) {
-			$restore_options['selective_themes'] = array_map('sanitize_text_field', $_POST['restore_themes_items']);
+			$restore_options['restore_themes_items'] = array_map('sanitize_text_field', $_POST['restore_themes_items']);
 		}
 		if (!empty($_POST['include_unspecified_tables'])) {
 			$restore_options['include_unspecified_tables'] = true;

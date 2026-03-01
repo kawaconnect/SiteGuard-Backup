@@ -55,6 +55,12 @@ class SiteGuard_Backup_Restorer {
 	/** @var bool Whether to include unspecified themes in restore */
 	private $include_unspecified_themes = true;
 
+	/** @var string Pre-import URLs saved before DB overwrite */
+	private $pre_import_siteurl = '';
+	private $pre_import_home = '';
+	private $pre_import_content_url = '';
+	private $pre_import_uploads_url = '';
+
 	/**
 	 * @param array $backup_set     Backup set from history.
 	 * @param array $restore_options What to restore: ['db' => bool, 'plugins' => bool, etc.]
@@ -261,6 +267,15 @@ class SiteGuard_Backup_Restorer {
 
 		$result = array('success' => true, 'errors' => array(), 'tables_restored' => 0);
 
+		// Save current site URLs BEFORE importing the DB, so search-replace
+		// can compare old URLs against these destination URLs (not the
+		// overwritten values that get_option would return after import).
+		$this->pre_import_siteurl = get_option('siteurl');
+		$this->pre_import_home = get_option('home');
+		$this->pre_import_content_url = content_url();
+		$uploads_info = wp_upload_dir();
+		$this->pre_import_uploads_url = $uploads_info['baseurl'];
+
 		// Save progress for resume support
 		$this->save_restore_progress('db', 'started');
 
@@ -425,11 +440,13 @@ class SiteGuard_Backup_Restorer {
 	private function do_search_replace() {
 		require_once SGBACKUP_DIR . 'includes/class-search-replace.php';
 
-		$current_siteurl = get_option('siteurl');
-		$current_home = get_option('home');
-		$current_content = content_url();
-		$current_uploads_info = wp_upload_dir();
-		$current_uploads = $current_uploads_info['baseurl'];
+		// Use pre-import URLs saved before the DB was overwritten.
+		// After DB import, get_option('siteurl') returns the OLD site's URL,
+		// making comparison useless. The pre-import values are the DESTINATION URLs.
+		$current_siteurl = $this->pre_import_siteurl;
+		$current_home = $this->pre_import_home;
+		$current_content = $this->pre_import_content_url;
+		$current_uploads = $this->pre_import_uploads_url;
 
 		$search = array();
 		$replace = array();
@@ -453,6 +470,12 @@ class SiteGuard_Backup_Restorer {
 			$this->sgbackup->log("No URL changes detected, skipping search-replace");
 			return;
 		}
+
+		// First, restore the destination siteurl/home in the DB so the site
+		// functions correctly after search-replace completes.
+		update_option('siteurl', $current_siteurl);
+		update_option('home', $current_home);
+		wp_cache_delete('alloptions', 'options');
 
 		$this->sgbackup->log("Search-replace: " . count($search) . " replacements");
 		foreach ($search as $i => $s) {
