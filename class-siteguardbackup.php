@@ -46,6 +46,11 @@ class SiteGuard_Backup {
 		'remotesend'  => 'Remote Site (migration)',
 	);
 
+	/** Get registered backup methods (read-only). */
+	public function get_backup_methods() {
+		return $this->backup_methods;
+	}
+
 	/**
 	 * Backup entities and their labels.
 	 */

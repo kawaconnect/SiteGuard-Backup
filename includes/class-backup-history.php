@@ -370,7 +370,7 @@ class SiteGuard_Backup_History {
 		$service = preg_replace('/[^a-zA-Z0-9_-]/', '', $service);
 
 		// Validate against known methods whitelist
-		if (!array_key_exists($service, SiteGuard_Backup::instance()->backup_methods)) {
+		if (!array_key_exists($service, SiteGuard_Backup::instance()->get_backup_methods())) {
 			return false;
 		}
 
