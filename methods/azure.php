@@ -208,6 +208,7 @@ class SiteGuard_Backup_Method_Azure extends SiteGuard_Backup_Module {
 
 		$block_ids = array();
 		$block_index = 0;
+		$offset = 0;
 		$sgbackup = SiteGuard_Backup::instance();
 
 		while (!feof($fh)) {
