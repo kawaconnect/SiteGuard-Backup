@@ -976,6 +976,9 @@ class SiteGuard_Backup {
 			$this->prune_retained_backups();
 		}
 
+		// Clean up old log files (older than 30 days)
+		$this->cleanup_old_logs(30);
+
 		// M10: Log if incremental consolidation threshold is approaching
 		if (!$force_abort && $this->jobdata_get('job_type') === 'incremental') {
 			if ($this->consolidate_incrementals()) {
@@ -1002,7 +1005,37 @@ class SiteGuard_Backup {
 			$this->jobdata_set('cleanup_time', time() + (14 * DAY_IN_SECONDS));
 		}
 
+		// Remove external DB credentials from jobdata for security
+		$extradbs = $this->jobdata_get('extradbs', array());
+		if (!empty($extradbs)) {
+			foreach ($extradbs as &$extdb) {
+				unset($extdb['pass']);
+			}
+			$this->jobdata_set('extradbs', $extradbs);
+		}
+
 		$this->logfile_close();
+	}
+
+	/**
+	 * Clean up old log files.
+	 *
+	 * @param int $days Delete log files older than this many days.
+	 */
+	private function cleanup_old_logs($days) {
+		$backup_dir = $this->get_backup_dir();
+		if (empty($backup_dir) || !is_dir($backup_dir)) return;
+
+		$cutoff = time() - ($days * DAY_IN_SECONDS);
+		$log_files = glob($backup_dir . 'log.*.txt');
+
+		if (empty($log_files)) return;
+
+		foreach ($log_files as $log_file) {
+			if (filemtime($log_file) < $cutoff) {
+				@unlink($log_file);
+			}
+		}
 	}
 
 	/**
@@ -1210,7 +1243,7 @@ class SiteGuard_Backup {
 		$body .= '<tr><td style="padding:8px 12px;border-bottom:1px solid #eee;font-weight:bold;">Backup Type</td>';
 		$body .= '<td style="padding:8px 12px;border-bottom:1px solid #eee;">' . esc_html(ucfirst($job_type)) . '</td></tr>';
 		$body .= '<tr><td style="padding:8px 12px;border-bottom:1px solid #eee;font-weight:bold;">Date</td>';
-		$body .= '<td style="padding:8px 12px;border-bottom:1px solid #eee;">' . esc_html(date('Y-m-d H:i:s', $this->backup_time)) . '</td></tr>';
+		$body .= '<td style="padding:8px 12px;border-bottom:1px solid #eee;">' . esc_html(gmdate('Y-m-d H:i:s', $this->backup_time)) . '</td></tr>';
 		$body .= '<tr><td style="padding:8px 12px;border-bottom:1px solid #eee;font-weight:bold;">Job ID</td>';
 		$body .= '<td style="padding:8px 12px;border-bottom:1px solid #eee;"><code>' . esc_html($this->nonce) . '</code></td></tr>';
 
@@ -1465,7 +1498,7 @@ class SiteGuard_Backup {
 
 				// Delete marked backups
 				foreach ($to_delete as $timestamp => $backup) {
-					$this->log("Retention rule pruning: removing backup at " . date('Y-m-d H:i:s', $timestamp));
+					$this->log("Retention rule pruning: removing backup at " . gmdate('Y-m-d H:i:s', $timestamp));
 					SiteGuard_Backup_History::delete_backup_set($timestamp, true);
 					// Also remove from history so subsequent rules see updated state
 					unset($history[$timestamp]);
@@ -1644,7 +1677,7 @@ class SiteGuard_Backup {
 	 * @return string e.g., "backup_2026-03-01-0300_sitename_abcdef123456"
 	 */
 	public function get_backup_file_basename() {
-		$date = date('Y-m-d-Hi', $this->backup_time);
+		$date = gmdate('Y-m-d-Hi', $this->backup_time);
 		$site = $this->get_site_name();
 		return "backup_{$date}_{$site}_{$this->file_nonce}";
 	}
@@ -1660,7 +1693,7 @@ class SiteGuard_Backup {
 		$manifest = array(
 			'plugin'         => 'siteguardbackup',
 			'version'        => SGBACKUP_VERSION,
-			'created'        => date('c', $this->backup_time),
+			'created'        => gmdate('c', $this->backup_time),
 			'timestamp'      => $this->backup_time,
 			'nonce'          => $this->nonce,
 			'site_url'       => site_url(),

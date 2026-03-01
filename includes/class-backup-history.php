@@ -324,6 +324,11 @@ class SiteGuard_Backup_History {
 		// Sanitize service name to prevent path traversal
 		$service = preg_replace('/[^a-zA-Z0-9_-]/', '', $service);
 
+		// Validate against known methods whitelist
+		if (!array_key_exists($service, SiteGuard_Backup::instance()->backup_methods)) {
+			return false;
+		}
+
 		$base_file = SGBACKUP_DIR . 'methods/backup-module.php';
 		$class_file = SGBACKUP_DIR . 'methods/' . $service . '.php';
 		if (!file_exists($class_file)) return false;

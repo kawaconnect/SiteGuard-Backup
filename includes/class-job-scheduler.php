@@ -24,6 +24,9 @@ class SiteGuard_Backup_Job_Scheduler {
 		// Track this resumption's check-in
 		$useful_checkins = $sgbackup->jobdata_get('useful_checkins', array());
 		$useful_checkins[$resumption] = time();
+		if (count($useful_checkins) > 20) {
+			$useful_checkins = array_slice($useful_checkins, -20, 20, true);
+		}
 		$sgbackup->jobdata_set('useful_checkins', $useful_checkins);
 
 		// For resumptions >= 9, ensure next one is scheduled
@@ -161,9 +164,31 @@ class SiteGuard_Backup_Job_Scheduler {
 	 * Clear all scheduled events for a backup job.
 	 */
 	public static function clear_scheduled_events($nonce) {
-		// Clear up to 100 possible resumptions
+		$crons = _get_cron_array();
+		$consecutive_misses = 0;
 		for ($i = 0; $i <= 100; $i++) {
-			wp_clear_scheduled_hook('sgbackup_backup_resume', array($i, $nonce));
+			$found = false;
+			if (!empty($crons)) {
+				foreach ($crons as $time => $hooks) {
+					if (isset($hooks['sgbackup_backup_resume'])) {
+						foreach ($hooks['sgbackup_backup_resume'] as $hash => $event) {
+							if (isset($event['args']) && $event['args'] === array($i, $nonce)) {
+								$found = true;
+								break 2;
+							}
+						}
+					}
+				}
+			}
+			if ($found) {
+				wp_clear_scheduled_hook('sgbackup_backup_resume', array($i, $nonce));
+				$consecutive_misses = 0;
+			} else {
+				$consecutive_misses++;
+				if ($consecutive_misses >= 5) {
+					break;
+				}
+			}
 		}
 	}
 
@@ -192,7 +217,11 @@ class SiteGuard_Backup_Job_Scheduler {
 		$opts = SiteGuard_Backup_Options::instance();
 		$backup_dir = $opts->get_backup_dir();
 		$flag_file = $backup_dir . 'deleteflag-' . $nonce . '.txt';
-		@file_put_contents($flag_file, time());
+		$result = file_put_contents($flag_file, time());
+		if ($result === false) {
+			$sgbackup = SiteGuard_Backup::instance();
+			$sgbackup->log("Failed to write abort flag file: {$flag_file}", 'error');
+		}
 	}
 
 	/**

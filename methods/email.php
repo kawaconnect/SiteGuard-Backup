@@ -38,7 +38,7 @@ class SiteGuard_Backup_Method_Email extends SiteGuard_Backup_Module {
 			"Backup file: %s\nSize: %s\nDate: %s\nSite: %s",
 			$filename,
 			SiteGuard_Backup_Filesystem::format_bytes($filesize),
-			date('Y-m-d H:i:s'),
+			gmdate('Y-m-d H:i:s'),
 			site_url()
 		);
 

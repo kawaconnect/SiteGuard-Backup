@@ -209,7 +209,11 @@ class SiteGuard_Backup_Database_Utility {
 
 			$output = array();
 			$return = -1;
-			@exec($cmd, $output, $return);
+			exec($cmd, $output, $return);
+
+			if (0 !== $return) {
+				error_log('SiteGuard Backup: mysqldump failed (return code ' . $return . '): ' . implode("\n", $output));
+			}
 
 			return (0 === $return && file_exists($outfile) && filesize($outfile) > 0);
 		} finally {
@@ -493,6 +497,7 @@ class SiteGuard_Backup_Database_Utility {
 		$value = intval($size_str);
 
 		switch ($unit) {
+			case 't': $value *= 1099511627776; break;
 			case 'g': $value *= 1024 * 1024 * 1024; break;
 			case 'm': $value *= 1024 * 1024; break;
 			case 'k': $value *= 1024; break;
