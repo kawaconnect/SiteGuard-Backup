@@ -13,7 +13,7 @@ if (!defined('ABSPATH')) die('No direct access.');
 class SiteGuard_Backup_Remote_Communications {
 
 	/** @var int Replay protection window in seconds */
-	private $replay_window = 300;
+	private $replay_window = 120;
 
 	/**
 	 * Generate a new RSA key pair for receiving migrations.
@@ -45,7 +45,7 @@ class SiteGuard_Backup_Remote_Communications {
 		$public_key = $details['key'];
 
 		// Create name hash for identification
-		$name_hash = substr(md5($name . time() . wp_generate_password(8, false)), 0, 12);
+		$name_hash = wp_generate_password(12, false);
 
 		// Store locally
 		$opts = SiteGuard_Backup_Options::instance();
@@ -193,8 +193,8 @@ class SiteGuard_Backup_Remote_Communications {
 	 */
 	private function encrypt_message($plaintext, $public_key) {
 		// Generate random AES key and IV (12 bytes for GCM)
-		$aes_key = openssl_random_pseudo_bytes(32);
-		$iv = openssl_random_pseudo_bytes(12);
+		$aes_key = random_bytes(32);
+		$iv = random_bytes(12);
 		$tag = '';
 
 		// Encrypt payload with AES-256-GCM (authenticated encryption)
@@ -259,6 +259,11 @@ class SiteGuard_Backup_Remote_Communications {
 			if (false === $plaintext) {
 				return new WP_Error('aes_decrypt', 'AES decryption failed.');
 			}
+			// Deprecation warning: CBC is only supported for legacy compatibility
+			@trigger_error('SiteGuard Backup RPC: AES-256-CBC decryption is deprecated. The remote site should upgrade to a version that uses AES-256-GCM.', E_USER_DEPRECATED);
+			if (class_exists('SiteGuard_Backup')) {
+				SiteGuard_Backup::instance()->log('Warning: Received RPC message using deprecated AES-256-CBC encryption. Remote site should be upgraded.');
+			}
 		} else {
 			// New GCM format: packed data = IV (12) + tag (16) + ciphertext
 			$packed = base64_decode($encrypted_data);
@@ -282,7 +287,7 @@ class SiteGuard_Backup_Remote_Communications {
 		// Replay protection: timestamp check (reject past AND future messages)
 		if (isset($payload['timestamp'])) {
 			$age = time() - $payload['timestamp'];
-			if ($age < -30 || $age > $this->replay_window) {
+			if ($age < -10 || $age > $this->replay_window) {
 				return new WP_Error('replay', "Message timestamp out of window ({$age}s). Check server time sync.");
 			}
 		}

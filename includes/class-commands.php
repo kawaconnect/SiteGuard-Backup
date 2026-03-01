@@ -53,7 +53,13 @@ class SiteGuard_Backup_Commands {
 
 		// H6: Per-table selection
 		if (!empty($params['include_tables']) && is_array($params['include_tables'])) {
-			$options['include_tables'] = array_map('sanitize_text_field', $params['include_tables']);
+			$options['include_tables'] = array_values(array_filter(
+				array_map(function($t) {
+					// Sanitize table names: only allow valid MySQL identifier characters
+					return preg_replace('/[^a-zA-Z0-9_$]/', '', sanitize_text_field($t));
+				}, $params['include_tables']),
+				function($t) { return !empty($t); }
+			));
 		}
 		if (!empty($params['include_nonwp_tables'])) {
 			$options['include_nonwp_tables'] = true;
@@ -301,6 +307,16 @@ class SiteGuard_Backup_Commands {
 			unset($params['email_recipients']);
 		}
 
+		// Handle encryption_key: empty means keep existing, non-empty means update
+		if (isset($params['encryption_key'])) {
+			$enc_key = $params['encryption_key'];
+			if (!empty($enc_key)) {
+				$opts->update_option('sgbackup_encryption_key', sanitize_text_field($enc_key));
+			}
+			// Empty = keep current key (don't clear it)
+			unset($params['encryption_key']);
+		}
+
 		// Handle lock_admin_support_url: sanitize as URL or email
 		if (isset($params['lock_admin_support_url'])) {
 			$support_val = trim($params['lock_admin_support_url']);
@@ -322,6 +338,8 @@ class SiteGuard_Backup_Commands {
 			if ($key === 'email_recipients') continue;
 			// lock_admin_support_url is handled above
 			if ($key === 'lock_admin_support_url') continue;
+			// encryption_key is handled above (empty = keep existing)
+			if ($key === 'encryption_key') continue;
 
 			if (isset($params[$key])) {
 				$value = $params[$key];
@@ -339,6 +357,18 @@ class SiteGuard_Backup_Commands {
 						if (empty($value)) $value = array('none');
 					} else {
 						$value = array('none');
+					}
+				} elseif (in_array($key, array('include_tables', 'exclude_tables'), true)) {
+					// Sanitize table name arrays: only valid MySQL identifier characters
+					if (is_array($value)) {
+						$value = array_values(array_filter(
+							array_map(function($t) {
+								return preg_replace('/[^a-zA-Z0-9_$]/', '', sanitize_text_field($t));
+							}, $value),
+							function($t) { return !empty($t); }
+						));
+					} else {
+						$value = array();
 					}
 				} elseif (is_string($value)) {
 					$value = sanitize_text_field($value);
@@ -708,7 +738,6 @@ class SiteGuard_Backup_Commands {
 		}
 
 		return array(
-			'path' => $path,
 			'size' => filesize($path),
 			'name' => $file,
 		);
@@ -1265,6 +1294,11 @@ class SiteGuard_Backup_Commands {
 
 		$result = $method->credentials_test();
 		if (is_wp_error($result)) return $result;
+
+		// Preserve backend-specific messages (e.g., SFTP fingerprint info)
+		if (is_array($result) && !empty($result['message'])) {
+			return array('success' => true, 'message' => $result['message']);
+		}
 
 		return array('success' => true, 'message' => ucfirst($method_name) . ' connection successful.');
 	}

@@ -28,10 +28,10 @@ class SiteGuard_Backup_Migrator {
 	 * Record old URLs from the backup source.
 	 */
 	public function record_old_urls($old_siteurl, $old_home = '', $old_content = '', $old_uploads = '', $old_abspath = '') {
-		$this->old_siteurl = $old_siteurl;
-		$this->old_home = $old_home ?: $old_siteurl;
-		$this->old_content = $old_content;
-		$this->old_uploads = $old_uploads;
+		$this->old_siteurl = esc_url_raw($old_siteurl);
+		$this->old_home = $old_home ? esc_url_raw($old_home) : $this->old_siteurl;
+		$this->old_content = $old_content ? esc_url_raw($old_content) : '';
+		$this->old_uploads = $old_uploads ? esc_url_raw($old_uploads) : '';
 		$this->old_abspath = $old_abspath;
 
 		// Detect migration
@@ -126,7 +126,16 @@ class SiteGuard_Backup_Migrator {
 		}
 
 		$user_id = get_current_user_id();
-		if (!$user_id) $user_id = 1; // Default to admin
+		if (!$user_id) {
+			$admin_user = get_user_by('id', 1);
+			if ($admin_user && user_can($admin_user, 'manage_options')) {
+				$user_id = 1;
+			} else {
+				// Find first admin user
+				$admins = get_users(array('role' => 'administrator', 'number' => 1));
+				$user_id = !empty($admins) ? $admins[0]->ID : 0;
+			}
+		}
 
 		$blog_id = wpmu_create_blog($domain, $path, $title, $user_id);
 
@@ -185,20 +194,22 @@ class SiteGuard_Backup_Migrator {
 			'breeze/breeze.php',
 		);
 
+		if (!function_exists('deactivate_plugins')) {
+			require_once ABSPATH . 'wp-admin/includes/plugin.php';
+		}
+
 		$active_plugins = get_option('active_plugins', array());
-		$disabled = array();
+		$to_deactivate = array();
 
 		foreach ($cache_plugins as $cp) {
-			$key = array_search($cp, $active_plugins);
-			if (false !== $key) {
-				unset($active_plugins[$key]);
-				$disabled[] = $cp;
+			if (in_array($cp, $active_plugins, true)) {
+				$to_deactivate[] = $cp;
 			}
 		}
 
-		if (!empty($disabled)) {
-			update_option('active_plugins', array_values($active_plugins));
-			SiteGuard_Backup::instance()->log("Disabled cache plugins post-migration: " . implode(', ', $disabled));
+		if (!empty($to_deactivate)) {
+			deactivate_plugins($to_deactivate, true);
+			SiteGuard_Backup::instance()->log("Disabled cache plugins post-migration: " . implode(', ', $to_deactivate));
 		}
 
 		// Also remove advanced-cache.php if it exists

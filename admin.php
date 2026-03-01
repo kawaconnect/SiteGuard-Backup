@@ -574,7 +574,7 @@ class SiteGuard_Backup_Admin {
 		}
 
 		// Whitelist valid OAuth methods to prevent arbitrary method invocation
-		$valid_oauth_methods = array('googledrive', 'dropbox', 'onedrive', 'pcloud');
+		$valid_oauth_methods = array('googledrive', 'dropbox', 'onedrive');
 		if (!in_array($method, $valid_oauth_methods, true)) {
 			wp_die('Unknown OAuth method.');
 		}

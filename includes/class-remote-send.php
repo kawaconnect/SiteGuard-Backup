@@ -55,8 +55,9 @@ class SiteGuard_Backup_Remote_Send {
 			: (isset($_SERVER['REMOTE_ADDR']) ? sanitize_text_field($_SERVER['REMOTE_ADDR']) : 'unknown');
 		$rate_key = 'sgbackup_rpc_rate_' . md5($ip);
 		$rate_count = (int) get_transient($rate_key);
-		if ($rate_count > 60) {
+		if ($rate_count >= 60) {
 			wp_send_json_error(array('message' => 'Rate limit exceeded. Try again later.'));
+			return;
 		}
 		set_transient($rate_key, $rate_count + 1, 60);
 
@@ -68,9 +69,16 @@ class SiteGuard_Backup_Remote_Send {
 
 		if (empty($name_hash) || !isset($local_keys[$name_hash])) {
 			wp_send_json_error(array('message' => 'Unknown key identifier.'));
+			return;
 		}
 
 		$key_data = $local_keys[$name_hash];
+
+		// Validate key data structure before use
+		if (empty($key_data['private_key']) || !is_string($key_data['private_key'])) {
+			wp_send_json_error(array('message' => 'Migration key data is corrupted.'));
+			return;
+		}
 
 		// Decrypt the message
 		require_once SGBACKUP_DIR . 'includes/class-remote-communications.php';
@@ -81,6 +89,7 @@ class SiteGuard_Backup_Remote_Send {
 		$enc_key = isset($_POST['key']) ? $_POST['key'] : '';
 		if (!is_string($encrypted) || !is_string($enc_key) || !preg_match('/^[A-Za-z0-9+\/=\s]+$/', $encrypted) || !preg_match('/^[A-Za-z0-9+\/=\s]+$/', $enc_key)) {
 			wp_send_json_error(array('message' => 'Invalid data format.'));
+			return;
 		}
 
 		$payload = $rpc->decrypt_message(
@@ -92,6 +101,7 @@ class SiteGuard_Backup_Remote_Send {
 		if (is_wp_error($payload)) {
 			// Generic error to avoid leaking internal details to unauthenticated callers
 			wp_send_json_error(array('message' => 'Authentication failed.'));
+			return;
 		}
 
 		// Route command
@@ -124,12 +134,14 @@ class SiteGuard_Backup_Remote_Send {
 		$local_keys = $opts->get_option('sgbackup_migrator_localkeys', array());
 		if (empty($local_keys)) {
 			wp_send_json_error(array('message' => 'No migration keys configured.'));
+			return;
 		}
 
 		// Validate name_hash maps to a known key before decryption
 		$name_hash = isset($_POST['name_hash']) ? sanitize_text_field($_POST['name_hash']) : '';
 		if (empty($name_hash) || !isset($local_keys[$name_hash])) {
 			wp_send_json_error(array('message' => 'Unknown key identifier.'));
+			return;
 		}
 
 		// Delegate to the shared handler
@@ -181,6 +193,13 @@ class SiteGuard_Backup_Remote_Send {
 
 		// Use basename() to strip any path components, then sanitize
 		$filename = sanitize_file_name(basename($data['file']));
+
+		// Estimate decoded size before base64_decode to prevent memory abuse
+		$b64_len = is_string($data['data']) ? strlen($data['data']) : 0;
+		if ($b64_len > 2796203) { // ~2MB decoded = ~2.67MB base64
+			return new WP_Error('chunk_too_large', 'Chunk data exceeds maximum size.');
+		}
+
 		$chunk_data = base64_decode($data['data']);
 		if (false === $chunk_data) {
 			return new WP_Error('invalid_data', 'Invalid base64 chunk data.');
@@ -227,7 +246,8 @@ class SiteGuard_Backup_Remote_Send {
 			return new WP_Error('file_lock', 'Cannot lock temp file for writing.');
 		}
 
-		// Track expected next offset to reject out-of-sequence writes
+		// Track expected next offset AFTER acquiring lock to avoid TOCTOU race
+		clearstatcache(true, $tmp_file);
 		$expected_offset = filesize($tmp_file);
 		if ($expected_offset === false) $expected_offset = 0;
 		if ($start !== $expected_offset) {
