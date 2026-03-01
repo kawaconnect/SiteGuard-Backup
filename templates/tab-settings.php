@@ -1374,6 +1374,16 @@ $period_labels = array(
 			</td>
 		</tr>
 		<tr>
+			<th><?php esc_html_e('Signing Secret', 'siteguardbackup'); ?></th>
+			<td>
+				<?php
+				$webhook_secret = SiteGuard_Backup_Options::instance()->get_option('sgbackup_webhook_secret', '');
+				?>
+				<input type="text" name="webhook_secret" value="<?php echo esc_attr($webhook_secret); ?>" class="regular-text" readonly />
+				<p class="description"><?php esc_html_e('Auto-generated secret used to sign webhook payloads (HMAC-SHA256). Share this with your webhook receiver to verify authenticity.', 'siteguardbackup'); ?></p>
+			</td>
+		</tr>
+		<tr>
 			<th><?php esc_html_e('Events', 'siteguardbackup'); ?></th>
 			<td>
 				<?php

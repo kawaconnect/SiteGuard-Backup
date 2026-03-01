@@ -13,6 +13,9 @@ class SiteGuard_Backup_Webhook {
 	/** @var string Option key for webhook URL */
 	const URL_KEY = 'sgbackup_webhook_url';
 
+	/** @var string Option key for webhook signing secret */
+	const SECRET_KEY = 'sgbackup_webhook_secret';
+
 	/** @var string Option key for enabled events */
 	const EVENTS_KEY = 'sgbackup_webhook_events';
 
@@ -21,6 +24,9 @@ class SiteGuard_Backup_Webhook {
 
 	/** @var string Cached URL */
 	private $url = null;
+
+	/** @var string Cached signing secret */
+	private $secret = null;
 
 	/** @var array Cached events list */
 	private $events = null;
@@ -43,6 +49,23 @@ class SiteGuard_Backup_Webhook {
 			$this->url = (string) $opts->get_option(self::URL_KEY, '');
 		}
 		return $this->url;
+	}
+
+	/**
+	 * Get the webhook signing secret. Auto-generates one if not set.
+	 *
+	 * @return string
+	 */
+	private function get_secret() {
+		if (null === $this->secret) {
+			$opts = SiteGuard_Backup_Options::instance();
+			$this->secret = (string) $opts->get_option(self::SECRET_KEY, '');
+			if (empty($this->secret)) {
+				$this->secret = wp_generate_password(40, false);
+				$opts->update_option(self::SECRET_KEY, $this->secret);
+			}
+		}
+		return $this->secret;
 	}
 
 	/**
@@ -89,7 +112,7 @@ class SiteGuard_Backup_Webhook {
 		);
 
 		$body = wp_json_encode($payload);
-		$signature = hash_hmac('sha256', $body, $url);
+		$signature = hash_hmac('sha256', $body, $self->get_secret());
 
 		wp_remote_post($url, array(
 			'timeout'  => 15,
@@ -112,6 +135,8 @@ class SiteGuard_Backup_Webhook {
 	 * @return array Array with 'success', 'message', and 'http_code' keys.
 	 */
 	public static function send_test($url) {
+		$self = self::instance();
+
 		if (empty($url)) {
 			return array('success' => false, 'message' => 'No webhook URL provided.', 'http_code' => 0);
 		}
@@ -129,7 +154,7 @@ class SiteGuard_Backup_Webhook {
 		);
 
 		$body = wp_json_encode($payload);
-		$signature = hash_hmac('sha256', $body, $url);
+		$signature = hash_hmac('sha256', $body, $self->get_secret());
 
 		$response = wp_remote_post($url, array(
 			'timeout'  => 15,
