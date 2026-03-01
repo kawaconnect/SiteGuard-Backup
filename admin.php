@@ -474,7 +474,7 @@ class SiteGuard_Backup_Admin {
 
 		$restore_options = array();
 		foreach (array('db', 'plugins', 'themes', 'uploads', 'others', 'wpcore') as $entity) {
-			$restore_options[$entity] = !empty($_POST['restore_' . $entity]);
+			$restore_options[$entity] = !empty($_POST['sgbackup_restore_' . $entity]) || !empty($_POST['restore_' . $entity]);
 		}
 		if (!empty($_POST['encryption_key'])) {
 			// Don't use sanitize_text_field - it strips characters valid in passphrases
