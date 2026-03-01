@@ -322,7 +322,7 @@ class SiteGuard_Backup_Method_S3 extends SiteGuard_Backup_Module {
 		$bucket = $options['bucket'];
 		$path = !empty($options['path']) ? trim($options['path'], '/') . '/' : '';
 		$uri = "/{$bucket}/{$path}{$key}";
-		$payload_hash = 'UNSIGNED-PAYLOAD';
+		$payload_hash = hash('sha256', ''); // Hash of empty body - required by B2
 
 		$headers = array('Host' => $this->get_host());
 		$signed_headers = $this->sign_request('GET', $uri, $headers, $payload_hash);

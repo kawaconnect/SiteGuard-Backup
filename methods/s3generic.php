@@ -41,7 +41,13 @@ class SiteGuard_Backup_Method_S3generic extends SiteGuard_Backup_Method_S3 {
 	protected function get_endpoint() {
 		$options = $this->get_options();
 		if (!empty($options['endpoint'])) {
-			return rtrim($options['endpoint'], '/');
+			$endpoint = rtrim($options['endpoint'], '/');
+			// Enforce HTTPS to prevent credential exposure
+			if (strpos($endpoint, 'https://') !== 0) {
+				error_log('SiteGuard Backup: S3-generic endpoint must use HTTPS. Got: ' . $endpoint);
+				$endpoint = str_replace('http://', 'https://', $endpoint);
+			}
+			return $endpoint;
 		}
 
 		// Fallback: use region-based AWS endpoint, but this method expects a custom endpoint

@@ -44,7 +44,7 @@ class SiteGuard_Backup_Method_Gcs extends SiteGuard_Backup_Method_S3 {
 
 		$storage_class = isset($opts['storage_class']) ? $opts['storage_class'] : 'STANDARD';
 		if ($storage_class !== 'STANDARD') {
-			$extra_headers['x-goog-storage-class'] = $storage_class;
+			$extra_headers['x-amz-storage-class'] = $storage_class;
 		}
 
 		$sse = isset($opts['server_side_encryption']) ? $opts['server_side_encryption'] : false;
