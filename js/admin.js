@@ -6,7 +6,6 @@
 
 	var SGB = {
 		pollTimer: null,
-		hadActiveJobs: false,
 
 		// HTML escape utility to prevent XSS
 		esc: function(str) {
@@ -54,7 +53,7 @@
 			this.pollActiveJobs();
 
 			$(window).on('beforeunload', function() {
-				if (SGB.pollTimer) { clearTimeout(SGB.pollTimer); SGB.pollTimer = null; }
+				if (SGB.pollTimer) { clearInterval(SGB.pollTimer); SGB.pollTimer = null; }
 			});
 		},
 
@@ -91,6 +90,18 @@
 
 		// ===== Tabs =====
 		bindTabs: function() {
+			// Restore active tab from URL hash on page load
+			var hash = window.location.hash.replace('#', '');
+			if (hash) {
+				var $tab = $('.sgbackup-tabs .nav-tab[data-tab="' + hash + '"]');
+				if ($tab.length) {
+					$('.sgbackup-tabs .nav-tab').removeClass('nav-tab-active');
+					$tab.addClass('nav-tab-active');
+					$('.sgbackup-tab-content').hide();
+					$('#tab-' + hash).show();
+				}
+			}
+
 			$('.sgbackup-tabs .nav-tab').on('click', function(e) {
 				e.preventDefault();
 				var tab = $(this).data('tab');
@@ -98,6 +109,12 @@
 				$(this).addClass('nav-tab-active');
 				$('.sgbackup-tab-content').hide();
 				$('#tab-' + tab).show();
+				// Persist active tab in URL hash so page reloads stay on same tab
+				if (history.replaceState) {
+					history.replaceState(null, null, '#' + tab);
+				} else {
+					window.location.hash = tab;
+				}
 			});
 		},
 
@@ -195,11 +212,42 @@
 				);
 			});
 
-			this.pollActiveJobs();
+			// Start interval polling immediately since we just launched a backup
+			this.startJobPolling();
 		},
 
 		// ===== Active Jobs Polling =====
 		pollActiveJobs: function() {
+			var self = this;
+			if (this.pollTimer) clearInterval(this.pollTimer);
+			this.pollTimer = null;
+
+			// Single initial check - only start interval polling if jobs are active
+			this.checkActiveJobs(function(hasJobs) {
+				if (hasJobs) {
+					self.startJobPolling();
+				}
+			});
+		},
+
+		checkActiveJobs: function(callback) {
+			var self = this;
+			this.ajax('activejobs_list', {}, function(data) {
+				if ($.isEmptyObject(data)) {
+					$('#sgbackup-active-jobs').hide();
+					$('#sgbackup-active-jobs-list').empty();
+					if (callback) callback(false);
+					return;
+				}
+				self.renderActiveJobs(data);
+				if (callback) callback(true);
+			}, function() {
+				// Silently ignore errors during job check
+				if (callback) callback(false);
+			});
+		},
+
+		startJobPolling: function() {
 			var self = this;
 			if (this.pollTimer) clearInterval(this.pollTimer);
 
@@ -211,48 +259,63 @@
 						$('#sgbackup-backup-status').text('').removeClass('success error');
 						clearInterval(self.pollTimer);
 						self.pollTimer = null;
-						// Only refresh the backup list if a job actually just finished
-						if (self.hadActiveJobs) {
-							self.hadActiveJobs = false;
-							self.refreshBackupsList();
-						}
+						self.refreshBackupsList();
 						return;
 					}
-
-					self.hadActiveJobs = true;
-					$('#sgbackup-active-jobs').show();
-					var html = '';
-					$.each(data, function(nonce, job) {
-						var phases = [];
-						if (job.backup_files === 'yes') {
-							phases.push('Files: ' + (job.files_phase_complete ? 'Done' : 'In progress'));
-						}
-						if (job.backup_database === 'yes') {
-							phases.push('DB: ' + (job.db_phase_complete ? 'Done' : (job.files_phase_complete ? 'In progress' : 'Pending')));
-						}
-						if (job.upload_phase_complete) phases.push('Upload: Done');
-
-						html += '<div class="sgbackup-job">';
-						html += '<button type="button" class="sgbackup-abort-btn" data-nonce="' + SGB.esc(nonce) + '">Abort</button>';
-						html += '<div class="sgbackup-job-title">' + SGB.esc(job.job_type) + ' backup [' + SGB.esc(nonce) + ']</div>';
-						html += '<div class="sgbackup-job-progress">Status: ' + SGB.esc(job.jobstatus) + ' | Resumption: ' + SGB.esc(String(job.resumption)) + '</div>';
-						html += '<div class="sgbackup-job-progress">' + SGB.esc(phases.join(' | ')) + '</div>';
-						html += '</div>';
-					});
-					$('#sgbackup-active-jobs-list').html(html);
-
-					// Bind abort buttons
-					$('.sgbackup-abort-btn').off('click').on('click', function() {
-						var nonce = $(this).data('nonce');
-						self.ajax('activejobs_delete', { job_id: nonce });
-					});
+					self.renderActiveJobs(data);
+				}, function() {
+					// Silently ignore errors during polling
 				});
 			}, 5000);
 		},
 
+		renderActiveJobs: function(data) {
+			var self = this;
+			$('#sgbackup-active-jobs').show();
+			var html = '';
+			$.each(data, function(nonce, job) {
+				var phases = [];
+				if (job.backup_files === 'yes') {
+					phases.push('Files: ' + (job.files_phase_complete ? 'Done' : 'In progress'));
+				}
+				if (job.backup_database === 'yes') {
+					phases.push('DB: ' + (job.db_phase_complete ? 'Done' : (job.files_phase_complete ? 'In progress' : 'Pending')));
+				}
+				if (job.upload_phase_complete) phases.push('Upload: Done');
+
+				html += '<div class="sgbackup-job">';
+				html += '<button type="button" class="sgbackup-abort-btn" data-nonce="' + SGB.esc(nonce) + '">Abort</button>';
+				html += '<div class="sgbackup-job-title">' + SGB.esc(job.job_type) + ' backup [' + SGB.esc(nonce) + ']</div>';
+				html += '<div class="sgbackup-job-progress">Status: ' + SGB.esc(job.jobstatus) + ' | Resumption: ' + SGB.esc(String(job.resumption)) + '</div>';
+				html += '<div class="sgbackup-job-progress">' + SGB.esc(phases.join(' | ')) + '</div>';
+				html += '</div>';
+			});
+			$('#sgbackup-active-jobs-list').html(html);
+
+			// Bind abort buttons
+			$('.sgbackup-abort-btn').off('click').on('click', function() {
+				var nonce = $(this).data('nonce');
+				self.ajax('activejobs_delete', { job_id: nonce });
+			});
+		},
+
 		refreshBackupsList: function() {
-			// Reload page once to show updated backup list after job completion
-			location.reload();
+			// Show completion notice and reload just the backup table via AJAX
+			$('#sgbackup-backup-status').text('Backup complete! Refreshing list...').addClass('success');
+			var self = this;
+			$.get(window.location.href, function(responseHtml) {
+				var $newPage = $(responseHtml);
+				var $newTable = $newPage.find('.sgbackup-backups-table').closest('#tab-backup-restore');
+				if ($newTable.length) {
+					$('#tab-backup-restore').html($newTable.html());
+					self.bindMassActions();
+					self.bindPagination();
+				}
+				setTimeout(function() { $('#sgbackup-backup-status').text('').removeClass('success error'); }, 3000);
+			}).fail(function() {
+				// Fallback: if AJAX refresh fails, show a manual reload link
+				$('#sgbackup-backup-status').html('Backup complete! <a href="javascript:location.reload()">Refresh page</a> to see results.').addClass('success');
+			});
 		},
 
 		// ===== Restore =====
@@ -1330,6 +1393,8 @@
 						html += '</div>';
 					});
 					$('#sgbackup-jobs-list').html(html);
+				}, function(msg) {
+					$('#sgbackup-jobs-list').html('<p><em>Error: ' + SGB.esc(msg) + '</em></p>');
 				});
 			});
 
