@@ -201,6 +201,10 @@ class SiteGuard_Backup_Restorer {
 			if (is_string($files)) $files = array($files);
 
 			foreach ($files as $file) {
+				// Prevent path traversal via tainted backup history
+				if (basename($file) !== $file || strpos($file, '..') !== false) {
+					return new WP_Error('invalid_file', "Unsafe filename rejected: {$file}");
+				}
 				$path = $backup_dir . $file;
 				if (!file_exists($path)) {
 					$this->sgbackup->log("Missing file: {$file}", 'error');
