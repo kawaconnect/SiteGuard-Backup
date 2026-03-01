@@ -32,7 +32,7 @@ class SiteGuard_Backup_Method_Onedrive extends SiteGuard_Backup_Module {
             'redirect_uri'  => $redirect,
             'response_type' => 'code',
             'scope'         => 'Files.ReadWrite.All offline_access',
-            'state'         => wp_create_nonce('sgbackup-onedrive-auth'),
+            'state'         => wp_create_nonce('sgbackup-oauth-onedrive'),
         ));
     }
 

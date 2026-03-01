@@ -86,6 +86,13 @@ class SiteGuard_Backup_Method_S3 extends SiteGuard_Backup_Module {
 		}
 		$signed_headers = implode(';', $signed_headers_list);
 
+		// Sort query string parameters as required by SigV4 spec
+		if (!empty($query)) {
+			parse_str($query, $qp);
+			ksort($qp);
+			$query = http_build_query($qp, '', '&', PHP_QUERY_RFC3986);
+		}
+
 		// Canonical request
 		$canonical = "{$method}\n{$uri}\n{$query}\n{$canonical_headers}\n{$signed_headers}\n{$payload_hash}";
 		$canonical_hash = hash('sha256', $canonical);
@@ -146,7 +153,7 @@ class SiteGuard_Backup_Method_S3 extends SiteGuard_Backup_Module {
 		$args = array(
 			'method'  => $method,
 			'headers' => $signed_headers,
-			'body'    => ($method === 'PUT') ? $body : null,
+			'body'    => ($method === 'PUT' || ($method === 'POST' && !empty($body))) ? $body : null,
 			'timeout' => 300,
 		);
 

@@ -35,7 +35,7 @@ class SiteGuard_Backup_Method_Dropbox extends SiteGuard_Backup_Module {
 			'redirect_uri'  => $redirect,
 			'response_type' => 'code',
 			'token_access_type' => 'offline',
-			'state'         => wp_create_nonce('sgbackup-dropbox-auth'),
+			'state'         => wp_create_nonce('sgbackup-oauth-dropbox'),
 		));
 	}
 

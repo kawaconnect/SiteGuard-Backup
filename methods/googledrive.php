@@ -38,7 +38,7 @@ class SiteGuard_Backup_Method_Googledrive extends SiteGuard_Backup_Module {
 			'scope'         => 'https://www.googleapis.com/auth/drive.file',
 			'access_type'   => 'offline',
 			'prompt'        => 'consent',
-			'state'         => wp_create_nonce('sgbackup-gdrive-auth'),
+			'state'         => wp_create_nonce('sgbackup-oauth-googledrive'),
 		));
 	}
 

@@ -81,6 +81,14 @@ class SiteGuard_Backup_Method_Webdav extends SiteGuard_Backup_Module {
 
             $url = $this->get_base_url() . '/' . ltrim($filename, '/');
 
+            // Read file into memory in chunks to build the body string.
+            // wp_remote_request() does not support streaming from a file handle.
+            $body = '';
+            while (!feof($fh)) {
+                $body .= fread($fh, 1048576); // 1MB chunks
+            }
+            fclose($fh);
+
             $response = wp_remote_request($url, array(
                 'method'  => 'PUT',
                 'headers' => array(
@@ -88,11 +96,11 @@ class SiteGuard_Backup_Method_Webdav extends SiteGuard_Backup_Module {
                     'Content-Type'  => 'application/octet-stream',
                     'Content-Length' => $filesize,
                 ),
-                'body'    => $fh,
+                'body'    => $body,
                 'timeout' => 600,
             ));
 
-            fclose($fh);
+            unset($body);
 
             if (is_wp_error($response)) return $response;
 
