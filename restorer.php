@@ -129,8 +129,15 @@ class SiteGuard_Backup_Restorer {
 		$integrity_errors = $this->verify_backup_integrity($backup_dir);
 		if (!empty($integrity_errors)) {
 			foreach ($integrity_errors as $err) {
-				$this->progress("Integrity warning: {$err}");
+				$this->progress("Integrity error: {$err}");
 			}
+			if (empty($this->restore_options['skip_integrity_check'])) {
+				$result['success'] = false;
+				$result['errors'][] = count($integrity_errors) . ' file(s) failed integrity verification. Restore aborted. Use skip_integrity_check option to override.';
+				$this->sgbackup->logfile_close();
+				return $result;
+			}
+			$this->progress("Integrity check failures overridden by skip_integrity_check option");
 		}
 
 		// Phase 2: Restore each entity

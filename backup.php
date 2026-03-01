@@ -757,7 +757,12 @@ class SiteGuard_Backup_Engine {
 				}
 
 				foreach ($ext_tables as $ext_table) {
-					$ext_table_file = $extdb_temp_dir . $ext_table . '.sql.gz';
+					$safe_table_name = preg_replace('/[^a-zA-Z0-9_]/', '', $ext_table);
+					if (empty($safe_table_name) || $safe_table_name !== $ext_table) {
+						$this->sgbackup->log("External DB #{$extdb_index}: skipping table with unsafe name: {$ext_table}", 'warning');
+						continue;
+					}
+					$ext_table_file = $extdb_temp_dir . $safe_table_name . '.sql.gz';
 					$ext_success = SiteGuard_Backup_Database_Utility::php_dump_table_with_connection($ext_table, $ext_table_file, $ext_wpdb);
 					if (!$ext_success) {
 						$this->sgbackup->log("External DB #{$extdb_index}: failed to backup table {$ext_table}", 'error');

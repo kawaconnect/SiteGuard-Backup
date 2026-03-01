@@ -643,9 +643,13 @@ class SiteGuard_Backup_Database_Utility {
 		if (!empty(trim($buffer))) {
 			$query = trim(rtrim($buffer, ';'));
 			if (!empty($query) && !$skipping_table) {
-				$res = $wpdb->query($query);
-				if (false === $res) {
-					$result['errors'][] = "SQL error at end: " . $wpdb->last_error;
+				if (self::is_dangerous_sql($query)) {
+					$result['errors'][] = "Blocked dangerous SQL at end of file";
+				} else {
+					$res = $wpdb->query($query);
+					if (false === $res) {
+						$result['errors'][] = "SQL error at end: " . $wpdb->last_error;
+					}
 				}
 			}
 		}
