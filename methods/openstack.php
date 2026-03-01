@@ -437,6 +437,13 @@ class SiteGuard_Backup_Method_Openstack extends SiteGuard_Backup_Module {
 		$offset = 0;
 
 		while ($offset < $file_size) {
+			// Re-fetch auth each iteration so storage_url stays fresh after token refresh
+			$auth = $this->authenticate();
+			if (is_wp_error($auth)) {
+				fclose($fh);
+				return $auth;
+			}
+
 			$chunk = fread($fh, $this->slo_chunk_size);
 			if (false === $chunk) {
 				fclose($fh);
@@ -487,7 +494,9 @@ class SiteGuard_Backup_Method_Openstack extends SiteGuard_Backup_Module {
 
 		fclose($fh);
 
-		// Create the SLO manifest object
+		// Create the SLO manifest object - refresh auth for fresh storage_url
+		$auth = $this->authenticate();
+		if (is_wp_error($auth)) return $auth;
 		$manifest_url = $auth['storage_url'] . '/' . $container . '/' . $this->encode_object_path($object_name) . '?multipart-manifest=put';
 		$manifest_body = wp_json_encode($manifest);
 
