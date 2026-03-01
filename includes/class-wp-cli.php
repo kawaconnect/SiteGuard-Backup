@@ -1819,9 +1819,11 @@ class SiteGuard_Backup_CLI_Command extends WP_CLI_Command {
         $action = !empty($args[0]) ? $args[0] : 'status';
 
         if ($action === 'clear') {
-            $opts = SiteGuard_Backup_Options::instance();
-            $opts->delete_option('sgbackup_lock_backup');
-            $opts->delete_option('sgbackup_lock_history');
+            // Semaphore stores locks in wp_options with sgbackup_ prefix
+            delete_option('sgbackup_backup');
+            delete_option('sgbackup_history');
+            wp_cache_delete('sgbackup_backup', 'options');
+            wp_cache_delete('sgbackup_history', 'options');
             WP_CLI::success('All locks cleared.');
             return;
         }
