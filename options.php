@@ -31,11 +31,11 @@ class SiteGuard_Backup_Options {
 	/**
 	 * Update an option value.
 	 */
-	public function update_option($key, $value, $use_cache = true) {
+	public function update_option($key, $value, $autoload = false) {
 		if (is_multisite()) {
 			return update_site_option($key, $value);
 		}
-		return update_option($key, $value, false);
+		return update_option($key, $value, $autoload);
 	}
 
 	/**
