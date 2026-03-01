@@ -6,6 +6,7 @@
 
 	var SGB = {
 		pollTimer: null,
+		hadActiveJobs: false,
 
 		// HTML escape utility to prevent XSS
 		esc: function(str) {
@@ -210,10 +211,15 @@
 						$('#sgbackup-backup-status').text('').removeClass('success error');
 						clearInterval(self.pollTimer);
 						self.pollTimer = null;
-						self.refreshBackupsList();
+						// Only refresh the backup list if a job actually just finished
+						if (self.hadActiveJobs) {
+							self.hadActiveJobs = false;
+							self.refreshBackupsList();
+						}
 						return;
 					}
 
+					self.hadActiveJobs = true;
 					$('#sgbackup-active-jobs').show();
 					var html = '';
 					$.each(data, function(nonce, job) {
@@ -245,11 +251,8 @@
 		},
 
 		refreshBackupsList: function() {
-			// Reload the page section
-			this.ajax('get_existing_backups', {}, function(data) {
-				// Rebuild table via page reload for simplicity
-				location.reload();
-			});
+			// Reload page once to show updated backup list after job completion
+			location.reload();
 		},
 
 		// ===== Restore =====
