@@ -363,6 +363,7 @@ $period_labels = array(
 	 * Helper: Retrieve all instances for a storage method.
 	 * Returns array of (instance_id => instance_settings).
 	 */
+	if (!function_exists('sgbackup_get_method_instances')) {
 	function sgbackup_get_method_instances($opts, $method_id, $defaults = array()) {
 		$stored = $opts->get_option('sgbackup_' . $method_id, array());
 		$instances = array();
@@ -381,6 +382,7 @@ $period_labels = array(
 
 		return $instances;
 	}
+	} // end function_exists guard
 	?>
 
 	<!-- S3 Configuration -->
