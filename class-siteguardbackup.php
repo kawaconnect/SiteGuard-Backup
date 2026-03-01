@@ -29,7 +29,7 @@ class SiteGuard_Backup {
 	/**
 	 * Available backup storage methods.
 	 */
-	public $backup_methods = array(
+	private $backup_methods = array(
 		'dropbox'     => 'Dropbox',
 		's3'          => 'Amazon S3 (or compatible)',
 		's3generic'   => 'S3-Compatible (Generic)',
@@ -925,6 +925,11 @@ class SiteGuard_Backup {
 
 			$service_all_ok = true;
 			foreach ($all_files as $file) {
+				// Prevent path traversal via tainted jobdata filenames
+				if (basename($file) !== $file || strpos($file, '..') !== false) {
+					$this->log("Rejected unsafe filename in upload: {$file}", 'error');
+					continue;
+				}
 				$filepath = $backup_dir . $file;
 				if (!file_exists($filepath)) {
 					$this->log("File not found for upload: {$file}", 'warning');
@@ -1545,6 +1550,11 @@ class SiteGuard_Backup {
 		$backup_dir = $this->get_backup_dir();
 
 		foreach ($all_files as $file) {
+			// Prevent path traversal - only allow basenames
+			if (basename($file) !== $file || strpos($file, '..') !== false) {
+				$this->log("Rejected unsafe filename in delete: {$file}", 'error');
+				continue;
+			}
 			$path = $backup_dir . $file;
 			if (file_exists($path)) {
 				@unlink($path);
