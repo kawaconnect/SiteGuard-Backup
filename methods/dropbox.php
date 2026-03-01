@@ -201,7 +201,10 @@ class SiteGuard_Backup_Method_Dropbox extends SiteGuard_Backup_Module {
 			$read_size = min($chunk_size, $remaining);
 			$chunk = fread($fh, $read_size);
 
-			if (strlen($chunk) === 0) break;
+			if (strlen($chunk) === 0) {
+				fclose($fh);
+				return new WP_Error('dropbox_session_read', 'Failed to read data from file during upload session.');
+			}
 
 			$is_last = ($offset + strlen($chunk) >= $filesize);
 
