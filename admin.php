@@ -116,6 +116,8 @@ class SiteGuard_Backup_Admin {
 				'migrate_send'      => wp_create_nonce('sgbackup-migrate_send'),
 				'searchreplace'     => wp_create_nonce('sgbackup-searchreplace'),
 				'test_webhook'      => wp_create_nonce('sgbackup-test_webhook'),
+				'get_multisite_info' => wp_create_nonce('sgbackup-get_multisite_info'),
+				'get_backup_subsites' => wp_create_nonce('sgbackup-get_backup_subsites'),
 			),
 			'max_upload_size' => wp_max_upload_size(),
 			'is_multisite' => is_multisite(),
@@ -308,7 +310,7 @@ class SiteGuard_Backup_Admin {
 		}
 
 		// Enforce settings lock on all mutating commands except activejobs_list (read-only status check)
-		$read_only_commands = array('activejobs_list', 'get_existing_backups', 'get_log', 'get_settings', 'get_sysinfo', 'get_remotesites', 'get_migrator_keys', 'get_backup_contents', 'get_database_tables', 'get_audit_log');
+		$read_only_commands = array('activejobs_list', 'get_existing_backups', 'get_log', 'get_settings', 'get_sysinfo', 'get_remotesites', 'get_migrator_keys', 'get_backup_contents', 'get_database_tables', 'get_audit_log', 'get_multisite_info', 'get_backup_subsites');
 		if (!in_array($subaction, $read_only_commands, true) && $this->is_settings_locked()) {
 			wp_send_json_error(array('message' => 'Settings are locked. Please unlock first.'));
 		}
@@ -362,6 +364,8 @@ class SiteGuard_Backup_Admin {
 			'toggle_audit_log',
 			'clear_audit_log',
 			'test_webhook',
+			'get_multisite_info',
+			'get_backup_subsites',
 		);
 
 		if (!in_array($subaction, $allowed_commands, true)) {

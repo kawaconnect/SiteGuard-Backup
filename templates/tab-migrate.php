@@ -140,5 +140,63 @@ $remote_sites = $opts->get_option('sgbackup_remotesites', array());
 			<?php esc_html_e('Send', 'siteguardbackup'); ?>
 		</button>
 		<span id="sgbackup-send-status" class="sgbackup-status"></span>
+		<div id="sgbackup-send-progress" class="sgbackup-send-progress" style="display:none;">
+			<div class="sgbackup-progress-bar-wrap">
+				<div class="sgbackup-progress-bar" style="width:0%;"></div>
+				<span class="sgbackup-progress-text">Preparing...</span>
+			</div>
+		</div>
 	</div>
 </div>
+
+<?php if (is_multisite()): ?>
+<hr />
+<div class="sgbackup-section">
+	<h2><?php esc_html_e('Multisite Subsite Management', 'siteguardbackup'); ?></h2>
+	<p><?php esc_html_e('When restoring a multisite backup, you can choose which subsites to restore and remap their domains/paths.', 'siteguardbackup'); ?></p>
+
+	<div id="sgbackup-multisite-restore-options">
+		<h3><?php esc_html_e('Current Subsites', 'siteguardbackup'); ?></h3>
+		<table class="widefat" id="sgbackup-current-subsites">
+			<thead>
+				<tr>
+					<th><?php esc_html_e('Blog ID', 'siteguardbackup'); ?></th>
+					<th><?php esc_html_e('Domain', 'siteguardbackup'); ?></th>
+					<th><?php esc_html_e('Path', 'siteguardbackup'); ?></th>
+					<th><?php esc_html_e('Name', 'siteguardbackup'); ?></th>
+				</tr>
+			</thead>
+			<tbody id="sgbackup-current-subsites-body">
+				<tr><td colspan="4"><?php esc_html_e('Loading...', 'siteguardbackup'); ?></td></tr>
+			</tbody>
+		</table>
+
+		<h3 style="margin-top:20px;"><?php esc_html_e('Restore Subsite Selection', 'siteguardbackup'); ?></h3>
+		<p><?php esc_html_e('Select a backup to see which subsites it contains. You can choose which to restore and remap their subdomains.', 'siteguardbackup'); ?></p>
+		<p>
+			<select id="sgbackup-subsite-backup-select">
+				<option value=""><?php esc_html_e('Select a backup to inspect...', 'siteguardbackup'); ?></option>
+			</select>
+			<button type="button" class="button" id="sgbackup-inspect-subsites-btn"><?php esc_html_e('Inspect Subsites', 'siteguardbackup'); ?></button>
+		</p>
+
+		<div id="sgbackup-backup-subsites-panel" style="display:none;">
+			<table class="widefat" id="sgbackup-backup-subsites">
+				<thead>
+					<tr>
+						<th style="width:30px;"><input type="checkbox" id="sgbackup-select-all-subsites" checked /></th>
+						<th><?php esc_html_e('Blog ID', 'siteguardbackup'); ?></th>
+						<th><?php esc_html_e('Original Domain', 'siteguardbackup'); ?></th>
+						<th><?php esc_html_e('New Subdomain / Domain', 'siteguardbackup'); ?></th>
+					</tr>
+				</thead>
+				<tbody id="sgbackup-backup-subsites-body">
+				</tbody>
+			</table>
+			<p style="margin-top:10px;">
+				<em><?php esc_html_e('Leave "New Subdomain" empty to keep the original domain, or enter a new subdomain to remap.', 'siteguardbackup'); ?></em>
+			</p>
+		</div>
+	</div>
+</div>
+<?php endif; ?>

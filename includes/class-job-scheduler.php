@@ -56,7 +56,7 @@ class SiteGuard_Backup_Job_Scheduler {
 	 * @param int    $interval      Seconds from now.
 	 */
 	public static function schedule_resumption($resumption_no, $nonce, $interval) {
-		$interval = max(60, $interval);
+		$interval = max(5, $interval);
 		$time = time() + $interval;
 
 		// Clear any existing scheduled resumption for this resumption_no

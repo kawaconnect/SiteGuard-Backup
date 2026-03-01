@@ -134,18 +134,26 @@
 	background: #f0f6fc;
 	border: 1px solid #c3c4c7;
 	border-left: 4px solid #2271b1;
-	padding: 10px 15px;
+	padding: 12px 15px;
 	margin-bottom: 8px;
+	position: relative;
 }
 
 .sgbackup-job .sgbackup-job-title {
 	font-weight: 600;
-	margin-bottom: 4px;
+	margin-bottom: 8px;
+	font-size: 13px;
 }
 
-.sgbackup-job .sgbackup-job-progress {
-	color: #666;
+.sgbackup-job .sgbackup-job-title small {
+	font-weight: normal;
+	color: #888;
+}
+
+.sgbackup-job .sgbackup-job-entities {
+	color: #555;
 	font-size: 12px;
+	margin-top: 6px;
 }
 
 .sgbackup-job .sgbackup-abort-btn {
@@ -153,8 +161,59 @@
 	color: #dc3232;
 	cursor: pointer;
 	background: none;
-	border: none;
-	text-decoration: underline;
+	border: 1px solid #dc3232;
+	border-radius: 3px;
+	padding: 2px 8px;
+	font-size: 12px;
+}
+
+.sgbackup-job .sgbackup-abort-btn:hover {
+	background: #dc3232;
+	color: #fff;
+}
+
+/* Progress bar */
+.sgbackup-progress-bar-wrap {
+	position: relative;
+	height: 24px;
+	background: #ddd;
+	border-radius: 4px;
+	overflow: hidden;
+}
+
+.sgbackup-progress-bar {
+	height: 100%;
+	background: linear-gradient(90deg, #2271b1, #135e96);
+	border-radius: 4px;
+	transition: width 0.5s ease;
+	min-width: 0;
+}
+
+.sgbackup-progress-text {
+	position: absolute;
+	top: 0;
+	left: 0;
+	right: 0;
+	text-align: center;
+	line-height: 24px;
+	font-size: 12px;
+	font-weight: 600;
+	color: #333;
+	text-shadow: 0 0 2px rgba(255,255,255,0.8);
+}
+
+/* Migration send progress */
+.sgbackup-send-progress {
+	margin-top: 10px;
+}
+
+.sgbackup-send-progress .sgbackup-progress-bar-wrap {
+	height: 20px;
+}
+
+.sgbackup-send-progress .sgbackup-progress-text {
+	line-height: 20px;
+	font-size: 11px;
 }
 
 /* Restore progress */
