@@ -1845,6 +1845,52 @@ class SiteGuard_Backup_CLI_Command extends WP_CLI_Command {
     }
 
     /**
+     * Force-resume a stuck backup job, bypassing WP-Cron.
+     *
+     * ## OPTIONS
+     *
+     * <nonce>
+     * : The backup job nonce to resume.
+     *
+     * ## EXAMPLES
+     *
+     *     wp siteguardbackup force_resume abc123def456
+     *
+     * @subcommand force_resume
+     */
+    public function force_resume($args, $assoc_args) {
+        if (empty($args[0])) {
+            WP_CLI::error('Usage: wp siteguardbackup force_resume <nonce>');
+        }
+
+        $nonce = sanitize_text_field($args[0]);
+        $sgbackup = SiteGuard_Backup::instance();
+        $jobdata = $sgbackup->jobdata_getarray($nonce);
+
+        if (empty($jobdata)) {
+            WP_CLI::error("No job data found for nonce: {$nonce}");
+        }
+
+        $status = isset($jobdata['jobstatus']) ? $jobdata['jobstatus'] : 'unknown';
+        WP_CLI::log("Job status: {$status}");
+
+        if (in_array($status, array('complete', 'error', 'aborted'), true)) {
+            WP_CLI::error("Job is already in terminal state: {$status}");
+        }
+
+        $current_resumption = isset($jobdata['current_resumption']) ? intval($jobdata['current_resumption']) : 0;
+        $next_resumption = $current_resumption + 1;
+
+        SiteGuard_Backup_Job_Scheduler::clear_scheduled_events($nonce);
+
+        WP_CLI::log("Force-resuming job at resumption {$next_resumption}...");
+        $sgbackup->backup_resume($next_resumption, $nonce);
+
+        $new_status = $sgbackup->jobdata_get('jobstatus', 'unknown');
+        WP_CLI::success("Resumption {$next_resumption} completed. Status: {$new_status}");
+    }
+
+    /**
      * Get the most recently modified log file.
      *
      * ## OPTIONS

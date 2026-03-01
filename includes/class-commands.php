@@ -139,6 +139,24 @@ class SiteGuard_Backup_Commands {
 				}
 			}
 
+			// Get last log message for this job
+			$last_activity = isset($jobdata['last_activity']) ? $jobdata['last_activity'] : '';
+			$last_log_line = '';
+			$log_nonce = isset($jobdata['nonce']) ? $jobdata['nonce'] : $nonce;
+			$logfile = $sgbackup->get_logfile_name($log_nonce);
+			if (file_exists($logfile)) {
+				// Read last 512 bytes to find last log line
+				$fh = @fopen($logfile, 'r');
+				if ($fh) {
+					$fsize = filesize($logfile);
+					if ($fsize > 512) fseek($fh, -512, SEEK_END);
+					$tail = fread($fh, 512);
+					fclose($fh);
+					$lines = explode("\n", trim($tail));
+					$last_log_line = end($lines);
+				}
+			}
+
 			$result[$nonce] = array(
 				'resumption'  => $job_info['resumption'],
 				'next'        => $job_info['next_scheduled'],
@@ -152,6 +170,12 @@ class SiteGuard_Backup_Commands {
 				'phase'       => $phase,
 				'entity_progress' => $entity_progress,
 				'elapsed'     => isset($jobdata['backup_time']) ? (time() - $jobdata['backup_time']) : 0,
+				'last_activity' => $last_activity,
+				'last_log'    => $last_log_line,
+				'files_added_count' => isset($jobdata['files_added_count']) ? $jobdata['files_added_count'] : 0,
+				'files_total_count' => isset($jobdata['files_total_count']) ? $jobdata['files_total_count'] : 0,
+				'db_tables_done'  => isset($jobdata['db_tables_done']) ? $jobdata['db_tables_done'] : 0,
+				'db_tables_total' => isset($jobdata['db_tables_total']) ? $jobdata['db_tables_total'] : 0,
 			);
 		}
 
@@ -256,6 +280,41 @@ class SiteGuard_Backup_Commands {
 		SiteGuard_Backup_Job_Scheduler::clear_scheduled_events($nonce);
 
 		return array('success' => true, 'nonce' => $nonce);
+	}
+
+	/**
+	 * Force-resume a stuck backup job, bypassing cron.
+	 */
+	public function force_resume($params) {
+		$nonce = isset($params['job_id']) ? sanitize_text_field($params['job_id']) : '';
+		if (empty($nonce)) return new WP_Error('missing_param', 'Missing job_id');
+
+		$sgbackup = SiteGuard_Backup::instance();
+		$jobdata = $sgbackup->jobdata_getarray($nonce);
+		if (empty($jobdata)) {
+			return new WP_Error('not_found', 'No job data found for this nonce');
+		}
+
+		$status = isset($jobdata['jobstatus']) ? $jobdata['jobstatus'] : '';
+		if (in_array($status, array('complete', 'error', 'aborted'), true)) {
+			return new WP_Error('invalid_state', "Job is already in terminal state: {$status}");
+		}
+
+		$current_resumption = isset($jobdata['current_resumption']) ? intval($jobdata['current_resumption']) : 0;
+		$next_resumption = $current_resumption + 1;
+
+		// Clear existing scheduled events and run directly
+		SiteGuard_Backup_Job_Scheduler::clear_scheduled_events($nonce);
+
+		$response = json_encode(array('success' => true, 'data' => array(
+			'nonce' => $nonce,
+			'resumption' => $next_resumption,
+			'message' => "Force-resuming job at resumption {$next_resumption}",
+		)));
+		$sgbackup->close_browser_connection($response);
+
+		$sgbackup->backup_resume($next_resumption, $nonce);
+		die;
 	}
 
 	/**
