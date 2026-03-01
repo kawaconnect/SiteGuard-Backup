@@ -156,7 +156,8 @@ class SiteGuard_Backup_Remote_Communications {
 			),
 			'timeout' => 120,
 			'headers' => array(
-				'X-SGBackup-RPC' => '1',
+				'X-SGBackup-RPC'  => '1',
+				'X-SGBackup-HMAC' => '1',
 			),
 		));
 

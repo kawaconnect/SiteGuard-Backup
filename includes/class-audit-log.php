@@ -176,8 +176,9 @@ class SiteGuard_Backup_Audit_Log {
 	 */
 	public function clear() {
 		$opts = SiteGuard_Backup_Options::instance();
-		$opts->update_option(self::LOG_KEY, array());
-		return $this->log('audit_log_cleared', 'Audit log was cleared.');
+		$result = $opts->update_option(self::LOG_KEY, array());
+		$this->log('audit_log_cleared', 'Audit log was cleared.');
+		return $result;
 	}
 
 	/**

@@ -575,7 +575,7 @@ class SiteGuard_Backup_Database_Utility {
 				}
 			}
 
-			if ($skipping_table && !$in_string) {
+			if ($skipping_table) {
 				// Track string state even when skipping, to handle multi-line values
 				$len = strlen($trimmed);
 				for ($ci = 0; $ci < $len; $ci++) {
@@ -610,12 +610,14 @@ class SiteGuard_Backup_Database_Utility {
 				}
 			}
 
-			if (!$in_string && substr($trimmed, -1) === $delimiter) {
+			$delim_len = strlen($delimiter);
+			if (!$in_string && substr($trimmed, -$delim_len) === $delimiter) {
 				$query = trim($buffer);
 				$buffer = '';
 
 				if (!empty($query)) {
-					$query = rtrim($query, ';');
+					$query = substr($query, 0, -$delim_len);
+					$query = trim($query);
 
 					if (self::is_dangerous_sql($query)) {
 						$result['errors'][] = "Blocked dangerous SQL on line {$line_count}";

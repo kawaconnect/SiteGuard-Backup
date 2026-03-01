@@ -308,6 +308,6 @@ class SiteGuard_Backup_Filesystem {
 		$free = @disk_free_space($path);
 		$total = @disk_total_space($path);
 		if (false === $free) return false;
-		return array('free' => $free, 'total' => $total);
+		return array('free' => $free, 'total' => (false === $total) ? 0 : $total);
 	}
 }

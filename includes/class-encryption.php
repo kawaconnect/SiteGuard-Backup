@@ -228,6 +228,8 @@ class SiteGuard_Backup_Encryption {
 		$out = fopen($tmp_file, 'wb');
 
 		if (!$in || !$out) {
+			if ($in) fclose($in);
+			if ($out) fclose($out);
 			@unlink($tmp_file);
 			return false;
 		}
@@ -356,6 +358,8 @@ class SiteGuard_Backup_Encryption {
 		$out = fopen($tmp_file, 'wb');
 
 		if (!$in || !$out) {
+			if ($in) fclose($in);
+			if ($out) fclose($out);
 			@unlink($tmp_file);
 			return false;
 		}
