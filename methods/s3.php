@@ -72,17 +72,20 @@ class SiteGuard_Backup_Method_S3 extends SiteGuard_Backup_Module {
 		$credential_scope = "{$date}/{$region}/{$service}/aws4_request";
 		$credential = $options['access_key'] . '/' . $credential_scope;
 
-		// Canonical headers
+		// Canonical headers - must be sorted by LOWERCASE name per SigV4 spec
 		$headers['x-amz-date'] = $now;
 		$headers['x-amz-content-sha256'] = $payload_hash;
 
-		ksort($headers);
-		$canonical_headers = '';
-		$signed_headers_list = array();
+		$lowered = array();
 		foreach ($headers as $k => $v) {
-			$lk = strtolower($k);
-			$canonical_headers .= $lk . ':' . trim($v) . "\n";
-			$signed_headers_list[] = $lk;
+			$lowered[strtolower($k)] = trim($v);
+		}
+		ksort($lowered);
+
+		$canonical_headers = '';
+		$signed_headers_list = array_keys($lowered);
+		foreach ($lowered as $lk => $v) {
+			$canonical_headers .= $lk . ':' . $v . "\n";
 		}
 		$signed_headers = implode(';', $signed_headers_list);
 
@@ -244,6 +247,10 @@ class SiteGuard_Backup_Method_S3 extends SiteGuard_Backup_Module {
 
 	protected function multipart_upload($file, $key) {
 		$storage_headers = $this->get_storage_headers();
+		// Include Object Lock headers (B2) - backup() builds these but they
+		// were not passed through to multipart_upload previously.
+		$object_lock_headers = $this->get_object_lock_headers();
+		$storage_headers = array_merge($storage_headers, $object_lock_headers);
 
 		// Initiate multipart - query string is separated by request()
 		$init = $this->request('POST', $key . '?uploads', '', array_merge(array(

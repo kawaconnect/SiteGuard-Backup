@@ -68,7 +68,7 @@ class SiteGuard_Backup_Method_Webdav extends SiteGuard_Backup_Module {
         // For large files (>50MB), use single PUT with streaming body to avoid memory issues.
         // WebDAV standard does not support Content-Range on PUT (unlike HTTP/1.1 PATCH).
         if ($filesize > 52428800) {
-            $fh = fopen($file, 'r');
+            $fh = fopen($file, 'rb');
             if (!$fh) {
                 return new WP_Error('webdav_read', 'Failed to open file for reading.');
             }
@@ -190,7 +190,7 @@ class SiteGuard_Backup_Method_Webdav extends SiteGuard_Backup_Module {
         $files = array();
 
         // Parse PROPFIND XML response
-        if (preg_match_all('/<d:displayname>([^<]+)<\/d:displayname>/i', $body, $matches)) {
+        if (preg_match_all('/<(?:[a-zA-Z0-9]+:)?displayname>([^<]+)<\/(?:[a-zA-Z0-9]+:)?displayname>/i', $body, $matches)) {
             foreach ($matches[1] as $name) {
                 if (preg_match('/^backup_/', $name)) {
                     $files[] = $name;
