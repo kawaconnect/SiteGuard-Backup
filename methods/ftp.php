@@ -54,7 +54,10 @@ class SiteGuard_Backup_Method_Ftp extends SiteGuard_Backup_Module {
 		}
 
 		if (!empty($options['passive'])) {
-			ftp_pasv($conn, true);
+			if (!@ftp_pasv($conn, true)) {
+				@ftp_close($conn);
+				return new WP_Error('ftp_pasv_failed', 'Failed to enable passive mode.');
+			}
 		}
 
 		return $conn;
@@ -115,7 +118,10 @@ class SiteGuard_Backup_Method_Ftp extends SiteGuard_Backup_Module {
 		}
 
 		if (!empty($options['passive'])) {
-			ftp_pasv($conn, true);
+			if (!@ftp_pasv($conn, true)) {
+				@ftp_close($conn);
+				return new WP_Error('ftp_pasv_failed', 'Failed to enable passive mode (implicit FTPS).');
+			}
 		}
 
 		return $conn;

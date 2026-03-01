@@ -113,6 +113,10 @@ class SiteGuard_Backup_Method_Googledrive extends SiteGuard_Backup_Module {
 			$options['token']['access_token'] = $body['access_token'];
 			$options['token']['expires_in'] = $body['expires_in'];
 			$options['token']['obtained_at'] = time();
+			// Google may rotate refresh tokens - save new one if provided
+			if (!empty($body['refresh_token'])) {
+				$options['token']['refresh_token'] = $body['refresh_token'];
+			}
 			$this->save_options($options);
 
 			return $body['access_token'];

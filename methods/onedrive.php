@@ -171,7 +171,8 @@ class SiteGuard_Backup_Method_Onedrive extends SiteGuard_Backup_Module {
         $token = $this->get_access_token();
         if (is_wp_error($token)) return $token;
 
-        $this->ensure_folder();
+        $folder_result = $this->ensure_folder();
+        if (is_wp_error($folder_result)) return $folder_result;
 
         $options = $this->get_options();
         $folder_name = $options['folder'] ?: 'SiteGuard Backups';
