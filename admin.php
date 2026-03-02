@@ -99,8 +99,13 @@ class SiteGuard_Backup_Admin {
 
 		$sgbackup = SiteGuard_Backup::instance();
 
+		// Use path-only AJAX URL so the browser sends the request to the same
+		// origin as the current page. This prevents cross-origin failures when
+		// DOMAIN_CURRENT_SITE (wp-config) doesn't match the DB siteurl - e.g.,
+		// after restoring a backup from a different domain.
+		$ajax_path = parse_url(admin_url('admin-ajax.php'), PHP_URL_PATH);
 		wp_localize_script('sgbackup-admin', 'sgbackup_settings', array(
-			'ajax_url'  => admin_url('admin-ajax.php'),
+			'ajax_url'  => $ajax_path ? $ajax_path : admin_url('admin-ajax.php'),
 			'nonce'     => wp_create_nonce('sgbackup-ajax'),
 			'nonces'    => array(
 				'backupnow'         => wp_create_nonce('sgbackup-backupnow'),

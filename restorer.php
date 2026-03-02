@@ -1233,6 +1233,17 @@ class SiteGuard_Backup_Restorer {
 		// Disable known caching plugins if this is a migration
 		if ($this->is_migration) {
 			$this->disable_cache_plugins();
+
+			// Warn about DOMAIN_CURRENT_SITE mismatch in wp-config.php.
+			// After a cross-domain restore, this constant still points to the
+			// old domain, causing network admin redirects and AJAX failures.
+			if (is_multisite() && defined('DOMAIN_CURRENT_SITE')) {
+				$new_domain = parse_url($this->pre_import_siteurl, PHP_URL_HOST);
+				if ($new_domain && DOMAIN_CURRENT_SITE !== $new_domain) {
+					$this->sgbackup->log("WARNING: DOMAIN_CURRENT_SITE in wp-config.php is '" . DOMAIN_CURRENT_SITE . "' but should be '{$new_domain}'. Update wp-config.php to fix network admin access.", 'warning');
+					$this->progress("WARNING: wp-config.php DOMAIN_CURRENT_SITE needs manual update to '{$new_domain}'");
+				}
+			}
 		}
 
 		// Gap 26: Check .htaccess for migration issues
