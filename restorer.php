@@ -43,6 +43,9 @@ class SiteGuard_Backup_Restorer {
 	/** @var bool Whether this is a migration (URL change) */
 	private $is_migration = false;
 
+	/** @var array|null Search-replace report for restore UI */
+	private $search_replace_report = null;
+
 	/** @var int Move-in mode for file restore */
 	private $move_in_mode = 0;
 
@@ -480,6 +483,11 @@ class SiteGuard_Backup_Restorer {
 			return;
 		}
 
+		// Multisite: enumerate all blogs and build per-blog replacements
+		if (is_multisite()) {
+			$this->build_multisite_replacements($search, $replace);
+		}
+
 		// First, restore the destination siteurl/home in the DB so the site
 		// functions correctly after search-replace completes.
 		update_option('siteurl', $current_siteurl);
@@ -504,7 +512,163 @@ class SiteGuard_Backup_Restorer {
 		$sr = new SiteGuard_Backup_Search_Replace();
 		$report = $sr->run($search, $replace, $tables);
 
-		$this->sgbackup->log("Search-replace complete: {$report['changes']} changes in {$report['tables']} tables");
+		$this->sgbackup->log("Search-replace complete: {$report['changes']} changes across {$report['tables']} tables, {$report['updates']} rows updated");
+		if (!empty($report['errors'])) {
+			$this->sgbackup->log("Search-replace warnings: " . count($report['errors']), 'warning');
+		}
+
+		// Store report for inclusion in final progress message
+		$this->search_replace_report = array(
+			'tables'  => $report['tables'],
+			'changes' => $report['changes'],
+			'updates' => $report['updates'],
+			'pairs'   => array_combine($search, $replace),
+			'errors'  => isset($report['errors']) ? $report['errors'] : array(),
+		);
+
+		// Emit search-replace report via RINFO for the JS to display
+		if ($this->search_replace_report) {
+			$sr_report = $this->search_replace_report;
+			$this->progress("Migration search-replace: {$sr_report['changes']} changes across {$sr_report['tables']} tables");
+			if (defined('DOING_AJAX') && DOING_AJAX) {
+				echo 'RINFO:' . json_encode(array(
+					'type' => 'search_replace',
+					'tables' => $sr_report['tables'],
+					'changes' => $sr_report['changes'],
+					'updates' => $sr_report['updates'],
+					'pairs' => $sr_report['pairs'],
+				)) . "\n";
+				if (ob_get_level()) @ob_flush();
+				@flush();
+			}
+		}
+
+		// Fix multisite-specific tables that string replacement can't handle correctly
+		$this->fix_multisite_sitemeta();
+	}
+
+	/**
+	 * Build search-replace pairs for all multisite blogs.
+	 *
+	 * For each blog in wp_blogs whose domain contains the old site's domain,
+	 * compute the new domain and add protocol-aware replacement pairs.
+	 * Specific (longer) replacements are added first; bare domain goes last.
+	 */
+	private function build_multisite_replacements(&$search, &$replace) {
+		global $wpdb;
+
+		$old_domain = parse_url($this->old_siteurl, PHP_URL_HOST);
+		$new_domain = parse_url($this->pre_import_siteurl, PHP_URL_HOST);
+		if (!$old_domain || !$new_domain || $old_domain === $new_domain) return;
+
+		$old_scheme = parse_url($this->old_siteurl, PHP_URL_SCHEME);
+		$new_scheme = parse_url($this->pre_import_siteurl, PHP_URL_SCHEME);
+
+		// Read all blog domains from wp_blogs
+		$blogs_table = $wpdb->base_prefix . 'blogs';
+		$blogs = $wpdb->get_col("SELECT DISTINCT domain FROM {$blogs_table}");
+		if (empty($blogs)) return;
+
+		$this->sgbackup->log("Multisite migration: found " . count($blogs) . " blog domains");
+
+		$added = array();
+
+		foreach ($blogs as $blog_domain) {
+			// Skip if this blog domain doesn't contain the old domain
+			if (strpos($blog_domain, $old_domain) === false) continue;
+
+			// Compute new blog domain by replacing old domain with new
+			$new_blog_domain = str_replace($old_domain, $new_domain, $blog_domain);
+
+			// Skip if already covered by existing pairs or is the bare domain
+			if ($blog_domain === $old_domain) continue;
+			if (in_array($blog_domain, $added, true)) continue;
+
+			// Full URL replacements (with protocol)
+			$old_url = $old_scheme . '://' . $blog_domain;
+			$new_url = $new_scheme . '://' . $new_blog_domain;
+
+			if (!in_array($old_url, $search, true)) {
+				$search[] = $old_url;
+				$replace[] = $new_url;
+				$this->sgbackup->log("  Blog: {$old_url} -> {$new_url}");
+			}
+
+			// If protocols differ, also add cross-protocol pair
+			if ($old_scheme !== $new_scheme) {
+				$alt_old_url = $new_scheme . '://' . $blog_domain;
+				if (!in_array($alt_old_url, $search, true)) {
+					$search[] = $alt_old_url;
+					$replace[] = $new_url;
+				}
+			}
+
+			// Domain-only replacement for this blog (no protocol)
+			if (!in_array($blog_domain, $search, true) && $blog_domain !== $new_blog_domain) {
+				$search[] = $blog_domain;
+				$replace[] = $new_blog_domain;
+			}
+
+			$added[] = $blog_domain;
+		}
+
+		// Bare domain catch-all (LAST so specific replacements run first)
+		if (!in_array($old_domain, $search, true)) {
+			$search[] = $old_domain;
+			$replace[] = $new_domain;
+			$this->sgbackup->log("  Bare domain catch-all: {$old_domain} -> {$new_domain}");
+		}
+	}
+
+	/**
+	 * Directly fix wp_sitemeta and wp_site after multisite migration.
+	 *
+	 * String replacement can produce wrong results for wp_sitemeta.siteurl
+	 * (e.g., wp.old-host.example -> wp.new-host.example instead of new-host.example).
+	 * This method sets the correct values directly via SQL.
+	 */
+	private function fix_multisite_sitemeta() {
+		if (!is_multisite()) return;
+
+		global $wpdb;
+		$new_domain = parse_url($this->pre_import_siteurl, PHP_URL_HOST);
+		$new_scheme = parse_url($this->pre_import_siteurl, PHP_URL_SCHEME);
+		if (!$new_domain) return;
+
+		$correct_siteurl = $new_scheme . '://' . $new_domain . '/';
+
+		// Fix wp_sitemeta
+		$sitemeta_table = $wpdb->base_prefix . 'sitemeta';
+		$wpdb->update(
+			$sitemeta_table,
+			array('meta_value' => $correct_siteurl),
+			array('meta_key' => 'siteurl'),
+			array('%s'),
+			array('%s')
+		);
+		$this->sgbackup->log("Fixed wp_sitemeta siteurl -> {$correct_siteurl}");
+
+		// Fix wp_site.domain
+		$site_table = $wpdb->base_prefix . 'site';
+		$wpdb->update(
+			$site_table,
+			array('domain' => $new_domain),
+			array('id' => 1),
+			array('%s'),
+			array('%d')
+		);
+		$this->sgbackup->log("Fixed wp_site.domain -> {$new_domain}");
+
+		// Fix wp_blogs for the main site (blog_id = 1)
+		$blogs_table = $wpdb->base_prefix . 'blogs';
+		$wpdb->update(
+			$blogs_table,
+			array('domain' => $new_domain),
+			array('blog_id' => 1),
+			array('%s'),
+			array('%d')
+		);
+		$this->sgbackup->log("Fixed wp_blogs main site domain -> {$new_domain}");
 	}
 
 	// ==========================================

@@ -37,6 +37,7 @@ class SiteGuard_Backup_Admin {
 		add_action('wp_ajax_sgbackup_unlock', array($this, 'ajax_unlock'));
 		add_action('admin_bar_menu', array($this, 'admin_bar_menu'), 100);
 		add_action('admin_head', array($this, 'admin_bar_css'));
+		add_action('admin_head', array($this, 'maybe_send_csp_headers'));
 		add_action('wp_head', array($this, 'admin_bar_css'));
 		add_action('wp_dashboard_setup', array($this, 'dashboard_widget_setup'));
 		if (is_multisite()) {
@@ -116,6 +117,14 @@ class SiteGuard_Backup_Admin {
 				'migrate_send'      => wp_create_nonce('sgbackup-migrate_send'),
 				'searchreplace'     => wp_create_nonce('sgbackup-searchreplace'),
 				'test_webhook'      => wp_create_nonce('sgbackup-test_webhook'),
+				'failover_status'   => wp_create_nonce('sgbackup-failover_status'),
+				'failover_prefailover'  => wp_create_nonce('sgbackup-failover_prefailover'),
+				'failover_postfailover' => wp_create_nonce('sgbackup-failover_postfailover'),
+				'save_restore_preset'   => wp_create_nonce('sgbackup-save_restore_preset'),
+				'get_restore_presets'   => wp_create_nonce('sgbackup-get_restore_presets'),
+				'delete_restore_preset' => wp_create_nonce('sgbackup-delete_restore_preset'),
+				'save_remotesend_schedule' => wp_create_nonce('sgbackup-save_remotesend_schedule'),
+				'get_remotesend_schedule'  => wp_create_nonce('sgbackup-get_remotesend_schedule'),
 			),
 			'max_upload_size' => wp_max_upload_size(),
 			'is_multisite' => is_multisite(),
@@ -276,6 +285,12 @@ class SiteGuard_Backup_Admin {
 			wp_send_json_error(array('message' => 'Missing subaction'));
 		}
 
+		// IP allowlist enforcement
+		require_once SGBACKUP_DIR . 'includes/class-security.php';
+		if (!SiteGuard_Backup_Security::check_ip_allowlist()) {
+			wp_send_json_error(array('message' => 'Access denied: your IP is not in the allowlist.'));
+		}
+
 		// Per-action nonce verification: try action-specific nonce first, fall back to generic
 		$nonce = isset($_POST['nonce']) ? sanitize_text_field($_POST['nonce']) : '';
 		$action_nonce_valid = wp_verify_nonce($nonce, 'sgbackup-' . $subaction);
@@ -286,12 +301,18 @@ class SiteGuard_Backup_Admin {
 
 		// Rate limiting on sensitive destructive/mutating endpoints
 		$rate_limits = array(
-			'wipe_settings'  => array('limit' => 2,  'window' => 60),   // 2 per minute
-			'searchreplace'  => array('limit' => 5,  'window' => 60),   // 5 per minute
-			'delete_backup'  => array('limit' => 15, 'window' => 60),   // 15 per minute
-			'migrate_send'   => array('limit' => 5,  'window' => 60),   // 5 per minute
-			'import_settings' => array('limit' => 3, 'window' => 60),   // 3 per minute
-			'clear_audit_log' => array('limit' => 2, 'window' => 60),   // 2 per minute
+			'wipe_settings'          => array('limit' => 2,  'window' => 60),   // 2 per minute
+			'searchreplace'          => array('limit' => 5,  'window' => 60),   // 5 per minute
+			'delete_backup'          => array('limit' => 15, 'window' => 60),   // 15 per minute
+			'migrate_send'           => array('limit' => 5,  'window' => 60),   // 5 per minute
+			'import_settings'        => array('limit' => 3,  'window' => 60),   // 3 per minute
+			'clear_audit_log'        => array('limit' => 2,  'window' => 60),   // 2 per minute
+			'backupnow'              => array('limit' => 10, 'window' => 60),   // 10 per minute
+			'restore_alldownloaded'  => array('limit' => 3,  'window' => 60),   // 3 per minute
+			'failover_prefailover'   => array('limit' => 3,  'window' => 60),   // 3 per minute
+			'failover_postfailover'  => array('limit' => 3,  'window' => 60),   // 3 per minute
+			'delete_restore_preset'  => array('limit' => 10, 'window' => 60),   // 10 per minute
+			'save_remotesend_schedule' => array('limit' => 5, 'window' => 60),  // 5 per minute
 		);
 		if (isset($rate_limits[$subaction])) {
 			$rl = $rate_limits[$subaction];
@@ -308,7 +329,7 @@ class SiteGuard_Backup_Admin {
 		}
 
 		// Enforce settings lock on all mutating commands except activejobs_list (read-only status check)
-		$read_only_commands = array('activejobs_list', 'get_existing_backups', 'get_log', 'get_settings', 'get_sysinfo', 'get_remotesites', 'get_migrator_keys', 'get_backup_contents', 'get_database_tables', 'get_audit_log');
+		$read_only_commands = array('activejobs_list', 'get_existing_backups', 'get_log', 'get_settings', 'get_sysinfo', 'get_remotesites', 'get_migrator_keys', 'get_backup_contents', 'get_database_tables', 'get_audit_log', 'failover_status', 'get_restore_presets', 'get_remotesend_schedule');
 		if (!in_array($subaction, $read_only_commands, true) && $this->is_settings_locked()) {
 			wp_send_json_error(array('message' => 'Settings are locked. Please unlock first.'));
 		}
@@ -362,6 +383,14 @@ class SiteGuard_Backup_Admin {
 			'toggle_audit_log',
 			'clear_audit_log',
 			'test_webhook',
+			'failover_status',
+			'failover_prefailover',
+			'failover_postfailover',
+			'save_restore_preset',
+			'get_restore_presets',
+			'delete_restore_preset',
+			'save_remotesend_schedule',
+			'get_remotesend_schedule',
 		);
 
 		if (!in_array($subaction, $allowed_commands, true)) {
@@ -814,6 +843,17 @@ class SiteGuard_Backup_Admin {
 			echo '</div>';
 		}
 
+		// Failover role badge
+		$failover_role = $opts->get_option('sgbackup_failover_role', 'standalone');
+		if ($failover_role !== 'standalone') {
+			$role_colors = array('production' => '#0073aa', 'standby' => '#826eb4');
+			$role_color = isset($role_colors[$failover_role]) ? $role_colors[$failover_role] : '#666';
+			echo '<p><strong>' . esc_html__('Failover Role:', 'siteguardbackup') . '</strong> ';
+			echo '<span style="display:inline-block;background:' . $role_color . ';color:#fff;padding:2px 8px;border-radius:3px;font-size:12px;">';
+			echo esc_html(ucfirst($failover_role));
+			echo '</span></p>';
+		}
+
 		echo '</div>';
 		$page_url = is_multisite() ? network_admin_url('admin.php?page=siteguardbackup') : admin_url('admin.php?page=siteguardbackup');
 		echo '<p style="margin-top:10px;"><a href="' . esc_url($page_url) . '" class="button">' . esc_html__('Open SiteGuard Backup', 'siteguardbackup') . '</a></p>';
@@ -856,6 +896,16 @@ class SiteGuard_Backup_Admin {
 			return current_user_can('manage_network_options');
 		}
 		return current_user_can('manage_options');
+	}
+
+	/**
+	 * Send Content-Security-Policy header on SiteGuard admin pages.
+	 */
+	public function maybe_send_csp_headers() {
+		$screen = get_current_screen();
+		if ($screen && strpos($screen->id, 'siteguardbackup') !== false && !headers_sent()) {
+			header("Content-Security-Policy: frame-ancestors 'self'");
+		}
 	}
 
 	/**

@@ -152,7 +152,7 @@ function sgbackup_check_schedule_missed() {
 	}
 
 	// Check each backup cron hook for overdue scheduling
-	$hooks = array('sgbackup_backup', 'sgbackup_backup_database', 'sgbackup_backup_incremental');
+	$hooks = array('sgbackup_backup', 'sgbackup_backup_database', 'sgbackup_backup_incremental', 'sgbackup_backup_remotesend');
 
 	foreach ($hooks as $hook) {
 		$event = wp_get_scheduled_event($hook);
@@ -188,6 +188,7 @@ function sgbackup_register_cron_hooks() {
 	add_action('sgbackup_backup_all', 'sgbackup_cron_backup_all');
 	add_action('sgbackup_backup_resume', 'sgbackup_cron_backup_resume', 10, 2);
 	add_action('sgbackup_backup_incremental', 'sgbackup_cron_backup_incremental');
+	add_action('sgbackup_backup_remotesend', 'sgbackup_cron_backup_remotesend');
 }
 
 function sgbackup_cron_backup_files() {
@@ -220,6 +221,37 @@ function sgbackup_cron_backup_incremental() {
 	SiteGuard_Backup::instance()->backup_incremental();
 }
 
+function sgbackup_cron_backup_remotesend() {
+	sgbackup_load_classes();
+	require_once SGBACKUP_DIR . 'class-siteguardbackup.php';
+
+	$opts = SiteGuard_Backup_Options::instance();
+	$destinations = $opts->get_option('sgbackup_remotesend_destinations', array());
+	if (empty($destinations)) return;
+
+	$entities = $opts->get_option('sgbackup_remotesend_entities', array());
+	$retain = intval($opts->get_option('sgbackup_remotesend_retain', 5));
+
+	// Build service array from destinations
+	$service = array();
+	foreach ($destinations as $site_id) {
+		$service[] = 'remotesend/' . intval($site_id);
+	}
+
+	$options = array(
+		'service' => $service,
+		'label'   => 'Scheduled remote send',
+	);
+	if (!empty($entities)) {
+		$options['entities'] = $entities;
+	}
+	if ($retain > 0) {
+		$options['retain'] = $retain;
+	}
+
+	SiteGuard_Backup::instance()->backup_all($options);
+}
+
 /**
  * Activation hook.
  */
@@ -238,6 +270,7 @@ function sgbackup_deactivate() {
 	wp_clear_scheduled_hook('sgbackup_backup_database');
 	wp_clear_scheduled_hook('sgbackup_backup_all');
 	wp_clear_scheduled_hook('sgbackup_backup_incremental');
+	wp_clear_scheduled_hook('sgbackup_backup_remotesend');
 	// Don't clear sgbackup_backup_resume - let running jobs finish
 }
 register_deactivation_hook(__FILE__, 'sgbackup_deactivate');

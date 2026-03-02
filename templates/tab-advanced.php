@@ -3,6 +3,42 @@ $opts = SiteGuard_Backup_Options::instance();
 ?>
 
 <div class="sgbackup-section">
+	<h2><?php esc_html_e('Failover', 'siteguardbackup'); ?></h2>
+	<p class="description"><?php esc_html_e('Enable Azure/Docker failover features. This adds a dedicated Failover tab for managing production/standby roles, pre-failover backups, and post-failover validation.', 'siteguardbackup'); ?></p>
+	<p>
+		<label>
+			<input type="checkbox" name="failover_enabled" id="sgbackup-failover-enabled" value="1" <?php checked($opts->get_option('sgbackup_failover_enabled', false)); ?> />
+			<?php esc_html_e('Enable Azure/Docker Failover features', 'siteguardbackup'); ?>
+		</label>
+	</p>
+</div>
+
+<div class="sgbackup-section">
+	<h2><?php esc_html_e('Security', 'siteguardbackup'); ?></h2>
+
+	<h3><?php esc_html_e('IP Allowlist', 'siteguardbackup'); ?></h3>
+	<p class="description"><?php esc_html_e('Restrict plugin admin access to specific IP addresses. One IP or CIDR range per line. Leave empty to allow all IPs. Your current IP must be included to prevent lockout.', 'siteguardbackup'); ?></p>
+	<?php
+	require_once SGBACKUP_DIR . 'includes/class-security.php';
+	$current_ip = SiteGuard_Backup_Security::get_client_ip();
+	?>
+	<p class="description"><?php printf(esc_html__('Your current IP: %s', 'siteguardbackup'), '<code>' . esc_html($current_ip) . '</code>'); ?></p>
+	<textarea name="ip_allowlist" id="sgbackup-ip-allowlist" rows="4" class="widefat" style="max-width:400px;font-family:monospace;" placeholder="192.168.1.0/24&#10;10.0.0.1"><?php echo esc_textarea($opts->get_option('sgbackup_ip_allowlist', '')); ?></textarea>
+
+	<h3 style="margin-top:20px;"><?php esc_html_e('Credential Encryption at Rest', 'siteguardbackup'); ?></h3>
+	<p class="description"><?php esc_html_e('Encrypt storage credentials (API keys, passwords, tokens) in the database using AES-256-GCM. Uses your WordPress AUTH_KEY for key derivation. Existing plaintext credentials will be encrypted when you enable this.', 'siteguardbackup'); ?></p>
+	<p>
+		<label>
+			<input type="checkbox" name="encrypt_credentials" id="sgbackup-encrypt-credentials" value="1" <?php checked($opts->get_option('sgbackup_encrypt_credentials', false)); ?> />
+			<?php esc_html_e('Encrypt storage credentials at rest', 'siteguardbackup'); ?>
+		</label>
+	</p>
+	<?php if (!function_exists('openssl_encrypt')): ?>
+		<p class="description" style="color:#dc3232;"><?php esc_html_e('Warning: OpenSSL extension is not available. Credential encryption will not function.', 'siteguardbackup'); ?></p>
+	<?php endif; ?>
+</div>
+
+<div class="sgbackup-section">
 	<h2><?php esc_html_e('System Information', 'siteguardbackup'); ?></h2>
 	<button type="button" class="button" id="sgbackup-sysinfo-btn"><?php esc_html_e('Show System Info', 'siteguardbackup'); ?></button>
 	<div id="sgbackup-sysinfo" style="display:none;margin-top:10px;">

@@ -54,6 +54,7 @@ abstract class SiteGuard_Backup_Module {
 
 	/**
 	 * Get method options from database.
+	 * Automatically decrypts credential fields when credential encryption is enabled.
 	 */
 	public function get_options() {
 		if (null !== $this->options) return $this->options;
@@ -69,6 +70,12 @@ abstract class SiteGuard_Backup_Module {
 				: $this->get_default_options();
 		} else {
 			$this->options = wp_parse_args($stored, $this->get_default_options());
+		}
+
+		// Transparently decrypt any encrypted credential fields
+		if ($opts->get_option('sgbackup_encrypt_credentials', false)) {
+			require_once SGBACKUP_DIR . 'includes/class-security.php';
+			$this->options = SiteGuard_Backup_Security::decrypt_method_options($this->method_id, $this->options);
 		}
 
 		return $this->options;

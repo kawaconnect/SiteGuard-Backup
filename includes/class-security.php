@@ -1,0 +1,330 @@
+<?php
+/**
+ * SiteGuard Backup - Security Hardening
+ *
+ * Provides credential encryption at rest (AES-256-GCM using AUTH_KEY)
+ * and IP allowlist enforcement with CIDR support.
+ */
+
+if (!defined('ABSPATH')) die('No direct access.');
+
+class SiteGuard_Backup_Security {
+
+	/** @var string Prefix for encrypted option values */
+	const ENCRYPTED_PREFIX = 'sgenc:';
+
+	/**
+	 * Credential field names per storage method that should be encrypted at rest.
+	 *
+	 * @var array
+	 */
+	private static $sensitive_fields = array(
+		's3'         => array('secret_key'),
+		's3generic'  => array('secret_key'),
+		'azure'      => array('key'),
+		'googledrive' => array('clientsecret', 'token', 'access_token', 'refresh_token'),
+		'dropbox'    => array('secret', 'token', 'access_token', 'refresh_token'),
+		'onedrive'   => array('clientsecret', 'token', 'access_token', 'refresh_token'),
+		'ftp'        => array('pass', 'key'),
+		'sftp'       => array('pass', 'key', 'private_key'),
+		'webdav'     => array('pass'),
+		'pcloud'     => array('pass', 'token', 'access_token'),
+		'gcs'        => array('clientsecret', 'token', 'access_token', 'refresh_token'),
+		'openstack'  => array('password', 'api_key'),
+	);
+
+	/**
+	 * Encrypt a plaintext value using AES-256-GCM.
+	 *
+	 * @param string $plaintext The value to encrypt.
+	 * @return string Encrypted value with sgenc: prefix, or original if encryption unavailable.
+	 */
+	public static function encrypt_option($plaintext) {
+		if (empty($plaintext) || !is_string($plaintext)) {
+			return $plaintext;
+		}
+
+		// Don't double-encrypt
+		if (strpos($plaintext, self::ENCRYPTED_PREFIX) === 0) {
+			return $plaintext;
+		}
+
+		if (!function_exists('openssl_encrypt') || !defined('AUTH_KEY')) {
+			return $plaintext;
+		}
+
+		$key = hash('sha256', AUTH_KEY . 'sgbackup_credential_encryption', true);
+		$iv = openssl_random_pseudo_bytes(12);
+		if (false === $iv) {
+			return $plaintext;
+		}
+
+		$tag = '';
+		$ciphertext = openssl_encrypt(
+			$plaintext,
+			'aes-256-gcm',
+			$key,
+			OPENSSL_RAW_DATA,
+			$iv,
+			$tag,
+			'',
+			16
+		);
+
+		if (false === $ciphertext) {
+			return $plaintext;
+		}
+
+		return self::ENCRYPTED_PREFIX . base64_encode($iv . $tag . $ciphertext);
+	}
+
+	/**
+	 * Decrypt a value encrypted with encrypt_option().
+	 *
+	 * @param string $encrypted The encrypted value (with sgenc: prefix).
+	 * @return string Decrypted plaintext, or original value if not encrypted or decryption fails.
+	 */
+	public static function decrypt_option($encrypted) {
+		if (empty($encrypted) || !is_string($encrypted)) {
+			return $encrypted;
+		}
+
+		// Passthrough if not encrypted
+		if (strpos($encrypted, self::ENCRYPTED_PREFIX) !== 0) {
+			return $encrypted;
+		}
+
+		if (!function_exists('openssl_decrypt') || !defined('AUTH_KEY')) {
+			return $encrypted;
+		}
+
+		$raw = base64_decode(substr($encrypted, strlen(self::ENCRYPTED_PREFIX)));
+		if (false === $raw || strlen($raw) < 28) { // 12 IV + 16 tag = 28 minimum
+			return $encrypted;
+		}
+
+		$key = hash('sha256', AUTH_KEY . 'sgbackup_credential_encryption', true);
+		$iv = substr($raw, 0, 12);
+		$tag = substr($raw, 12, 16);
+		$ciphertext = substr($raw, 28);
+
+		$plaintext = openssl_decrypt(
+			$ciphertext,
+			'aes-256-gcm',
+			$key,
+			OPENSSL_RAW_DATA,
+			$iv,
+			$tag
+		);
+
+		if (false === $plaintext) {
+			return $encrypted; // Decryption failed, return as-is
+		}
+
+		return $plaintext;
+	}
+
+	/**
+	 * Check if a value is encrypted.
+	 *
+	 * @param string $value The value to check.
+	 * @return bool
+	 */
+	public static function is_encrypted($value) {
+		return is_string($value) && strpos($value, self::ENCRYPTED_PREFIX) === 0;
+	}
+
+	/**
+	 * Get the list of sensitive field names for a storage method.
+	 *
+	 * @param string $method_id Storage method identifier.
+	 * @return array Field names to encrypt.
+	 */
+	public static function get_sensitive_fields($method_id) {
+		return isset(self::$sensitive_fields[$method_id]) ? self::$sensitive_fields[$method_id] : array();
+	}
+
+	/**
+	 * Encrypt sensitive fields in a storage method's options array.
+	 *
+	 * @param string $method_id Storage method identifier.
+	 * @param array  $options   Method options.
+	 * @return array Options with sensitive fields encrypted.
+	 */
+	public static function encrypt_method_options($method_id, $options) {
+		$fields = self::get_sensitive_fields($method_id);
+		if (empty($fields)) {
+			return $options;
+		}
+
+		foreach ($fields as $field) {
+			if (isset($options[$field]) && !empty($options[$field]) && !self::is_encrypted($options[$field])) {
+				$options[$field] = self::encrypt_option($options[$field]);
+			}
+		}
+
+		return $options;
+	}
+
+	/**
+	 * Decrypt sensitive fields in a storage method's options array.
+	 *
+	 * @param string $method_id Storage method identifier.
+	 * @param array  $options   Method options.
+	 * @return array Options with sensitive fields decrypted.
+	 */
+	public static function decrypt_method_options($method_id, $options) {
+		$fields = self::get_sensitive_fields($method_id);
+		if (empty($fields)) {
+			return $options;
+		}
+
+		foreach ($fields as $field) {
+			if (isset($options[$field]) && self::is_encrypted($options[$field])) {
+				$options[$field] = self::decrypt_option($options[$field]);
+			}
+		}
+
+		return $options;
+	}
+
+	/**
+	 * Check the client IP against the configured allowlist.
+	 *
+	 * @return bool True if IP is allowed (or no allowlist configured).
+	 */
+	public static function check_ip_allowlist() {
+		$opts = SiteGuard_Backup_Options::instance();
+		$allowlist_raw = $opts->get_option('sgbackup_ip_allowlist', '');
+
+		if (empty($allowlist_raw)) {
+			return true; // No allowlist = all IPs allowed
+		}
+
+		$entries = array_filter(array_map('trim', explode("\n", $allowlist_raw)));
+		if (empty($entries)) {
+			return true;
+		}
+
+		$client_ip = self::get_client_ip();
+		if (empty($client_ip)) {
+			return false; // Can't determine IP, deny
+		}
+
+		foreach ($entries as $entry) {
+			if (strpos($entry, '/') !== false) {
+				// CIDR notation
+				if (self::ip_in_cidr($client_ip, $entry)) {
+					return true;
+				}
+			} else {
+				// Exact match
+				if ($client_ip === $entry) {
+					return true;
+				}
+			}
+		}
+
+		return false;
+	}
+
+	/**
+	 * Get the client's real IP address, respecting Cloudflare proxy.
+	 *
+	 * @return string Client IP address.
+	 */
+	public static function get_client_ip() {
+		// Cloudflare: CF-Connecting-IP is the original client IP
+		if (!empty($_SERVER['HTTP_CF_CONNECTING_IP'])) {
+			return sanitize_text_field($_SERVER['HTTP_CF_CONNECTING_IP']);
+		}
+
+		if (!empty($_SERVER['REMOTE_ADDR'])) {
+			return sanitize_text_field($_SERVER['REMOTE_ADDR']);
+		}
+
+		return '';
+	}
+
+	/**
+	 * Check if an IP address is within a CIDR range.
+	 *
+	 * Supports both IPv4 and IPv6.
+	 *
+	 * @param string $ip   IP address to check.
+	 * @param string $cidr CIDR notation (e.g., '192.168.1.0/24').
+	 * @return bool
+	 */
+	public static function ip_in_cidr($ip, $cidr) {
+		$parts = explode('/', $cidr, 2);
+		if (count($parts) !== 2) {
+			return false;
+		}
+
+		list($subnet, $bits) = $parts;
+		$bits = intval($bits);
+
+		$ip_bin = inet_pton($ip);
+		$subnet_bin = inet_pton($subnet);
+
+		if (false === $ip_bin || false === $subnet_bin) {
+			return false;
+		}
+
+		// Ensure same address family
+		if (strlen($ip_bin) !== strlen($subnet_bin)) {
+			return false;
+		}
+
+		// Build netmask
+		$total_bits = strlen($ip_bin) * 8;
+		if ($bits < 0 || $bits > $total_bits) {
+			return false;
+		}
+
+		$mask = str_repeat("\xff", intval($bits / 8));
+		if ($bits % 8) {
+			$mask .= chr(0xff << (8 - ($bits % 8)));
+		}
+		$mask = str_pad($mask, strlen($ip_bin), "\x00");
+
+		return ($ip_bin & $mask) === ($subnet_bin & $mask);
+	}
+
+	/**
+	 * Validate that an IP allowlist includes the current user's IP.
+	 * Used to prevent self-lockout when saving settings.
+	 *
+	 * @param string $allowlist_text Newline-separated IP/CIDR entries.
+	 * @return bool True if current IP is included (or allowlist is empty).
+	 */
+	public static function validate_allowlist_includes_current_ip($allowlist_text) {
+		if (empty(trim($allowlist_text))) {
+			return true;
+		}
+
+		$entries = array_filter(array_map('trim', explode("\n", $allowlist_text)));
+		if (empty($entries)) {
+			return true;
+		}
+
+		$client_ip = self::get_client_ip();
+		if (empty($client_ip)) {
+			return false;
+		}
+
+		foreach ($entries as $entry) {
+			if (strpos($entry, '/') !== false) {
+				if (self::ip_in_cidr($client_ip, $entry)) {
+					return true;
+				}
+			} else {
+				if ($client_ip === $entry) {
+					return true;
+				}
+			}
+		}
+
+		return false;
+	}
+}

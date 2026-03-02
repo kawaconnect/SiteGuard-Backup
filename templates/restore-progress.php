@@ -1,6 +1,21 @@
 <?php if (!defined('ABSPATH')) die('No direct access.'); ?>
 <div id="sgbackup-restore-modal" title="<?php esc_attr_e('Restore Backup', 'siteguardbackup'); ?>" style="display:none;">
 	<div id="sgbackup-restore-options">
+		<!-- Restore Presets -->
+		<div id="sgbackup-restore-presets" style="margin-bottom:12px;padding:8px 12px;background:#f0f6fc;border:1px solid #c3c4c7;border-radius:3px;">
+			<label><strong><?php esc_html_e('Preset:', 'siteguardbackup'); ?></strong>
+				<select id="sgbackup-preset-select" style="margin-left:6px;">
+					<option value=""><?php esc_html_e('- None -', 'siteguardbackup'); ?></option>
+				</select>
+			</label>
+			<button type="button" class="button button-small" id="sgbackup-preset-save" style="margin-left:6px;">
+				<?php esc_html_e('Save As...', 'siteguardbackup'); ?>
+			</button>
+			<button type="button" class="button button-small" id="sgbackup-preset-delete" style="margin-left:4px;display:none;">
+				<?php esc_html_e('Delete', 'siteguardbackup'); ?>
+			</button>
+		</div>
+
 		<h3><?php esc_html_e('Select what to restore:', 'siteguardbackup'); ?></h3>
 		<p><label><input type="checkbox" name="sgbackup_restore_db" value="1" checked /> <?php esc_html_e('Database', 'siteguardbackup'); ?></label></p>
 		<p><label><input type="checkbox" name="sgbackup_restore_plugins" value="1" checked /> <?php esc_html_e('Plugins', 'siteguardbackup'); ?></label></p>

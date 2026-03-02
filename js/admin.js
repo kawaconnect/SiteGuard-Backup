@@ -6,12 +6,35 @@
 
 	var SGB = {
 		pollTimer: null,
+		lastKnownJobs: {},
 
 		// HTML escape utility to prevent XSS
 		esc: function(str) {
 			var div = document.createElement('div');
 			div.textContent = str;
 			return div.innerHTML;
+		},
+
+		/**
+		 * Show a WordPress-style admin notice.
+		 * @param {string} message - The notice text.
+		 * @param {string} type    - 'success', 'error', or 'warning'.
+		 */
+		showNotice: function(message, type) {
+			type = type || 'info';
+			var $container = $('#sgbackup-notices');
+			if (!$container.length) $container = $('#sgbackup-notices-migrate');
+			if (!$container.length) return;
+
+			var $notice = $('<div class="notice notice-' + type + ' is-dismissible"><p>' + this.esc(message) + '</p>' +
+				'<button type="button" class="notice-dismiss"><span class="screen-reader-text">Dismiss</span></button></div>');
+			$notice.find('.notice-dismiss').on('click', function() { $notice.fadeOut(200, function() { $(this).remove(); }); });
+			$container.append($notice);
+
+			// Auto-dismiss success notices after 8 seconds
+			if (type === 'success') {
+				setTimeout(function() { $notice.fadeOut(400, function() { $(this).remove(); }); }, 8000);
+			}
 		},
 
 		// Fallback copy using deprecated execCommand for older browsers
@@ -50,6 +73,9 @@
 			this.bindCronEvents();
 			this.bindExportImportSettings();
 			this.bindWebhook();
+			this.bindFailover();
+			this.bindRestorePresets();
+			this.bindRemoteSendSchedule();
 			this.pollActiveJobs();
 
 			$(window).on('beforeunload', function() {
@@ -259,9 +285,30 @@
 						$('#sgbackup-backup-status').text('').removeClass('success error');
 						clearInterval(self.pollTimer);
 						self.pollTimer = null;
+
+						// Check last known jobs for errors
+						var hadErrors = false;
+						$.each(self.lastKnownJobs, function(nonce, job) {
+							if (job.jobstatus === 'error' || job.jobstatus === 'failed' || job.jobstatus === 'aborted' || job.has_errors) {
+								hadErrors = true;
+								var errMsg = 'Backup job failed';
+								if (job.errors && job.errors.length) {
+									errMsg = job.errors[job.errors.length - 1];
+								} else if (job.last_log) {
+									errMsg = job.last_log;
+								}
+								self.showNotice(errMsg, 'error');
+							}
+						});
+
+						if (!hadErrors) {
+							self.showNotice('Backup complete!', 'success');
+						}
 						self.refreshBackupsList();
+						self.lastKnownJobs = {};
 						return;
 					}
+					self.lastKnownJobs = data;
 					self.renderActiveJobs(data);
 				}, function() {
 					// Silently ignore errors during polling
@@ -313,12 +360,18 @@
 					elapsed = mins > 0 ? (mins + 'm ' + secs + 's') : (secs + 's');
 				}
 
-				html += '<div class="sgbackup-job">';
+				html += '<div class="sgbackup-job' + (job.has_errors ? ' sgbackup-job-error' : '') + '">';
 				html += '<button type="button" class="sgbackup-abort-btn" data-nonce="' + SGB.esc(nonce) + '">Abort</button>';
 				html += '<div class="sgbackup-job-title">' + SGB.esc(job.job_type) + ' backup [' + SGB.esc(nonce) + ']</div>';
 				html += '<div class="sgbackup-job-phase">' + SGB.esc(job.phase || job.jobstatus) + (elapsed ? ' (' + elapsed + ')' : '') + '</div>';
+				if (job.last_log) {
+					html += '<div class="sgbackup-job-log">' + SGB.esc(job.last_log) + '</div>';
+				}
 				html += '<div class="sgbackup-job-steps">' + steps.join(' &rarr; ') + '</div>';
 				html += entityDetail;
+				if (job.has_errors && job.errors && job.errors.length) {
+					html += '<div class="sgbackup-job-error-msg">' + SGB.esc(job.errors[job.errors.length - 1]) + '</div>';
+				}
 				html += '</div>';
 			});
 			$('#sgbackup-active-jobs-list').html(html);
@@ -457,6 +510,24 @@
 							warnings.push('Security downgrade: HTTPS to HTTP. Data will be transmitted unencrypted.');
 						}
 					}
+
+					// Multisite blog mapping
+					if (data.multisite_blogs && data.multisite_blogs.length > 0) {
+						var oldHost = data.old_siteurl.replace(/https?:\/\//, '').replace(/\/.*/, '');
+						var newHost = data.current_siteurl.replace(/https?:\/\//, '').replace(/\/.*/, '');
+						html += '<tr><td><strong>Multisite blogs:</strong></td><td>' + data.multisite_blogs.length + ' sites</td></tr>';
+
+						var mapHtml = '<table class="widefat" style="margin-top:10px;"><thead><tr><th>Old Domain</th><th>New Domain</th></tr></thead><tbody>';
+						for (var b = 0; b < data.multisite_blogs.length; b++) {
+							var oldBlog = data.multisite_blogs[b];
+							var newBlog = oldBlog.replace(new RegExp(oldHost.replace(/\./g, '\\\\.'), 'g'), newHost);
+							mapHtml += '<tr><td>' + SGB.esc(oldBlog) + '</td><td>' + SGB.esc(newBlog) + '</td></tr>';
+						}
+						mapHtml += '</tbody></table>';
+						html += '<tr><td colspan="2">' + mapHtml + '</td></tr>';
+
+						warnings.push('This is a multisite migration. All ' + data.multisite_blogs.length + ' blog domains will be updated automatically.');
+					}
 				}
 
 				html += '</tbody></table>';
@@ -550,9 +621,25 @@
 							if (info.type === 'error') cls = 'restore-error';
 							if (info.type === 'warning') cls = 'restore-warning';
 							if (info.type === 'complete' && info.success) cls = 'restore-success';
-							$('#sgbackup-restore-log').append(
-								'<div class="' + cls + '">' + SGB.esc(info.message || '') + '</div>'
-							);
+
+							if (info.type === 'search_replace') {
+								var srHtml = '<div class="sgbackup-sr-report">';
+								srHtml += '<h4>Migration Search-Replace</h4>';
+								srHtml += '<p>' + SGB.esc(String(info.changes)) + ' changes across ' + SGB.esc(String(info.tables)) + ' tables</p>';
+								if (info.pairs) {
+									srHtml += '<ul>';
+									$.each(info.pairs, function(oldVal, newVal) {
+										srHtml += '<li>' + SGB.esc(oldVal) + ' &rarr; ' + SGB.esc(newVal) + '</li>';
+									});
+									srHtml += '</ul>';
+								}
+								srHtml += '</div>';
+								$('#sgbackup-restore-log').append(srHtml);
+							} else {
+								$('#sgbackup-restore-log').append(
+									'<div class="' + cls + '">' + SGB.esc(info.message || '') + '</div>'
+								);
+							}
 							$('#sgbackup-restore-log').scrollTop($('#sgbackup-restore-log')[0].scrollHeight);
 
 							if (info.type === 'complete') {
@@ -776,6 +863,17 @@
 				var params = {};
 				var $form = $('#sgbackup-settings-form');
 
+				// Also collect from Advanced and Failover tabs (outside settings form)
+				$('#tab-advanced, #tab-failover').find('input[name], select[name], textarea[name]').each(function() {
+					var name = $(this).attr('name');
+					if (!name) return;
+					if ($(this).is(':checkbox')) {
+						params[name] = $(this).is(':checked') ? 1 : 0;
+					} else {
+						params[name] = $(this).val();
+					}
+				});
+
 				// Collect standard form fields (skip instance fields which are handled separately)
 				$form.find('input, select, textarea').each(function() {
 					var name = $(this).attr('name');
@@ -941,17 +1039,40 @@
 									var fname = response.data ? response.data.filename : file.name;
 									var isSgBackup = /^backup_\d{4}-\d{2}-\d{2}-\d{4}_[^_]+_[a-zA-Z0-9]+/.test(fname);
 									if (!isSgBackup && fname) {
-										var doImport = confirm('This file does not match the SiteGuard Backup naming pattern.\n\nWould you like to import it as a foreign backup?');
-										if (doImport) {
-											self.ajax('import_foreign_backup', { file: fname }, function(importData) {
-												$('#sgbackup-upload-status').text('Imported as backup!').addClass('success');
-												$('#sgbackup-upload-input').val('');
-												setTimeout(function() { location.reload(); }, 1500);
-											}, function(msg) {
-												$('#sgbackup-upload-status').text('Import error: ' + msg).addClass('error');
-											});
-											return;
-										}
+										// Detect format first, then offer import
+										self.ajax('import_foreign_backup', { file: fname, detect_only: true }, function(detectData) {
+											var detections = detectData.detections || [];
+											var detected = detections.length > 0 && detections[0].detected;
+											var formatLabel = detected ? detections[0].label : 'Unknown';
+											var entities = detected && detections[0].entities ? detections[0].entities.join(', ') : '';
+											var msg = 'Detected format: ' + formatLabel;
+											if (entities) msg += ' (entities: ' + entities + ')';
+											msg += '\n\nWould you like to import it as a foreign backup?';
+											if (confirm(msg)) {
+												self.ajax('import_foreign_backup', { file: fname }, function(importData) {
+													var importMsg = 'Imported as ' + (importData.label || importData.format || 'backup') + '!';
+													$('#sgbackup-upload-status').text(importMsg).addClass('success');
+													$('#sgbackup-upload-input').val('');
+													setTimeout(function() { location.reload(); }, 1500);
+												}, function(importErr) {
+													$('#sgbackup-upload-status').text('Import error: ' + importErr).addClass('error');
+												});
+												return;
+											}
+										}, function() {
+											// Detection failed, fall back to basic prompt
+											if (confirm('This file does not match the SiteGuard Backup naming pattern.\n\nWould you like to import it as a foreign backup?')) {
+												self.ajax('import_foreign_backup', { file: fname }, function(importData) {
+													$('#sgbackup-upload-status').text('Imported as backup!').addClass('success');
+													$('#sgbackup-upload-input').val('');
+													setTimeout(function() { location.reload(); }, 1500);
+												}, function(importErr) {
+													$('#sgbackup-upload-status').text('Import error: ' + importErr).addClass('error');
+												});
+												return;
+											}
+										});
+										return;
 									}
 									$('#sgbackup-upload-status').text('Upload complete!').addClass('success');
 									$('#sgbackup-upload-input').val('');
@@ -1075,10 +1196,13 @@
 
 				$btn.prop('disabled', true).text('Cloning...');
 
-				self.ajax('clone_to_site', { site_id: siteId }, function(data) {
+				var cloneData = { site_id: siteId };
+				var label = $('#sgbackup-send-label').val();
+				if (label) cloneData.label = label;
+				self.ajax('clone_to_site', cloneData, function(data) {
 					$btn.prop('disabled', false).text('Clone to Site');
 					$('#sgbackup-send-status').text('Clone started! Job: ' + (data.nonce || '')).addClass('success');
-					self.pollActiveJobs();
+					self.startJobPolling();
 				}, function(msg) {
 					$btn.prop('disabled', false).text('Clone to Site');
 					alert('Clone error: ' + msg);
@@ -1112,19 +1236,27 @@
 
 				$('#sgbackup-send-status').text('Sending...').removeClass('success error');
 
+				var label = $('#sgbackup-send-label').val();
+
 				if (sendType === 'existing') {
 					var timestamp = $('#sgbackup-send-existing-select').val();
 					if (!timestamp) {
 						$('#sgbackup-send-status').text('Select a backup first').addClass('error');
 						return;
 					}
-					self.ajax('migrate_send', { site_id: siteId, timestamp: timestamp }, function(data) {
+					var sendData = { site_id: siteId, timestamp: timestamp };
+					if (label) sendData.label = label;
+					self.ajax('migrate_send', sendData, function(data) {
 						$('#sgbackup-send-status').text('Send started! Job: ' + data.nonce).addClass('success');
+						self.startJobPolling();
 					});
 				} else {
 					// Create new backup and send
-					self.ajax('backupnow', { service: ['remotesend/' + siteId] }, function(data) {
+					var newData = { service: ['remotesend/' + siteId] };
+					if (label) newData.label = label;
+					self.ajax('backupnow', newData, function(data) {
 						$('#sgbackup-send-status').text('Backup + send started! Job: ' + data.nonce).addClass('success');
+						self.startJobPolling();
 					});
 				}
 			});
@@ -1969,6 +2101,296 @@
 			var i = Math.floor(Math.log(bytes) / Math.log(1024));
 			if (i >= units.length) i = units.length - 1;
 			return (bytes / Math.pow(1024, i)).toFixed(i > 0 ? 2 : 0) + ' ' + units[i];
+		},
+
+		// ===== Phase 4: Failover UI =====
+		bindFailover: function() {
+			var self = this;
+
+			// Role dropdown: show/hide production URL field
+			$('#sgbackup-failover-role').on('change', function() {
+				$('#sgbackup-failover-production-url-row').toggle($(this).val() === 'standby');
+			});
+
+			// Status check
+			$('#sgbackup-failover-status-btn').on('click', function() {
+				var $btn = $(this);
+				var $spinner = $('#sgbackup-failover-status-spinner');
+				$btn.prop('disabled', true);
+				$spinner.text('Checking...');
+
+				self.ajax('failover_status', {}, function(data) {
+					$btn.prop('disabled', false);
+					$spinner.text('');
+					$('#sgbackup-failover-status-result').show();
+					var $tbody = $('#sgbackup-failover-status-table tbody').empty();
+
+					var rows = [];
+					if (data.environment) {
+						rows.push(['Docker', data.environment.is_docker ? '<span class="sgbackup-failover-status-ok">Yes</span>' : 'No']);
+						rows.push(['Azure', data.environment.is_azure ? '<span class="sgbackup-failover-status-ok">Yes</span>' : 'No']);
+						rows.push(['Multisite', data.environment.is_multisite ? '<span class="sgbackup-failover-status-ok">Yes</span>' : 'No']);
+						rows.push(['Cloudflare Scripts', data.environment.has_cf_scripts ? '<span class="sgbackup-failover-status-ok">Found</span>' : 'Not found']);
+					}
+					rows.push(['Role', self.esc(data.role || 'standalone')]);
+					if (data.backup) {
+						var ageClass = '';
+						if (data.backup.age_seconds !== null) {
+							if (data.backup.age_seconds > 86400 * 7) ageClass = 'sgbackup-failover-status-error';
+							else if (data.backup.age_seconds > 86400 * 2) ageClass = 'sgbackup-failover-status-warn';
+							else ageClass = 'sgbackup-failover-status-ok';
+						}
+						rows.push(['Last Backup', data.backup.has_backup
+							? '<span class="' + ageClass + '">' + self.esc(data.backup.age_human) + '</span> (' + self.esc(data.backup.last_backup) + ' UTC)'
+							: '<span class="sgbackup-failover-status-error">Never</span>'
+						]);
+					}
+					rows.push(['Database', data.db_ok ? '<span class="sgbackup-failover-status-ok">Connected</span>' : '<span class="sgbackup-failover-status-error">Error</span>']);
+					if (data.disk) {
+						var freePct = data.disk.total > 0 ? Math.round((data.disk.free / data.disk.total) * 100) : 0;
+						var diskClass = freePct < 5 ? 'sgbackup-failover-status-error' : (freePct < 15 ? 'sgbackup-failover-status-warn' : 'sgbackup-failover-status-ok');
+						rows.push(['Disk Space', self.formatBytes(data.disk.free) + ' free <span class="' + diskClass + '">(' + freePct + '%)</span>']);
+					}
+					if (data.dns && data.dns.host) {
+						var dnsText = self.esc(data.dns.host) + ': ';
+						if (data.dns.a_records && data.dns.a_records.length) {
+							dnsText += 'A=' + data.dns.a_records.map(function(ip) { return self.esc(ip); }).join(', ');
+						}
+						if (data.dns.cname_records && data.dns.cname_records.length) {
+							dnsText += ' CNAME=' + data.dns.cname_records.map(function(c) { return self.esc(c); }).join(', ');
+						}
+						rows.push(['DNS', dnsText]);
+					}
+
+					for (var i = 0; i < rows.length; i++) {
+						$tbody.append('<tr><td>' + self.esc(rows[i][0]) + '</td><td>' + rows[i][1] + '</td></tr>');
+					}
+				}, function(msg) {
+					$btn.prop('disabled', false);
+					$spinner.text('Error: ' + msg);
+				});
+			});
+
+			// Pre-failover backup
+			$('#sgbackup-failover-prefailover-btn').on('click', function() {
+				if (!confirm('This will create a database-only backup. Continue?')) return;
+
+				var $btn = $(this);
+				var $status = $('#sgbackup-failover-prefailover-status');
+				$btn.prop('disabled', true);
+				$status.text('Running backup...');
+
+				self.ajax('failover_prefailover', {}, function(data) {
+					$btn.prop('disabled', false);
+					$status.text(data.message || 'Complete').addClass('success');
+					if (data.db_files && data.db_files.length) {
+						$('#sgbackup-failover-action-result').show();
+						$('#sgbackup-failover-action-output').text('DB files: ' + data.db_files.join(', '));
+					}
+				}, function(msg) {
+					$btn.prop('disabled', false);
+					$status.text('Error: ' + msg).addClass('error');
+				});
+			});
+
+			// Post-failover cleanup
+			$('#sgbackup-failover-postfailover-btn').on('click', function() {
+				if (!confirm('This will flush all caches and verify the system. Continue?')) return;
+				if (!confirm('Are you sure? This clears transients, object cache, and rewrite rules.')) return;
+
+				var $btn = $(this);
+				var $status = $('#sgbackup-failover-postfailover-status');
+				$btn.prop('disabled', true);
+				$status.text('Running cleanup...');
+
+				self.ajax('failover_postfailover', {}, function(data) {
+					$btn.prop('disabled', false);
+					$status.text(data.message || 'Complete').addClass('success');
+					$('#sgbackup-failover-action-result').show();
+					$('#sgbackup-failover-action-output').text(JSON.stringify(data.results || {}, null, 2));
+				}, function(msg) {
+					$btn.prop('disabled', false);
+					$status.text('Error: ' + msg).addClass('error');
+				});
+			});
+
+			// Healthcheck (reuses failover_status)
+			$('#sgbackup-failover-healthcheck-btn').on('click', function() {
+				var $btn = $(this);
+				var $status = $('#sgbackup-failover-healthcheck-status');
+				$btn.prop('disabled', true);
+				$status.text('Running...');
+
+				self.ajax('failover_status', {}, function(data) {
+					$btn.prop('disabled', false);
+					$status.text('Complete').addClass('success');
+					$('#sgbackup-failover-action-result').show();
+					$('#sgbackup-failover-action-output').text(JSON.stringify(data, null, 2));
+				}, function(msg) {
+					$btn.prop('disabled', false);
+					$status.text('Error: ' + msg).addClass('error');
+				});
+			});
+		},
+
+		// ===== Restore Presets =====
+		loadRestorePresets: function(callback) {
+			var self = this;
+			self.ajax('get_restore_presets', {}, function(presets) {
+				var $sel = $('#sgbackup-preset-select');
+				$sel.find('option:not(:first)').remove();
+				if (presets && typeof presets === 'object') {
+					var keys = Object.keys(presets);
+					for (var i = 0; i < keys.length; i++) {
+						var id = keys[i];
+						$sel.append('<option value="' + self.esc(id) + '">' + self.esc(presets[id].name) + '</option>');
+					}
+				}
+				if (callback) callback(presets);
+			});
+		},
+
+		bindRestorePresets: function() {
+			var self = this;
+			var presetCache = {};
+
+			// Load presets when restore modal opens
+			$(document).on('click', '.sgbackup-restore-btn', function() {
+				self.loadRestorePresets(function(presets) { presetCache = presets || {}; });
+			});
+
+			// Apply preset on select change
+			$('#sgbackup-preset-select').on('change', function() {
+				var id = $(this).val();
+				$('#sgbackup-preset-delete').toggle(!!id);
+				if (!id || !presetCache[id]) return;
+
+				var opts = presetCache[id].restore_options || {};
+				$('input[name="sgbackup_restore_db"]').prop('checked', !!opts.db);
+				$('input[name="sgbackup_restore_plugins"]').prop('checked', !!opts.plugins);
+				$('input[name="sgbackup_restore_themes"]').prop('checked', !!opts.themes);
+				$('input[name="sgbackup_restore_uploads"]').prop('checked', !!opts.uploads);
+				$('input[name="sgbackup_restore_others"]').prop('checked', !!opts.others);
+				$('input[name="sgbackup_restore_wpcore"]').prop('checked', !!opts.wpcore);
+				$('select[name="sgbackup_move_in_mode"]').val(opts.move_in_mode || 0);
+				$('input[name="sgbackup_restore_pre_backup"]').prop('checked', opts.pre_restore_backup !== false);
+				$('input[name="sgbackup_include_unspecified_tables"]').prop('checked', opts.include_unspecified_tables !== false);
+				$('input[name="sgbackup_include_unspecified_plugins"]').prop('checked', opts.include_unspecified_plugins !== false);
+				$('input[name="sgbackup_include_unspecified_themes"]').prop('checked', opts.include_unspecified_themes !== false);
+			});
+
+			// Save preset
+			$('#sgbackup-preset-save').on('click', function() {
+				var name = prompt('Preset name:');
+				if (!name) return;
+
+				var params = {
+					name: name,
+					db: $('input[name="sgbackup_restore_db"]').is(':checked'),
+					plugins: $('input[name="sgbackup_restore_plugins"]').is(':checked'),
+					themes: $('input[name="sgbackup_restore_themes"]').is(':checked'),
+					uploads: $('input[name="sgbackup_restore_uploads"]').is(':checked'),
+					others: $('input[name="sgbackup_restore_others"]').is(':checked'),
+					wpcore: $('input[name="sgbackup_restore_wpcore"]').is(':checked'),
+					move_in_mode: $('select[name="sgbackup_move_in_mode"]').val(),
+					pre_restore_backup: $('input[name="sgbackup_restore_pre_backup"]').is(':checked'),
+					include_unspecified_tables: $('input[name="sgbackup_include_unspecified_tables"]').is(':checked'),
+					include_unspecified_plugins: $('input[name="sgbackup_include_unspecified_plugins"]').is(':checked'),
+					include_unspecified_themes: $('input[name="sgbackup_include_unspecified_themes"]').is(':checked')
+				};
+
+				self.ajax('save_restore_preset', params, function(data) {
+					presetCache = data.presets || {};
+					self.loadRestorePresets(function(p) { presetCache = p || {}; });
+					self.showNotice('Preset saved: ' + name, 'success');
+				});
+			});
+
+			// Delete preset
+			$('#sgbackup-preset-delete').on('click', function() {
+				var id = $('#sgbackup-preset-select').val();
+				if (!id) return;
+				if (!confirm('Delete this preset?')) return;
+
+				self.ajax('delete_restore_preset', { preset_id: id }, function(data) {
+					presetCache = data.presets || {};
+					self.loadRestorePresets(function(p) { presetCache = p || {}; });
+					$('#sgbackup-preset-delete').hide();
+					self.showNotice('Preset deleted.', 'success');
+				});
+			});
+		},
+
+		// ===== Scheduled Remote Send =====
+		bindRemoteSendSchedule: function() {
+			var self = this;
+
+			// Load existing schedule on page load
+			self.ajax('get_remotesend_schedule', {}, function(data) {
+				if (!data) return;
+				$('#sgbackup-remotesend-interval').val(data.interval || 'manual');
+				$('#sgbackup-remotesend-retain').val(data.retain || 5);
+
+				// Check destination boxes
+				if (data.destinations && data.destinations.length) {
+					for (var i = 0; i < data.destinations.length; i++) {
+						$('input[name="sgbackup_remotesend_dest[]"][value="' + data.destinations[i] + '"]').prop('checked', true);
+					}
+				}
+
+				// Check entity boxes
+				if (data.entities && data.entities.length) {
+					for (var j = 0; j < data.entities.length; j++) {
+						$('input[name="sgbackup_remotesend_entity[]"][value="' + data.entities[j] + '"]').prop('checked', true);
+					}
+				}
+
+				// Show next scheduled time
+				if (data.next) {
+					var d = new Date(data.next * 1000);
+					$('#sgbackup-remotesend-next').text('Next: ' + d.toUTCString());
+				}
+			});
+
+			// Save schedule
+			$('#sgbackup-save-remotesend-schedule').on('click', function() {
+				var destinations = [];
+				$('input[name="sgbackup_remotesend_dest[]"]:checked').each(function() {
+					destinations.push($(this).val());
+				});
+
+				var entities = [];
+				$('input[name="sgbackup_remotesend_entity[]"]:checked').each(function() {
+					entities.push($(this).val());
+				});
+
+				var params = {
+					interval: $('#sgbackup-remotesend-interval').val(),
+					destinations: destinations,
+					entities: entities,
+					retain: $('#sgbackup-remotesend-retain').val()
+				};
+
+				var $status = $('#sgbackup-remotesend-schedule-status');
+				$status.text('Saving...').removeClass('success error');
+
+				self.ajax('save_remotesend_schedule', params, function(data) {
+					$status.text('Saved!').addClass('success');
+					setTimeout(function() { $status.text(''); }, 3000);
+
+					// Update next display
+					self.ajax('get_remotesend_schedule', {}, function(sched) {
+						if (sched && sched.next) {
+							var d = new Date(sched.next * 1000);
+							$('#sgbackup-remotesend-next').text('Next: ' + d.toUTCString());
+						} else {
+							$('#sgbackup-remotesend-next').text('');
+						}
+					});
+				}, function(msg) {
+					$status.text('Error: ' + msg).addClass('error');
+				});
+			});
 		}
 	};
 

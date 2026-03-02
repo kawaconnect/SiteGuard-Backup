@@ -4,6 +4,8 @@ $schedule = $sgbackup->get_schedule_info();
 $opts = SiteGuard_Backup_Options::instance();
 ?>
 
+<div id="sgbackup-notices" class="sgbackup-notices"></div>
+
 <div class="sgbackup-section">
 	<h2><?php esc_html_e('Next Scheduled Backups', 'siteguardbackup'); ?></h2>
 	<table class="widefat sgbackup-schedule-table">

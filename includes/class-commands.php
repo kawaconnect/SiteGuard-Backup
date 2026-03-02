@@ -165,6 +165,9 @@ class SiteGuard_Backup_Commands {
 				}
 			}
 
+			// Collect error messages from jobdata
+			$job_errors = isset($jobdata['errors']) ? (array) $jobdata['errors'] : array();
+
 			$result[$nonce] = array(
 				'resumption'  => $job_info['resumption'],
 				'next'        => $job_info['next_scheduled'],
@@ -184,6 +187,8 @@ class SiteGuard_Backup_Commands {
 				'files_total_count' => isset($jobdata['files_total_count']) ? $jobdata['files_total_count'] : 0,
 				'db_tables_done'  => isset($jobdata['db_tables_done']) ? $jobdata['db_tables_done'] : 0,
 				'db_tables_total' => isset($jobdata['db_tables_total']) ? $jobdata['db_tables_total'] : 0,
+				'errors'      => $job_errors,
+				'has_errors'  => !empty($job_errors),
 			);
 		}
 
@@ -373,6 +378,11 @@ class SiteGuard_Backup_Commands {
 			'zip_nocompress',
 			'webhook_url',
 			'webhook_events',
+			'ip_allowlist',
+			'encrypt_credentials',
+			'failover_enabled',
+			'failover_role',
+			'failover_production_url',
 		);
 
 		// H5: Handle password protection settings specially before the main loop
@@ -479,6 +489,53 @@ class SiteGuard_Backup_Commands {
 			unset($params['webhook_events']);
 		}
 
+		// IP allowlist: validate current IP is included to prevent self-lockout
+		if (isset($params['ip_allowlist']) && !empty(trim($params['ip_allowlist']))) {
+			require_once SGBACKUP_DIR . 'includes/class-security.php';
+			if (!SiteGuard_Backup_Security::validate_allowlist_includes_current_ip($params['ip_allowlist'])) {
+				return new WP_Error('lockout_prevention', 'Your current IP (' . SiteGuard_Backup_Security::get_client_ip() . ') is not in the allowlist. Add it to prevent locking yourself out.');
+			}
+		}
+
+		// Failover role: validate against known roles
+		if (isset($params['failover_role'])) {
+			$valid_roles = array('standalone', 'production', 'standby');
+			if (!in_array($params['failover_role'], $valid_roles, true)) {
+				$params['failover_role'] = 'standalone';
+			}
+		}
+
+		// Failover production URL: sanitize as URL
+		if (isset($params['failover_production_url'])) {
+			$params['failover_production_url'] = esc_url_raw(trim($params['failover_production_url']), array('https', 'http'));
+		}
+
+		// Handle credential encryption toggle: migrate existing credentials when first enabled
+		if (isset($params['encrypt_credentials']) && intval($params['encrypt_credentials'])) {
+			$was_enabled = $opts->get_option('sgbackup_encrypt_credentials', false);
+			if (!$was_enabled) {
+				require_once SGBACKUP_DIR . 'includes/class-security.php';
+				// Encrypt existing plaintext credentials for all storage methods
+				foreach (self::$valid_methods as $method_id) {
+					$stored = $opts->get_option('sgbackup_' . $method_id, array());
+					if (empty($stored) || !isset($stored['settings'])) continue;
+					$changed = false;
+					foreach ($stored['settings'] as $instance_id => &$instance_settings) {
+						if (!is_array($instance_settings)) continue;
+						$encrypted = SiteGuard_Backup_Security::encrypt_method_options($method_id, $instance_settings);
+						if ($encrypted !== $instance_settings) {
+							$instance_settings = $encrypted;
+							$changed = true;
+						}
+					}
+					unset($instance_settings);
+					if ($changed) {
+						$opts->update_option('sgbackup_' . $method_id, $stored);
+					}
+				}
+			}
+		}
+
 		// Checkbox arrays: default to empty when absent from POST (unchecked = not submitted)
 		if (!isset($params['include_entities'])) {
 			$params['include_entities'] = array();
@@ -497,11 +554,13 @@ class SiteGuard_Backup_Commands {
 			if ($key === 'encryption_key') continue;
 			// webhook_url and webhook_events are handled above
 			if ($key === 'webhook_url' || $key === 'webhook_events') continue;
+			// failover_role and failover_production_url are sanitized above
+			if ($key === 'failover_role' || $key === 'failover_production_url') continue;
 
 			if (isset($params[$key])) {
 				$value = $params[$key];
 				// Sanitize
-				if (in_array($key, array('retain', 'retain_db', 'split_every', 'max_split', 'delete_local', 'debug_mode', 'encryption_enabled', 'syslog_enabled', 'lock_admin', 'lock_admin_session_length', 'backupdb_nonwp', 'db_anonymise', 'max_incrementals_before_full', 'ssl_disableverify', 'ssl_useservercerts', 'auto_update'))) {
+				if (in_array($key, array('retain', 'retain_db', 'split_every', 'max_split', 'delete_local', 'debug_mode', 'encryption_enabled', 'syslog_enabled', 'lock_admin', 'lock_admin_session_length', 'backupdb_nonwp', 'db_anonymise', 'max_incrementals_before_full', 'ssl_disableverify', 'ssl_useservercerts', 'auto_update', 'encrypt_credentials', 'failover_enabled'))) {
 					$value = intval($value);
 				} elseif ($key === 'email') {
 					$value = sanitize_email($value);
@@ -534,6 +593,26 @@ class SiteGuard_Backup_Commands {
 					}
 					if (!is_array($value)) $value = array();
 					$value = array_map('sanitize_text_field', $value);
+				} elseif ($key === 'ip_allowlist') {
+					// Preserve newlines for textarea (one IP/CIDR per line)
+					if (is_string($value)) {
+						$lines = array_filter(array_map('trim', explode("\n", $value)));
+						// Validate each line is a valid IP or CIDR
+						$valid_lines = array();
+						foreach ($lines as $line) {
+							$line = sanitize_text_field($line);
+							if (filter_var($line, FILTER_VALIDATE_IP)) {
+								$valid_lines[] = $line;
+							} elseif (preg_match('#^[0-9a-f.:]+/\d{1,3}$#i', $line)) {
+								// CIDR notation
+								$parts = explode('/', $line, 2);
+								if (filter_var($parts[0], FILTER_VALIDATE_IP) && intval($parts[1]) >= 0 && intval($parts[1]) <= 128) {
+									$valid_lines[] = $line;
+								}
+							}
+						}
+						$value = implode("\n", $valid_lines);
+					}
 				} elseif (is_string($value)) {
 					$value = sanitize_text_field($value);
 				}
@@ -584,12 +663,21 @@ class SiteGuard_Backup_Commands {
 						$instance_id = sanitize_text_field($instance_id);
 						if (!is_array($instance_settings)) continue;
 						array_walk($instance_settings, $sanitize_method_value);
+						// Encrypt credentials at rest if enabled
+						if ($opts->get_option('sgbackup_encrypt_credentials', false)) {
+							require_once SGBACKUP_DIR . 'includes/class-security.php';
+							$instance_settings = SiteGuard_Backup_Security::encrypt_method_options($method, $instance_settings);
+						}
 						$stored['settings'][$instance_id] = $instance_settings;
 					}
 					$opts->update_option('sgbackup_' . $method, $stored);
 				} else {
 					// Legacy flat format
 					array_walk($method_data, $sanitize_method_value);
+					if ($opts->get_option('sgbackup_encrypt_credentials', false)) {
+						require_once SGBACKUP_DIR . 'includes/class-security.php';
+						$method_data = SiteGuard_Backup_Security::encrypt_method_options($method, $method_data);
+					}
 					$opts->update_option('sgbackup_' . $method, $method_data);
 				}
 			}
@@ -860,6 +948,10 @@ class SiteGuard_Backup_Commands {
 			),
 		);
 
+		if (!empty($params['label'])) {
+			$options['label'] = sanitize_text_field(substr($params['label'], 0, 40));
+		}
+
 		$sgbackup->backup_all($options);
 
 		$nonce = $sgbackup->nonce;
@@ -950,9 +1042,12 @@ class SiteGuard_Backup_Commands {
 
 		// Start a full backup (all entities + DB) with remotesend as the service
 		$sgbackup = SiteGuard_Backup::instance();
+		$label = !empty($params['label'])
+			? sanitize_text_field(substr($params['label'], 0, 40))
+			: 'Migration clone ' . gmdate('Y-m-d H:i');
 		$options = array(
 			'service' => array("remotesend/{$site_id}"),
-			'label'   => 'Migration clone ' . gmdate('Y-m-d H:i'),
+			'label'   => $label,
 		);
 		$sgbackup->backup_all($options);
 
@@ -1244,6 +1339,8 @@ class SiteGuard_Backup_Commands {
 				if (!$fh) continue;
 
 				$lines = 0;
+				$in_blogs_insert = false;
+				$multisite_blogs = array();
 				while (!($is_gz ? gzeof($fh) : feof($fh)) && $lines < 50000) {
 					$line = $is_gz ? gzgets($fh) : fgets($fh);
 					if (false === $line) break;
@@ -1251,15 +1348,42 @@ class SiteGuard_Backup_Commands {
 
 					if (preg_match('/^CREATE TABLE\s+`([^`]+)`/i', trim($line), $m)) {
 						$result['tables'][] = $m[1];
+						$in_blogs_insert = false;
 					}
 
 					// Gap 24: Detect old siteurl from the SQL for migration detection
 					if (empty($result['old_siteurl']) && preg_match("/INSERT INTO\s+`[^`]*options`.*'siteurl'\s*,\s*'([^']+)'/i", $line, $url_m)) {
 						$result['old_siteurl'] = $url_m[1];
 					}
+
+					// Detect multisite blog domains from wp_blogs INSERT statements.
+					// Handles both single-line (mysqldump) and multi-line (PHP dump) formats
+					// by tracking state until the statement-ending semicolon.
+					if (preg_match("/INSERT INTO\s+`[^`]*_?blogs`/i", $line)) {
+						$in_blogs_insert = true;
+					}
+					if ($in_blogs_insert) {
+						if (preg_match_all("/'([a-zA-Z0-9._-]+\.[a-zA-Z]{2,})'/", $line, $domain_matches)) {
+							foreach ($domain_matches[1] as $d) {
+								$multisite_blogs[] = $d;
+							}
+						}
+						// End of INSERT statement
+						if (strpos($line, ';') !== false) {
+							$in_blogs_insert = false;
+						}
+					}
 				}
 				$is_gz ? @gzclose($fh) : @fclose($fh);
+
+				if (!empty($multisite_blogs)) {
+					if (!isset($result['multisite_blogs'])) $result['multisite_blogs'] = array();
+					$result['multisite_blogs'] = array_merge($result['multisite_blogs'], $multisite_blogs);
+				}
 			}
+		}
+		if (!empty($result['multisite_blogs'])) {
+			$result['multisite_blogs'] = array_values(array_unique($result['multisite_blogs']));
 		}
 
 		// M8: Add multisite blog grouping for tables
@@ -1539,89 +1663,65 @@ class SiteGuard_Backup_Commands {
 	/**
 	 * L7: Import a foreign (non-SiteGuard) backup file into the backup history.
 	 *
-	 * Accepts SQL dumps (.sql, .gz) and ZIP files. ZIP contents are inspected
-	 * to determine whether the archive is a database or file backup.
+	 * Supports 7+ plugin formats: UpdraftPlus, BackWPUp, BackupWordPress,
+	 * Simple Backups, InfiniteWP, WP-DB-Backup, and generic SQL/ZIP.
 	 *
-	 * @param array $params Must contain 'file' key with the filename in the backup directory.
-	 * @return array|WP_Error Result with success status and timestamp.
+	 * @param array $params 'file' (string or array of filenames), optional 'detect_only' (bool).
+	 * @return array|WP_Error Result with success status, timestamp, and detected format.
 	 */
 	public function import_foreign_backup($params) {
 		if (empty($params['file'])) {
 			return new WP_Error('missing_param', 'Missing file parameter');
 		}
 
-		$file = sanitize_file_name($params['file']);
+		require_once SGBACKUP_DIR . 'includes/class-foreign-importer.php';
+
 		$opts = SiteGuard_Backup_Options::instance();
 		$backup_dir = $opts->get_backup_dir();
-		$path = $backup_dir . $file;
-
-		if (!file_exists($path)) {
-			return new WP_Error('not_found', 'File not found in backup directory');
-		}
-
-		// Verify the file is in the backup directory (prevent directory traversal)
-		$real_path = realpath($path);
 		$real_dir = realpath($backup_dir);
-		if ($real_path === false || strpos($real_path, $real_dir) !== 0) {
-			return new WP_Error('invalid_path', 'Invalid file path');
+
+		// Support single file or array of files
+		$files = is_array($params['file']) ? $params['file'] : array($params['file']);
+		$filepaths = array();
+
+		foreach ($files as $file) {
+			$file = sanitize_file_name($file);
+			$path = $backup_dir . $file;
+
+			if (!file_exists($path)) {
+				return new WP_Error('not_found', 'File not found in backup directory: ' . $file);
+			}
+
+			$real_path = realpath($path);
+			if ($real_path === false || strpos($real_path, $real_dir) !== 0) {
+				return new WP_Error('invalid_path', 'Invalid file path');
+			}
+
+			$filepaths[] = $real_path;
 		}
 
-		$ext = strtolower(pathinfo($file, PATHINFO_EXTENSION));
-		$timestamp = time();
-		$nonce = substr(wp_generate_password(12, false), 0, 12);
-
-		// Build backup data
-		$backup_data = array(
-			'nonce'    => $nonce,
-			'service'  => array('none'),
-			'imported' => true,
-		);
-
-		$new_name = '';
-
-		if (in_array($ext, array('sql', 'gz'), true)) {
-			// SQL dump - register as DB backup
-			$new_name = 'backup_' . gmdate('Y-m-d-Hi') . '_imported_' . $nonce . '-db.' . $ext;
-			if (!rename($path, $backup_dir . $new_name)) {
-				return new WP_Error('rename_failed', 'Failed to rename file');
+		// Detect-only mode: return format info without importing
+		if (!empty($params['detect_only'])) {
+			$detections = array();
+			foreach ($filepaths as $fp) {
+				$detection = SiteGuard_Backup_Foreign_Importer::detect($fp);
+				$detections[] = array(
+					'file'     => basename($fp),
+					'detected' => $detection !== false,
+					'format'   => $detection ? $detection['format'] : null,
+					'label'    => $detection ? $detection['label'] : null,
+					'entities' => $detection ? $detection['entities'] : array(),
+				);
 			}
-			$backup_data['db'] = array($new_name);
-		} elseif ($ext === 'zip') {
-			// ZIP - try to detect contents (check for SQL files inside = db, otherwise = files)
-			$entity = 'others';
-			if (class_exists('ZipArchive')) {
-				$zip = new ZipArchive();
-				if ($zip->open($path) === true) {
-					$has_sql = false;
-					for ($i = 0; $i < $zip->numFiles; $i++) {
-						if (preg_match('/\.sql(\.gz)?$/', $zip->getNameIndex($i))) {
-							$has_sql = true;
-							break;
-						}
-					}
-					$zip->close();
-					if ($has_sql) {
-						$entity = 'db';
-					}
-				}
-			}
-			$new_name = 'backup_' . gmdate('Y-m-d-Hi') . '_imported_' . $nonce . '-' . $entity . '.zip';
-			if (!rename($path, $backup_dir . $new_name)) {
-				return new WP_Error('rename_failed', 'Failed to rename file');
-			}
-			$backup_data[$entity] = array($new_name);
-		} else {
-			return new WP_Error('unsupported_type', 'Unsupported file type: ' . $ext);
+			return array('success' => true, 'detections' => $detections);
 		}
 
-		$backup_data['size'] = filesize($backup_dir . $new_name);
-		SiteGuard_Backup_History::add_backup($timestamp, $backup_data);
+		// Import
+		if (count($filepaths) === 1) {
+			return SiteGuard_Backup_Foreign_Importer::import($filepaths[0]);
+		}
 
-		return array(
-			'success'   => true,
-			'timestamp' => $timestamp,
-			'filename'  => $new_name,
-		);
+		return SiteGuard_Backup_Foreign_Importer::import_set($filepaths);
 	}
 
 	/**
@@ -2239,5 +2339,342 @@ class SiteGuard_Backup_Commands {
 		}
 
 		return SiteGuard_Backup_Webhook::send_test($url);
+	}
+
+	// ===== Phase 4: Failover Admin AJAX Commands =====
+
+	/**
+	 * Get failover environment status (read-only).
+	 *
+	 * @return array Environment info, backup freshness, role status.
+	 */
+	public function failover_status($params = array()) {
+		$opts = SiteGuard_Backup_Options::instance();
+
+		$env = array(
+			'is_docker'       => file_exists('/.dockerenv'),
+			'is_azure'        => !empty(getenv('WEBSITE_INSTANCE_ID')),
+			'is_multisite'    => is_multisite(),
+			'has_cf_scripts'  => file_exists(dirname(ABSPATH) . '/scripts/cf-status.sh') || file_exists('/opt/docker/wordpressmultisite/scripts/cf-status.sh'),
+			'php_version'     => PHP_VERSION,
+			'wp_version'      => get_bloginfo('version'),
+		);
+
+		$role = $opts->get_option('sgbackup_failover_role', 'standalone');
+		$production_url = $opts->get_option('sgbackup_failover_production_url', '');
+
+		// Backup freshness
+		$latest = SiteGuard_Backup_History::get_latest();
+		$backup_info = array(
+			'has_backup'    => !empty($latest),
+			'last_backup'   => $latest ? gmdate('Y-m-d H:i:s', $latest['timestamp']) : null,
+			'age_seconds'   => $latest ? (time() - $latest['timestamp']) : null,
+			'age_human'     => $latest ? human_time_diff($latest['timestamp']) . ' ago' : 'Never',
+		);
+
+		// DNS check
+		$dns_info = array();
+		if (!empty($production_url)) {
+			$host = wp_parse_url($production_url, PHP_URL_HOST);
+			if ($host) {
+				$dns_info['host'] = $host;
+				$dns_info['a_records'] = array();
+				$dns_info['cname_records'] = array();
+				$ips = @dns_get_record($host, DNS_A);
+				if (is_array($ips)) {
+					foreach ($ips as $record) {
+						if (isset($record['ip'])) $dns_info['a_records'][] = $record['ip'];
+					}
+				}
+				$cnames = @dns_get_record($host, DNS_CNAME);
+				if (is_array($cnames)) {
+					foreach ($cnames as $record) {
+						if (isset($record['target'])) $dns_info['cname_records'][] = $record['target'];
+					}
+				}
+			}
+		}
+
+		// Database & disk
+		global $wpdb;
+		$db_ok = (bool) $wpdb->get_var('SELECT 1');
+		$disk = SiteGuard_Backup_Filesystem::check_disk_space($opts->get_backup_dir());
+
+		return array(
+			'environment'    => $env,
+			'role'           => $role,
+			'production_url' => $production_url,
+			'backup'         => $backup_info,
+			'dns'            => $dns_info,
+			'db_ok'          => $db_ok,
+			'disk'           => $disk,
+		);
+	}
+
+	/**
+	 * Run a pre-failover backup (synchronous DB-only backup).
+	 *
+	 * @return array|WP_Error Result with backup file info.
+	 */
+	public function failover_prefailover($params = array()) {
+		$sgbackup = SiteGuard_Backup::instance();
+
+		$options = array(
+			'nodb'     => false,
+			'nofiles'  => true,
+			'entities' => array(),
+			'service'  => array('none'),
+			'label'    => 'Pre-failover backup',
+		);
+
+		$sgbackup->backup_all($options);
+		$nonce = $sgbackup->nonce;
+
+		$max_resumptions = 20;
+		for ($i = 0; $i < $max_resumptions; $i++) {
+			$jobdata = $sgbackup->jobdata_getarray($nonce);
+			$status = isset($jobdata['jobstatus']) ? $jobdata['jobstatus'] : '';
+			if (in_array($status, array('complete', 'finished', 'error', 'aborted', 'failed'), true)) break;
+			$sgbackup->backup_resume($i, $nonce);
+			$jobdata = $sgbackup->jobdata_getarray($nonce);
+			$status = isset($jobdata['jobstatus']) ? $jobdata['jobstatus'] : '';
+			if (in_array($status, array('complete', 'finished', 'error', 'aborted', 'failed'), true)) break;
+		}
+
+		$jobdata = $sgbackup->jobdata_getarray($nonce);
+		$status = isset($jobdata['jobstatus']) ? $jobdata['jobstatus'] : '';
+
+		if ($status === 'complete' || $status === 'finished') {
+			return array(
+				'success'  => true,
+				'nonce'    => $nonce,
+				'db_files' => isset($jobdata['db_backup_files']) ? $jobdata['db_backup_files'] : array(),
+				'message'  => 'Pre-failover DB backup completed.',
+			);
+		}
+
+		return new WP_Error('backup_failed', 'Pre-failover backup did not complete (status: ' . $status . ')');
+	}
+
+	/**
+	 * Run post-failover cleanup (cache flush, validation).
+	 *
+	 * @return array Result with validation checks.
+	 */
+	public function failover_postfailover($params = array()) {
+		$results = array();
+
+		// Flush object cache
+		if (function_exists('wp_cache_flush')) {
+			wp_cache_flush();
+			$results['object_cache'] = 'flushed';
+		}
+
+		// Flush transients
+		global $wpdb;
+		$wpdb->query($wpdb->prepare("DELETE FROM {$wpdb->options} WHERE option_name LIKE %s", '%\_transient\_%'));
+		if (is_multisite()) {
+			$wpdb->query($wpdb->prepare("DELETE FROM {$wpdb->sitemeta} WHERE meta_key LIKE %s", '%\_transient\_%'));
+		}
+		$results['transients'] = 'cleared';
+
+		// Flush Redis if available
+		if (class_exists('Redis')) {
+			$redis_host = defined('WP_REDIS_HOST') ? WP_REDIS_HOST : 'redis';
+			$redis_port = defined('WP_REDIS_PORT') ? (int) WP_REDIS_PORT : 6379;
+			try {
+				$redis = new Redis();
+				if ($redis->connect($redis_host, $redis_port, 2)) {
+					$redis->flushAll();
+					$results['redis'] = 'flushed';
+				}
+			} catch (Exception $e) {
+				$results['redis'] = 'not_available';
+			}
+		}
+
+		// Flush rewrite rules
+		flush_rewrite_rules();
+		$results['rewrite_rules'] = 'flushed';
+
+		// Verify DB
+		$db_ok = (bool) $wpdb->get_var('SELECT 1');
+		$results['db_connectivity'] = $db_ok ? 'ok' : 'failed';
+
+		// Check theme
+		$theme = wp_get_theme();
+		$results['theme'] = array('name' => $theme->get('Name'), 'exists' => $theme->exists());
+
+		// Check plugins
+		$active_plugins = get_option('active_plugins', array());
+		$missing_plugins = array();
+		foreach ($active_plugins as $plugin) {
+			if (!file_exists(WP_PLUGIN_DIR . '/' . $plugin)) {
+				$missing_plugins[] = $plugin;
+			}
+		}
+		$results['plugins'] = array('active_count' => count($active_plugins), 'missing' => $missing_plugins);
+
+		// Multisite
+		if (is_multisite()) {
+			$results['multisite'] = array('enabled' => true, 'site_count' => get_sites(array('count' => true)));
+		} else {
+			$results['multisite'] = array('enabled' => false);
+		}
+
+		// Search-replace if requested
+		if (!empty($params['search_replace'])) {
+			$sr_parts = explode('|', $params['search_replace'], 2);
+			if (count($sr_parts) === 2 && !empty($sr_parts[0]) && !empty($sr_parts[1])) {
+				require_once SGBACKUP_DIR . 'includes/class-search-replace.php';
+				$sr = new SiteGuard_Backup_Search_Replace();
+				$results['search_replace'] = $sr->run($sr_parts[0], $sr_parts[1], false);
+			}
+		}
+
+		return array('success' => true, 'results' => $results, 'message' => 'Post-failover cleanup completed.');
+	}
+
+	// ==========================================
+	// RESTORE PRESETS
+	// ==========================================
+
+	/**
+	 * Save a restore preset.
+	 */
+	public function save_restore_preset($params) {
+		if (empty($params['name'])) {
+			return new WP_Error('missing_param', 'Preset name is required.');
+		}
+
+		$opts = SiteGuard_Backup_Options::instance();
+		$presets = $opts->get_option('sgbackup_restore_presets', array());
+
+		$name = sanitize_text_field(substr($params['name'], 0, 80));
+
+		// Build restore_options from params
+		$restore_options = array();
+		foreach (array('db', 'plugins', 'themes', 'uploads', 'others', 'wpcore') as $entity) {
+			$restore_options[$entity] = !empty($params[$entity]);
+		}
+		$restore_options['move_in_mode'] = isset($params['move_in_mode']) ? intval($params['move_in_mode']) : 0;
+		$restore_options['pre_restore_backup'] = !empty($params['pre_restore_backup']);
+		$restore_options['include_unspecified_tables'] = !empty($params['include_unspecified_tables']);
+		$restore_options['include_unspecified_plugins'] = !empty($params['include_unspecified_plugins']);
+		$restore_options['include_unspecified_themes'] = !empty($params['include_unspecified_themes']);
+
+		// Auto-increment ID
+		if (!empty($params['preset_id']) && isset($presets[intval($params['preset_id'])])) {
+			$preset_id = intval($params['preset_id']);
+		} else {
+			$preset_id = empty($presets) ? 0 : max(array_keys($presets)) + 1;
+		}
+
+		$presets[$preset_id] = array(
+			'name'            => $name,
+			'created'         => time(),
+			'restore_options' => $restore_options,
+		);
+
+		$opts->update_option('sgbackup_restore_presets', $presets);
+
+		return array('success' => true, 'preset_id' => $preset_id, 'presets' => $presets);
+	}
+
+	/**
+	 * Get all restore presets.
+	 */
+	public function get_restore_presets() {
+		$opts = SiteGuard_Backup_Options::instance();
+		return $opts->get_option('sgbackup_restore_presets', array());
+	}
+
+	/**
+	 * Delete a restore preset.
+	 */
+	public function delete_restore_preset($params) {
+		if (!isset($params['preset_id'])) {
+			return new WP_Error('missing_param', 'Missing preset_id.');
+		}
+
+		$opts = SiteGuard_Backup_Options::instance();
+		$presets = $opts->get_option('sgbackup_restore_presets', array());
+		$preset_id = intval($params['preset_id']);
+
+		if (!isset($presets[$preset_id])) {
+			return new WP_Error('not_found', 'Preset not found.');
+		}
+
+		unset($presets[$preset_id]);
+		$opts->update_option('sgbackup_restore_presets', $presets);
+
+		return array('success' => true, 'presets' => $presets);
+	}
+
+	// ==========================================
+	// SCHEDULED REMOTE SEND
+	// ==========================================
+
+	/**
+	 * Save scheduled remote send settings.
+	 */
+	public function save_remotesend_schedule($params) {
+		$opts = SiteGuard_Backup_Options::instance();
+		$sgbackup = SiteGuard_Backup::instance();
+
+		$valid_intervals = array('manual', 'everyhour', 'every2hours', 'every4hours', 'every8hours', 'twicedaily', 'daily', 'weekly', 'fortnightly', 'monthly');
+		$interval = isset($params['interval']) ? sanitize_text_field($params['interval']) : 'manual';
+		if (!in_array($interval, $valid_intervals, true)) {
+			$interval = 'manual';
+		}
+
+		// Validate destinations
+		$destinations = array();
+		if (!empty($params['destinations']) && is_array($params['destinations'])) {
+			$sites = $opts->get_option('sgbackup_remotesites', array());
+			foreach ($params['destinations'] as $id) {
+				$id = intval($id);
+				if (isset($sites[$id])) {
+					$destinations[] = $id;
+				}
+			}
+		}
+
+		// Validate entities
+		$entities = array();
+		if (!empty($params['entities']) && is_array($params['entities'])) {
+			$entities = array_values(array_intersect(
+				array_map('sanitize_text_field', $params['entities']),
+				self::$valid_entities
+			));
+		}
+
+		$retain = isset($params['retain']) ? max(1, intval($params['retain'])) : 5;
+		$schedule_day = isset($params['schedule_day']) ? sanitize_text_field($params['schedule_day']) : '';
+
+		$opts->update_option('sgbackup_remotesend_schedule', $interval);
+		$opts->update_option('sgbackup_remotesend_destinations', $destinations);
+		$opts->update_option('sgbackup_remotesend_entities', $entities);
+		$opts->update_option('sgbackup_remotesend_retain', $retain);
+		$opts->update_option('sgbackup_remotesend_schedule_day', $schedule_day);
+
+		$sgbackup->schedule_backup_remotesend($interval);
+
+		return array('success' => true, 'interval' => $interval, 'destinations' => $destinations);
+	}
+
+	/**
+	 * Get scheduled remote send settings.
+	 */
+	public function get_remotesend_schedule() {
+		$opts = SiteGuard_Backup_Options::instance();
+		return array(
+			'interval'     => $opts->get_option('sgbackup_remotesend_schedule', 'manual'),
+			'destinations' => $opts->get_option('sgbackup_remotesend_destinations', array()),
+			'entities'     => $opts->get_option('sgbackup_remotesend_entities', array()),
+			'retain'       => $opts->get_option('sgbackup_remotesend_retain', 5),
+			'schedule_day' => $opts->get_option('sgbackup_remotesend_schedule_day', ''),
+			'next'         => wp_next_scheduled('sgbackup_backup_remotesend'),
+		);
 	}
 }

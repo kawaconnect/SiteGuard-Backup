@@ -347,6 +347,25 @@ class SiteGuard_Backup {
 	}
 
 	/**
+	 * Set up the scheduled remote send schedule.
+	 *
+	 * @param string $interval Cron schedule name.
+	 */
+	public function schedule_backup_remotesend($interval) {
+		$opts = SiteGuard_Backup_Options::instance();
+		$opts->update_option('sgbackup_remotesend_schedule', $interval);
+
+		wp_clear_scheduled_hook('sgbackup_backup_remotesend');
+
+		if ('manual' !== $interval) {
+			$schedule_day = $opts->get_option('sgbackup_remotesend_schedule_day', '');
+			$first_time = $this->get_first_scheduled_time($interval, $schedule_day);
+			wp_schedule_event($first_time, $interval, 'sgbackup_backup_remotesend');
+			$this->log("Scheduled remote send: {$interval}, first at " . gmdate('Y-m-d H:i:s', $first_time));
+		}
+	}
+
+	/**
 	 * Calculate the first scheduled time for a backup, respecting preferred
 	 * time-of-day and day-of-week/month settings.
 	 *
@@ -449,9 +468,11 @@ class SiteGuard_Backup {
 			'interval'             => $opts->get_option('sgbackup_interval', 'manual'),
 			'interval_database'    => $opts->get_option('sgbackup_interval_database', 'manual'),
 			'interval_incremental' => $opts->get_option('sgbackup_interval_incremental', 'none'),
+			'interval_remotesend'  => $opts->get_option('sgbackup_remotesend_schedule', 'manual'),
 			'next_files'           => wp_next_scheduled('sgbackup_backup'),
 			'next_database'        => wp_next_scheduled('sgbackup_backup_database'),
 			'next_incremental'     => wp_next_scheduled('sgbackup_backup_incremental'),
+			'next_remotesend'      => wp_next_scheduled('sgbackup_backup_remotesend'),
 		);
 	}
 
@@ -1365,6 +1386,15 @@ class SiteGuard_Backup {
 		$job_type = $this->jobdata_get('job_type', 'backup');
 		$subject = "[SiteGuard Backup] {$status}: {$site_name}";
 
+		/**
+		 * Filter the email report subject line.
+		 *
+		 * @param string              $subject The email subject.
+		 * @param string              $status  Backup status: 'Success', 'Warning', or 'Failed'.
+		 * @param SiteGuard_Backup    $this    The backup instance.
+		 */
+		$subject = apply_filters('sgbackup_report_subject', $subject, $status, $this);
+
 		// Collect file info
 		$backup_array = $this->jobdata_get('backup_files_array', array());
 		$db_files = $this->jobdata_get('db_backup_files', array());
@@ -1444,7 +1474,7 @@ class SiteGuard_Backup {
 				if (file_exists($fpath)) {
 					$download_url = wp_nonce_url(
 						$admin_url . '?action=sgbackup_download&file=' . urlencode(basename($file)),
-						'sgbackup-ajax'
+						'sgbackup-download'
 					);
 					$body .= '<li style="margin-bottom:4px;"><a href="' . esc_url($download_url) . '">' . esc_html($file) . '</a></li>';
 				}
@@ -1478,6 +1508,16 @@ class SiteGuard_Backup {
 		$body .= '<p style="font-size:12px;color:#999;">SiteGuard Backup v' . esc_html(SGBACKUP_VERSION) . '</p>';
 		$body .= '</div></body></html>';
 
+		/**
+		 * Filter the email report HTML body.
+		 *
+		 * @param string              $body      The HTML email body.
+		 * @param string              $status    Backup status: 'Success', 'Warning', or 'Failed'.
+		 * @param array               $all_files All backup filenames.
+		 * @param SiteGuard_Backup    $this      The backup instance.
+		 */
+		$body = apply_filters('sgbackup_report_body', $body, $status, $all_files, $this);
+
 		// Base attachments: log file when debug mode is on or errors occurred
 		$base_attachments = array();
 		$debug_mode = $opts->get_option('sgbackup_debug_mode', false);
@@ -1487,6 +1527,15 @@ class SiteGuard_Backup {
 				$base_attachments[] = $logfile;
 			}
 		}
+
+		/**
+		 * Filter the base email attachments (before per-recipient attachments are added).
+		 *
+		 * @param array               $base_attachments File paths to attach.
+		 * @param string              $status           Backup status: 'Success', 'Warning', or 'Failed'.
+		 * @param SiteGuard_Backup    $this             The backup instance.
+		 */
+		$base_attachments = apply_filters('sgbackup_report_attachments', $base_attachments, $status, $this);
 
 		// Attachment size limit (25MB total for email)
 		$attachment_size_limit = 25 * 1048576;
@@ -1537,6 +1586,15 @@ class SiteGuard_Backup {
 		}
 
 		remove_filter('wp_mail_content_type', array($this, 'email_content_type_html'));
+
+		/**
+		 * Fires after all email reports have been sent.
+		 *
+		 * @param string              $status     Backup status: 'Success', 'Warning', or 'Failed'.
+		 * @param array               $recipients Array of recipient data sent to.
+		 * @param SiteGuard_Backup    $this       The backup instance.
+		 */
+		do_action('sgbackup_report_finished', $status, $recipients, $this);
 	}
 
 	/**

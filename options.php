@@ -246,6 +246,42 @@ class SiteGuard_Backup_Options {
 			'zip_nocompress'     => '',
 			'webhook_url'        => '',
 			'webhook_events'     => array(),
+			'ip_allowlist'       => '',
+			'encrypt_credentials' => false,
+			'failover_enabled'   => false,
+			'failover_role'      => 'standalone',
+			'failover_production_url' => '',
 		);
+	}
+
+	/**
+	 * Get a sensitive option, decrypting if encrypted.
+	 *
+	 * @param string $key     Option key (without sgbackup_ prefix).
+	 * @param mixed  $default Default value if not found.
+	 * @return mixed Decrypted value or default.
+	 */
+	public function get_sensitive_option($key, $default = false) {
+		$value = $this->get_option('sgbackup_' . $key, $default);
+		if (is_string($value)) {
+			require_once SGBACKUP_DIR . 'includes/class-security.php';
+			return SiteGuard_Backup_Security::decrypt_option($value);
+		}
+		return $value;
+	}
+
+	/**
+	 * Update a sensitive option, encrypting before storage if credential encryption is enabled.
+	 *
+	 * @param string $key   Option key (without sgbackup_ prefix).
+	 * @param mixed  $value Value to store.
+	 * @return bool
+	 */
+	public function update_sensitive_option($key, $value) {
+		if (is_string($value) && !empty($value) && $this->get_option('sgbackup_encrypt_credentials', false)) {
+			require_once SGBACKUP_DIR . 'includes/class-security.php';
+			$value = SiteGuard_Backup_Security::encrypt_option($value);
+		}
+		return $this->update_option('sgbackup_' . $key, $value);
 	}
 }

@@ -4,6 +4,8 @@ $local_keys = $opts->get_option('sgbackup_migrator_localkeys', array());
 $remote_sites = $opts->get_option('sgbackup_remotesites', array());
 ?>
 
+<div id="sgbackup-notices-migrate" class="sgbackup-notices"></div>
+
 <div class="sgbackup-section">
 	<h2><?php esc_html_e('Receive a Backup (This Site)', 'siteguardbackup'); ?></h2>
 	<p><?php esc_html_e('Generate a key on this site, then paste it on the sending site to allow backup transfers.', 'siteguardbackup'); ?></p>
@@ -136,9 +138,81 @@ $remote_sites = $opts->get_option('sgbackup_remotesites', array());
 				<option value=""><?php esc_html_e('Select backup...', 'siteguardbackup'); ?></option>
 			</select>
 		</p>
+		<p>
+			<label><?php esc_html_e('Backup label:', 'siteguardbackup'); ?>
+				<input type="text" id="sgbackup-send-label" maxlength="40" placeholder="<?php esc_attr_e('e.g., pre-migration-2024', 'siteguardbackup'); ?>" class="regular-text" />
+			</label>
+		</p>
 		<button type="button" class="button button-primary" id="sgbackup-send-btn">
 			<?php esc_html_e('Send', 'siteguardbackup'); ?>
 		</button>
 		<span id="sgbackup-send-status" class="sgbackup-status"></span>
 	</div>
+</div>
+
+<hr />
+
+<div class="sgbackup-section">
+	<h2><?php esc_html_e('Scheduled Remote Send', 'siteguardbackup'); ?></h2>
+	<p><?php esc_html_e('Automatically create backups and send them to remote destinations on a schedule.', 'siteguardbackup'); ?></p>
+
+	<table class="form-table" id="sgbackup-remotesend-schedule-form">
+		<tr>
+			<th><?php esc_html_e('Interval', 'siteguardbackup'); ?></th>
+			<td>
+				<select id="sgbackup-remotesend-interval">
+					<option value="manual"><?php esc_html_e('Manual only', 'siteguardbackup'); ?></option>
+					<option value="everyhour"><?php esc_html_e('Every hour', 'siteguardbackup'); ?></option>
+					<option value="every2hours"><?php esc_html_e('Every 2 hours', 'siteguardbackup'); ?></option>
+					<option value="every4hours"><?php esc_html_e('Every 4 hours', 'siteguardbackup'); ?></option>
+					<option value="every8hours"><?php esc_html_e('Every 8 hours', 'siteguardbackup'); ?></option>
+					<option value="twicedaily"><?php esc_html_e('Twice daily', 'siteguardbackup'); ?></option>
+					<option value="daily"><?php esc_html_e('Daily', 'siteguardbackup'); ?></option>
+					<option value="weekly"><?php esc_html_e('Weekly', 'siteguardbackup'); ?></option>
+					<option value="fortnightly"><?php esc_html_e('Fortnightly', 'siteguardbackup'); ?></option>
+					<option value="monthly"><?php esc_html_e('Monthly', 'siteguardbackup'); ?></option>
+				</select>
+			</td>
+		</tr>
+		<tr>
+			<th><?php esc_html_e('Destinations', 'siteguardbackup'); ?></th>
+			<td id="sgbackup-remotesend-destinations">
+				<?php if (!empty($remote_sites)): ?>
+					<?php foreach ($remote_sites as $id => $site): ?>
+					<label style="display:block;margin-bottom:4px;">
+						<input type="checkbox" name="sgbackup_remotesend_dest[]" value="<?php echo esc_attr($id); ?>" />
+						<?php echo esc_html(isset($site['name']) ? $site['name'] : "Site #{$id}"); ?>
+						<small>(<?php echo esc_html(isset($site['url']) ? $site['url'] : ''); ?>)</small>
+					</label>
+					<?php endforeach; ?>
+				<?php else: ?>
+					<em><?php esc_html_e('No remote sites configured. Add a destination above first.', 'siteguardbackup'); ?></em>
+				<?php endif; ?>
+			</td>
+		</tr>
+		<tr>
+			<th><?php esc_html_e('Entities', 'siteguardbackup'); ?></th>
+			<td>
+				<label><input type="checkbox" name="sgbackup_remotesend_entity[]" value="plugins" /> <?php esc_html_e('Plugins', 'siteguardbackup'); ?></label>
+				<label><input type="checkbox" name="sgbackup_remotesend_entity[]" value="themes" /> <?php esc_html_e('Themes', 'siteguardbackup'); ?></label>
+				<label><input type="checkbox" name="sgbackup_remotesend_entity[]" value="uploads" /> <?php esc_html_e('Uploads', 'siteguardbackup'); ?></label>
+				<label><input type="checkbox" name="sgbackup_remotesend_entity[]" value="others" /> <?php esc_html_e('Others', 'siteguardbackup'); ?></label>
+				<label><input type="checkbox" name="sgbackup_remotesend_entity[]" value="wpcore" /> <?php esc_html_e('WP Core', 'siteguardbackup'); ?></label>
+				<p class="description"><?php esc_html_e('Leave all unchecked to send all entities.', 'siteguardbackup'); ?></p>
+			</td>
+		</tr>
+		<tr>
+			<th><?php esc_html_e('Local Retention', 'siteguardbackup'); ?></th>
+			<td>
+				<input type="number" id="sgbackup-remotesend-retain" min="1" max="100" value="5" style="width:60px;" />
+				<p class="description"><?php esc_html_e('Number of local backup copies to keep from scheduled remote sends.', 'siteguardbackup'); ?></p>
+			</td>
+		</tr>
+	</table>
+
+	<button type="button" class="button button-primary" id="sgbackup-save-remotesend-schedule">
+		<?php esc_html_e('Save Schedule', 'siteguardbackup'); ?>
+	</button>
+	<span id="sgbackup-remotesend-schedule-status" class="sgbackup-status"></span>
+	<span id="sgbackup-remotesend-next" style="margin-left:12px;font-style:italic;color:#666;"></span>
 </div>

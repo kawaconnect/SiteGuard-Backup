@@ -179,10 +179,14 @@ class SiteGuard_Backup_CLI_Command extends WP_CLI_Command {
      * [--tables=<tables>]
      * : Comma-separated table names for selective restore.
      *
+     * [--preset=<name>]
+     * : Load restore options from a named preset.
+     *
      * ## EXAMPLES
      *
      *     wp siteguardbackup restore 1709283600
      *     wp siteguardbackup restore 1709283600 --entities=db,plugins
+     *     wp siteguardbackup restore 1709283600 --preset="migration-standard"
      *
      * @subcommand restore
      */
@@ -199,7 +203,23 @@ class SiteGuard_Backup_CLI_Command extends WP_CLI_Command {
 
         $restore_options = array();
 
-        if (isset($assoc_args['entities'])) {
+        // Load preset if specified
+        if (isset($assoc_args['preset'])) {
+            $opts = SiteGuard_Backup_Options::instance();
+            $presets = $opts->get_option('sgbackup_restore_presets', array());
+            $found = false;
+            foreach ($presets as $preset) {
+                if (isset($preset['name']) && $preset['name'] === $assoc_args['preset']) {
+                    $restore_options = $preset['restore_options'];
+                    $found = true;
+                    WP_CLI::log("Using preset: {$preset['name']}");
+                    break;
+                }
+            }
+            if (!$found) {
+                WP_CLI::error("Preset not found: {$assoc_args['preset']}");
+            }
+        } elseif (isset($assoc_args['entities'])) {
             $entities = array_map('trim', explode(',', $assoc_args['entities']));
             foreach ($entities as $e) {
                 $restore_options[$e] = true;
@@ -1455,11 +1475,18 @@ class SiteGuard_Backup_CLI_Command extends WP_CLI_Command {
      * [--retain-db=<count>]
      * : Number of database backups to retain.
      *
+     * [--remote-send=<interval>]
+     * : Set scheduled remote send interval (same options as --files).
+     *
+     * [--remote-destination=<ids>]
+     * : Comma-separated remote site IDs for scheduled send.
+     *
      * ## EXAMPLES
      *
      *     wp siteguardbackup schedule
      *     wp siteguardbackup schedule set --files=daily --database=every4hours
      *     wp siteguardbackup schedule set --retain=5 --retain-db=10
+     *     wp siteguardbackup schedule set --remote-send=daily --remote-destination=0,1
      *
      * @subcommand schedule
      */
@@ -1521,8 +1548,25 @@ class SiteGuard_Backup_CLI_Command extends WP_CLI_Command {
                 $changed = true;
             }
 
+            if (isset($assoc_args['remote-send'])) {
+                $interval = $assoc_args['remote-send'];
+                if (!in_array($interval, $valid_intervals)) {
+                    WP_CLI::error("Invalid interval: {$interval}. Valid: " . implode(', ', $valid_intervals));
+                }
+                $sgbackup->schedule_backup_remotesend($interval);
+                WP_CLI::log("Remote send schedule set to: {$interval}");
+                $changed = true;
+            }
+
+            if (isset($assoc_args['remote-destination'])) {
+                $dest_ids = array_map('intval', array_filter(explode(',', $assoc_args['remote-destination']), 'strlen'));
+                $opts->update_option('sgbackup_remotesend_destinations', $dest_ids);
+                WP_CLI::log("Remote send destinations set to: " . implode(', ', $dest_ids));
+                $changed = true;
+            }
+
             if (!$changed) {
-                WP_CLI::warning('No schedule options specified. Use --files, --database, --incremental, --retain, or --retain-db.');
+                WP_CLI::warning('No schedule options specified. Use --files, --database, --incremental, --retain, --retain-db, --remote-send, or --remote-destination.');
             } else {
                 WP_CLI::success('Schedule updated.');
             }
@@ -1540,6 +1584,8 @@ class SiteGuard_Backup_CLI_Command extends WP_CLI_Command {
                 ($schedule['next_database'] ? ' (next: ' . gmdate('Y-m-d H:i', $schedule['next_database']) . ' UTC)' : ''));
             WP_CLI::log("  Incremental: {$schedule['interval_incremental']}" .
                 ($schedule['next_incremental'] ? ' (next: ' . gmdate('Y-m-d H:i', $schedule['next_incremental']) . ' UTC)' : ''));
+            WP_CLI::log("  Remote Send: {$schedule['interval_remotesend']}" .
+                ($schedule['next_remotesend'] ? ' (next: ' . gmdate('Y-m-d H:i', $schedule['next_remotesend']) . ' UTC)' : ''));
             WP_CLI::log('');
             WP_CLI::log("  Retention (files): {$retain_files}");
             WP_CLI::log("  Retention (DB):    {$retain_db}");
@@ -2120,5 +2166,107 @@ class SiteGuard_Backup_CLI_Command extends WP_CLI_Command {
         }
 
         WP_CLI\Utils\format_items('table', $table_data, array('Date', 'Action', 'User', 'IP', 'Details'));
+    }
+
+    /**
+     * Import a foreign (non-SiteGuard) backup file.
+     *
+     * Detects and imports backups from 7+ WordPress backup plugin formats:
+     * UpdraftPlus, BackWPup, BackupWordPress, Simple Backups, InfiniteWP,
+     * WP-DB-Backup, and generic SQL/ZIP.
+     *
+     * ## OPTIONS
+     *
+     * <file>...
+     * : One or more backup filenames in the backup directory.
+     *
+     * [--detect-only]
+     * : Only detect the format without importing.
+     *
+     * [--format=<format>]
+     * : Output format. Default: table.
+     * ---
+     * default: table
+     * options:
+     *   - table
+     *   - json
+     * ---
+     *
+     * ## EXAMPLES
+     *
+     *     wp siteguardbackup import_foreign backup_2024-01-15-1200_mysite_abc123-db.zip
+     *     wp siteguardbackup import_foreign backwpup_abc_2024-01-15_1200.zip --detect-only
+     *     wp siteguardbackup import_foreign *.zip --format=json
+     *
+     * @subcommand import_foreign
+     */
+    public function import_foreign($args, $assoc_args) {
+        if (empty($args)) {
+            WP_CLI::error('Provide one or more backup filenames.');
+        }
+
+        require_once SGBACKUP_DIR . 'includes/class-foreign-importer.php';
+
+        $opts = SiteGuard_Backup_Options::instance();
+        $backup_dir = $opts->get_backup_dir();
+        $format = isset($assoc_args['format']) ? $assoc_args['format'] : 'table';
+        $detect_only = isset($assoc_args['detect-only']);
+
+        $filepaths = array();
+        foreach ($args as $file) {
+            $file = basename($file);
+            $path = $backup_dir . $file;
+            if (!file_exists($path)) {
+                WP_CLI::warning("File not found: {$file}");
+                continue;
+            }
+            $filepaths[] = $path;
+        }
+
+        if (empty($filepaths)) {
+            WP_CLI::error('No valid files found in backup directory.');
+        }
+
+        if ($detect_only) {
+            $detections = array();
+            foreach ($filepaths as $fp) {
+                $detection = SiteGuard_Backup_Foreign_Importer::detect($fp);
+                $detections[] = array(
+                    'File'     => basename($fp),
+                    'Detected' => $detection !== false ? 'Yes' : 'No',
+                    'Format'   => $detection ? $detection['label'] : '-',
+                    'Entities' => $detection ? implode(', ', $detection['entities']) : '-',
+                );
+            }
+
+            if ($format === 'json') {
+                WP_CLI::line(json_encode($detections, JSON_PRETTY_PRINT));
+            } else {
+                WP_CLI\Utils\format_items('table', $detections, array('File', 'Detected', 'Format', 'Entities'));
+            }
+            return;
+        }
+
+        // Import
+        if (count($filepaths) === 1) {
+            $result = SiteGuard_Backup_Foreign_Importer::import($filepaths[0]);
+        } else {
+            $result = SiteGuard_Backup_Foreign_Importer::import_set($filepaths);
+        }
+
+        if (is_wp_error($result)) {
+            WP_CLI::error($result->get_error_message());
+        }
+
+        if ($format === 'json') {
+            WP_CLI::line(json_encode($result, JSON_PRETTY_PRINT));
+        } else {
+            WP_CLI::success(sprintf(
+                'Imported as %s format. Timestamp: %d. File(s): %s',
+                $result['label'] ?? $result['format'],
+                $result['timestamp'],
+                isset($result['filename']) ? $result['filename'] : implode(', ', $result['filenames'] ?? array())
+            ));
+        }
     }
 }
