@@ -39,9 +39,17 @@ class SiteGuard_Backup_Commands {
 		if (!empty($params['incremental'])) $options['job_type'] = 'incremental';
 		if (!empty($params['service'])) {
 			// Validate service array against whitelist
+			// Allow "method/instance" format (e.g., "remotesend/0" for site-to-site migration)
 			$svc = (array) $params['service'];
-			$svc = array_values(array_filter($svc, function($s) {
-				return in_array($s, array_merge(self::$valid_methods, array('none')), true);
+			$valid_with_none = array_merge(self::$valid_methods, array('none'));
+			$svc = array_values(array_filter($svc, function($s) use ($valid_with_none) {
+				if (in_array($s, $valid_with_none, true)) return true;
+				// Check for "method/instance" format
+				if (strpos($s, '/') !== false) {
+					$method = explode('/', $s, 2)[0];
+					return in_array($method, $valid_with_none, true);
+				}
+				return false;
 			}));
 			if (!empty($svc)) $options['service'] = $svc;
 		}
@@ -824,8 +832,11 @@ class SiteGuard_Backup_Commands {
 		$timestamp = intval($params['timestamp']);
 		$site_id = intval($params['site_id']);
 
+		error_log("SiteGuard Backup: migrate_send called - timestamp={$timestamp}, site_id={$site_id}");
+
 		$backup_set = SiteGuard_Backup_History::get_history($timestamp);
 		if (empty($backup_set)) {
+			error_log("SiteGuard Backup: migrate_send - backup not found for timestamp {$timestamp}");
 			return new WP_Error('not_found', 'Backup not found');
 		}
 
@@ -833,6 +844,8 @@ class SiteGuard_Backup_Commands {
 		// Pre-set all phase-complete flags and file arrays so they're included
 		// in the initial jobdata BEFORE the cron resumption is scheduled.
 		$backup_files = SiteGuard_Backup_History::get_all_files($backup_set);
+		error_log("SiteGuard Backup: migrate_send - files to send: " . json_encode($backup_files));
+
 		$options = array(
 			'service'                => array("remotesend/{$site_id}"),
 			'nofiles'                => true,
@@ -849,7 +862,16 @@ class SiteGuard_Backup_Commands {
 
 		$sgbackup->backup_all($options);
 
-		return array('success' => true, 'nonce' => $sgbackup->nonce);
+		$nonce = $sgbackup->nonce;
+		error_log("SiteGuard Backup: migrate_send - job started with nonce: " . $nonce);
+
+		// Close browser connection and run the send inline (same pattern as backupnow).
+		// Required for DISABLE_WP_CRON environments where spawn_cron() does nothing.
+		$response = json_encode(array('success' => true, 'data' => array('nonce' => $nonce)));
+		$sgbackup->close_browser_connection($response);
+
+		$sgbackup->backup_resume(0, $nonce);
+		die;
 	}
 
 	/**
@@ -934,7 +956,15 @@ class SiteGuard_Backup_Commands {
 		);
 		$sgbackup->backup_all($options);
 
-		return array('success' => true, 'nonce' => $sgbackup->nonce);
+		$nonce = $sgbackup->nonce;
+
+		// Close browser connection and run inline (same pattern as backupnow).
+		// Required for DISABLE_WP_CRON environments where spawn_cron() does nothing.
+		$response = json_encode(array('success' => true, 'data' => array('nonce' => $nonce)));
+		$sgbackup->close_browser_connection($response);
+
+		$sgbackup->backup_resume(0, $nonce);
+		die;
 	}
 
 	/**

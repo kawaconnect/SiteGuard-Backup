@@ -36,17 +36,26 @@ class SiteGuard_Backup_Remote_Send {
 	 * receiver's private key can decrypt - this provides authentication.
 	 */
 	public function handle_rpc_message() {
+		if (empty($_POST['subaction']) || $_POST['subaction'] !== 'rpc_message') return;
+
+		error_log("SiteGuard Backup RPC Receiver: handle_rpc_message entered (authenticated path)");
+
 		if (!current_user_can('manage_options')) {
+			error_log("SiteGuard Backup RPC Receiver: rejected - insufficient permissions");
 			wp_send_json_error(array('message' => 'Insufficient permissions.'));
 			return;
 		}
 
-		if (empty($_POST['subaction']) || $_POST['subaction'] !== 'rpc_message') return;
-
 		// Verify required RPC header is present
-		if (empty($_SERVER['HTTP_X_SGBACKUP_RPC'])) return;
+		if (empty($_SERVER['HTTP_X_SGBACKUP_RPC'])) {
+			error_log("SiteGuard Backup RPC Receiver: rejected - missing X-SGBackup-RPC header");
+			return;
+		}
 
-		if (empty($_POST['encrypted']) || empty($_POST['key'])) return;
+		if (empty($_POST['encrypted']) || empty($_POST['key'])) {
+			error_log("SiteGuard Backup RPC Receiver: rejected - missing encrypted/key POST data");
+			return;
+		}
 
 		// Rate limiting: max 60 requests per minute per IP
 		// Use CF-Connecting-IP behind Cloudflare, fall back to REMOTE_ADDR
@@ -204,6 +213,8 @@ class SiteGuard_Backup_Remote_Send {
 	 * Dispatch an RPC command.
 	 */
 	private function dispatch_command($command, $data, $name_hash, $key_data) {
+		error_log("SiteGuard Backup RPC Receiver: command='{$command}' name_hash={$name_hash}");
+
 		switch ($command) {
 			case 'ping':
 				return $this->cmd_ping($data, $name_hash);
@@ -218,6 +229,7 @@ class SiteGuard_Backup_Remote_Send {
 				return $this->cmd_upload_complete($data);
 
 			default:
+				error_log("SiteGuard Backup RPC Receiver: unknown command '{$command}'");
 				return new WP_Error('unknown_command', "Unknown RPC command: {$command}");
 		}
 	}
@@ -240,11 +252,13 @@ class SiteGuard_Backup_Remote_Send {
 	 */
 	private function cmd_send_chunk($data, $name_hash) {
 		if (empty($data['file']) || !isset($data['data']) || !isset($data['start'])) {
+			error_log("SiteGuard Backup RPC Receiver: send_chunk missing params - file=" . (isset($data['file']) ? 'yes' : 'no') . " data=" . (isset($data['data']) ? 'yes' : 'no') . " start=" . (isset($data['start']) ? 'yes' : 'no'));
 			return new WP_Error('invalid_chunk', 'Missing required chunk parameters.');
 		}
 
 		// Use basename() to strip any path components, then sanitize
 		$filename = sanitize_file_name(basename($data['file']));
+		error_log("SiteGuard Backup RPC Receiver: send_chunk file={$filename} start={$data['start']} last=" . (!empty($data['last_chunk']) ? 'yes' : 'no'));
 
 		// Estimate decoded size before base64_decode to prevent memory abuse
 		$b64_len = is_string($data['data']) ? strlen($data['data']) : 0;
@@ -276,7 +290,8 @@ class SiteGuard_Backup_Remote_Send {
 		}
 
 		// Validate filename pattern - strict whitelist
-		if (!preg_match('/^backup_[\w\-]+\.(zip|gz|sql|sql\.gz|sql\.bz2|tar|tar\.gz|tar\.bz2|txt)$/', $filename)) {
+		if (!preg_match('/^backup_[\w\-]+\.(zip|gz|json|sql|sql\.gz|sql\.bz2|tar|tar\.gz|tar\.bz2|txt)$/', $filename)) {
+			error_log("SiteGuard Backup RPC Receiver: rejected filename '{$filename}' - does not match whitelist pattern");
 			return new WP_Error('invalid_filename', 'Invalid backup filename format.');
 		}
 
@@ -352,7 +367,7 @@ class SiteGuard_Backup_Remote_Send {
 		$filename = sanitize_file_name(basename($data['file']));
 
 		// Validate filename pattern (same whitelist as cmd_send_chunk)
-		if (!preg_match('/^backup_[\w\-]+\.(zip|gz|sql|sql\.gz|sql\.bz2|tar|tar\.gz|tar\.bz2|txt)$/', $filename)) {
+		if (!preg_match('/^backup_[\w\-]+\.(zip|gz|json|sql|sql\.gz|sql\.bz2|tar|tar\.gz|tar\.bz2|txt)$/', $filename)) {
 			return new WP_Error('invalid_filename', 'Invalid backup filename format.');
 		}
 		$opts = SiteGuard_Backup_Options::instance();

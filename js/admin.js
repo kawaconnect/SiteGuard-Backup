@@ -1044,6 +1044,27 @@
 			$(document).on('click', '.sgbackup-send-site', function() {
 				var siteId = $(this).data('site-id');
 				$('#sgbackup-send-options').show().data('site-id', siteId);
+
+				// Populate the existing-backup dropdown
+				var $select = $('#sgbackup-send-existing-select');
+				$select.html('<option value="">Loading...</option>');
+				self.ajax('get_existing_backups', {}, function(data) {
+					var html = '<option value="">Select backup...</option>';
+					if (data && data.length) {
+						for (var i = 0; i < data.length; i++) {
+							var b = data[i];
+							var entities = [];
+							$.each(['db','plugins','themes','uploads','others','wpcore'], function(_, e) {
+								if (b[e]) entities.push(e);
+							});
+							html += '<option value="' + SGB.esc(String(b.timestamp)) + '">'
+								+ SGB.esc(b.date) + ' (' + entities.join(', ') + ')</option>';
+						}
+					}
+					$select.html(html);
+				}, function() {
+					$select.html('<option value="">Error loading backups</option>');
+				});
 			});
 
 			// M6: Clone to site (backup + send in one step)

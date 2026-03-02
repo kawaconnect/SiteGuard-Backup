@@ -57,6 +57,7 @@ class SiteGuard_Backup_Method_Remotesend extends SiteGuard_Backup_Module {
 		// Determine site_id from service string (e.g., "remotesend/3")
 		$services = $sgbackup->jobdata_get('service', array('none'));
 		$site_id = 0;
+		$sgbackup->log("RemoteSend: services = " . json_encode($services));
 		foreach ($services as $svc) {
 			if (preg_match('/^remotesend\/(\d+)$/', $svc, $m)) {
 				$site_id = intval($m[1]);
@@ -64,8 +65,14 @@ class SiteGuard_Backup_Method_Remotesend extends SiteGuard_Backup_Module {
 			}
 		}
 
+		$sgbackup->log("RemoteSend: resolved site_id = {$site_id}");
 		$site = $this->load_remote_site($site_id);
-		if (is_wp_error($site)) return $site;
+		if (is_wp_error($site)) {
+			$sgbackup->log("RemoteSend: load_remote_site failed: " . $site->get_error_message(), 'error');
+			return $site;
+		}
+
+		$sgbackup->log("RemoteSend: target URL = " . (isset($site['url']) ? $site['url'] : 'unknown'));
 
 		require_once SGBACKUP_DIR . 'includes/class-remote-communications.php';
 		$rpc = new SiteGuard_Backup_Remote_Communications();

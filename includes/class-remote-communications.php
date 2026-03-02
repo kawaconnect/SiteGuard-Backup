@@ -137,11 +137,16 @@ class SiteGuard_Backup_Remote_Communications {
 
 		// Encrypt with receiver's public key using AES + RSA hybrid
 		$encrypted = $this->encrypt_message($json_payload, $site['public_key']);
-		if (is_wp_error($encrypted)) return $encrypted;
+		if (is_wp_error($encrypted)) {
+			error_log("SiteGuard Backup RPC: Encryption failed for {$command}: " . $encrypted->get_error_message());
+			return $encrypted;
+		}
 
 		// Determine endpoint
 		$name_hash = isset($site['name_hash']) ? $site['name_hash'] : '';
 		$endpoint = trailingslashit($site['url']) . 'wp-admin/admin-ajax.php';
+
+		error_log("SiteGuard Backup RPC: Sending '{$command}' to {$endpoint} (name_hash={$name_hash})");
 
 		// Send via POST
 		$response = wp_remote_post($endpoint, array(
@@ -161,23 +166,30 @@ class SiteGuard_Backup_Remote_Communications {
 			),
 		));
 
-		if (is_wp_error($response)) return $response;
+		if (is_wp_error($response)) {
+			error_log("SiteGuard Backup RPC: HTTP error for {$command}: " . $response->get_error_message());
+			return $response;
+		}
 
 		$code = wp_remote_retrieve_response_code($response);
+		$body = wp_remote_retrieve_body($response);
+
+		error_log("SiteGuard Backup RPC: Response for '{$command}': HTTP {$code}, body=" . substr($body, 0, 500));
+
 		if ($code !== 200) {
-			$body = wp_remote_retrieve_body($response);
 			return new WP_Error('rpc_error', "RPC error (HTTP {$code}): " . substr($body, 0, 200));
 		}
 
-		$body = wp_remote_retrieve_body($response);
 		$result = @json_decode($body, true);
 
 		if (!is_array($result)) {
+			error_log("SiteGuard Backup RPC: Unparseable response for '{$command}': " . substr($body, 0, 500));
 			return new WP_Error('rpc_parse_error', 'Could not parse RPC response.');
 		}
 
 		if (isset($result['success']) && !$result['success']) {
 			$msg = isset($result['data']['message']) ? $result['data']['message'] : 'RPC error';
+			error_log("SiteGuard Backup RPC: Remote error for '{$command}': {$msg}");
 			return new WP_Error('rpc_remote_error', $msg);
 		}
 
