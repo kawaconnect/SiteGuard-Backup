@@ -182,11 +182,20 @@ class SiteGuard_Backup_CLI_Command extends WP_CLI_Command {
      * [--preset=<name>]
      * : Load restore options from a named preset.
      *
+     * [--db-restore-mode=<mode>]
+     * : Database restore mode. Values: migrate, overwrite, tables-only, skip-db.
+     * Falls back to site default if not specified.
+     *
+     * [--move-in-mode=<mode>]
+     * : File restore mode. Values: overwrite, backup, skip, merge.
+     *
      * ## EXAMPLES
      *
      *     wp siteguardbackup restore 1709283600
      *     wp siteguardbackup restore 1709283600 --entities=db,plugins
      *     wp siteguardbackup restore 1709283600 --preset="migration-standard"
+     *     wp siteguardbackup restore 1709283600 --db-restore-mode=migrate
+     *     wp siteguardbackup restore 1709283600 --move-in-mode=skip
      *
      * @subcommand restore
      */
@@ -238,6 +247,36 @@ class SiteGuard_Backup_CLI_Command extends WP_CLI_Command {
 
         if (isset($assoc_args['tables'])) {
             $restore_options['restore_tables'] = array_map('trim', explode(',', $assoc_args['tables']));
+        }
+
+        // Database restore mode
+        if (isset($assoc_args['db-restore-mode'])) {
+            $db_mode_map = array(
+                'migrate'     => 0,
+                'overwrite'   => 1,
+                'tables-only' => 2,
+                'skip-db'     => 3,
+            );
+            $db_mode = $assoc_args['db-restore-mode'];
+            if (!isset($db_mode_map[$db_mode])) {
+                WP_CLI::error("Invalid --db-restore-mode. Valid values: migrate, overwrite, tables-only, skip-db");
+            }
+            $restore_options['db_restore_mode'] = $db_mode_map[$db_mode];
+        }
+
+        // File move-in mode
+        if (isset($assoc_args['move-in-mode'])) {
+            $move_mode_map = array(
+                'overwrite' => 0,
+                'backup'    => 1,
+                'skip'      => 2,
+                'merge'     => 3,
+            );
+            $move_mode = $assoc_args['move-in-mode'];
+            if (!isset($move_mode_map[$move_mode])) {
+                WP_CLI::error("Invalid --move-in-mode. Valid values: overwrite, backup, skip, merge");
+            }
+            $restore_options['move_in_mode'] = $move_mode_map[$move_mode];
         }
 
         WP_CLI::confirm('This will restore the backup. Continue?');

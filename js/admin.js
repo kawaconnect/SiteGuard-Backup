@@ -587,6 +587,10 @@
 			var moveInMode = $('select[name="sgbackup_move_in_mode"]').val();
 			formData.append('move_in_mode', moveInMode || '0');
 
+			// Collect db_restore_mode
+			var dbRestoreMode = $('select[name="sgbackup_db_restore_mode"]').val();
+			formData.append('db_restore_mode', dbRestoreMode || '0');
+
 			// Gap 25: Collect include-unspecified options
 			formData.append('include_unspecified_tables', $('input[name="sgbackup_include_unspecified_tables"]').is(':checked') ? '1' : '0');
 			formData.append('include_unspecified_plugins', $('input[name="sgbackup_include_unspecified_plugins"]').is(':checked') ? '1' : '0');
@@ -2273,6 +2277,7 @@
 				$('input[name="sgbackup_restore_others"]').prop('checked', !!opts.others);
 				$('input[name="sgbackup_restore_wpcore"]').prop('checked', !!opts.wpcore);
 				$('select[name="sgbackup_move_in_mode"]').val(opts.move_in_mode || 0);
+				$('select[name="sgbackup_db_restore_mode"]').val(opts.db_restore_mode || 0);
 				$('input[name="sgbackup_restore_pre_backup"]').prop('checked', opts.pre_restore_backup !== false);
 				$('input[name="sgbackup_include_unspecified_tables"]').prop('checked', opts.include_unspecified_tables !== false);
 				$('input[name="sgbackup_include_unspecified_plugins"]').prop('checked', opts.include_unspecified_plugins !== false);
@@ -2293,6 +2298,7 @@
 					others: $('input[name="sgbackup_restore_others"]').is(':checked'),
 					wpcore: $('input[name="sgbackup_restore_wpcore"]').is(':checked'),
 					move_in_mode: $('select[name="sgbackup_move_in_mode"]').val(),
+					db_restore_mode: $('select[name="sgbackup_db_restore_mode"]').val(),
 					pre_restore_backup: $('input[name="sgbackup_restore_pre_backup"]').is(':checked'),
 					include_unspecified_tables: $('input[name="sgbackup_include_unspecified_tables"]').is(':checked'),
 					include_unspecified_plugins: $('input[name="sgbackup_include_unspecified_plugins"]').is(':checked'),

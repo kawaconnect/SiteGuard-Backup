@@ -265,6 +265,19 @@ $period_labels = array(
 				<p class="description"><?php esc_html_e('Replaces names, emails, addresses and other PII with anonymous placeholders. Useful for sharing backups with developers.', 'siteguardbackup'); ?></p>
 			</td>
 		</tr>
+		<tr>
+			<th><?php esc_html_e('Default Database Restore Mode', 'siteguardbackup'); ?></th>
+			<td>
+				<?php $default_db_mode = isset($settings['default_db_restore_mode']) ? intval($settings['default_db_restore_mode']) : 0; ?>
+				<select name="default_db_restore_mode">
+					<option value="0" <?php selected($default_db_mode, 0); ?>><?php esc_html_e('Migrate - Full overwrite + auto search-replace (default)', 'siteguardbackup'); ?></option>
+					<option value="1" <?php selected($default_db_mode, 1); ?>><?php esc_html_e('Overwrite - Full overwrite, no search-replace', 'siteguardbackup'); ?></option>
+					<option value="2" <?php selected($default_db_mode, 2); ?>><?php esc_html_e('Tables only - Import only tables not already in DB', 'siteguardbackup'); ?></option>
+					<option value="3" <?php selected($default_db_mode, 3); ?>><?php esc_html_e('Skip database - Restore files only', 'siteguardbackup'); ?></option>
+				</select>
+				<p class="description"><?php esc_html_e('Default mode for WP-CLI restores, remote-receive migrations, and any restore where the mode is not explicitly chosen.', 'siteguardbackup'); ?></p>
+			</td>
+		</tr>
 		<tr class="sgbackup-anonymise-mode-row" style="<?php echo empty($settings['db_anonymise']) ? 'display:none;' : ''; ?>">
 			<th><?php esc_html_e('Anonymisation Mode', 'siteguardbackup'); ?></th>
 			<td>

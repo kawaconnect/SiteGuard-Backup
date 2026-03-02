@@ -371,6 +371,7 @@ class SiteGuard_Backup_Commands {
 			'include_tables', 'exclude_tables',
 			'backupdb_nonwp',
 			'db_anonymise', 'db_anonymise_mode',
+			'default_db_restore_mode',
 			'extra_dirs', 'max_incrementals_before_full',
 			'ssl_disableverify', 'ssl_useservercerts',
 			'auto_update',
@@ -827,6 +828,12 @@ class SiteGuard_Backup_Commands {
 		}
 		if (!empty($params['encryption_key'])) {
 			$restore_options['encryption_key'] = sanitize_text_field($params['encryption_key']);
+		}
+		if (isset($params['move_in_mode'])) {
+			$restore_options['move_in_mode'] = intval($params['move_in_mode']);
+		}
+		if (isset($params['db_restore_mode'])) {
+			$restore_options['db_restore_mode'] = intval($params['db_restore_mode']);
 		}
 
 		require_once SGBACKUP_DIR . 'restorer.php';
@@ -2558,6 +2565,7 @@ class SiteGuard_Backup_Commands {
 			$restore_options[$entity] = !empty($params[$entity]);
 		}
 		$restore_options['move_in_mode'] = isset($params['move_in_mode']) ? intval($params['move_in_mode']) : 0;
+		$restore_options['db_restore_mode'] = isset($params['db_restore_mode']) ? intval($params['db_restore_mode']) : 0;
 		$restore_options['pre_restore_backup'] = !empty($params['pre_restore_backup']);
 		$restore_options['include_unspecified_tables'] = !empty($params['include_unspecified_tables']);
 		$restore_options['include_unspecified_plugins'] = !empty($params['include_unspecified_plugins']);

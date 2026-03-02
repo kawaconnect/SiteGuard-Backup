@@ -15,6 +15,12 @@ class SiteGuard_Backup_Restorer {
 	const MOVEIN_SKIP_EXISTING = 2;    // Do nothing if file already exists
 	const MOVEIN_MERGE_CONTENTS = 3;   // Copy contents into existing directory
 
+	/** Database restore mode constants */
+	const DB_RESTORE_MIGRATE = 0;      // Full overwrite + auto search-replace + multisite fixes (default)
+	const DB_RESTORE_OVERWRITE = 1;    // Full overwrite, NO search-replace (same-domain restore)
+	const DB_RESTORE_TABLES_ONLY = 2;  // Only import tables not already present in DB
+	const DB_RESTORE_SKIP_DB = 3;      // Skip database entirely (restore files only)
+
 	/** @var SiteGuard_Backup */
 	private $sgbackup;
 
@@ -49,6 +55,9 @@ class SiteGuard_Backup_Restorer {
 	/** @var int Move-in mode for file restore */
 	private $move_in_mode = 0;
 
+	/** @var int Database restore mode */
+	private $db_restore_mode = 0;
+
 	/** @var bool Whether to include unspecified tables in restore */
 	private $include_unspecified_tables = true;
 
@@ -77,6 +86,13 @@ class SiteGuard_Backup_Restorer {
 		// Gap 23: Move-in mode
 		if (isset($restore_options['move_in_mode'])) {
 			$this->move_in_mode = intval($restore_options['move_in_mode']);
+		}
+
+		// Database restore mode - fall back to site-wide default
+		if (isset($restore_options['db_restore_mode'])) {
+			$this->db_restore_mode = intval($restore_options['db_restore_mode']);
+		} else {
+			$this->db_restore_mode = intval(SiteGuard_Backup_Options::instance()->get_option('sgbackup_default_db_restore_mode', 0));
 		}
 
 		// Gap 25: Include-unspecified options
@@ -281,6 +297,22 @@ class SiteGuard_Backup_Restorer {
 
 		$result = array('success' => true, 'errors' => array(), 'tables_restored' => 0);
 
+		$mode_labels = array(
+			self::DB_RESTORE_MIGRATE     => 'migrate (full overwrite + search-replace)',
+			self::DB_RESTORE_OVERWRITE   => 'overwrite (no search-replace)',
+			self::DB_RESTORE_TABLES_ONLY => 'tables-only (new tables only)',
+			self::DB_RESTORE_SKIP_DB     => 'skip-db (no database import)',
+		);
+		$this->sgbackup->log("Database restore mode: " . ($mode_labels[$this->db_restore_mode] ?? 'unknown'));
+		$this->progress("Database restore mode: " . ($mode_labels[$this->db_restore_mode] ?? 'unknown'));
+
+		// Mode 3: Skip DB entirely
+		if ($this->db_restore_mode === self::DB_RESTORE_SKIP_DB) {
+			$this->sgbackup->log("Skipping database restore (mode: skip-db)");
+			$this->progress("Database restore skipped by user selection");
+			return $result;
+		}
+
 		// Save current site URLs BEFORE importing the DB, so search-replace
 		// can compare old URLs against these destination URLs (not the
 		// overwritten values that get_option would return after import).
@@ -304,6 +336,15 @@ class SiteGuard_Backup_Restorer {
 			}
 		}
 
+		// Mode 2: Tables-only - build list of tables NOT already in DB
+		if ($this->db_restore_mode === self::DB_RESTORE_TABLES_ONLY && $selected_tables === null) {
+			global $wpdb;
+			$existing_tables = $wpdb->get_col("SHOW TABLES");
+			// We'll pass these as an exclusion set; import only tables not in this list
+			$this->sgbackup->log("Tables-only mode: " . count($existing_tables) . " existing tables will be skipped");
+			$this->progress("Tables-only mode: skipping " . count($existing_tables) . " existing tables");
+		}
+
 		foreach ($db_files as $db_file) {
 			$file_path = $backup_dir . $db_file;
 
@@ -322,8 +363,26 @@ class SiteGuard_Backup_Restorer {
 
 			$this->sgbackup->log("Importing database: {$db_file}");
 
-			// Use filtered method when selective tables are specified
-			if ($selected_tables !== null) {
+			// Mode 2 (tables-only): use filtered import with only tables NOT in DB
+			if ($this->db_restore_mode === self::DB_RESTORE_TABLES_ONLY && $selected_tables === null) {
+				// Extract table names from SQL file, then filter to only new ones
+				$backup_tables = SiteGuard_Backup_Database_Utility::get_tables_in_sql_file($file_path);
+				$new_tables = array_diff($backup_tables, $existing_tables);
+				if (empty($new_tables)) {
+					$this->sgbackup->log("Tables-only mode: no new tables to import from {$db_file}");
+					$this->progress("No new tables found in {$db_file}");
+					continue;
+				}
+				$this->sgbackup->log("Tables-only mode: importing " . count($new_tables) . " new tables: " . implode(', ', $new_tables));
+				$import_result = SiteGuard_Backup_Database_Utility::execute_sql_file_filtered(
+					$file_path,
+					$new_tables,
+					function($lines_done) {
+						$this->progress("Database import: {$lines_done} lines processed");
+					}
+				);
+			} elseif ($selected_tables !== null) {
+				// Use filtered method when selective tables are specified
 				$import_result = SiteGuard_Backup_Database_Utility::execute_sql_file_filtered(
 					$file_path,
 					$selected_tables,
@@ -349,10 +408,13 @@ class SiteGuard_Backup_Restorer {
 			}
 		}
 
-		// Perform search-replace if this is a migration
-		if ($this->is_migration) {
+		// Perform search-replace if this is a migration (mode 0 only)
+		if ($this->is_migration && $this->db_restore_mode === self::DB_RESTORE_MIGRATE) {
 			$this->progress("Performing search-replace for migration");
 			$this->do_search_replace();
+		} elseif ($this->is_migration && $this->db_restore_mode !== self::DB_RESTORE_MIGRATE) {
+			$this->sgbackup->log("Migration detected but search-replace skipped (db_restore_mode=" . $this->db_restore_mode . ")");
+			$this->progress("Search-replace skipped (not in migrate mode)");
 		}
 
 		// Save progress for resume support

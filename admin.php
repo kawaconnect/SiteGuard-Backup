@@ -533,6 +533,12 @@ class SiteGuard_Backup_Admin {
 			$restore_options['include_unspecified_themes'] = true;
 		}
 
+		// Move-in mode (file restore behavior)
+		$restore_options['move_in_mode'] = isset($_POST['move_in_mode']) ? intval($_POST['move_in_mode']) : 0;
+
+		// Database restore mode
+		$restore_options['db_restore_mode'] = isset($_POST['db_restore_mode']) ? intval($_POST['db_restore_mode']) : 0;
+
 		// Audit log
 		$audit = SiteGuard_Backup_Audit_Log::instance();
 		$restore_entities = array_keys(array_filter($restore_options, function($v, $k) {

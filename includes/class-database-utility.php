@@ -1020,4 +1020,29 @@ class SiteGuard_Backup_Database_Utility {
 		}
 		return false;
 	}
+
+	/**
+	 * Extract table names from a SQL dump file without importing.
+	 *
+	 * @param string $sql_file Path to .sql or .sql.gz file.
+	 * @return array List of table names found in CREATE TABLE statements.
+	 */
+	public static function get_tables_in_sql_file($sql_file) {
+		$is_gz = (substr($sql_file, -3) === '.gz');
+		$fh = $is_gz ? @gzopen($sql_file, 'rb') : @fopen($sql_file, 'r');
+		if (!$fh) return array();
+
+		$tables = array();
+		while (!($is_gz ? gzeof($fh) : feof($fh))) {
+			$line = $is_gz ? gzgets($fh) : fgets($fh);
+			if (false === $line) break;
+
+			if (preg_match('/^CREATE TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?`([^`]+)`/i', trim($line), $m)) {
+				$tables[] = $m[1];
+			}
+		}
+
+		$is_gz ? gzclose($fh) : fclose($fh);
+		return $tables;
+	}
 }

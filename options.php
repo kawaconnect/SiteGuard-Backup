@@ -251,6 +251,7 @@ class SiteGuard_Backup_Options {
 			'failover_enabled'   => false,
 			'failover_role'      => 'standalone',
 			'failover_production_url' => '',
+			'default_db_restore_mode' => 0,
 		);
 	}
 

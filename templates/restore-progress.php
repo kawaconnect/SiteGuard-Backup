@@ -57,6 +57,16 @@
 				</select>
 			</label>
 		</p>
+		<p>
+			<label><?php esc_html_e('Database restore mode:', 'siteguardbackup'); ?>
+				<select name="sgbackup_db_restore_mode">
+					<option value="0"><?php esc_html_e('Migrate - Full overwrite + auto search-replace (default)', 'siteguardbackup'); ?></option>
+					<option value="1"><?php esc_html_e('Overwrite - Full overwrite, no search-replace', 'siteguardbackup'); ?></option>
+					<option value="2"><?php esc_html_e('Tables only - Import only tables not already in DB', 'siteguardbackup'); ?></option>
+					<option value="3"><?php esc_html_e('Skip database - Restore files only', 'siteguardbackup'); ?></option>
+				</select>
+			</label>
+		</p>
 
 		<hr />
 		<p>
