@@ -416,17 +416,30 @@ class SiteGuard_Backup_Restorer {
 		// cached option values stale (they still hold the pre-import data).
 		wp_cache_flush();
 
-		// Post-import failsafe: if the SQL scan didn't detect migration (e.g.,
-		// regex couldn't parse the dump format), check the actual imported data.
-		if (!$this->is_migration && $this->db_restore_mode === self::DB_RESTORE_MIGRATE) {
+		// AUTHORITATIVE migration detection from the actual imported database.
+		// The SQL scan may have picked up a subsite's siteurl (e.g.,
+		// wp_10_options appears before wp_options alphabetically), giving us
+		// the wrong base domain. Reading from wp_options after import gives
+		// the correct main site URL.
+		if ($this->db_restore_mode === self::DB_RESTORE_MIGRATE) {
 			$imported_siteurl = get_option('siteurl');
+			$imported_home = get_option('home');
 			if (!empty($imported_siteurl) && !empty($this->pre_import_siteurl) && $imported_siteurl !== $this->pre_import_siteurl) {
+				if ($this->is_migration && $this->old_siteurl !== $imported_siteurl) {
+					$this->sgbackup->log("Correcting old_siteurl from SQL scan ({$this->old_siteurl}) to actual imported value ({$imported_siteurl})");
+				}
 				$this->is_migration = true;
 				$this->old_siteurl = $imported_siteurl;
-				$this->old_home = get_option('home');
-				$this->sgbackup->log("Migration detected (post-import failsafe): {$imported_siteurl} -> {$this->pre_import_siteurl}");
-				$this->progress("Migration detected: domains differ, will run search-replace");
+				$this->old_home = $imported_home;
+				$this->sgbackup->log("Migration confirmed (post-import): {$imported_siteurl} -> {$this->pre_import_siteurl}");
+				$this->progress("Migration detected: {$imported_siteurl} -> {$this->pre_import_siteurl}");
 				$this->check_protocol_transition($imported_siteurl, $this->pre_import_siteurl);
+			} elseif (empty($imported_siteurl) || $imported_siteurl === $this->pre_import_siteurl) {
+				// URLs match - this is a same-site restore, not a migration
+				if ($this->is_migration) {
+					$this->sgbackup->log("SQL scan detected migration but imported siteurl matches current site - not a migration");
+					$this->is_migration = false;
+				}
 			}
 		}
 
