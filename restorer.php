@@ -168,7 +168,11 @@ class SiteGuard_Backup_Restorer {
 				$result['errors'] = array_merge($result['errors'], $db_result['errors']);
 				$result['success'] = false;
 			}
-			$result['messages'][] = "Database: {$db_result['tables_restored']} tables restored";
+			if ($this->db_restore_mode === self::DB_RESTORE_SKIP_DB) {
+				$result['messages'][] = "Database: skipped (user selected skip-db mode)";
+			} else {
+				$result['messages'][] = "Database: {$db_result['tables_restored']} tables restored";
+			}
 		}
 
 		// Restore file entities (standard + extra directories)
@@ -337,10 +341,10 @@ class SiteGuard_Backup_Restorer {
 		}
 
 		// Mode 2: Tables-only - build list of tables NOT already in DB
+		$existing_tables = array();
 		if ($this->db_restore_mode === self::DB_RESTORE_TABLES_ONLY && $selected_tables === null) {
 			global $wpdb;
 			$existing_tables = $wpdb->get_col("SHOW TABLES");
-			// We'll pass these as an exclusion set; import only tables not in this list
 			$this->sgbackup->log("Tables-only mode: " . count($existing_tables) . " existing tables will be skipped");
 			$this->progress("Tables-only mode: skipping " . count($existing_tables) . " existing tables");
 		}

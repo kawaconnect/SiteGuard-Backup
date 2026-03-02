@@ -415,6 +415,11 @@
 				$('#sgbackup-restore-progress').hide();
 				$('#sgbackup-restore-log').empty();
 
+				// Initialize DB restore mode dropdown from site default
+				if (sgbackup_settings.default_db_restore_mode) {
+					$('select[name="sgbackup_db_restore_mode"]').val(sgbackup_settings.default_db_restore_mode);
+				}
+
 				$('#sgbackup-restore-modal').dialog({
 					modal: true,
 					width: 600,

@@ -128,6 +128,7 @@ class SiteGuard_Backup_Admin {
 			),
 			'max_upload_size' => wp_max_upload_size(),
 			'is_multisite' => is_multisite(),
+			'default_db_restore_mode' => intval(SiteGuard_Backup_Options::instance()->get_option('sgbackup_default_db_restore_mode', 0)),
 			'strings'   => array(
 				'backup_started'   => __('Backup started...', 'siteguardbackup'),
 				'backup_complete'  => __('Backup complete!', 'siteguardbackup'),
@@ -533,11 +534,13 @@ class SiteGuard_Backup_Admin {
 			$restore_options['include_unspecified_themes'] = true;
 		}
 
-		// Move-in mode (file restore behavior)
-		$restore_options['move_in_mode'] = isset($_POST['move_in_mode']) ? intval($_POST['move_in_mode']) : 0;
+		// Move-in mode (file restore behavior) - clamp to valid range
+		$restore_options['move_in_mode'] = isset($_POST['move_in_mode']) ? min(3, max(0, intval($_POST['move_in_mode']))) : 0;
 
-		// Database restore mode
-		$restore_options['db_restore_mode'] = isset($_POST['db_restore_mode']) ? intval($_POST['db_restore_mode']) : 0;
+		// Database restore mode - only set if explicitly provided, so restorer can fall back to site default
+		if (isset($_POST['db_restore_mode'])) {
+			$restore_options['db_restore_mode'] = min(3, max(0, intval($_POST['db_restore_mode'])));
+		}
 
 		// Audit log
 		$audit = SiteGuard_Backup_Audit_Log::instance();
