@@ -412,6 +412,24 @@ class SiteGuard_Backup_Restorer {
 			}
 		}
 
+		// Flush WordPress object cache - the atomic RENAME TABLE makes all
+		// cached option values stale (they still hold the pre-import data).
+		wp_cache_flush();
+
+		// Post-import failsafe: if the SQL scan didn't detect migration (e.g.,
+		// regex couldn't parse the dump format), check the actual imported data.
+		if (!$this->is_migration && $this->db_restore_mode === self::DB_RESTORE_MIGRATE) {
+			$imported_siteurl = get_option('siteurl');
+			if (!empty($imported_siteurl) && !empty($this->pre_import_siteurl) && $imported_siteurl !== $this->pre_import_siteurl) {
+				$this->is_migration = true;
+				$this->old_siteurl = $imported_siteurl;
+				$this->old_home = get_option('home');
+				$this->sgbackup->log("Migration detected (post-import failsafe): {$imported_siteurl} -> {$this->pre_import_siteurl}");
+				$this->progress("Migration detected: domains differ, will run search-replace");
+				$this->check_protocol_transition($imported_siteurl, $this->pre_import_siteurl);
+			}
+		}
+
 		// Perform search-replace if this is a migration (mode 0 only)
 		if ($this->is_migration && $this->db_restore_mode === self::DB_RESTORE_MIGRATE) {
 			$this->progress("Performing search-replace for migration");
@@ -429,6 +447,12 @@ class SiteGuard_Backup_Restorer {
 
 	/**
 	 * Scan database dump for old URLs to detect migration.
+	 *
+	 * Handles both mysqldump format (all values on one line) and the PHP dump
+	 * format where INSERT INTO and VALUES are on separate lines:
+	 *   INSERT INTO `wp_options` (col, ...) VALUES
+	 *   (1, 'siteurl', 'https://example.com', 'yes'),
+	 *   (2, 'home', 'https://example.com', 'yes');
 	 */
 	private function scan_db_for_old_urls($file_path) {
 		$is_gz = (substr($file_path, -3) === '.gz');
@@ -439,6 +463,7 @@ class SiteGuard_Backup_Restorer {
 		$max_scan = 200000; // Scan enough lines to reach wp_options in large databases
 		$found_siteurl = false;
 		$found_home = false;
+		$in_options_insert = false; // Track multi-line INSERT INTO *options* context
 
 		while (!($is_gz ? gzeof($fh) : feof($fh)) && $lines_scanned < $max_scan) {
 			// Stop early once we have both URLs
@@ -447,25 +472,42 @@ class SiteGuard_Backup_Restorer {
 			if (false === $line) break;
 
 			$lines_scanned++;
+			$trimmed = trim($line);
 
-			// Look for siteurl/home in INSERT INTO wp_options
-			if (preg_match("/INSERT INTO\s+`[^`]*options`.*'(siteurl|home)'\s*,\s*'([^']+)'/i", $line, $m)) {
-				if ($m[1] === 'siteurl') {
-					$this->old_siteurl = $m[2];
-					$found_siteurl = true;
-				} elseif ($m[1] === 'home') {
-					$this->old_home = $m[2];
-					$found_home = true;
+			// Track INSERT INTO *options* context for multi-line format
+			if (preg_match('/^INSERT INTO\s+`[^`]*options`/i', $trimmed)) {
+				$in_options_insert = true;
+			}
+			// New CREATE/INSERT/DROP statement ends the multi-line context
+			if ($in_options_insert && preg_match('/^(CREATE|DROP|INSERT INTO\s+`[^`]*(?<!options)`)/i', $trimmed)) {
+				$in_options_insert = false;
+			}
+			// Statement terminator on its own line ends context
+			if ($in_options_insert && $trimmed === ';') {
+				$in_options_insert = false;
+			}
+
+			// Match siteurl/home: works for single-line mysqldump format AND
+			// multi-line PHP dump format (value rows within options INSERT)
+			if ($in_options_insert || preg_match('/^INSERT INTO\s+`[^`]*options`/i', $trimmed)) {
+				if (preg_match("/'(siteurl|home)'\s*,\s*'([^']+)'/i", $trimmed, $m)) {
+					if ($m[1] === 'siteurl' && !$found_siteurl) {
+						$this->old_siteurl = $m[2];
+						$found_siteurl = true;
+					} elseif ($m[1] === 'home' && !$found_home) {
+						$this->old_home = $m[2];
+						$found_home = true;
+					}
+				}
+
+				// Look for upload_url_path in same context
+				if (preg_match("/'upload_url_path'\s*,\s*'([^']+)'/i", $trimmed, $m)) {
+					$this->old_uploads = $m[1];
 				}
 			}
 
-			// Look for upload_path or upload_url_path
-			if (preg_match("/INSERT INTO\s+`[^`]*options`.*'upload_url_path'\s*,\s*'([^']+)'/i", $line, $m)) {
-				$this->old_uploads = $m[1];
-			}
-
 			// Detect table prefix from CREATE TABLE statements
-			if (preg_match('/CREATE TABLE\s+`([a-zA-Z0-9_]+)options`/i', $line, $m)) {
+			if (preg_match('/CREATE TABLE\s+`([a-zA-Z0-9_]+)options`/i', $trimmed, $m)) {
 				$detected_prefix = str_replace('options', '', $m[1]);
 				// Validate prefix contains only safe characters
 				if (!empty($detected_prefix) && preg_match('/^[a-zA-Z0-9_]+$/', $detected_prefix)) {
@@ -476,8 +518,9 @@ class SiteGuard_Backup_Restorer {
 
 		$is_gz ? @gzclose($fh) : @fclose($fh);
 
-		// Detect migration
-		$current_siteurl = get_option('siteurl');
+		// Detect migration using pre-import URL (stable reference, not affected by
+		// prior DB file imports in multi-file restores or WordPress object cache)
+		$current_siteurl = !empty($this->pre_import_siteurl) ? $this->pre_import_siteurl : get_option('siteurl');
 		if (!empty($this->old_siteurl) && $this->old_siteurl !== $current_siteurl) {
 			$this->is_migration = true;
 			$this->sgbackup->log("Migration detected: {$this->old_siteurl} -> {$current_siteurl}");
@@ -532,6 +575,16 @@ class SiteGuard_Backup_Restorer {
 		if (!empty($this->old_siteurl) && $this->old_siteurl !== $current_siteurl) {
 			$search[] = $this->old_siteurl;
 			$replace[] = $current_siteurl;
+
+			// Also add the opposite-protocol variant of old_siteurl in case
+			// some DB values use http:// while old_siteurl was detected as https://
+			$old_scheme = parse_url($this->old_siteurl, PHP_URL_SCHEME);
+			$alt_scheme = ($old_scheme === 'https') ? 'http' : 'https';
+			$alt_old_siteurl = preg_replace('/^' . preg_quote($old_scheme, '/') . '/', $alt_scheme, $this->old_siteurl);
+			if ($alt_old_siteurl !== $current_siteurl && !in_array($alt_old_siteurl, $search, true)) {
+				$search[] = $alt_old_siteurl;
+				$replace[] = $current_siteurl;
+			}
 		}
 
 		if (!empty($this->old_home) && $this->old_home !== $current_home && $this->old_home !== $this->old_siteurl) {
@@ -618,6 +671,8 @@ class SiteGuard_Backup_Restorer {
 	 *
 	 * For each blog in wp_blogs whose domain contains the old site's domain,
 	 * compute the new domain and add protocol-aware replacement pairs.
+	 * Both http:// and https:// variants are added for each blog to handle
+	 * cases where subsites use a different protocol than the main site.
 	 * Specific (longer) replacements are added first; bare domain goes last.
 	 */
 	private function build_multisite_replacements(&$search, &$replace) {
@@ -627,7 +682,6 @@ class SiteGuard_Backup_Restorer {
 		$new_domain = parse_url($this->pre_import_siteurl, PHP_URL_HOST);
 		if (!$old_domain || !$new_domain || $old_domain === $new_domain) return;
 
-		$old_scheme = parse_url($this->old_siteurl, PHP_URL_SCHEME);
 		$new_scheme = parse_url($this->pre_import_siteurl, PHP_URL_SCHEME);
 
 		// Read all blog domains from wp_blogs
@@ -650,23 +704,23 @@ class SiteGuard_Backup_Restorer {
 			if ($blog_domain === $old_domain) continue;
 			if (in_array($blog_domain, $added, true)) continue;
 
-			// Full URL replacements (with protocol)
-			$old_url = $old_scheme . '://' . $blog_domain;
 			$new_url = $new_scheme . '://' . $new_blog_domain;
 
-			if (!in_array($old_url, $search, true)) {
-				$search[] = $old_url;
-				$replace[] = $new_url;
-				$this->sgbackup->log("  Blog: {$old_url} -> {$new_url}");
-			}
+			// Add BOTH http:// and https:// search variants for this blog.
+			// Subsites often use a different protocol than the main site
+			// (e.g., main site https:// but subsites http://).
+			$old_url_https = 'https://' . $blog_domain;
+			$old_url_http = 'http://' . $blog_domain;
 
-			// If protocols differ, also add cross-protocol pair
-			if ($old_scheme !== $new_scheme) {
-				$alt_old_url = $new_scheme . '://' . $blog_domain;
-				if (!in_array($alt_old_url, $search, true)) {
-					$search[] = $alt_old_url;
-					$replace[] = $new_url;
-				}
+			if (!in_array($old_url_https, $search, true)) {
+				$search[] = $old_url_https;
+				$replace[] = $new_url;
+				$this->sgbackup->log("  Blog: {$old_url_https} -> {$new_url}");
+			}
+			if (!in_array($old_url_http, $search, true)) {
+				$search[] = $old_url_http;
+				$replace[] = $new_url;
+				$this->sgbackup->log("  Blog: {$old_url_http} -> {$new_url}");
 			}
 
 			// Domain-only replacement for this blog (no protocol)
@@ -678,11 +732,39 @@ class SiteGuard_Backup_Restorer {
 			$added[] = $blog_domain;
 		}
 
+		// Also add both protocol variants for the main site URL to catch
+		// any references using the opposite protocol
+		$old_main_https = 'https://' . $old_domain;
+		$old_main_http = 'http://' . $old_domain;
+		$new_main_url = $new_scheme . '://' . $new_domain;
+
+		if (!in_array($old_main_https, $search, true)) {
+			$search[] = $old_main_https;
+			$replace[] = $new_main_url;
+		}
+		if (!in_array($old_main_http, $search, true)) {
+			$search[] = $old_main_http;
+			$replace[] = $new_main_url;
+		}
+
 		// Bare domain catch-all (LAST so specific replacements run first)
 		if (!in_array($old_domain, $search, true)) {
 			$search[] = $old_domain;
 			$replace[] = $new_domain;
 			$this->sgbackup->log("  Bare domain catch-all: {$old_domain} -> {$new_domain}");
+		}
+
+		// Protocol normalization for the new domain: if destination uses https,
+		// ensure any http:// references to the new domain also get upgraded.
+		// This catches cases where bare domain replacement leaves http:// intact.
+		if ($new_scheme === 'https') {
+			$http_new = 'http://' . $new_domain;
+			$https_new = 'https://' . $new_domain;
+			if (!in_array($http_new, $search, true)) {
+				$search[] = $http_new;
+				$replace[] = $https_new;
+				$this->sgbackup->log("  Protocol fix: {$http_new} -> {$https_new}");
+			}
 		}
 	}
 
@@ -1122,6 +1204,13 @@ class SiteGuard_Backup_Restorer {
 		// Clear object cache
 		wp_cache_delete('alloptions', 'options');
 
+		// Clean up imported cron events and job state from the source site.
+		// After a DB import, the cron table contains events from the source
+		// site (e.g., sgbackup_backup_resume) that would fire on page loads
+		// and attempt to resume old backup/restore jobs, potentially causing
+		// repeated DB overwrites or other failures.
+		$this->cleanup_imported_cron_events();
+
 		// Validate active theme exists
 		$this->validate_theme();
 
@@ -1145,6 +1234,84 @@ class SiteGuard_Backup_Restorer {
 		));
 
 		$this->progress("Post-restore cleanup complete");
+	}
+
+	/**
+	 * Clean up imported cron events and plugin job state from the source site.
+	 *
+	 * After a DB restore, the imported cron table may contain stale
+	 * sgbackup_backup_resume events from the source site. If not cleaned up,
+	 * these fire on every page load and attempt to resume old jobs.
+	 */
+	private function cleanup_imported_cron_events() {
+		global $wpdb;
+
+		// Remove all sgbackup_backup_resume cron events
+		$crons = _get_cron_array();
+		if (is_array($crons)) {
+			$cleaned = 0;
+			foreach ($crons as $timestamp => $hooks) {
+				if (isset($hooks['sgbackup_backup_resume'])) {
+					foreach ($hooks['sgbackup_backup_resume'] as $key => $event) {
+						wp_unschedule_event($timestamp, 'sgbackup_backup_resume', $event['args']);
+						$cleaned++;
+					}
+				}
+			}
+			if ($cleaned > 0) {
+				$this->sgbackup->log("Cleaned up {$cleaned} imported sgbackup_backup_resume cron events");
+			}
+		}
+
+		// Mark any imported jobs as complete so they don't try to resume
+		if (is_multisite()) {
+			$job_rows = $wpdb->get_results($wpdb->prepare(
+				"SELECT meta_key, meta_value FROM {$wpdb->sitemeta} WHERE meta_key LIKE %s",
+				$wpdb->esc_like('sgbackup_jobdata_') . '%'
+			));
+			foreach ($job_rows as $row) {
+				if (strpos($row->meta_value, '"running"') !== false) {
+					$wpdb->update(
+						$wpdb->sitemeta,
+						array('meta_value' => str_replace('"running"', '"complete"', $row->meta_value)),
+						array('meta_key' => $row->meta_key),
+						array('%s'),
+						array('%s')
+					);
+				}
+			}
+		} else {
+			$job_rows = $wpdb->get_results($wpdb->prepare(
+				"SELECT option_name, option_value FROM {$wpdb->options} WHERE option_name LIKE %s",
+				$wpdb->esc_like('sgbackup_jobdata_') . '%'
+			));
+			foreach ($job_rows as $row) {
+				if (strpos($row->option_value, '"running"') !== false) {
+					$wpdb->update(
+						$wpdb->options,
+						array('option_value' => str_replace('"running"', '"complete"', $row->option_value)),
+						array('option_name' => $row->option_name),
+						array('%s'),
+						array('%s')
+					);
+				}
+			}
+		}
+
+		// Remove semaphore locks from the imported DB
+		$wpdb->query($wpdb->prepare(
+			"DELETE FROM {$wpdb->options} WHERE option_name LIKE %s",
+			$wpdb->esc_like('sgbackup_sem_') . '%'
+		));
+
+		// Remove restore progress transients
+		if (is_multisite()) {
+			delete_site_option('sgbackup_restore_progress');
+		} else {
+			delete_option('sgbackup_restore_progress');
+		}
+
+		$this->sgbackup->log("Cleaned up imported job state and semaphore locks");
 	}
 
 	/**
