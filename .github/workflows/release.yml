@@ -14,10 +14,16 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Extract version from plugin header
         id: version
-        run: echo "version=$(grep -oP 'Version:\s*\K[0-9.]+' siteguardbackup.php)" >> "$GITHUB_OUTPUT"
+        run: |
+          VER=$(grep -oP 'Version:\s*\K[0-9.]+' siteguardbackup.php)
+          SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+          echo "version=${VER}" >> "$GITHUB_OUTPUT"
+          echo "tag=v${VER}-${SHA}" >> "$GITHUB_OUTPUT"
 
       - name: Build plugin zip
         run: |
@@ -27,11 +33,17 @@ jobs:
             --exclude='.github/' \
             --exclude='.gitignore' \
             --exclude='.DS_Store' \
+            --exclude='docs/' \
             ./ siteguardbackup/
           zip -r "siteguardbackup-${{ steps.version.outputs.version }}.zip" siteguardbackup/
 
-      - name: Upload plugin zip
-        uses: actions/upload-artifact@v4
-        with:
-          name: siteguardbackup-${{ steps.version.outputs.version }}
-          path: siteguardbackup-*.zip
+      - name: Create GitHub Release
+        run: |
+          COMMIT_MSG=$(git log -1 --pretty=%s)
+          gh release create "${{ steps.version.outputs.tag }}" \
+            --title "$COMMIT_MSG" \
+            --notes "Version ${{ steps.version.outputs.version }} - ${{ github.sha }}" \
+            --target "${{ github.sha }}" \
+            "siteguardbackup-${{ steps.version.outputs.version }}.zip"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
