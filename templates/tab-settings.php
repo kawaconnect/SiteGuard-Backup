@@ -278,6 +278,19 @@ $period_labels = array(
 				<p class="description"><?php esc_html_e('Default mode for WP-CLI restores, remote-receive migrations, and any restore where the mode is not explicitly chosen.', 'siteguardbackup'); ?></p>
 			</td>
 		</tr>
+		<tr>
+			<th><?php esc_html_e('Default Subsite Migration Mode', 'siteguardbackup'); ?></th>
+			<td>
+				<?php $default_subsite_mode = isset($settings['default_subsite_mode']) ? intval($settings['default_subsite_mode']) : 0; ?>
+				<select name="default_subsite_mode">
+					<option value="0" <?php selected($default_subsite_mode, 0); ?>><?php esc_html_e('Mirror all subsites to new domain (default)', 'siteguardbackup'); ?></option>
+					<option value="1" <?php selected($default_subsite_mode, 1); ?>><?php esc_html_e('Main site only - remove subsites', 'siteguardbackup'); ?></option>
+					<option value="2" <?php selected($default_subsite_mode, 2); ?>><?php esc_html_e('Keep original domains (no remap)', 'siteguardbackup'); ?></option>
+					<option value="3" <?php selected($default_subsite_mode, 3); ?>><?php esc_html_e('Custom mapping - choose subdomain for each site', 'siteguardbackup'); ?></option>
+				</select>
+				<p class="description"><?php esc_html_e('How subsites are handled during multisite-to-multisite migrations. Only applies when database restore mode is "Migrate".', 'siteguardbackup'); ?></p>
+			</td>
+		</tr>
 		<tr class="sgbackup-anonymise-mode-row" style="<?php echo empty($settings['db_anonymise']) ? 'display:none;' : ''; ?>">
 			<th><?php esc_html_e('Anonymisation Mode', 'siteguardbackup'); ?></th>
 			<td>

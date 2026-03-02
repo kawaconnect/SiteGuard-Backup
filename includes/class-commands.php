@@ -372,6 +372,7 @@ class SiteGuard_Backup_Commands {
 			'backupdb_nonwp',
 			'db_anonymise', 'db_anonymise_mode',
 			'default_db_restore_mode',
+			'default_subsite_mode',
 			'extra_dirs', 'max_incrementals_before_full',
 			'ssl_disableverify', 'ssl_useservercerts',
 			'auto_update',
@@ -561,7 +562,7 @@ class SiteGuard_Backup_Commands {
 			if (isset($params[$key])) {
 				$value = $params[$key];
 				// Sanitize
-				if (in_array($key, array('retain', 'retain_db', 'split_every', 'max_split', 'delete_local', 'debug_mode', 'encryption_enabled', 'syslog_enabled', 'lock_admin', 'lock_admin_session_length', 'backupdb_nonwp', 'db_anonymise', 'max_incrementals_before_full', 'ssl_disableverify', 'ssl_useservercerts', 'auto_update', 'encrypt_credentials', 'failover_enabled', 'default_db_restore_mode'))) {
+				if (in_array($key, array('retain', 'retain_db', 'split_every', 'max_split', 'delete_local', 'debug_mode', 'encryption_enabled', 'syslog_enabled', 'lock_admin', 'lock_admin_session_length', 'backupdb_nonwp', 'db_anonymise', 'max_incrementals_before_full', 'ssl_disableverify', 'ssl_useservercerts', 'auto_update', 'encrypt_credentials', 'failover_enabled', 'default_db_restore_mode', 'default_subsite_mode'))) {
 					$value = intval($value);
 				} elseif ($key === 'email') {
 					$value = sanitize_email($value);
@@ -834,6 +835,12 @@ class SiteGuard_Backup_Commands {
 		}
 		if (isset($params['db_restore_mode'])) {
 			$restore_options['db_restore_mode'] = min(3, max(0, intval($params['db_restore_mode'])));
+		}
+		if (isset($params['subsite_mode'])) {
+			$restore_options['subsite_mode'] = min(3, max(0, intval($params['subsite_mode'])));
+		}
+		if (!empty($params['subsite_map']) && is_array($params['subsite_map'])) {
+			$restore_options['subsite_map'] = $params['subsite_map'];
 		}
 
 		require_once SGBACKUP_DIR . 'restorer.php';
@@ -1370,7 +1377,17 @@ class SiteGuard_Backup_Commands {
 						$in_blogs_insert = true;
 					}
 					if ($in_blogs_insert) {
-						if (preg_match_all("/'([a-zA-Z0-9._-]+\.[a-zA-Z]{2,})'/", $line, $domain_matches)) {
+						// Try structured extraction: (blog_id, site_id, 'domain', 'path', ...)
+						if (preg_match_all("/\(\s*(\d+)\s*,\s*\d+\s*,\s*'([a-zA-Z0-9._-]+\.[a-zA-Z]{2,})'\s*,\s*'([^']*)'/", $line, $tuple_matches, PREG_SET_ORDER)) {
+							foreach ($tuple_matches as $tm) {
+								$multisite_blogs[] = array(
+									'blog_id' => (int) $tm[1],
+									'domain'  => $tm[2],
+									'path'    => $tm[3],
+								);
+							}
+						} elseif (preg_match_all("/'([a-zA-Z0-9._-]+\.[a-zA-Z]{2,})'/", $line, $domain_matches)) {
+							// Fallback: just extract domains (legacy format)
 							foreach ($domain_matches[1] as $d) {
 								$multisite_blogs[] = $d;
 							}
@@ -1390,13 +1407,39 @@ class SiteGuard_Backup_Commands {
 			}
 		}
 		if (!empty($result['multisite_blogs'])) {
-			$result['multisite_blogs'] = array_values(array_unique($result['multisite_blogs']));
+			// Normalize: deduplicate by domain, prefer structured entries over plain strings
+			$seen = array();
+			$normalized = array();
+			foreach ($result['multisite_blogs'] as $entry) {
+				$domain = is_array($entry) ? $entry['domain'] : $entry;
+				if (!isset($seen[$domain])) {
+					$seen[$domain] = true;
+					$normalized[] = $entry;
+				}
+			}
+			$result['multisite_blogs'] = $normalized;
 		}
 
 		// M8: Add multisite blog grouping for tables
 		if (is_multisite() && !empty($result['tables'])) {
 			global $wpdb;
 			$result['table_groups'] = $this->group_tables_by_blog($result['tables'], $wpdb->prefix);
+		}
+
+		// Return current site's multisite blogs for two-sided mapping UI
+		if (is_multisite()) {
+			$current_blogs = array();
+			$sites = get_sites(array('number' => 500));
+			foreach ($sites as $site) {
+				$blog_details = get_blog_details($site->blog_id);
+				$current_blogs[] = array(
+					'blog_id'  => (int) $site->blog_id,
+					'domain'   => $site->domain,
+					'path'     => $site->path,
+					'blogname' => $blog_details ? $blog_details->blogname : '',
+				);
+			}
+			$result['current_multisite_blogs'] = $current_blogs;
 		}
 
 		// Extract plugin/theme names from zip files
@@ -2566,6 +2609,10 @@ class SiteGuard_Backup_Commands {
 		}
 		$restore_options['move_in_mode'] = isset($params['move_in_mode']) ? min(3, max(0, intval($params['move_in_mode']))) : 0;
 		$restore_options['db_restore_mode'] = isset($params['db_restore_mode']) ? min(3, max(0, intval($params['db_restore_mode']))) : 0;
+		$restore_options['subsite_mode'] = isset($params['subsite_mode']) ? min(3, max(0, intval($params['subsite_mode']))) : 0;
+		if (!empty($params['subsite_map']) && is_array($params['subsite_map'])) {
+			$restore_options['subsite_map'] = $params['subsite_map'];
+		}
 		$restore_options['pre_restore_backup'] = !empty($params['pre_restore_backup']);
 		$restore_options['include_unspecified_tables'] = !empty($params['include_unspecified_tables']);
 		$restore_options['include_unspecified_plugins'] = !empty($params['include_unspecified_plugins']);

@@ -11,6 +11,14 @@ class SiteGuard_Backup_Options {
 
 	private static $instance = null;
 
+	/**
+	 * Keys that must remain network-wide (shared across all sites).
+	 * Migration RSA keys = one identity per install.
+	 */
+	private static $network_wide_keys = array(
+		'sgbackup_migrator_localkeys',
+	);
+
 	public static function instance() {
 		if (null === self::$instance) {
 			self::$instance = new self();
@@ -20,30 +28,48 @@ class SiteGuard_Backup_Options {
 
 	/**
 	 * Get an option value.
+	 * On multisite: per-site first, falling back to network option for backward compat.
 	 */
 	public function get_option($key, $default = false) {
 		if (is_multisite()) {
-			return get_site_option($key, $default);
+			if (in_array($key, self::$network_wide_keys, true)) {
+				return get_site_option($key, $default);
+			}
+			// Per-site first; fall back to network option for backward compat
+			$value = get_option($key, null);
+			if (null === $value) {
+				$network = get_site_option($key, null);
+				return (null !== $network) ? $network : $default;
+			}
+			return $value;
 		}
 		return get_option($key, $default);
 	}
 
 	/**
 	 * Update an option value.
+	 * On multisite: always writes per-site except network-wide keys.
 	 */
 	public function update_option($key, $value, $autoload = false) {
 		if (is_multisite()) {
-			return update_site_option($key, $value);
+			if (in_array($key, self::$network_wide_keys, true)) {
+				return update_site_option($key, $value);
+			}
+			return update_option($key, $value, $autoload);
 		}
 		return update_option($key, $value, $autoload);
 	}
 
 	/**
 	 * Delete an option.
+	 * On multisite: deletes per-site except network-wide keys.
 	 */
 	public function delete_option($key) {
 		if (is_multisite()) {
-			return delete_site_option($key);
+			if (in_array($key, self::$network_wide_keys, true)) {
+				return delete_site_option($key);
+			}
+			return delete_option($key);
 		}
 		return delete_option($key);
 	}
@@ -53,7 +79,10 @@ class SiteGuard_Backup_Options {
 	 */
 	public function get_transient($key) {
 		if (is_multisite()) {
-			return get_site_transient($key);
+			if (in_array($key, self::$network_wide_keys, true)) {
+				return get_site_transient($key);
+			}
+			return get_transient($key);
 		}
 		return get_transient($key);
 	}
@@ -63,7 +92,10 @@ class SiteGuard_Backup_Options {
 	 */
 	public function set_transient($key, $value, $expiration = 0) {
 		if (is_multisite()) {
-			return set_site_transient($key, $value, $expiration);
+			if (in_array($key, self::$network_wide_keys, true)) {
+				return set_site_transient($key, $value, $expiration);
+			}
+			return set_transient($key, $value, $expiration);
 		}
 		return set_transient($key, $value, $expiration);
 	}
@@ -73,7 +105,10 @@ class SiteGuard_Backup_Options {
 	 */
 	public function delete_transient($key) {
 		if (is_multisite()) {
-			return delete_site_transient($key);
+			if (in_array($key, self::$network_wide_keys, true)) {
+				return delete_site_transient($key);
+			}
+			return delete_transient($key);
 		}
 		return delete_transient($key);
 	}
@@ -97,6 +132,11 @@ class SiteGuard_Backup_Options {
 
 		if (empty($dir)) {
 			$dir = WP_CONTENT_DIR . '/sgbackup';
+		}
+
+		// Per-site subdirectory for subsites (blog_id > 1)
+		if (is_multisite() && get_current_blog_id() > 1) {
+			$dir .= '/site-' . get_current_blog_id();
 		}
 
 		if (!file_exists($dir)) {
@@ -252,6 +292,7 @@ class SiteGuard_Backup_Options {
 			'failover_role'      => 'standalone',
 			'failover_production_url' => '',
 			'default_db_restore_mode' => 0,
+			'default_subsite_mode' => 0,
 		);
 	}
 

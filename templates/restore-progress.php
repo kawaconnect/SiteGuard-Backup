@@ -67,6 +67,19 @@
 				</select>
 			</label>
 		</p>
+		<p id="sgbackup-subsite-mode-row">
+			<label><?php esc_html_e('Multisite subsite handling:', 'siteguardbackup'); ?>
+				<select name="sgbackup_subsite_mode">
+					<option value="0"><?php esc_html_e('Mirror all subsites to new domain (default)', 'siteguardbackup'); ?></option>
+					<option value="1"><?php esc_html_e('Main site only - remove subsites', 'siteguardbackup'); ?></option>
+					<option value="2"><?php esc_html_e('Keep original domains (no remap)', 'siteguardbackup'); ?></option>
+					<option value="3"><?php esc_html_e('Custom mapping - choose subdomain for each site', 'siteguardbackup'); ?></option>
+				</select>
+			</label>
+		</p>
+		<div id="sgbackup-subsite-map-container" style="display:none;margin:8px 0;padding:10px;background:#f0f6fc;border:1px solid #c3c4c7;border-radius:3px;">
+			<p><em><?php esc_html_e('Loading subsite list...', 'siteguardbackup'); ?></em></p>
+		</div>
 
 		<hr />
 		<p>

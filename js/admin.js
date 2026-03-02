@@ -416,9 +416,13 @@
 				$('#sgbackup-restore-log').empty();
 
 				// Initialize DB restore mode dropdown from site default
-				if (sgbackup_settings.default_db_restore_mode) {
-					$('select[name="sgbackup_db_restore_mode"]').val(sgbackup_settings.default_db_restore_mode);
-				}
+				$('select[name="sgbackup_db_restore_mode"]').val(sgbackup_settings.default_db_restore_mode || 0);
+
+				// Initialize subsite mode from site default
+				$('select[name="sgbackup_subsite_mode"]').val(sgbackup_settings.default_subsite_mode || 0);
+
+				// Show subsite mode only when DB mode = Migrate (0)
+				$('#sgbackup-subsite-mode-row').toggle($('select[name="sgbackup_db_restore_mode"]').val() === '0');
 
 				$('#sgbackup-restore-modal').dialog({
 					modal: true,
@@ -459,6 +463,284 @@
 				$('#sgbackup-restore-modal').dialog('close');
 				$('#sgbackup-restore-done').hide();
 			});
+
+			// Show/hide subsite mode based on DB restore mode
+			$(document).on('change', 'select[name="sgbackup_db_restore_mode"]', function() {
+				var isMigrate = $(this).val() === '0';
+				$('#sgbackup-subsite-mode-row').toggle(isMigrate);
+				if (!isMigrate) $('#sgbackup-subsite-map-container').hide();
+			});
+
+			// Show/hide custom mapping container based on subsite mode
+			$(document).on('change', 'select[name="sgbackup_subsite_mode"]', function() {
+				var isCustom = $(this).val() === '3';
+				$('#sgbackup-subsite-map-container').toggle(isCustom);
+				if (isCustom) {
+					self.loadSubsiteMap();
+				}
+			});
+		},
+
+		/**
+		 * Load subsite list from the backup and build the two-sided mapping table.
+		 * Columns: Source (backup) | Action | Destination (current site or new domain)
+		 */
+		loadSubsiteMap: function() {
+			var timestamp = $('#sgbackup-restore-modal').data('timestamp');
+			var $container = $('#sgbackup-subsite-map-container');
+
+			// Check if already populated for this timestamp
+			if ($container.data('loaded-ts') === timestamp && $container.find('table').length) return;
+
+			$container.html('<p><em>Loading subsite list from backup...</em></p>');
+
+			this.ajax('get_backup_contents', { timestamp: timestamp }, function(data) {
+				if (!data.multisite_blogs || data.multisite_blogs.length === 0) {
+					$container.html('<p><em>No multisite blogs detected in this backup. Custom mapping requires a multisite backup.</em></p>');
+					return;
+				}
+
+				var oldHost = '';
+				var newHost = '';
+				if (data.old_siteurl && data.current_siteurl) {
+					oldHost = data.old_siteurl.replace(/https?:\/\//, '').replace(/\/.*/, '');
+					newHost = data.current_siteurl.replace(/https?:\/\//, '').replace(/\/.*/, '');
+				}
+
+				// Normalize source blogs: support both structured {blog_id, domain, path} and plain strings
+				var sourceBlogs = [];
+				for (var i = 0; i < data.multisite_blogs.length; i++) {
+					var entry = data.multisite_blogs[i];
+					if (typeof entry === 'object' && entry.domain) {
+						sourceBlogs.push({ blog_id: entry.blog_id, domain: entry.domain, path: entry.path || '/' });
+					} else {
+						sourceBlogs.push({ blog_id: 0, domain: entry, path: '/' });
+					}
+				}
+
+				// Sort: blog_id=1 first, then by blog_id
+				sourceBlogs.sort(function(a, b) {
+					if (a.blog_id === 1) return -1;
+					if (b.blog_id === 1) return 1;
+					return a.blog_id - b.blog_id;
+				});
+
+				// Build destination blog lookup (current site)
+				var destBlogs = data.current_multisite_blogs || [];
+				var hasDestBlogs = destBlogs.length > 0;
+
+				// Build destination options HTML for <select>
+				var destOptionsHtml = '';
+				if (hasDestBlogs) {
+					for (var d = 0; d < destBlogs.length; d++) {
+						var db = destBlogs[d];
+						var label = db.domain + (db.blogname ? ' (' + db.blogname + ')' : '') + ' #' + db.blog_id;
+						destOptionsHtml += '<option value="' + SGB.esc(db.domain) + '">' + SGB.esc(label) + '</option>';
+					}
+				}
+
+				// Auto-match helper: find destination blog matching the source.
+				// Supports both subdomain-style (blog.old.com → blog.new.com) and
+				// independent domain sites (shop.otherdomain.com → shop.otherdomain.com)
+				var findDestMatch = function(srcDomain) {
+					if (!hasDestBlogs) return null;
+
+					// 1. Exact domain match (independent domains that exist on both sites)
+					for (var d = 0; d < destBlogs.length; d++) {
+						if (destBlogs[d].domain === srcDomain) return destBlogs[d].domain;
+					}
+
+					// 2. Subdomain prefix match (blog.old.com → blog.new.com)
+					if (oldHost && newHost) {
+						var srcPrefix = '';
+						var oldHostEsc = oldHost.replace(/\./g, '\\.');
+						var prefixMatch = srcDomain.match(new RegExp('^(.+)\\.' + oldHostEsc + '$'));
+						if (prefixMatch) {
+							srcPrefix = prefixMatch[1];
+						}
+						if (srcPrefix) {
+							for (var d = 0; d < destBlogs.length; d++) {
+								var destPrefix = '';
+								var newHostEsc = newHost.replace(/\./g, '\\.');
+								var dMatch = destBlogs[d].domain.match(new RegExp('^(.+)\\.' + newHostEsc + '$'));
+								if (dMatch) destPrefix = dMatch[1];
+								if (srcPrefix === destPrefix) return destBlogs[d].domain;
+							}
+						}
+					}
+
+					return null;
+				};
+
+				var html = '<p><strong>Map each backup subsite to a destination:</strong></p>';
+				html += '<table class="sgbackup-subsite-map-table widefat">';
+				html += '<thead><tr><th>Source (Backup)</th><th>Action</th><th>Destination</th></tr></thead><tbody>';
+
+				for (var i = 0; i < sourceBlogs.length; i++) {
+					var src = sourceBlogs[i];
+					var isMainSite = (src.blog_id === 1);
+					var mirrorDomain = oldHost ? src.domain.replace(new RegExp(oldHost.replace(/\./g, '\\\\.'), 'g'), newHost) : src.domain;
+
+					// Determine default action and destination
+					var defaultAction, defaultDest;
+					if (isMainSite) {
+						defaultAction = 'overwrite';
+						defaultDest = newHost || mirrorDomain;
+					} else {
+						var destMatch = findDestMatch(src.domain);
+						if (destMatch) {
+							defaultAction = 'overwrite';
+							defaultDest = destMatch;
+						} else {
+							defaultAction = 'create';
+							defaultDest = mirrorDomain;
+						}
+					}
+
+					var srcLabel = SGB.esc(src.domain);
+					if (src.blog_id > 0) srcLabel += ' <small style="color:#888;">#' + src.blog_id + '</small>';
+
+					html += '<tr class="sgbackup-subsite-map-row" data-source-domain="' + SGB.esc(src.domain) + '">';
+					html += '<td>' + srcLabel + '</td>';
+
+					// Action dropdown
+					html += '<td>';
+					if (isMainSite) {
+						html += '<select class="sgbackup-subsite-action" disabled><option value="overwrite">Overwrite main site</option></select>';
+						html += '<input type="hidden" class="sgbackup-subsite-action-val" value="overwrite" />';
+					} else {
+						html += '<select class="sgbackup-subsite-action">';
+						if (hasDestBlogs) {
+							html += '<option value="overwrite"' + (defaultAction === 'overwrite' ? ' selected' : '') + '>Overwrite existing</option>';
+						}
+						html += '<option value="create"' + (defaultAction === 'create' ? ' selected' : '') + '>Create new site</option>';
+						html += '<option value="skip">Skip</option>';
+						html += '</select>';
+					}
+					html += '</td>';
+
+					// Destination column
+					html += '<td class="sgbackup-subsite-dest-cell">';
+					if (isMainSite) {
+						// Main site: always overwrite, show destination main site
+						var mainDestLabel = newHost || mirrorDomain;
+						if (hasDestBlogs && destBlogs[0]) {
+							mainDestLabel = destBlogs[0].domain + (destBlogs[0].blogname ? ' (' + destBlogs[0].blogname + ')' : '');
+						}
+						html += '<span>' + SGB.esc(mainDestLabel) + '</span>';
+						html += '<input type="hidden" class="sgbackup-subsite-dest-select" value="' + SGB.esc(defaultDest) + '" />';
+					} else if (defaultAction === 'overwrite' && hasDestBlogs) {
+						// Show dropdown of existing destination subsites
+						html += '<select class="sgbackup-subsite-dest-select">' + destOptionsHtml + '</select>';
+						// Also keep a text input hidden for "create" mode
+						html += '<input type="text" class="sgbackup-subsite-dest-input regular-text" value="' + SGB.esc(mirrorDomain) + '" style="display:none;width:100%;" />';
+						html += '<span class="sgbackup-subsite-skip-label" style="display:none;color:#888;font-style:italic;">Skipped</span>';
+					} else {
+						// Create mode or no dest blogs: show text input
+						html += '<select class="sgbackup-subsite-dest-select" style="display:none;">' + destOptionsHtml + '</select>';
+						html += '<input type="text" class="sgbackup-subsite-dest-input regular-text" value="' + SGB.esc(mirrorDomain) + '" style="width:100%;" />';
+						html += '<span class="sgbackup-subsite-skip-label" style="display:none;color:#888;font-style:italic;">Skipped</span>';
+					}
+					html += '<span class="sgbackup-collision-warning" style="display:none;"> Collision!</span>';
+					html += '</td>';
+
+					html += '</tr>';
+
+					// Pre-select the matching destination in the dropdown
+					if (!isMainSite && defaultAction === 'overwrite' && defaultDest) {
+						// Will set after DOM insertion below
+					}
+				}
+
+				html += '</tbody></table>';
+				html += '<p class="description">Choose an action for each subsite: overwrite an existing destination site, create a new site, or skip.</p>';
+
+				$container.html(html).data('loaded-ts', timestamp);
+
+				// Pre-select matched destinations and set main site destination
+				$container.find('.sgbackup-subsite-map-row').each(function() {
+					var $row = $(this);
+					var srcDomain = $row.data('source-domain');
+					var src = null;
+					for (var s = 0; s < sourceBlogs.length; s++) {
+						if (sourceBlogs[s].domain === srcDomain) { src = sourceBlogs[s]; break; }
+					}
+					if (!src || src.blog_id === 1) return;
+
+					var destMatch = findDestMatch(src.domain);
+					if (destMatch) {
+						$row.find('.sgbackup-subsite-dest-select').val(destMatch);
+					}
+				});
+
+				// Bind action change events
+				$container.on('change', '.sgbackup-subsite-action', function() {
+					var $row = $(this).closest('.sgbackup-subsite-map-row');
+					var action = $(this).val();
+					var $destSelect = $row.find('.sgbackup-subsite-dest-select');
+					var $destInput = $row.find('.sgbackup-subsite-dest-input');
+					var $skipLabel = $row.find('.sgbackup-subsite-skip-label');
+
+					if (action === 'overwrite') {
+						$destSelect.show();
+						$destInput.hide();
+						$skipLabel.hide();
+					} else if (action === 'create') {
+						$destSelect.hide();
+						$destInput.show();
+						$skipLabel.hide();
+					} else { // skip
+						$destSelect.hide();
+						$destInput.hide();
+						$skipLabel.show();
+					}
+					SGB.checkSubsiteCollisions();
+				});
+
+				// Bind destination change for collision detection
+				$container.on('change', '.sgbackup-subsite-dest-select, .sgbackup-subsite-dest-input', function() {
+					SGB.checkSubsiteCollisions();
+				});
+
+				SGB.checkSubsiteCollisions();
+			}, function(msg) {
+				$container.html('<p class="sgbackup-verify-fail">Error loading subsites: ' + SGB.esc(msg) + '</p>');
+			});
+		},
+
+		/**
+		 * Check for destination collisions in the subsite mapping table.
+		 */
+		checkSubsiteCollisions: function() {
+			var destinations = {};
+			$('.sgbackup-subsite-map-row').each(function() {
+				var $row = $(this);
+				var action = $row.find('.sgbackup-subsite-action').val() || $row.find('.sgbackup-subsite-action-val').val();
+				if (action === 'skip') return;
+
+				var dest = '';
+				if (action === 'overwrite') {
+					dest = $row.find('.sgbackup-subsite-dest-select').val();
+				} else {
+					dest = $.trim($row.find('.sgbackup-subsite-dest-input').val());
+				}
+				if (!dest) return;
+
+				if (!destinations[dest]) destinations[dest] = [];
+				destinations[dest].push($row);
+			});
+
+			// Clear all warnings first
+			$('.sgbackup-collision-warning').hide();
+
+			// Show warnings for collisions
+			for (var dest in destinations) {
+				if (destinations[dest].length > 1) {
+					for (var i = 0; i < destinations[dest].length; i++) {
+						destinations[dest][i].find('.sgbackup-collision-warning').show();
+					}
+				}
+			}
 		},
 
 		/**
@@ -522,15 +804,60 @@
 						var newHost = data.current_siteurl.replace(/https?:\/\//, '').replace(/\/.*/, '');
 						html += '<tr><td><strong>Multisite blogs:</strong></td><td>' + data.multisite_blogs.length + ' sites</td></tr>';
 
-						var mapHtml = '<table class="widefat" style="margin-top:10px;"><thead><tr><th>Old Domain</th><th>New Domain</th></tr></thead><tbody>';
-						for (var b = 0; b < data.multisite_blogs.length; b++) {
-							var oldBlog = data.multisite_blogs[b];
-							var newBlog = oldBlog.replace(new RegExp(oldHost.replace(/\./g, '\\\\.'), 'g'), newHost);
-							mapHtml += '<tr><td>' + SGB.esc(oldBlog) + '</td><td>' + SGB.esc(newBlog) + '</td></tr>';
-						}
-						mapHtml += '</tbody></table>';
-						html += '<tr><td colspan="2">' + mapHtml + '</td></tr>';
+						// Show selected subsite mode
+						var subsiteModeVal = $('select[name="sgbackup_subsite_mode"]').val() || '0';
+						var subsiteModeLabels = {'0': 'Mirror all subsites', '1': 'Main site only', '2': 'Keep original domains', '3': 'Custom mapping'};
+						html += '<tr><td><strong>Subsite mode:</strong></td><td>' + SGB.esc(subsiteModeLabels[subsiteModeVal] || 'Mirror') + '</td></tr>';
 
+						if (subsiteModeVal === '1') {
+							warnings.push('Main-only mode: ' + (data.multisite_blogs.length - 1) + ' subsites will be REMOVED from wp_blogs after restore.');
+						} else if (subsiteModeVal === '0' || subsiteModeVal === '3') {
+							var mapHtml = '<table class="widefat" style="margin-top:10px;"><thead><tr><th>Source</th><th>Action</th><th>Destination</th></tr></thead><tbody>';
+							for (var b = 0; b < data.multisite_blogs.length; b++) {
+								var blogEntry = data.multisite_blogs[b];
+								var oldBlog = (typeof blogEntry === 'object') ? blogEntry.domain : blogEntry;
+								var newBlog, actionLabel, actionClass;
+
+								if (subsiteModeVal === '3') {
+									// Read from custom mapping UI
+									var $row = $('.sgbackup-subsite-map-row[data-source-domain="' + oldBlog + '"]');
+									if ($row.length) {
+										var rowAction = $row.find('.sgbackup-subsite-action').val() || $row.find('.sgbackup-subsite-action-val').val();
+										if (rowAction === 'skip') {
+											actionLabel = 'SKIP';
+											actionClass = 'sgbackup-action-skip';
+											newBlog = '\u2014';
+										} else if (rowAction === 'overwrite') {
+											actionLabel = 'OVERWRITE';
+											actionClass = 'sgbackup-action-overwrite';
+											newBlog = $row.find('.sgbackup-subsite-dest-select').val();
+										} else {
+											actionLabel = 'CREATE';
+											actionClass = 'sgbackup-action-create';
+											newBlog = $.trim($row.find('.sgbackup-subsite-dest-input').val());
+										}
+									} else {
+										actionLabel = 'CREATE';
+										actionClass = 'sgbackup-action-create';
+										newBlog = oldBlog.replace(new RegExp(oldHost.replace(/\./g, '\\\\.'), 'g'), newHost);
+									}
+								} else {
+									// Mirror mode
+									actionLabel = 'MIRROR';
+									actionClass = 'sgbackup-action-create';
+									newBlog = oldBlog.replace(new RegExp(oldHost.replace(/\./g, '\\\\.'), 'g'), newHost);
+								}
+								var badge = '<span class="sgbackup-action-badge ' + actionClass + '">' + actionLabel + '</span>';
+								mapHtml += '<tr><td>' + SGB.esc(oldBlog) + '</td><td>' + badge + '</td>';
+								mapHtml += '<td>' + (newBlog === '\u2014' ? '\u2014' : SGB.esc(newBlog)) + '</td></tr>';
+							}
+							mapHtml += '</tbody></table>';
+							html += '<tr><td colspan="2">' + mapHtml + '</td></tr>';
+						}
+
+						if (data.multisite_blogs.length > 1 && subsiteModeVal !== '1') {
+							warnings.push('Subsites require wildcard DNS (*.' + newHost + ') and web server config to accept subdomains.');
+						}
 						warnings.push('This is a multisite migration. All ' + data.multisite_blogs.length + ' blog domains will be updated automatically.');
 					}
 				}
@@ -595,6 +922,27 @@
 			// Collect db_restore_mode
 			var dbRestoreMode = $('select[name="sgbackup_db_restore_mode"]').val();
 			formData.append('db_restore_mode', dbRestoreMode || '0');
+
+			// Collect subsite_mode
+			var subsiteMode = $('select[name="sgbackup_subsite_mode"]').val();
+			formData.append('subsite_mode', subsiteMode || '0');
+
+			// Collect custom subsite mapping if in custom mode
+			if (subsiteMode === '3') {
+				var subsiteMap = {};
+				$('.sgbackup-subsite-map-row').each(function() {
+					var oldDomain = $(this).data('source-domain');
+					var action = $(this).find('.sgbackup-subsite-action').val() || $(this).find('.sgbackup-subsite-action-val').val();
+					if (action === 'skip') {
+						subsiteMap[oldDomain] = '__skip__';
+					} else if (action === 'overwrite') {
+						subsiteMap[oldDomain] = $(this).find('.sgbackup-subsite-dest-select').val();
+					} else { // create
+						subsiteMap[oldDomain] = $.trim($(this).find('.sgbackup-subsite-dest-input').val());
+					}
+				});
+				formData.append('subsite_map', JSON.stringify(subsiteMap));
+			}
 
 			// Gap 25: Collect include-unspecified options
 			formData.append('include_unspecified_tables', $('input[name="sgbackup_include_unspecified_tables"]').is(':checked') ? '1' : '0');
@@ -2283,6 +2631,9 @@
 				$('input[name="sgbackup_restore_wpcore"]').prop('checked', !!opts.wpcore);
 				$('select[name="sgbackup_move_in_mode"]').val(opts.move_in_mode || 0);
 				$('select[name="sgbackup_db_restore_mode"]').val(opts.db_restore_mode || 0);
+				$('select[name="sgbackup_subsite_mode"]').val(opts.subsite_mode || 0);
+				$('#sgbackup-subsite-mode-row').toggle(String(opts.db_restore_mode || 0) === '0');
+				$('#sgbackup-subsite-map-container').toggle(String(opts.subsite_mode || 0) === '3');
 				$('input[name="sgbackup_restore_pre_backup"]').prop('checked', opts.pre_restore_backup !== false);
 				$('input[name="sgbackup_include_unspecified_tables"]').prop('checked', opts.include_unspecified_tables !== false);
 				$('input[name="sgbackup_include_unspecified_plugins"]').prop('checked', opts.include_unspecified_plugins !== false);
@@ -2304,6 +2655,16 @@
 					wpcore: $('input[name="sgbackup_restore_wpcore"]').is(':checked'),
 					move_in_mode: $('select[name="sgbackup_move_in_mode"]').val(),
 					db_restore_mode: $('select[name="sgbackup_db_restore_mode"]').val(),
+					subsite_mode: $('select[name="sgbackup_subsite_mode"]').val(),
+					subsite_map: (function() {
+						var map = {};
+						$('.sgbackup-subsite-map-input').each(function() {
+							var old = $(this).data('old-domain');
+							var nw = $.trim($(this).val());
+							if (old && nw) map[old] = nw;
+						});
+						return Object.keys(map).length ? map : null;
+					})(),
 					pre_restore_backup: $('input[name="sgbackup_restore_pre_backup"]').is(':checked'),
 					include_unspecified_tables: $('input[name="sgbackup_include_unspecified_tables"]').is(':checked'),
 					include_unspecified_plugins: $('input[name="sgbackup_include_unspecified_plugins"]').is(':checked'),

@@ -133,6 +133,11 @@ function sgbackup_init() {
 		require_once SGBACKUP_DIR . 'includes/class-wp-cli.php';
 		WP_CLI::add_command('siteguardbackup', 'SiteGuard_Backup_CLI_Command');
 	}
+
+	// Multisite: dispatch subsite cron events from main site during cron runs
+	if (is_multisite() && is_main_site() && defined('DOING_CRON') && DOING_CRON) {
+		add_action('wp_loaded', 'sgbackup_multisite_cron_dispatch');
+	}
 }
 add_action('plugins_loaded', 'sgbackup_init', 1);
 
@@ -250,6 +255,59 @@ function sgbackup_cron_backup_remotesend() {
 	}
 
 	SiteGuard_Backup::instance()->backup_all($options);
+}
+
+/**
+ * Multisite cron dispatcher: fire due sgbackup cron events on subsites.
+ *
+ * WordPress cron only fires events for the site that receives the request.
+ * On environments where subsites don't receive regular traffic (standby,
+ * failover, or single-entry cron runners), their scheduled events never fire.
+ * This dispatcher runs on the main site's cron and directly executes any
+ * due sgbackup events on each subsite via switch_to_blog().
+ */
+function sgbackup_multisite_cron_dispatch() {
+	if (!is_multisite() || !is_main_site()) return;
+
+	// Throttle: run at most every 4 minutes (main site option, not per-site)
+	$last_run = (int) get_option('sgbackup_cron_dispatch_last', 0);
+	if ((time() - $last_run) < 240) return;
+	update_option('sgbackup_cron_dispatch_last', time(), true);
+
+	$sgb_hooks = array(
+		'sgbackup_backup', 'sgbackup_backup_database', 'sgbackup_backup_all',
+		'sgbackup_backup_incremental', 'sgbackup_backup_remotesend', 'sgbackup_backup_resume',
+	);
+
+	$sites = get_sites(array('fields' => 'ids', 'number' => 0));
+	$gmt_time = microtime(true);
+
+	foreach ($sites as $site_id) {
+		if ((int) $site_id === (int) get_main_site_id()) continue;
+
+		switch_to_blog($site_id);
+
+		$crons = _get_cron_array();
+		if (is_array($crons)) {
+			foreach ($crons as $timestamp => $cronhooks) {
+				if ($timestamp > $gmt_time) break;
+
+				foreach ($cronhooks as $hook => $keys) {
+					if (!in_array($hook, $sgb_hooks, true)) continue;
+
+					foreach ($keys as $k => $v) {
+						if (!empty($v['schedule'])) {
+							wp_reschedule_event($timestamp, $v['schedule'], $hook, $v['args']);
+						}
+						wp_unschedule_event($timestamp, $hook, $v['args']);
+						do_action_ref_array($hook, $v['args']);
+					}
+				}
+			}
+		}
+
+		restore_current_blog();
+	}
 }
 
 /**

@@ -49,7 +49,7 @@ class SiteGuard_Backup_Admin {
 	 * Register admin menu page.
 	 */
 	public function admin_menu() {
-		$cap = is_multisite() ? 'manage_network_options' : 'manage_options';
+		$cap = is_network_admin() ? 'manage_network_options' : 'manage_options';
 
 		add_menu_page(
 			'SiteGuard Backup',
@@ -134,6 +134,7 @@ class SiteGuard_Backup_Admin {
 			'max_upload_size' => wp_max_upload_size(),
 			'is_multisite' => is_multisite(),
 			'default_db_restore_mode' => intval(SiteGuard_Backup_Options::instance()->get_option('sgbackup_default_db_restore_mode', 0)),
+			'default_subsite_mode' => intval(SiteGuard_Backup_Options::instance()->get_option('sgbackup_default_subsite_mode', 0)),
 			'strings'   => array(
 				'backup_started'   => __('Backup started...', 'siteguardbackup'),
 				'backup_complete'  => __('Backup complete!', 'siteguardbackup'),
@@ -547,6 +548,22 @@ class SiteGuard_Backup_Admin {
 			$restore_options['db_restore_mode'] = min(3, max(0, intval($_POST['db_restore_mode'])));
 		}
 
+		// Subsite migration mode
+		if (isset($_POST['subsite_mode'])) {
+			$restore_options['subsite_mode'] = min(3, max(0, intval($_POST['subsite_mode'])));
+		}
+
+		// Custom subsite mapping (JSON object: old_domain => new_domain)
+		if (!empty($_POST['subsite_map'])) {
+			$raw_map = wp_unslash($_POST['subsite_map']);
+			if (is_string($raw_map)) {
+				$raw_map = json_decode($raw_map, true);
+			}
+			if (is_array($raw_map)) {
+				$restore_options['subsite_map'] = $raw_map;
+			}
+		}
+
 		// Audit log
 		$audit = SiteGuard_Backup_Audit_Log::instance();
 		$restore_entities = array_keys(array_filter($restore_options, function($v, $k) {
@@ -710,7 +727,7 @@ class SiteGuard_Backup_Admin {
 	public function admin_bar_menu($wp_admin_bar) {
 		if (!$this->user_can_manage()) return;
 
-		$page_url = is_multisite() ? network_admin_url('admin.php?page=siteguardbackup') : admin_url('admin.php?page=siteguardbackup');
+		$page_url = (is_multisite() && is_network_admin()) ? network_admin_url('admin.php?page=siteguardbackup') : admin_url('admin.php?page=siteguardbackup');
 
 		$wp_admin_bar->add_node(array(
 			'id'    => 'sgbackup',
@@ -869,7 +886,7 @@ class SiteGuard_Backup_Admin {
 		}
 
 		echo '</div>';
-		$page_url = is_multisite() ? network_admin_url('admin.php?page=siteguardbackup') : admin_url('admin.php?page=siteguardbackup');
+		$page_url = (is_multisite() && is_network_admin()) ? network_admin_url('admin.php?page=siteguardbackup') : admin_url('admin.php?page=siteguardbackup');
 		echo '<p style="margin-top:10px;"><a href="' . esc_url($page_url) . '" class="button">' . esc_html__('Open SiteGuard Backup', 'siteguardbackup') . '</a></p>';
 	}
 
@@ -907,7 +924,9 @@ class SiteGuard_Backup_Admin {
 	 */
 	private function user_can_manage() {
 		if (is_multisite()) {
-			return current_user_can('manage_network_options');
+			if (current_user_can('manage_network_options')) return true;
+			if (!is_network_admin() && current_user_can('manage_options')) return true;
+			return false;
 		}
 		return current_user_can('manage_options');
 	}

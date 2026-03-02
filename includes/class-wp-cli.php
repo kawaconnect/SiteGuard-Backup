@@ -189,6 +189,14 @@ class SiteGuard_Backup_CLI_Command extends WP_CLI_Command {
      * [--move-in-mode=<mode>]
      * : File restore mode. Values: overwrite, backup, skip, merge.
      *
+     * [--subsite-mode=<mode>]
+     * : Multisite subsite handling. Values: mirror, main-only, skip-remap, custom.
+     *
+     * [--subsite-map=<json>]
+     * : JSON mapping of old_domain => new_domain for custom subsite mode.
+     *   Use "__skip__" as the destination to skip a subsite entirely.
+     *   Example: '{"blog.old.com":"blog.new.com","shop.old.com":"__skip__"}'
+     *
      * ## EXAMPLES
      *
      *     wp siteguardbackup restore 1709283600
@@ -196,6 +204,7 @@ class SiteGuard_Backup_CLI_Command extends WP_CLI_Command {
      *     wp siteguardbackup restore 1709283600 --preset="migration-standard"
      *     wp siteguardbackup restore 1709283600 --db-restore-mode=migrate
      *     wp siteguardbackup restore 1709283600 --move-in-mode=skip
+     *     wp siteguardbackup restore 1709283600 --subsite-mode=mirror --db-restore-mode=migrate
      *
      * @subcommand restore
      */
@@ -277,6 +286,34 @@ class SiteGuard_Backup_CLI_Command extends WP_CLI_Command {
                 WP_CLI::error("Invalid --move-in-mode. Valid values: overwrite, backup, skip, merge");
             }
             $restore_options['move_in_mode'] = $move_mode_map[$move_mode];
+        }
+
+        // Subsite migration mode
+        if (isset($assoc_args['subsite-mode'])) {
+            $subsite_mode_map = array(
+                'mirror'      => 0,
+                'main-only'   => 1,
+                'skip-remap'  => 2,
+                'custom'      => 3,
+            );
+            $sm = $assoc_args['subsite-mode'];
+            if (!isset($subsite_mode_map[$sm])) {
+                WP_CLI::error("Invalid --subsite-mode. Valid values: mirror, main-only, skip-remap, custom");
+            }
+            $restore_options['subsite_mode'] = $subsite_mode_map[$sm];
+        }
+
+        // Custom subsite mapping (JSON: {"old_domain": "new_domain", ...})
+        if (isset($assoc_args['subsite-map'])) {
+            $map = json_decode($assoc_args['subsite-map'], true);
+            if (!is_array($map) || empty($map)) {
+                WP_CLI::error("Invalid --subsite-map: must be a valid JSON object mapping old domains to new domains.");
+            }
+            $restore_options['subsite_map'] = $map;
+            // Auto-set custom mode if map is provided but mode wasn't explicitly set
+            if (!isset($restore_options['subsite_mode'])) {
+                $restore_options['subsite_mode'] = 3;
+            }
         }
 
         WP_CLI::confirm('This will restore the backup. Continue?');

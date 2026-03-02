@@ -21,6 +21,14 @@ class SiteGuard_Backup_Restorer {
 	const DB_RESTORE_TABLES_ONLY = 2;  // Only import tables not already present in DB
 	const DB_RESTORE_SKIP_DB = 3;      // Skip database entirely (restore files only)
 
+	/** Subsite migration mode constants */
+	const SUBSITE_MODE_MIRROR = 0;     // Map all subsites to equivalent subdomains on target (default)
+	const SUBSITE_MODE_MAIN_ONLY = 1;  // Only restore main site, remove subsite blog entries
+	const SUBSITE_MODE_SKIP_REMAP = 2; // Import subsite data but don't remap domains
+	const SUBSITE_MODE_CUSTOM = 3;     // Custom per-subsite domain mapping
+
+	const SUBSITE_SKIP = '__skip__';   // Sentinel: skip this subsite in custom mapping
+
 	/** @var SiteGuard_Backup */
 	private $sgbackup;
 
@@ -58,6 +66,12 @@ class SiteGuard_Backup_Restorer {
 	/** @var int Database restore mode */
 	private $db_restore_mode = 0;
 
+	/** @var int Subsite migration mode */
+	private $subsite_mode = 0;
+
+	/** @var array Custom subsite domain mapping: old_domain => new_domain */
+	private $subsite_map = array();
+
 	/** @var bool Whether to include unspecified tables in restore */
 	private $include_unspecified_tables = true;
 
@@ -83,16 +97,34 @@ class SiteGuard_Backup_Restorer {
 		$this->restore_options = $restore_options;
 		$this->import_table_prefix = $GLOBALS['wpdb']->prefix;
 
-		// Gap 23: Move-in mode
+		// Gap 23: Move-in mode - clamp to valid range [0, 3]
 		if (isset($restore_options['move_in_mode'])) {
-			$this->move_in_mode = intval($restore_options['move_in_mode']);
+			$this->move_in_mode = min(3, max(0, intval($restore_options['move_in_mode'])));
 		}
 
-		// Database restore mode - fall back to site-wide default
+		// Database restore mode - fall back to site-wide default, clamp to [0, 3]
 		if (isset($restore_options['db_restore_mode'])) {
-			$this->db_restore_mode = intval($restore_options['db_restore_mode']);
+			$this->db_restore_mode = min(3, max(0, intval($restore_options['db_restore_mode'])));
 		} else {
-			$this->db_restore_mode = intval(SiteGuard_Backup_Options::instance()->get_option('sgbackup_default_db_restore_mode', 0));
+			$this->db_restore_mode = min(3, max(0, intval(SiteGuard_Backup_Options::instance()->get_option('sgbackup_default_db_restore_mode', 0))));
+		}
+
+		// Subsite migration mode - fall back to site-wide default, clamp to valid range
+		if (isset($restore_options['subsite_mode'])) {
+			$this->subsite_mode = min(3, max(0, intval($restore_options['subsite_mode'])));
+		} else {
+			$this->subsite_mode = min(3, max(0, intval(SiteGuard_Backup_Options::instance()->get_option('sgbackup_default_subsite_mode', 0))));
+		}
+
+		// Custom subsite mapping: array of old_domain => new_full_domain
+		if (!empty($restore_options['subsite_map']) && is_array($restore_options['subsite_map'])) {
+			foreach ($restore_options['subsite_map'] as $old => $new) {
+				$old = sanitize_text_field($old);
+				$new = sanitize_text_field($new);
+				if (!empty($old) && !empty($new)) {
+					$this->subsite_map[$old] = $new;
+				}
+			}
 		}
 
 		// Gap 25: Include-unspecified options
@@ -691,18 +723,58 @@ class SiteGuard_Backup_Restorer {
 	private function build_multisite_replacements(&$search, &$replace) {
 		global $wpdb;
 
+		// Skip remap mode: don't modify search-replace pairs for subsites
+		if ($this->subsite_mode === self::SUBSITE_MODE_SKIP_REMAP) {
+			$this->sgbackup->log("Multisite migration: skip-remap mode, not building subsite replacements");
+			return;
+		}
+
 		$old_domain = parse_url($this->old_siteurl, PHP_URL_HOST);
 		$new_domain = parse_url($this->pre_import_siteurl, PHP_URL_HOST);
 		if (!$old_domain || !$new_domain || $old_domain === $new_domain) return;
 
 		$new_scheme = parse_url($this->pre_import_siteurl, PHP_URL_SCHEME);
 
+		// Main-only mode: only build main site URL pairs, skip subsite pairs
+		if ($this->subsite_mode === self::SUBSITE_MODE_MAIN_ONLY) {
+			$this->sgbackup->log("Multisite migration: main-only mode, skipping subsite replacement pairs");
+			// Still add main site domain pairs (bare domain catch-all + protocol variants)
+			$old_main_https = 'https://' . $old_domain;
+			$old_main_http = 'http://' . $old_domain;
+			$new_main_url = $new_scheme . '://' . $new_domain;
+			if (!in_array($old_main_https, $search, true)) {
+				$search[] = $old_main_https;
+				$replace[] = $new_main_url;
+			}
+			if (!in_array($old_main_http, $search, true)) {
+				$search[] = $old_main_http;
+				$replace[] = $new_main_url;
+			}
+			if (!in_array($old_domain, $search, true)) {
+				$search[] = $old_domain;
+				$replace[] = $new_domain;
+			}
+			if ($new_scheme === 'https') {
+				$http_new = 'http://' . $new_domain;
+				$https_new = 'https://' . $new_domain;
+				if (!in_array($http_new, $search, true)) {
+					$search[] = $http_new;
+					$replace[] = $https_new;
+				}
+			}
+			return;
+		}
+
+		// Mirror/Custom mode: build per-blog URL pairs
+		$is_custom = ($this->subsite_mode === self::SUBSITE_MODE_CUSTOM && !empty($this->subsite_map));
+
 		// Read all blog domains from wp_blogs
 		$blogs_table = $wpdb->base_prefix . 'blogs';
 		$blogs = $wpdb->get_col("SELECT DISTINCT domain FROM {$blogs_table}");
 		if (empty($blogs)) return;
 
-		$this->sgbackup->log("Multisite migration: found " . count($blogs) . " blog domains");
+		$mode_label = $is_custom ? 'custom-map' : 'mirror';
+		$this->sgbackup->log("Multisite migration ({$mode_label}): found " . count($blogs) . " blog domains");
 
 		$added = array();
 
@@ -710,8 +782,16 @@ class SiteGuard_Backup_Restorer {
 			// Skip if this blog domain doesn't contain the old domain
 			if (strpos($blog_domain, $old_domain) === false) continue;
 
-			// Compute new blog domain by replacing old domain with new
-			$new_blog_domain = str_replace($old_domain, $new_domain, $blog_domain);
+			// Compute new blog domain: custom map lookup or mirror (str_replace)
+			if ($is_custom && isset($this->subsite_map[$blog_domain])) {
+				if ($this->subsite_map[$blog_domain] === self::SUBSITE_SKIP) {
+					$this->sgbackup->log("  Custom map: skipping blog domain {$blog_domain}");
+					continue;
+				}
+				$new_blog_domain = $this->subsite_map[$blog_domain];
+			} else {
+				$new_blog_domain = str_replace($old_domain, $new_domain, $blog_domain);
+			}
 
 			// Skip if already covered by existing pairs or is the bare domain
 			if ($blog_domain === $old_domain) continue;
@@ -791,10 +871,17 @@ class SiteGuard_Backup_Restorer {
 	private function fix_multisite_sitemeta() {
 		if (!is_multisite()) return;
 
+		// Skip remap mode: don't modify any multisite tables
+		if ($this->subsite_mode === self::SUBSITE_MODE_SKIP_REMAP) {
+			$this->sgbackup->log("Multisite fix: skip-remap mode, not modifying sitemeta/blogs tables");
+			return;
+		}
+
 		global $wpdb;
+		$old_domain = parse_url($this->old_siteurl, PHP_URL_HOST);
 		$new_domain = parse_url($this->pre_import_siteurl, PHP_URL_HOST);
 		$new_scheme = parse_url($this->pre_import_siteurl, PHP_URL_SCHEME);
-		if (!$new_domain) return;
+		if (!$new_domain || !$old_domain) return;
 
 		$correct_siteurl = $new_scheme . '://' . $new_domain . '/';
 
@@ -830,6 +917,168 @@ class SiteGuard_Backup_Restorer {
 			array('%d')
 		);
 		$this->sgbackup->log("Fixed wp_blogs main site domain -> {$new_domain}");
+
+		// Main-only mode: remove all subsites from wp_blogs
+		if ($this->subsite_mode === self::SUBSITE_MODE_MAIN_ONLY) {
+			$removed = $wpdb->query("DELETE FROM {$blogs_table} WHERE blog_id > 1");
+			$this->sgbackup->log("Main-only mode: removed {$removed} subsite entries from wp_blogs");
+			$this->progress("Main-only mode: removed {$removed} subsites");
+			return;
+		}
+
+		// Mirror/Custom mode: fix ALL subsite blogs
+		$is_custom = ($this->subsite_mode === self::SUBSITE_MODE_CUSTOM && !empty($this->subsite_map));
+		$all_blogs = $wpdb->get_results("SELECT blog_id, domain, path FROM {$blogs_table}");
+		$fixed_count = 0;
+		foreach ($all_blogs as $blog) {
+			if ($blog->blog_id == 1) continue; // Already fixed above
+
+			// Determine new domain: custom map lookup or mirror (str_replace)
+			if ($is_custom && isset($this->subsite_map[$blog->domain])) {
+				if ($this->subsite_map[$blog->domain] === self::SUBSITE_SKIP) {
+					$this->sgbackup->log("  Custom map: skipping blog #{$blog->blog_id} ({$blog->domain})");
+					continue;
+				}
+				$new_blog_domain = $this->subsite_map[$blog->domain];
+			} elseif (strpos($blog->domain, $old_domain) !== false) {
+				$new_blog_domain = str_replace($old_domain, $new_domain, $blog->domain);
+			} else {
+				continue; // Domain doesn't match old domain and no custom mapping
+			}
+
+			if ($new_blog_domain === $blog->domain) continue; // No change needed
+
+			$wpdb->update(
+				$blogs_table,
+				array('domain' => $new_blog_domain),
+				array('blog_id' => $blog->blog_id),
+				array('%s'),
+				array('%d')
+			);
+
+			// Also directly fix wp_N_options siteurl and home
+			$blog_prefix = ($blog->blog_id > 1) ? $wpdb->base_prefix . $blog->blog_id . '_' : $wpdb->base_prefix;
+			$blog_options_table = $blog_prefix . 'options';
+
+			if ($wpdb->get_var($wpdb->prepare("SHOW TABLES LIKE %s", $blog_options_table)) === $blog_options_table) {
+				foreach (array('siteurl', 'home') as $opt) {
+					$old_val = $wpdb->get_var($wpdb->prepare(
+						"SELECT option_value FROM {$blog_options_table} WHERE option_name = %s", $opt
+					));
+					if (!$old_val) continue;
+
+					// For custom mapping, replace the old blog domain with the new one
+					if ($is_custom && isset($this->subsite_map[$blog->domain])) {
+						$new_val = str_replace($blog->domain, $new_blog_domain, $old_val);
+					} elseif (strpos($old_val, $old_domain) !== false) {
+						$new_val = str_replace($old_domain, $new_domain, $old_val);
+					} else {
+						continue;
+					}
+
+					// Also fix protocol if needed
+					if ($new_scheme === 'https' && strpos($new_val, 'http://') === 0) {
+						$new_val = 'https://' . substr($new_val, 7);
+					}
+					$wpdb->update(
+						$blog_options_table,
+						array('option_value' => $new_val),
+						array('option_name' => $opt),
+						array('%s'),
+						array('%s')
+					);
+				}
+			}
+			$fixed_count++;
+			if ($is_custom) {
+				$this->sgbackup->log("  Custom map: blog #{$blog->blog_id} {$blog->domain} -> {$new_blog_domain}");
+			}
+		}
+		$mode_label = $is_custom ? 'custom-map' : 'mirror';
+		$this->sgbackup->log("Fixed {$fixed_count} subsite blog domains in wp_blogs + per-site options ({$mode_label})");
+		if ($fixed_count > 0) {
+			$this->progress("Fixed {$fixed_count} subsite domains for migration ({$mode_label})");
+		}
+	}
+
+	/**
+	 * Verify all subsites have correct domains after migration.
+	 * Called from post_restore_cleanup() for multisite migrations.
+	 */
+	private function verify_subsites() {
+		if (!is_multisite() || !$this->is_migration) return;
+
+		// Skip-remap mode: domains were intentionally NOT remapped, don't verify against new domain
+		if ($this->subsite_mode === self::SUBSITE_MODE_SKIP_REMAP) {
+			$this->sgbackup->log("Subsite verification: skip-remap mode, skipping domain checks");
+			$this->progress("Subsite domains were not remapped (skip-remap mode)");
+			return;
+		}
+
+		global $wpdb;
+		$blogs_table = $wpdb->base_prefix . 'blogs';
+		$blogs = $wpdb->get_results("SELECT blog_id, domain, path FROM {$blogs_table} ORDER BY blog_id");
+
+		$new_domain = parse_url($this->pre_import_siteurl, PHP_URL_HOST);
+		if (!$new_domain) return;
+
+		// Main-only mode: only blog_id=1 should exist
+		if ($this->subsite_mode === self::SUBSITE_MODE_MAIN_ONLY) {
+			$count = count($blogs);
+			if ($count === 1) {
+				$this->sgbackup->log("Subsite verification: main-only mode, 1 blog remaining (subsites removed)");
+				$this->progress("Main-only mode: subsites removed, 1 blog remaining");
+			} else {
+				$this->sgbackup->log("Subsite verification: main-only mode, expected 1 blog but found {$count}", 'warning');
+				$this->progress("WARNING: main-only mode but {$count} blogs found");
+			}
+			return;
+		}
+
+		// Mirror/custom mode: verify all blogs have correct domains
+		$issues = array();
+
+		// In custom mode, collect domains that were intentionally skipped
+		$skipped_domains = array();
+		if ($this->subsite_mode === self::SUBSITE_MODE_CUSTOM && !empty($this->subsite_map)) {
+			$skipped_domains = array_keys(array_filter($this->subsite_map, function($v) {
+				return $v === self::SUBSITE_SKIP;
+			}));
+		}
+
+		foreach ($blogs as $blog) {
+			// Skip verification for blogs intentionally skipped in custom map
+			if (!empty($skipped_domains) && in_array($blog->domain, $skipped_domains, true)) continue;
+
+			// Check domain ends with new domain (suffix match, not substring)
+			$domain_matches = ($blog->domain === $new_domain)
+				|| (substr($blog->domain, -(strlen($new_domain) + 1)) === '.' . $new_domain);
+			if (!$domain_matches) {
+				$issues[] = "Blog #{$blog->blog_id} has domain '{$blog->domain}' which doesn't match target domain '{$new_domain}'";
+			}
+
+			// Check per-site options table exists
+			$blog_prefix = ($blog->blog_id > 1) ? $wpdb->base_prefix . $blog->blog_id . '_' : $wpdb->base_prefix;
+			$opts_table = $blog_prefix . 'options';
+			if ($wpdb->get_var($wpdb->prepare("SHOW TABLES LIKE %s", $opts_table)) !== $opts_table) {
+				$issues[] = "Blog #{$blog->blog_id} ({$blog->domain}) is missing its options table ({$opts_table})";
+			}
+		}
+
+		if (empty($issues)) {
+			$this->sgbackup->log("Subsite verification: all " . count($blogs) . " blogs verified OK");
+			$this->progress("All " . count($blogs) . " subsites verified successfully");
+		} else {
+			foreach ($issues as $issue) {
+				$this->sgbackup->log("Subsite issue: {$issue}", 'warning');
+			}
+			$this->progress("WARNING: " . count($issues) . " subsite issues detected - check logs");
+		}
+
+		// Infrastructure warnings
+		if (count($blogs) > 1) {
+			$this->progress("NOTE: Subsites require wildcard DNS (*." . $new_domain . ") and web server config to accept subdomains");
+		}
 	}
 
 	// ==========================================
@@ -1229,6 +1478,22 @@ class SiteGuard_Backup_Restorer {
 
 		// Check active plugins exist
 		$this->validate_plugins();
+
+		// Verify subsites after migration
+		$this->verify_subsites();
+
+		// Flush multisite blog caches aggressively
+		if (is_multisite()) {
+			global $wpdb;
+			$all_blog_ids = $wpdb->get_col("SELECT blog_id FROM {$wpdb->base_prefix}blogs");
+			foreach ($all_blog_ids as $bid) {
+				if (function_exists('clean_blog_cache')) {
+					clean_blog_cache(intval($bid));
+				}
+			}
+			wp_cache_delete('site-options-0', 'site-options');
+			wp_cache_delete('1:active_sitewide_plugins', 'site-options');
+		}
 
 		// Disable known caching plugins if this is a migration
 		if ($this->is_migration) {
