@@ -491,6 +491,14 @@ class SiteGuard_Backup_Restorer {
 			$this->progress("Search-replace skipped (not in migrate mode)");
 		}
 
+		// Handle subsite skips even on same-site restores (non-migration).
+		// fix_multisite_sitemeta handles this when called during migration, but
+		// for same-site restores is_migration=false so it never runs. We need
+		// a separate pass to remove skipped subsites from wp_blogs + drop tables.
+		if (!$this->is_migration && is_multisite() && !empty($this->subsite_map)) {
+			$this->apply_subsite_skips();
+		}
+
 		// Save progress for resume support
 		$this->save_restore_progress('db', 'completed');
 
@@ -1110,6 +1118,50 @@ class SiteGuard_Backup_Restorer {
 		// Infrastructure warnings
 		if (count($blogs) > 1) {
 			$this->progress("NOTE: Subsites require wildcard DNS (*." . $new_domain . ") and web server config to accept subdomains");
+		}
+	}
+
+	/**
+	 * Remove skipped subsites from wp_blogs and drop their tables.
+	 *
+	 * Called for same-site restores (non-migration) when the user has
+	 * unchecked subsites in mirror mode or marked them as __skip__ in
+	 * custom mode. During migrations, fix_multisite_sitemeta() handles
+	 * this as part of its domain-remapping loop.
+	 */
+	private function apply_subsite_skips() {
+		global $wpdb;
+		$blogs_table = $wpdb->base_prefix . 'blogs';
+		$removed = 0;
+
+		foreach ($this->subsite_map as $domain => $action) {
+			if ($action !== self::SUBSITE_SKIP) continue;
+
+			$blog = $wpdb->get_row($wpdb->prepare(
+				"SELECT blog_id FROM {$blogs_table} WHERE domain = %s AND blog_id > 1",
+				$domain
+			));
+			if (!$blog) {
+				$this->sgbackup->log("Subsite skip: domain {$domain} not found in wp_blogs, skipping");
+				continue;
+			}
+
+			$wpdb->delete($blogs_table, array('blog_id' => $blog->blog_id), array('%d'));
+			$blog_prefix = $wpdb->base_prefix . $blog->blog_id . '_';
+			$subsite_tables = $wpdb->get_col($wpdb->prepare(
+				"SHOW TABLES LIKE %s", $wpdb->esc_like($blog_prefix) . '%'
+			));
+			foreach ($subsite_tables as $table) {
+				$wpdb->query("DROP TABLE IF EXISTS `{$table}`");
+			}
+			$table_count = count($subsite_tables);
+			$this->sgbackup->log("Removed skipped subsite #{$blog->blog_id} ({$domain}): dropped {$table_count} tables");
+			$this->progress("Removed skipped subsite: {$domain} ({$table_count} tables dropped)");
+			$removed++;
+		}
+
+		if ($removed > 0) {
+			$this->sgbackup->log("apply_subsite_skips: removed {$removed} subsites");
 		}
 	}
 

@@ -74,6 +74,10 @@ class SiteGuard_Backup_CLI_Command extends WP_CLI_Command {
             $options['job_type'] = 'incremental';
         }
 
+        if (!empty($assoc_args['label'])) {
+            $options['label'] = sanitize_text_field(substr($assoc_args['label'], 0, 40));
+        }
+
         WP_CLI::log('Starting backup...');
         $sgbackup->backup_all($options);
 
