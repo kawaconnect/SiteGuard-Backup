@@ -260,9 +260,10 @@ class SiteGuard_Backup_Remote_Send {
 		$filename = sanitize_file_name(basename($data['file']));
 		error_log("SiteGuard Backup RPC Receiver: send_chunk file={$filename} start={$data['start']} last=" . (!empty($data['last_chunk']) ? 'yes' : 'no'));
 
-		// Estimate decoded size before base64_decode to prevent memory abuse
+		// Estimate decoded size before base64_decode to prevent memory abuse.
+		// 2MB decoded = ceil(2097152 * 4/3) = 2796204 bytes base64 (with padding).
 		$b64_len = is_string($data['data']) ? strlen($data['data']) : 0;
-		if ($b64_len > 2796203) { // ~2MB decoded = ~2.67MB base64
+		if ($b64_len > 2796204) {
 			return new WP_Error('chunk_too_large', 'Chunk data exceeds maximum size.');
 		}
 
