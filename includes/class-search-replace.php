@@ -46,6 +46,10 @@ class SiteGuard_Backup_Search_Replace {
 			'dry_run' => $dry_run,
 		);
 
+		// Accept strings as well as arrays
+		if (is_string($search)) $search = array($search);
+		if (is_string($replace)) $replace = array($replace);
+
 		if (empty($search) || empty($replace) || count($search) !== count($replace)) {
 			$this->report['errors'][] = 'Search and replace arrays must be non-empty and same length';
 			return $this->report;
