@@ -278,6 +278,7 @@ $period_labels = array(
 				<p class="description"><?php esc_html_e('Default mode for WP-CLI restores, remote-receive migrations, and any restore where the mode is not explicitly chosen.', 'siteguardbackup'); ?></p>
 			</td>
 		</tr>
+		<?php if (is_multisite()) : ?>
 		<tr>
 			<th><?php esc_html_e('Default Subsite Migration Mode', 'siteguardbackup'); ?></th>
 			<td>
@@ -291,6 +292,7 @@ $period_labels = array(
 				<p class="description"><?php esc_html_e('How subsites are handled during multisite-to-multisite migrations. Only applies when database restore mode is "Migrate".', 'siteguardbackup'); ?></p>
 			</td>
 		</tr>
+		<?php endif; ?>
 		<tr class="sgbackup-anonymise-mode-row" style="<?php echo empty($settings['db_anonymise']) ? 'display:none;' : ''; ?>">
 			<th><?php esc_html_e('Anonymisation Mode', 'siteguardbackup'); ?></th>
 			<td>

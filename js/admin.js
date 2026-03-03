@@ -421,9 +421,9 @@
 				// Initialize subsite mode from site default
 				$('select[name="sgbackup_subsite_mode"]').val(sgbackup_settings.default_subsite_mode || 0);
 
-				// Show subsite mode when DB mode = Migrate (0) or Overwrite (1) - both do full DB import
+				// Show subsite mode when multisite AND DB mode = Migrate (0) or Overwrite (1)
 				var initDbMode = $('select[name="sgbackup_db_restore_mode"]').val();
-				$('#sgbackup-subsite-mode-row').toggle(initDbMode === '0' || initDbMode === '1');
+				$('#sgbackup-subsite-mode-row').toggle(sgbackup_settings.is_multisite && (initDbMode === '0' || initDbMode === '1'));
 
 				$('#sgbackup-restore-modal').dialog({
 					modal: true,
@@ -465,10 +465,10 @@
 				$('#sgbackup-restore-done').hide();
 			});
 
-			// Show/hide subsite mode based on DB restore mode (Migrate or Overwrite both need it)
+			// Show/hide subsite mode based on DB restore mode (multisite only)
 			$(document).on('change', 'select[name="sgbackup_db_restore_mode"]', function() {
 				var val = $(this).val();
-				var showSubsite = (val === '0' || val === '1');
+				var showSubsite = sgbackup_settings.is_multisite && (val === '0' || val === '1');
 				$('#sgbackup-subsite-mode-row').toggle(showSubsite);
 				if (!showSubsite) $('#sgbackup-subsite-map-container').hide();
 			});
@@ -2745,7 +2745,7 @@
 				$('select[name="sgbackup_subsite_mode"]').val(opts.subsite_mode || 0);
 				var presetDbMode = String(opts.db_restore_mode || 0);
 				var presetSubsiteMode = String(opts.subsite_mode || 0);
-				var presetShowSubsite = (presetDbMode === '0' || presetDbMode === '1');
+				var presetShowSubsite = sgbackup_settings.is_multisite && (presetDbMode === '0' || presetDbMode === '1');
 				$('#sgbackup-subsite-mode-row').toggle(presetShowSubsite);
 				$('#sgbackup-subsite-map-container').toggle(presetShowSubsite && (presetSubsiteMode === '0' || presetSubsiteMode === '1' || presetSubsiteMode === '3'));
 				$('input[name="sgbackup_restore_pre_backup"]').prop('checked', opts.pre_restore_backup !== false);

@@ -67,7 +67,7 @@
 				</select>
 			</label>
 		</p>
-		<p id="sgbackup-subsite-mode-row">
+		<p id="sgbackup-subsite-mode-row" style="display:none;">
 			<label><?php esc_html_e('Multisite subsite handling:', 'siteguardbackup'); ?>
 				<select name="sgbackup_subsite_mode">
 					<option value="0"><?php esc_html_e('Mirror all subsites to new domain (default)', 'siteguardbackup'); ?></option>
