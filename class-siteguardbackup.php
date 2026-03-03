@@ -905,7 +905,9 @@ class SiteGuard_Backup {
 			$opts_enc = SiteGuard_Backup_Options::instance();
 			if ($opts_enc->get_option('sgbackup_encryption_enabled', false)) {
 				$enc_key = $opts_enc->get_option('sgbackup_encryption_key', '');
-				if (!empty($enc_key)) {
+				if (empty($enc_key)) {
+					$this->log("WARNING: Encryption is enabled but no encryption key is set - backup will NOT be encrypted", 'warning');
+				} elseif (!empty($enc_key)) {
 					$this->log("Starting encryption phase");
 					require_once SGBACKUP_DIR . 'includes/class-encryption.php';
 

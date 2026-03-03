@@ -806,7 +806,15 @@ class SiteGuard_Backup_Commands {
 	 */
 	public function get_settings() {
 		$opts = SiteGuard_Backup_Options::instance();
-		return $opts->get_all_settings();
+		$settings = $opts->get_all_settings();
+		// Redact sensitive fields - use export_settings for full export
+		if (!empty($settings['encryption_key'])) {
+			$settings['encryption_key'] = '***';
+		}
+		if (!empty($settings['lock_admin_password'])) {
+			$settings['lock_admin_password'] = '***';
+		}
+		return $settings;
 	}
 
 	/**
