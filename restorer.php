@@ -491,12 +491,15 @@ class SiteGuard_Backup_Restorer {
 			$this->progress("Search-replace skipped (not in migrate mode)");
 		}
 
-		// Handle subsite skips even on same-site restores (non-migration).
-		// fix_multisite_sitemeta handles this when called during migration, but
-		// for same-site restores is_migration=false so it never runs. We need
-		// a separate pass to remove skipped subsites from wp_blogs + drop tables.
-		if (!$this->is_migration && is_multisite() && !empty($this->subsite_map)) {
-			$this->apply_subsite_skips();
+		// Handle subsite operations on same-site restores (non-migration).
+		// fix_multisite_sitemeta handles this during migration, but for same-site
+		// restores is_migration=false so it never runs.
+		if (!$this->is_migration && is_multisite()) {
+			if ($this->subsite_mode === self::SUBSITE_MODE_MAIN_ONLY) {
+				$this->apply_main_only_mode();
+			} elseif (!empty($this->subsite_map)) {
+				$this->apply_subsite_skips();
+			}
 		}
 
 		// Save progress for resume support
@@ -1163,6 +1166,45 @@ class SiteGuard_Backup_Restorer {
 		if ($removed > 0) {
 			$this->sgbackup->log("apply_subsite_skips: removed {$removed} subsites");
 		}
+	}
+
+	/**
+	 * Remove all subsites, keeping only the main site (blog_id=1).
+	 *
+	 * Called for same-site restores in SUBSITE_MODE_MAIN_ONLY when
+	 * is_migration is false. During migrations, fix_multisite_sitemeta()
+	 * handles this via its DELETE WHERE blog_id > 1 path.
+	 */
+	private function apply_main_only_mode() {
+		global $wpdb;
+		$blogs_table = $wpdb->base_prefix . 'blogs';
+
+		// Get all subsite blog_ids before deleting
+		$subsites = $wpdb->get_results("SELECT blog_id, domain FROM {$blogs_table} WHERE blog_id > 1");
+		if (empty($subsites)) {
+			$this->sgbackup->log("Main-only mode: no subsites to remove");
+			return;
+		}
+
+		// Remove from wp_blogs
+		$removed = $wpdb->query("DELETE FROM {$blogs_table} WHERE blog_id > 1");
+		$this->sgbackup->log("Main-only mode: removed {$removed} subsite entries from wp_blogs");
+
+		// Drop each subsite's tables
+		$total_tables = 0;
+		foreach ($subsites as $blog) {
+			$blog_prefix = $wpdb->base_prefix . $blog->blog_id . '_';
+			$subsite_tables = $wpdb->get_col($wpdb->prepare(
+				"SHOW TABLES LIKE %s", $wpdb->esc_like($blog_prefix) . '%'
+			));
+			foreach ($subsite_tables as $table) {
+				$wpdb->query("DROP TABLE IF EXISTS `{$table}`");
+			}
+			$total_tables += count($subsite_tables);
+		}
+
+		$this->sgbackup->log("Main-only mode: dropped {$total_tables} subsite tables");
+		$this->progress("Main-only mode: removed {$removed} subsites ({$total_tables} tables dropped)");
 	}
 
 	// ==========================================
