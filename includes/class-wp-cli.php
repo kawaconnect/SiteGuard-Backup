@@ -35,11 +35,15 @@ class SiteGuard_Backup_CLI_Command extends WP_CLI_Command {
      * [--incremental]
      * : Perform incremental backup.
      *
+     * [--subsite-only]
+     * : Backup only the current subsite's data (multisite only, requires --url for a subsite).
+     *
      * ## EXAMPLES
      *
      *     wp siteguardbackup backup
      *     wp siteguardbackup backup --exclude-db --include-files=plugins,themes
      *     wp siteguardbackup backup --send-to-cloud --always-keep
+     *     wp siteguardbackup backup --url=subsite.example.com --subsite-only
      *
      * @subcommand backup
      */
@@ -76,6 +80,13 @@ class SiteGuard_Backup_CLI_Command extends WP_CLI_Command {
 
         if (!empty($assoc_args['label'])) {
             $options['label'] = sanitize_text_field(substr($assoc_args['label'], 0, 40));
+        }
+
+        if (isset($assoc_args['subsite-only'])) {
+            if (!is_multisite() || get_current_blog_id() <= 1) {
+                WP_CLI::error('--subsite-only requires multisite and a subsite context (use --url=subsite.domain).');
+            }
+            $options['subsite_backup'] = true;
         }
 
         WP_CLI::log('Starting backup...');

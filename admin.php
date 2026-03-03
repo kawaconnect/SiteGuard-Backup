@@ -133,6 +133,7 @@ class SiteGuard_Backup_Admin {
 			),
 			'max_upload_size' => wp_max_upload_size(),
 			'is_multisite' => is_multisite(),
+			'current_blog_id' => get_current_blog_id(),
 			'default_db_restore_mode' => intval(SiteGuard_Backup_Options::instance()->get_option('sgbackup_default_db_restore_mode', 0)),
 			'default_subsite_mode' => intval(SiteGuard_Backup_Options::instance()->get_option('sgbackup_default_subsite_mode', 0)),
 			'strings'   => array(

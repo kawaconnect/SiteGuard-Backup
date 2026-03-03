@@ -174,6 +174,11 @@
 			$('input[name="sgbackup_include_files"]').on('change', function() {
 				$('#sgbackup-entity-checkboxes').toggle(this.checked);
 			});
+
+			// Show subsite backup option when on a multisite subsite
+			if (sgbackup_settings.is_multisite && sgbackup_settings.current_blog_id > 1) {
+				$('#sgbackup-subsite-backup-option').show();
+			}
 		},
 
 		doBackupNow: function() {
@@ -222,6 +227,11 @@
 					params.anonymise = true;
 					params.anonymise_mode = $('input[name="sgbackup_anonymise_mode"]:checked').val() || 'all';
 				}
+			}
+
+			// Subsite-only backup
+			if ($('input[name="sgbackup_subsite_backup"]').is(':checked')) {
+				params.subsite_backup = true;
 			}
 
 			var sendTo = $('#sgbackup-send-to-select').val();
@@ -414,6 +424,8 @@
 				$('#sgbackup-restore-verify').hide();
 				$('#sgbackup-restore-progress').hide();
 				$('#sgbackup-restore-log').empty();
+				$('#sgbackup-subsite-import').hide();
+				$('input[name="sgbackup_target_subsite_domain"]').val('');
 
 				// Initialize DB restore mode dropdown from site default
 				$('select[name="sgbackup_db_restore_mode"]').val(sgbackup_settings.default_db_restore_mode || 0);
@@ -831,6 +843,15 @@
 					html += '<tr><td><strong>Backup size:</strong></td><td>' + SGB.esc(data.size) + '</td></tr>';
 				}
 
+				// Detect subsite backup and show import UI
+				if (data.is_subsite_backup && sgbackup_settings.is_multisite) {
+					html += '<tr><td><strong>Subsite backup:</strong></td><td>Blog #' + SGB.esc(String(data.subsite_blog_id)) + ' (' + SGB.esc(data.subsite_domain || 'unknown') + ')</td></tr>';
+					$('#sgbackup-subsite-import-notice').text('This is a per-subsite backup from ' + (data.subsite_domain || 'blog #' + data.subsite_blog_id) + '. Enter a target domain to import it as a subsite on this multisite.');
+					$('#sgbackup-subsite-import').show();
+				} else {
+					$('#sgbackup-subsite-import').hide();
+				}
+
 				// Show entities available
 				var entities = [];
 				if (data.tables && data.tables.length) entities.push('Database (' + data.tables.length + ' tables)');
@@ -1033,6 +1054,12 @@
 				if (Object.keys(mirrorSkips).length) {
 					formData.append('subsite_map', JSON.stringify(mirrorSkips));
 				}
+			}
+
+			// Target domain for subsite import
+			var targetSubsiteDomain = $('input[name="sgbackup_target_subsite_domain"]').val();
+			if (targetSubsiteDomain) {
+				formData.append('target_subsite_domain', targetSubsiteDomain);
 			}
 
 			// Gap 25: Collect include-unspecified options

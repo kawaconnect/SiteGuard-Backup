@@ -234,6 +234,7 @@ class SiteGuard_Backup_Engine {
 		}
 
 		$source_path = $entities_info[$entity]['path'];
+
 		if (!is_dir($source_path)) {
 			$this->sgbackup->log("Source directory not found: {$source_path}", 'warning');
 			return true;
@@ -574,6 +575,14 @@ class SiteGuard_Backup_Engine {
 	public function backup_database() {
 		global $wpdb;
 
+		// Per-subsite backup: delegate to subsite-scoped method
+		if ($this->sgbackup->jobdata_get('is_subsite_backup', false)) {
+			$blog_id = $this->sgbackup->jobdata_get('subsite_blog_id', 0);
+			if ($blog_id > 1) {
+				return $this->backup_subsite_database($blog_id);
+			}
+		}
+
 		$table_prefix = $wpdb->prefix;
 
 		// M4: Check if non-WordPress tables should be included
@@ -823,6 +832,118 @@ class SiteGuard_Backup_Engine {
 		}
 
 		return true;
+	}
+
+	/**
+	 * Backup only the tables and users belonging to a specific subsite.
+	 *
+	 * Exports: wp_{blog_id}_* tables + filtered wp_users/wp_usermeta rows.
+	 *
+	 * @param int $blog_id The subsite blog ID.
+	 * @return true|string|false True on success, 'needs_resumption', or false on failure.
+	 */
+	private function backup_subsite_database($blog_id) {
+		global $wpdb;
+
+		$base_prefix = $wpdb->base_prefix;
+		$subsite_prefix = $base_prefix . $blog_id . '_';
+
+		// Get subsite-specific tables
+		$subsite_tables = SiteGuard_Backup_Database_Utility::get_tables($subsite_prefix);
+		if (empty($subsite_tables)) {
+			$this->sgbackup->log("No tables found with prefix {$subsite_prefix}", 'warning');
+			return true;
+		}
+
+		$this->sgbackup->log("Subsite backup (blog #{$blog_id}): " . count($subsite_tables) . " tables with prefix {$subsite_prefix}");
+
+		// Get user IDs associated with this subsite
+		$user_ids = SiteGuard_Backup_Database_Utility::get_subsite_user_ids($blog_id);
+		$this->sgbackup->log("Subsite backup: " . count($user_ids) . " users associated with blog #{$blog_id}");
+
+		// Output file
+		$db_filename = $this->zip_basename . '-db.gz';
+		$db_path = $this->backup_dir . $db_filename;
+		$temp_dir = $this->backup_dir . 'dbtemp_' . $this->sgbackup->nonce . '/';
+
+		if (!file_exists($temp_dir)) {
+			wp_mkdir_p($temp_dir);
+		}
+
+		$completed_tables = $this->sgbackup->jobdata_get('db_completed_tables', array());
+		$all_tables = $subsite_tables;
+
+		// Dump subsite tables
+		foreach ($subsite_tables as $table) {
+			if (in_array($table, $completed_tables)) continue;
+
+			$this->sgbackup->log("Backing up table: {$table}");
+			$table_file = $temp_dir . $table . '.sql.gz';
+
+			$success = SiteGuard_Backup_Database_Utility::php_dump_table($table, $table_file);
+
+			if ($success) {
+				$completed_tables[] = $table;
+				$this->sgbackup->jobdata_set('db_completed_tables', $completed_tables);
+				$this->sgbackup->jobdata_set('db_tables_done', count($completed_tables));
+				$this->sgbackup->jobdata_set('db_tables_total', count($all_tables) + 2); // +2 for users tables
+				SiteGuard_Backup_Job_Scheduler::something_useful_happened();
+			} else {
+				$this->sgbackup->log("Failed to backup table: {$table}", 'error');
+			}
+
+			$elapsed = microtime(true) - $this->sgbackup->job_time_ms;
+			if ($elapsed > (SGBACKUP_SET_TIME_LIMIT * 0.7)) {
+				return 'needs_resumption';
+			}
+		}
+
+		// Dump filtered wp_users and wp_usermeta for this subsite's users
+		if (!empty($user_ids)) {
+			$users_table = $base_prefix . 'users';
+			$usermeta_table = $base_prefix . 'usermeta';
+
+			if (!in_array($users_table, $completed_tables)) {
+				$users_file = $temp_dir . $users_table . '.sql.gz';
+				$id_list = implode(',', array_map('intval', $user_ids));
+				$success = SiteGuard_Backup_Database_Utility::php_dump_table($users_table, $users_file, 1000, false, "ID IN ({$id_list})");
+				if ($success) {
+					$completed_tables[] = $users_table;
+					$this->sgbackup->jobdata_set('db_completed_tables', $completed_tables);
+					$this->sgbackup->log("Backed up {$users_table} (filtered: " . count($user_ids) . " users)");
+				}
+			}
+
+			if (!in_array($usermeta_table, $completed_tables)) {
+				$usermeta_file = $temp_dir . $usermeta_table . '.sql.gz';
+				$id_list = implode(',', array_map('intval', $user_ids));
+				$success = SiteGuard_Backup_Database_Utility::php_dump_table($usermeta_table, $usermeta_file, 1000, false, "user_id IN ({$id_list})");
+				if ($success) {
+					$completed_tables[] = $usermeta_table;
+					$this->sgbackup->jobdata_set('db_completed_tables', $completed_tables);
+					$this->sgbackup->log("Backed up {$usermeta_table} (filtered: " . count($user_ids) . " users)");
+				}
+			}
+		}
+
+		// Stitch all per-table files into single .gz
+		$all_dump_tables = array_merge($subsite_tables, !empty($user_ids) ? array($base_prefix . 'users', $base_prefix . 'usermeta') : array());
+		$this->sgbackup->log("Stitching subsite database backup into {$db_filename}");
+		$result = $this->stitch_db_files($temp_dir, $db_path, $all_dump_tables);
+
+		$db_backup_files = array();
+		if ($result) {
+			$db_backup_files[] = $db_filename;
+			$size = file_exists($db_path) ? SiteGuard_Backup_Filesystem::format_bytes(filesize($db_path)) : '0 B';
+			$this->sgbackup->log("Subsite database backup complete: {$db_filename} ({$size})");
+		} else {
+			$this->sgbackup->log("Failed to stitch subsite database files", 'error');
+		}
+
+		$this->remove_dir($temp_dir);
+		$this->sgbackup->jobdata_set('db_backup_files', $db_backup_files);
+
+		return !empty($db_backup_files);
 	}
 
 	/**

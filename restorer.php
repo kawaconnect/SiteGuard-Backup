@@ -26,6 +26,7 @@ class SiteGuard_Backup_Restorer {
 	const SUBSITE_MODE_MAIN_ONLY = 1;  // Only restore main site, remove subsite blog entries
 	const SUBSITE_MODE_SKIP_REMAP = 2; // Import subsite data but don't remap domains
 	const SUBSITE_MODE_CUSTOM = 3;     // Custom per-subsite domain mapping
+	const SUBSITE_MODE_IMPORT_AS = 4;  // Import a subsite backup into a multisite as a new/existing subsite
 
 	const SUBSITE_SKIP = '__skip__';   // Sentinel: skip this subsite in custom mapping
 
@@ -87,6 +88,15 @@ class SiteGuard_Backup_Restorer {
 	private $pre_import_content_url = '';
 	private $pre_import_uploads_url = '';
 
+	/** @var bool Whether this backup is a per-subsite backup */
+	private $is_subsite_backup = false;
+
+	/** @var int Source blog ID from the subsite backup */
+	private $source_blog_id = 0;
+
+	/** @var string Target domain for subsite import */
+	private $target_subsite_domain = '';
+
 	/**
 	 * @param array $backup_set     Backup set from history.
 	 * @param array $restore_options What to restore: ['db' => bool, 'plugins' => bool, etc.]
@@ -136,6 +146,20 @@ class SiteGuard_Backup_Restorer {
 		}
 		if (isset($restore_options['include_unspecified_themes'])) {
 			$this->include_unspecified_themes = (bool) $restore_options['include_unspecified_themes'];
+		}
+
+		// Detect subsite backup from metadata
+		if (!empty($backup_set['is_subsite_backup'])) {
+			$this->is_subsite_backup = true;
+			$this->source_blog_id = intval($backup_set['subsite_blog_id']);
+		}
+
+		// Target domain for subsite import mode
+		if (!empty($restore_options['target_subsite_domain'])) {
+			$this->target_subsite_domain = sanitize_text_field($restore_options['target_subsite_domain']);
+			if ($this->is_subsite_backup && is_multisite()) {
+				$this->subsite_mode = self::SUBSITE_MODE_IMPORT_AS;
+			}
 		}
 	}
 
@@ -192,6 +216,23 @@ class SiteGuard_Backup_Restorer {
 		}
 
 		// Phase 2: Restore each entity
+		// Subsite import mode: use dedicated restore path
+		if ($this->subsite_mode === self::SUBSITE_MODE_IMPORT_AS && $this->is_subsite_backup && is_multisite()) {
+			$this->progress("Restoring subsite backup as new subsite: {$this->target_subsite_domain}");
+			$subsite_result = $this->restore_as_subsite($backup_dir);
+			if (!$subsite_result['success']) {
+				$result['errors'] = array_merge($result['errors'], $subsite_result['errors']);
+				$result['success'] = false;
+			}
+			$result['messages'] = array_merge($result['messages'], $subsite_result['messages']);
+
+			// Phase 3: Post-restore
+			$this->post_restore_cleanup();
+			$result['messages'] = array_merge($this->progress, $result['messages']);
+			$this->sgbackup->logfile_close();
+			return $result;
+		}
+
 		// Restore database first (if requested)
 		if (!empty($this->restore_options['db']) && !empty($this->backup_set['db'])) {
 			$this->progress("Restoring database");
@@ -506,6 +547,405 @@ class SiteGuard_Backup_Restorer {
 		$this->save_restore_progress('db', 'completed');
 
 		return $result;
+	}
+
+	/**
+	 * Import a subsite backup into this multisite as a new or existing subsite.
+	 *
+	 * Steps:
+	 * 1. Create or find the target subsite in wp_blogs
+	 * 2. Import SQL with prefix remapping (wp_{source_id}_ -> wp_{target_id}_)
+	 * 3. Merge users by email (reuse existing or insert new)
+	 * 4. Move uploaded files from /sites/{source}/ to /sites/{target}/
+	 * 5. Search-replace old domain -> new domain in subsite tables
+	 * 6. Fix wp_{target_id}_options siteurl/home
+	 *
+	 * @param string $backup_dir Path to backup directory.
+	 * @return array ['success' => bool, 'messages' => array, 'errors' => array]
+	 */
+	private function restore_as_subsite($backup_dir) {
+		global $wpdb;
+
+		$result = array('success' => true, 'messages' => array(), 'errors' => array());
+		$source_id = $this->source_blog_id;
+		$target_domain = $this->target_subsite_domain;
+
+		if (!$source_id || empty($target_domain)) {
+			$result['success'] = false;
+			$result['errors'][] = 'Missing source blog ID or target domain for subsite import.';
+			return $result;
+		}
+
+		$this->sgbackup->log("Subsite import: source blog #{$source_id} -> target domain {$target_domain}");
+		$this->progress("Importing subsite backup from blog #{$source_id} to {$target_domain}");
+
+		// Step 1: Find or create the target subsite
+		$target_blog = get_blog_details(array('domain' => $target_domain), false);
+		$target_id = null;
+
+		if ($target_blog) {
+			$target_id = (int) $target_blog->blog_id;
+			$this->sgbackup->log("Target subsite exists: blog #{$target_id} ({$target_domain})");
+			$this->progress("Target subsite already exists (blog #{$target_id}), will overwrite tables");
+
+			// Drop existing subsite tables so we can import fresh
+			$target_prefix = $wpdb->base_prefix . $target_id . '_';
+			$existing_tables = SiteGuard_Backup_Database_Utility::get_tables($target_prefix);
+			if (!empty($existing_tables)) {
+				$wpdb->query('SET FOREIGN_KEY_CHECKS = 0');
+				foreach ($existing_tables as $table) {
+					$safe = SiteGuard_Backup_Database_Utility::sanitize_table_name($table);
+					if ($safe) {
+						$wpdb->query("DROP TABLE IF EXISTS `{$safe}`");
+					}
+				}
+				$wpdb->query('SET FOREIGN_KEY_CHECKS = 1');
+				$this->sgbackup->log("Dropped " . count($existing_tables) . " existing tables for blog #{$target_id}");
+			}
+		} else {
+			// Create new subsite
+			$network = get_network();
+			$path = '/';
+
+			// Determine if this is a subdomain or subdirectory install
+			if (is_subdomain_install()) {
+				$path = '/';
+			} else {
+				// Subdirectory: derive path from domain
+				$path = '/' . trim(str_replace($network->domain, '', $target_domain), './ ') . '/';
+				if ($path === '//') $path = '/';
+				$target_domain = $network->domain;
+			}
+
+			$target_id = wpmu_create_blog($target_domain, $path, 'Imported subsite', get_current_user_id(), array('public' => 1), $network->id);
+			if (is_wp_error($target_id)) {
+				$result['success'] = false;
+				$result['errors'][] = 'Failed to create subsite: ' . $target_id->get_error_message();
+				return $result;
+			}
+
+			$this->sgbackup->log("Created new subsite: blog #{$target_id} ({$target_domain}{$path})");
+			$this->progress("Created new subsite blog #{$target_id}");
+
+			// Drop the auto-created tables (we'll import from backup)
+			$target_prefix = $wpdb->base_prefix . $target_id . '_';
+			$auto_tables = SiteGuard_Backup_Database_Utility::get_tables($target_prefix);
+			if (!empty($auto_tables)) {
+				$wpdb->query('SET FOREIGN_KEY_CHECKS = 0');
+				foreach ($auto_tables as $table) {
+					$safe = SiteGuard_Backup_Database_Utility::sanitize_table_name($table);
+					if ($safe) {
+						$wpdb->query("DROP TABLE IF EXISTS `{$safe}`");
+					}
+				}
+				$wpdb->query('SET FOREIGN_KEY_CHECKS = 1');
+			}
+		}
+
+		// Step 2: Import SQL with prefix remapping
+		if (!empty($this->restore_options['db']) && !empty($this->backup_set['db'])) {
+			$db_files = $this->backup_set['db'];
+			if (is_string($db_files)) $db_files = array($db_files);
+
+			$source_prefix = $wpdb->base_prefix . $source_id . '_';
+			$target_prefix = $wpdb->base_prefix . $target_id . '_';
+
+			$this->progress("Importing database: remapping {$source_prefix}* -> {$target_prefix}*");
+
+			foreach ($db_files as $db_file) {
+				$file_path = $backup_dir . $db_file;
+
+				// Decrypt if needed
+				if (preg_match('/\.crypt$/', $db_file)) {
+					$file_path = $this->decrypt_file($file_path);
+					if (!$file_path) {
+						$result['errors'][] = "Failed to decrypt: {$db_file}";
+						$result['success'] = false;
+						continue;
+					}
+				}
+
+				$import_result = SiteGuard_Backup_Database_Utility::execute_sql_file_remap_prefix(
+					$file_path,
+					$source_prefix,
+					$target_prefix,
+					$wpdb->base_prefix
+				);
+
+				$result['messages'][] = "Database: {$import_result['tables_restored']} tables imported (remapped to blog #{$target_id})";
+				if (!empty($import_result['errors'])) {
+					$result['errors'] = array_merge($result['errors'], $import_result['errors']);
+				}
+				if (!$import_result['success']) {
+					$result['success'] = false;
+				}
+			}
+
+			// Step 3: Merge users - match by email
+			$this->merge_subsite_users($source_id, $target_id, $backup_dir);
+		}
+
+		// Step 4: Move uploaded files
+		if (!empty($this->restore_options['uploads']) && !empty($this->backup_set['uploads'])) {
+			$this->progress("Restoring uploads for subsite #{$target_id}");
+			$uploads_result = $this->restore_subsite_uploads($backup_dir, $source_id, $target_id);
+			if ($uploads_result) {
+				$result['messages'][] = "Uploads: restored to /sites/{$target_id}/";
+			} else {
+				$result['errors'][] = "Failed to restore uploads";
+			}
+		}
+
+		// Step 5: Search-replace old domain -> new domain in subsite tables only
+		$old_domain = isset($this->backup_set['subsite_domain']) ? $this->backup_set['subsite_domain'] : '';
+		if (!empty($old_domain) && $old_domain !== $target_domain) {
+			$this->progress("Search-replace: {$old_domain} -> {$target_domain}");
+
+			require_once SGBACKUP_DIR . 'includes/class-search-replace.php';
+
+			$target_prefix = $wpdb->base_prefix . $target_id . '_';
+			$tables = SiteGuard_Backup_Database_Utility::get_tables($target_prefix);
+
+			$search = array();
+			$replace = array();
+
+			// Full URL replacements (both protocols)
+			$new_scheme = parse_url(get_option('siteurl'), PHP_URL_SCHEME);
+			$new_url = $new_scheme . '://' . $target_domain;
+			$search[] = 'https://' . $old_domain;
+			$replace[] = $new_url;
+			$search[] = 'http://' . $old_domain;
+			$replace[] = $new_url;
+			// Bare domain catch-all
+			$search[] = $old_domain;
+			$replace[] = $target_domain;
+
+			$sr = new SiteGuard_Backup_Search_Replace();
+			$report = $sr->run($search, $replace, $tables);
+
+			$this->sgbackup->log("Subsite search-replace: {$report['changes']} changes across {$report['tables']} tables");
+			$this->progress("Search-replace: {$report['changes']} changes in {$report['tables']} tables");
+
+			$result['messages'][] = "Search-replace: {$report['changes']} changes ({$old_domain} -> {$target_domain})";
+		}
+
+		// Step 6: Fix subsite options (siteurl, home)
+		$target_prefix = $wpdb->base_prefix . $target_id . '_';
+		$new_scheme = parse_url(get_option('siteurl'), PHP_URL_SCHEME);
+		$new_siteurl = $new_scheme . '://' . $target_domain;
+
+		$wpdb->update(
+			$target_prefix . 'options',
+			array('option_value' => $new_siteurl),
+			array('option_name' => 'siteurl')
+		);
+		$wpdb->update(
+			$target_prefix . 'options',
+			array('option_value' => $new_siteurl),
+			array('option_name' => 'home')
+		);
+
+		$this->sgbackup->log("Fixed subsite siteurl/home -> {$new_siteurl}");
+		$result['messages'][] = "Subsite import complete: blog #{$target_id} at {$target_domain}";
+
+		return $result;
+	}
+
+	/**
+	 * Merge users from a subsite backup into the existing multisite user base.
+	 * Matches by email - reuses existing users, inserts new ones.
+	 */
+	private function merge_subsite_users($source_id, $target_id, $backup_dir) {
+		global $wpdb;
+
+		$db_files = $this->backup_set['db'];
+		if (is_string($db_files)) $db_files = array($db_files);
+
+		$base_prefix = $wpdb->base_prefix;
+		$users_table = $base_prefix . 'users';
+		$usermeta_table = $base_prefix . 'usermeta';
+		$source_cap_key = $base_prefix . $source_id . '_capabilities';
+		$target_cap_key = $base_prefix . $target_id . '_capabilities';
+
+		// Read users from the SQL dump
+		$backup_users = array(); // email => array of user data
+		foreach ($db_files as $db_file) {
+			$file_path = $backup_dir . $db_file;
+			if (preg_match('/\.crypt$/', $db_file)) continue;
+
+			$is_gz = (substr($file_path, -3) === '.gz');
+			$fh = $is_gz ? @gzopen($file_path, 'rb') : @fopen($file_path, 'r');
+			if (!$fh) continue;
+
+			$in_users_insert = false;
+			while (!($is_gz ? gzeof($fh) : feof($fh))) {
+				$line = $is_gz ? gzgets($fh) : fgets($fh);
+				if (false === $line) break;
+
+				// Detect INSERT INTO wp_users
+				if (preg_match("/INSERT INTO\s+`{$users_table}`/i", $line)) {
+					$in_users_insert = true;
+				}
+
+				if ($in_users_insert) {
+					// Extract user rows: (ID, login, pass, nicename, email, ...)
+					if (preg_match_all("/\(\s*(\d+)\s*,\s*'([^']*)'\s*,\s*'([^']*)'\s*,\s*'([^']*)'\s*,\s*'([^']*)'/", $line, $matches, PREG_SET_ORDER)) {
+						foreach ($matches as $m) {
+							$backup_users[$m[5]] = array(
+								'old_id' => intval($m[1]),
+								'login'  => $m[2],
+								'email'  => $m[5],
+							);
+						}
+					}
+					if (strpos($line, ';') !== false) {
+						$in_users_insert = false;
+					}
+				}
+			}
+			$is_gz ? @gzclose($fh) : @fclose($fh);
+		}
+
+		if (empty($backup_users)) {
+			$this->sgbackup->log("Subsite user merge: no users found in backup");
+			return;
+		}
+
+		$this->sgbackup->log("Subsite user merge: " . count($backup_users) . " users in backup");
+
+		// Map old user IDs to new (existing or matching) user IDs
+		$id_map = array();
+		foreach ($backup_users as $email => $user_data) {
+			$existing = get_user_by('email', $email);
+			if ($existing) {
+				$id_map[$user_data['old_id']] = $existing->ID;
+			} else {
+				$existing_by_login = get_user_by('login', $user_data['login']);
+				if ($existing_by_login) {
+					$id_map[$user_data['old_id']] = $existing_by_login->ID;
+				}
+				// If no match, user data was imported with the subsite tables;
+				// we leave user references as-is (they may need manual resolution)
+			}
+		}
+
+		// For users that exist, add them to the target subsite with their capabilities
+		$target_prefix = $base_prefix . $target_id . '_';
+		foreach ($id_map as $old_id => $new_id) {
+			// Read capabilities from the imported subsite usermeta
+			$caps = $wpdb->get_var($wpdb->prepare(
+				"SELECT meta_value FROM {$usermeta_table} WHERE user_id = %d AND meta_key = %s",
+				$old_id, $source_cap_key
+			));
+
+			if ($caps) {
+				// Set on target subsite
+				update_user_meta($new_id, $target_cap_key, maybe_unserialize($caps));
+			} else {
+				// Default: subscriber role
+				add_user_to_blog($target_id, $new_id, 'subscriber');
+			}
+		}
+
+		// Update user IDs in subsite tables (e.g., post_author, comment_user_id)
+		if (!empty($id_map)) {
+			$target_posts = $target_prefix . 'posts';
+			$target_comments = $target_prefix . 'comments';
+
+			foreach ($id_map as $old_id => $new_id) {
+				if ($old_id === $new_id) continue;
+
+				// Check tables exist before updating
+				if ($wpdb->get_var("SHOW TABLES LIKE '{$target_posts}'")) {
+					$wpdb->update($target_posts, array('post_author' => $new_id), array('post_author' => $old_id));
+				}
+				if ($wpdb->get_var("SHOW TABLES LIKE '{$target_comments}'")) {
+					$wpdb->update($target_comments, array('user_id' => $new_id), array('user_id' => $old_id));
+				}
+			}
+			$this->sgbackup->log("Subsite user merge: remapped " . count($id_map) . " user IDs in subsite tables");
+		}
+	}
+
+	/**
+	 * Restore uploads for a subsite import, moving from /sites/{source}/ to /sites/{target}/.
+	 */
+	private function restore_subsite_uploads($backup_dir, $source_id, $target_id) {
+		$upload_files = $this->backup_set['uploads'];
+		if (is_string($upload_files)) $upload_files = array($upload_files);
+
+		$opts = SiteGuard_Backup_Options::instance();
+		$uploads_base = SiteGuard_Backup_Filesystem::wp_uploads_dir();
+		$target_dir = trailingslashit($uploads_base) . 'sites/' . $target_id . '/';
+
+		if (!file_exists($target_dir)) {
+			wp_mkdir_p($target_dir);
+		}
+
+		foreach ($upload_files as $zip_file) {
+			$zip_path = $backup_dir . $zip_file;
+			if (!file_exists($zip_path)) continue;
+
+			// Extract to a temp directory first
+			$temp_extract = $backup_dir . 'temp_uploads_' . time() . '/';
+			wp_mkdir_p($temp_extract);
+
+			$extract_ok = SiteGuard_Backup_Filesystem::extract_zip($zip_path, $temp_extract);
+			if (!$extract_ok) {
+				$this->sgbackup->log("Failed to extract uploads zip: {$zip_file}", 'error');
+				$this->remove_dir_recursive($temp_extract);
+				continue;
+			}
+
+			// Find the actual files - might be in sites/{source_id}/ or root
+			$source_subdir = $temp_extract . 'sites/' . $source_id . '/';
+			$copy_from = is_dir($source_subdir) ? $source_subdir : $temp_extract;
+
+			// Copy files to target directory
+			$this->copy_dir_recursive($copy_from, $target_dir);
+
+			$this->remove_dir_recursive($temp_extract);
+			$this->sgbackup->log("Restored uploads from {$zip_file} to /sites/{$target_id}/");
+		}
+
+		return true;
+	}
+
+	/**
+	 * Recursively copy a directory.
+	 */
+	private function copy_dir_recursive($source, $dest) {
+		if (!is_dir($source)) return;
+		if (!is_dir($dest)) wp_mkdir_p($dest);
+
+		$iterator = new RecursiveIteratorIterator(
+			new RecursiveDirectoryIterator($source, FilesystemIterator::SKIP_DOTS),
+			RecursiveIteratorIterator::SELF_FIRST
+		);
+
+		foreach ($iterator as $item) {
+			$target = $dest . DIRECTORY_SEPARATOR . $iterator->getSubPathname();
+			if ($item->isDir()) {
+				if (!is_dir($target)) wp_mkdir_p($target);
+			} else {
+				@copy($item->getPathname(), $target);
+			}
+		}
+	}
+
+	/**
+	 * Recursively remove a directory.
+	 */
+	private function remove_dir_recursive($dir) {
+		if (!is_dir($dir)) return;
+		$files = new RecursiveIteratorIterator(
+			new RecursiveDirectoryIterator($dir, FilesystemIterator::SKIP_DOTS),
+			RecursiveIteratorIterator::CHILD_FIRST
+		);
+		foreach ($files as $file) {
+			$file->isDir() ? @rmdir($file->getPathname()) : @unlink($file->getPathname());
+		}
+		@rmdir($dir);
 	}
 
 	/**
@@ -1133,6 +1573,7 @@ class SiteGuard_Backup_Restorer {
 	 * this as part of its domain-remapping loop.
 	 */
 	private function apply_subsite_skips() {
+		if (!is_multisite()) return;
 		global $wpdb;
 		$blogs_table = $wpdb->base_prefix . 'blogs';
 		$removed = 0;
@@ -1176,6 +1617,7 @@ class SiteGuard_Backup_Restorer {
 	 * handles this via its DELETE WHERE blog_id > 1 path.
 	 */
 	private function apply_main_only_mode() {
+		if (!is_multisite()) return;
 		global $wpdb;
 		$blogs_table = $wpdb->base_prefix . 'blogs';
 

@@ -663,6 +663,16 @@ class SiteGuard_Backup {
 			$initial_jobdata['is_autobackup'] = true;
 		}
 
+		// Per-subsite backup: detect if running from a subsite admin context
+		if (is_multisite() && get_current_blog_id() > 1 && !empty($options['subsite_backup'])) {
+			$blog_id = get_current_blog_id();
+			$blog_details = get_blog_details($blog_id);
+			$initial_jobdata['is_subsite_backup'] = true;
+			$initial_jobdata['subsite_blog_id'] = $blog_id;
+			$initial_jobdata['subsite_domain'] = $blog_details ? $blog_details->domain : '';
+			$initial_jobdata['subsite_path'] = $blog_details ? $blog_details->path : '/';
+		}
+
 		// Merge any extra jobdata (e.g., from migrate_send pre-setting phase flags)
 		if (!empty($options['initial_jobdata_extra']) && is_array($options['initial_jobdata_extra'])) {
 			$initial_jobdata = array_merge($initial_jobdata, $options['initial_jobdata_extra']);
@@ -1090,11 +1100,56 @@ class SiteGuard_Backup {
 
 			if ($service_all_ok) {
 				$any_service_succeeded = true;
+				// Send metadata (label, always_keep, source_url) after all files uploaded
+				if ($method_name === 'remotesend') {
+					$this->send_remotesend_metadata($service_instance);
+				}
 			}
 		}
 
 		$this->jobdata_set('remote_upload_succeeded', $any_service_succeeded);
 		return true;
+	}
+
+	/**
+	 * Send backup metadata to a remote site after all files have been uploaded.
+	 *
+	 * @param string|null $instance_id The remotesend instance (site_id).
+	 */
+	private function send_remotesend_metadata($instance_id) {
+		$label = $this->jobdata_get('label', '');
+		$always_keep = $this->jobdata_get('always_keep', false);
+		$timestamp = $this->jobdata_get('original_backup_timestamp', $this->backup_time);
+		$nonce = $this->jobdata_get('file_nonce', $this->nonce);
+
+		// Nothing to send if no meaningful metadata
+		if (empty($label) && !$always_keep) return;
+
+		$site_id = ($instance_id !== null) ? intval($instance_id) : 0;
+		$opts = SiteGuard_Backup_Options::instance();
+		$sites = $opts->get_option('sgbackup_remotesites', array());
+		if (!isset($sites[$site_id])) {
+			$this->log("RemoteSend metadata: site #{$site_id} not found, skipping");
+			return;
+		}
+
+		require_once SGBACKUP_DIR . 'includes/class-remote-communications.php';
+		$rpc = new SiteGuard_Backup_Remote_Communications();
+
+		$payload = array(
+			'timestamp'  => intval($timestamp),
+			'nonce'      => $nonce,
+			'source_url' => site_url(),
+		);
+		if (!empty($label)) $payload['label'] = $label;
+		if ($always_keep) $payload['always_keep'] = true;
+
+		$result = $rpc->send_message($sites[$site_id], 'set_backup_metadata', $payload);
+		if (is_wp_error($result)) {
+			$this->log("RemoteSend metadata: failed to send - " . $result->get_error_message(), 'warning');
+		} else {
+			$this->log("RemoteSend metadata: label/metadata sent to remote site");
+		}
 	}
 
 	/**
@@ -1280,6 +1335,14 @@ class SiteGuard_Backup {
 		$label = $this->jobdata_get('label', '');
 		if (!empty($label)) {
 			$backup_data['label'] = $label;
+		}
+
+		// Per-subsite backup metadata
+		if ($this->jobdata_get('is_subsite_backup', false)) {
+			$backup_data['is_subsite_backup'] = true;
+			$backup_data['subsite_blog_id'] = $this->jobdata_get('subsite_blog_id', 0);
+			$backup_data['subsite_domain'] = $this->jobdata_get('subsite_domain', '');
+			$backup_data['subsite_path'] = $this->jobdata_get('subsite_path', '/');
 		}
 
 		// Handle incremental merging

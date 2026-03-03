@@ -228,6 +228,9 @@ class SiteGuard_Backup_Remote_Send {
 			case 'upload_complete':
 				return $this->cmd_upload_complete($data);
 
+			case 'set_backup_metadata':
+				return $this->cmd_set_backup_metadata($data);
+
 			default:
 				error_log("SiteGuard Backup RPC Receiver: unknown command '{$command}'");
 				return new WP_Error('unknown_command', "Unknown RPC command: {$command}");
@@ -394,6 +397,60 @@ class SiteGuard_Backup_Remote_Send {
 	private function cmd_upload_complete($data) {
 		$filename = isset($data['file']) ? sanitize_file_name($data['file']) : '';
 		return array('status' => 'acknowledged', 'file' => $filename);
+	}
+
+	/**
+	 * Set metadata (label, always_keep, source_url) on a received backup.
+	 */
+	private function cmd_set_backup_metadata($data) {
+		$timestamp = isset($data['timestamp']) ? intval($data['timestamp']) : 0;
+		$nonce = isset($data['nonce']) ? sanitize_text_field($data['nonce']) : '';
+
+		if (empty($timestamp) && empty($nonce)) {
+			return new WP_Error('missing_param', 'Missing timestamp or nonce');
+		}
+
+		$history = SiteGuard_Backup_History::get_history_raw();
+		$target_ts = null;
+
+		// Try exact timestamp match first
+		if ($timestamp && isset($history[$timestamp])) {
+			$target_ts = $timestamp;
+		}
+
+		// Fall back to nonce match
+		if (!$target_ts && !empty($nonce)) {
+			foreach ($history as $ts => $entry) {
+				if (isset($entry['nonce']) && $entry['nonce'] === $nonce) {
+					$target_ts = $ts;
+					break;
+				}
+			}
+		}
+
+		if (!$target_ts) {
+			return new WP_Error('not_found', 'No matching backup found in history');
+		}
+
+		$changed = false;
+		if (!empty($data['label'])) {
+			$history[$target_ts]['label'] = sanitize_text_field(substr($data['label'], 0, 40));
+			$changed = true;
+		}
+		if (isset($data['always_keep'])) {
+			$history[$target_ts]['always_keep'] = (bool) $data['always_keep'];
+			$changed = true;
+		}
+		if (!empty($data['source_url'])) {
+			$history[$target_ts]['source_url'] = esc_url_raw($data['source_url']);
+			$changed = true;
+		}
+
+		if ($changed) {
+			SiteGuard_Backup_History::save_history($history);
+		}
+
+		return array('status' => 'ok', 'timestamp' => $target_ts);
 	}
 
 	/**

@@ -228,15 +228,32 @@ class SiteGuard_Backup_Database_Utility {
 	}
 
 	/**
+	 * Get user IDs that have capabilities on a specific subsite.
+	 *
+	 * @param int $blog_id The subsite blog ID.
+	 * @return array User IDs.
+	 */
+	public static function get_subsite_user_ids($blog_id) {
+		global $wpdb;
+		$cap_key = $wpdb->base_prefix . intval($blog_id) . '_capabilities';
+		$user_ids = $wpdb->get_col($wpdb->prepare(
+			"SELECT DISTINCT user_id FROM {$wpdb->usermeta} WHERE meta_key = %s",
+			$cap_key
+		));
+		return array_map('intval', $user_ids);
+	}
+
+	/**
 	 * Dump a table using PHP (fallback when mysqldump is unavailable).
 	 *
 	 * @param string $table          Table name.
 	 * @param string $outfile        Output file path (.sql or .sql.gz).
 	 * @param int    $batch_size     Rows per batch.
 	 * @param bool   $structure_only If true, dump only CREATE TABLE (no INSERT statements).
+	 * @param string $where_clause   Optional WHERE clause for filtered dumps (e.g. "ID IN (1,2,3)").
 	 * @return bool True on success.
 	 */
-	public static function php_dump_table($table, $outfile, $batch_size = 1000, $structure_only = false) {
+	public static function php_dump_table($table, $outfile, $batch_size = 1000, $structure_only = false, $where_clause = '') {
 		global $wpdb;
 
 		$table = self::sanitize_table_name($table);
@@ -267,7 +284,9 @@ class SiteGuard_Backup_Database_Utility {
 		}
 
 		// Table data
-		$total_rows = self::get_table_row_count($table);
+		$where_sql = !empty($where_clause) ? " WHERE {$where_clause}" : '';
+		$count_query = "SELECT COUNT(*) FROM `{$table}`{$where_sql}";
+		$total_rows = (int) $wpdb->get_var($count_query);
 		if ($total_rows === 0) {
 			$use_gzip ? @gzclose($fh) : @fclose($fh);
 			return true;
@@ -290,7 +309,7 @@ class SiteGuard_Backup_Database_Utility {
 		$offset = 0;
 		while ($offset < $total_rows) {
 			$rows = $wpdb->get_results(
-				$wpdb->prepare("SELECT * FROM `{$table}` LIMIT %d OFFSET %d", $batch_size, $offset),
+				$wpdb->prepare("SELECT * FROM `{$table}`{$where_sql} LIMIT %d OFFSET %d", $batch_size, $offset),
 				ARRAY_A
 			);
 
@@ -1044,5 +1063,169 @@ class SiteGuard_Backup_Database_Utility {
 
 		$is_gz ? gzclose($fh) : fclose($fh);
 		return $tables;
+	}
+
+	/**
+	 * Import a SQL file with table prefix remapping.
+	 *
+	 * Rewrites table names from source prefix to target prefix.
+	 * Skips wp_users and wp_usermeta tables (handled by user merge).
+	 *
+	 * @param string $sql_file       Path to SQL file.
+	 * @param string $source_prefix  Source table prefix (e.g. "wp_2_").
+	 * @param string $target_prefix  Target table prefix (e.g. "wp_5_").
+	 * @param string $base_prefix    WordPress base prefix (e.g. "wp_") for skipping global tables.
+	 * @return array ['success' => bool, 'errors' => array, 'tables_restored' => int]
+	 */
+	public static function execute_sql_file_remap_prefix($sql_file, $source_prefix, $target_prefix, $base_prefix = '') {
+		global $wpdb;
+
+		$result = array('success' => true, 'errors' => array(), 'tables_restored' => 0);
+
+		$is_gz = (substr($sql_file, -3) === '.gz');
+		$fh = $is_gz ? @gzopen($sql_file, 'rb') : @fopen($sql_file, 'r');
+		if (!$fh) {
+			$result['success'] = false;
+			$result['errors'][] = "Failed to open SQL file: {$sql_file}";
+			return $result;
+		}
+
+		// Tables to skip (global multisite tables that shouldn't be remapped)
+		$skip_tables = array();
+		if (!empty($base_prefix)) {
+			$skip_tables = array(
+				$base_prefix . 'users',
+				$base_prefix . 'usermeta',
+			);
+		}
+
+		$buffer = '';
+		$line_count = 0;
+		$in_string = false;
+		$string_char = '';
+		$current_table = '';
+		$skipping_table = false;
+
+		$wpdb->query('SET FOREIGN_KEY_CHECKS = 0');
+		$wpdb->query("SET SQL_MODE = 'NO_AUTO_VALUE_ON_ZERO'");
+
+		while (!($is_gz ? gzeof($fh) : feof($fh))) {
+			$line = $is_gz ? gzgets($fh) : fgets($fh);
+			if (false === $line) break;
+
+			$line_count++;
+			$trimmed = trim($line);
+
+			if (!$in_string) {
+				if (empty($trimmed)) continue;
+				if (empty($buffer) && (0 === strpos($trimmed, '--') || 0 === strpos($trimmed, '#') || 0 === strpos($trimmed, '/*'))) continue;
+				if (preg_match('/^(LOCK\s+TABLES|UNLOCK\s+TABLES)/i', $trimmed)) continue;
+
+				// Track current table and decide whether to skip
+				if (preg_match('/^(?:DROP TABLE|CREATE TABLE)\s+(?:IF\s+(?:NOT\s+)?EXISTS\s+)?`([^`]+)`/i', $trimmed, $m)) {
+					$current_table = $m[1];
+					$skipping_table = in_array($current_table, $skip_tables);
+				}
+				if (preg_match('/^INSERT\s+INTO\s+`([^`]+)`/i', $trimmed, $m)) {
+					$current_table = $m[1];
+					$skipping_table = in_array($current_table, $skip_tables);
+				}
+			}
+
+			if ($skipping_table) {
+				// Track string state even when skipping
+				$len = strlen($trimmed);
+				for ($ci = 0; $ci < $len; $ci++) {
+					$ch = $trimmed[$ci];
+					if ($in_string) {
+						if ($ch === '\\') { $ci++; }
+						elseif ($ch === $string_char) {
+							if ($ci + 1 < $len && $trimmed[$ci + 1] === $string_char) { $ci++; }
+							else { $in_string = false; }
+						}
+					} else {
+						if ($ch === "'" || $ch === '"') { $in_string = true; $string_char = $ch; }
+					}
+				}
+				continue;
+			}
+
+			$buffer .= $line;
+
+			// Track string state
+			$len = strlen($trimmed);
+			for ($ci = 0; $ci < $len; $ci++) {
+				$ch = $trimmed[$ci];
+				if ($in_string) {
+					if ($ch === '\\') { $ci++; }
+					elseif ($ch === $string_char) {
+						if ($ci + 1 < $len && $trimmed[$ci + 1] === $string_char) { $ci++; }
+						else { $in_string = false; }
+					}
+				} else {
+					if ($ch === "'" || $ch === '"') { $in_string = true; $string_char = $ch; }
+				}
+			}
+
+			if (!$in_string && substr($trimmed, -1) === ';') {
+				$query = trim(rtrim($buffer, ';'));
+				$buffer = '';
+
+				if (empty($query)) continue;
+
+				// Remap table prefixes in the query
+				$query = self::remap_table_prefix_in_query($query, $source_prefix, $target_prefix);
+
+				if (self::is_dangerous_sql($query)) {
+					$result['errors'][] = "Blocked dangerous SQL on line {$line_count}";
+					continue;
+				}
+
+				$res = $wpdb->query($query);
+				if (false === $res) {
+					$result['errors'][] = "SQL error on line {$line_count}: " . $wpdb->last_error;
+				}
+
+				if (preg_match('/^CREATE\s+TABLE/i', $query)) {
+					$result['tables_restored']++;
+				}
+			}
+		}
+
+		if (!empty(trim($buffer))) {
+			$query = trim(rtrim($buffer, ';'));
+			if (!empty($query) && !$skipping_table) {
+				$query = self::remap_table_prefix_in_query($query, $source_prefix, $target_prefix);
+				if (!self::is_dangerous_sql($query)) {
+					$res = $wpdb->query($query);
+					if (false === $res) {
+						$result['errors'][] = "SQL error at end: " . $wpdb->last_error;
+					}
+				}
+			}
+		}
+
+		$wpdb->query('SET FOREIGN_KEY_CHECKS = 1');
+		$is_gz ? @gzclose($fh) : @fclose($fh);
+
+		if (!empty($result['errors'])) {
+			$result['success'] = false;
+		}
+
+		return $result;
+	}
+
+	/**
+	 * Remap table prefix in a SQL statement.
+	 *
+	 * @param string $query         The SQL statement.
+	 * @param string $source_prefix Source prefix (e.g. "wp_2_").
+	 * @param string $target_prefix Target prefix (e.g. "wp_5_").
+	 * @return string Modified query.
+	 */
+	private static function remap_table_prefix_in_query($query, $source_prefix, $target_prefix) {
+		// Replace backtick-quoted table names
+		$escaped_source = preg_quote($source_prefix, '/');
+		return preg_replace('/`' . $escaped_source . '([^`]+)`/', '`' . $target_prefix . '$1`', $query);
 	}
 }

@@ -39,6 +39,14 @@
 		</div>
 	</div>
 
+	<div id="sgbackup-subsite-backup-option" style="display:none;">
+		<hr />
+		<p>
+			<label><input type="checkbox" name="sgbackup_subsite_backup" value="1" /> <?php esc_html_e('Backup this subsite only', 'siteguardbackup'); ?></label>
+			<br /><span class="description"><?php esc_html_e('Only include this subsite\'s database tables and uploads. Plugins, themes, and core files are still backed up in full if selected above.', 'siteguardbackup'); ?></span>
+		</p>
+	</div>
+
 	<hr />
 
 	<p>

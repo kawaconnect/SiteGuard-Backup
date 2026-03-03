@@ -81,6 +81,11 @@ class SiteGuard_Backup_Commands {
 			$options['db_anonymise_mode'] = in_array($mode, $valid_modes, true) ? $mode : 'all';
 		}
 
+		// Per-subsite backup: only the current subsite's data
+		if (!empty($params['subsite_backup']) && is_multisite() && get_current_blog_id() > 1) {
+			$options['subsite_backup'] = true;
+		}
+
 		$sgbackup->backup_all($options);
 
 		// Audit log
@@ -851,6 +856,28 @@ class SiteGuard_Backup_Commands {
 		if (!empty($params['subsite_map']) && is_array($params['subsite_map'])) {
 			$restore_options['subsite_map'] = $params['subsite_map'];
 		}
+		if (!empty($params['target_subsite_domain'])) {
+			$restore_options['target_subsite_domain'] = sanitize_text_field($params['target_subsite_domain']);
+		}
+		if (!empty($params['pre_restore_backup'])) {
+			$restore_options['pre_restore_backup'] = true;
+		}
+
+		// Gap 25: Include-unspecified options
+		if (isset($params['include_unspecified_tables'])) {
+			$restore_options['include_unspecified_tables'] = !empty($params['include_unspecified_tables']);
+		}
+		if (isset($params['include_unspecified_plugins'])) {
+			$restore_options['include_unspecified_plugins'] = !empty($params['include_unspecified_plugins']);
+		}
+		if (isset($params['include_unspecified_themes'])) {
+			$restore_options['include_unspecified_themes'] = !empty($params['include_unspecified_themes']);
+		}
+
+		// Selective table restore
+		if (!empty($params['restore_tables']) && is_array($params['restore_tables'])) {
+			$restore_options['restore_tables'] = array_map('sanitize_text_field', $params['restore_tables']);
+		}
 
 		require_once SGBACKUP_DIR . 'restorer.php';
 		$restorer = new SiteGuard_Backup_Restorer($backup_set, $restore_options);
@@ -962,12 +989,13 @@ class SiteGuard_Backup_Commands {
 			'nofiles'                => true,
 			'nodb'                   => true,
 			'initial_jobdata_extra'  => array(
-				'backup_files_array'       => $backup_files,
-				'db_backup_files'          => array(),
-				'files_phase_complete'     => true,
-				'db_phase_complete'        => true,
+				'backup_files_array'        => $backup_files,
+				'db_backup_files'           => array(),
+				'files_phase_complete'      => true,
+				'db_phase_complete'         => true,
 				'encryption_phase_complete' => true,
-				'manifest_phase_complete'  => true,
+				'manifest_phase_complete'   => true,
+				'original_backup_timestamp' => $timestamp,
 			),
 		);
 
@@ -1328,6 +1356,13 @@ class SiteGuard_Backup_Commands {
 		$result['timestamp'] = $timestamp;
 		$result['current_siteurl'] = get_option('siteurl');
 		$result['old_siteurl'] = '';
+
+		// Include subsite backup metadata
+		if (!empty($backup_set['is_subsite_backup'])) {
+			$result['is_subsite_backup'] = true;
+			$result['subsite_blog_id'] = isset($backup_set['subsite_blog_id']) ? intval($backup_set['subsite_blog_id']) : 0;
+			$result['subsite_domain'] = isset($backup_set['subsite_domain']) ? $backup_set['subsite_domain'] : '';
+		}
 
 		// Calculate total backup size
 		$total_size = 0;

@@ -81,6 +81,18 @@
 			<p><em><?php esc_html_e('Loading subsite list...', 'siteguardbackup'); ?></em></p>
 		</div>
 
+		<!-- Subsite import notice and target domain input -->
+		<div id="sgbackup-subsite-import" style="display:none;margin:8px 0;padding:10px;background:#e8f4fd;border:1px solid #72aee6;border-radius:3px;">
+			<p><strong id="sgbackup-subsite-import-notice"></strong></p>
+			<p>
+				<label><?php esc_html_e('Target domain for this subsite:', 'siteguardbackup'); ?>
+					<input type="text" name="sgbackup_target_subsite_domain" value="" class="regular-text"
+						placeholder="<?php esc_attr_e('e.g. blog.example.com', 'siteguardbackup'); ?>" />
+				</label>
+			</p>
+			<p class="description"><?php esc_html_e('The subsite will be created at (or overwritten on) this domain.', 'siteguardbackup'); ?></p>
+		</div>
+
 		<hr />
 		<p>
 			<label><input type="checkbox" name="sgbackup_restore_pre_backup" value="1" checked />

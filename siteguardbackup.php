@@ -5,7 +5,6 @@
  * Version: 1.3.0
  * Author: SiteGuard
  * License: GPL-2.0-or-later
- * Network: true
  * Requires at least: 5.6
  * Requires PHP: 7.4
  * Text Domain: siteguardbackup
