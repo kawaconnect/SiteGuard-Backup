@@ -54,18 +54,11 @@ class SiteGuard_Backup_Method_Remotesend extends SiteGuard_Backup_Module {
 	public function backup($file) {
 		$sgbackup = SiteGuard_Backup::instance();
 
-		// Determine site_id from service string (e.g., "remotesend/3")
-		$services = $sgbackup->jobdata_get('service', array('none'));
-		$site_id = 0;
-		$sgbackup->log("RemoteSend: services = " . json_encode($services));
-		foreach ($services as $svc) {
-			if (preg_match('/^remotesend\/(\d+)$/', $svc, $m)) {
-				$site_id = intval($m[1]);
-				break;
-			}
-		}
+		// Use instance_id (set from service string e.g. "remotesend/3") so that
+		// each multi-instance destination resolves to its own remote site.
+		$site_id = ($this->instance_id !== '') ? intval($this->instance_id) : null;
+		$sgbackup->log("RemoteSend: instance_id=" . var_export($this->instance_id, true) . " site_id=" . var_export($site_id, true));
 
-		$sgbackup->log("RemoteSend: resolved site_id = {$site_id}");
 		$site = $this->load_remote_site($site_id);
 		if (is_wp_error($site)) {
 			$sgbackup->log("RemoteSend: load_remote_site failed: " . $site->get_error_message(), 'error');

@@ -35,11 +35,14 @@ class SiteGuard_Backup_Options {
 			if (in_array($key, self::$network_wide_keys, true)) {
 				return get_site_option($key, $default);
 			}
-			// Per-site first; fall back to network option for backward compat
-			$value = get_option($key, null);
-			if (null === $value) {
-				$network = get_site_option($key, null);
-				return (null !== $network) ? $network : $default;
+			// Per-site first; fall back to network option for backward compat.
+			// Use a unique sentinel because WP get_option() returns false for
+			// missing options, which is indistinguishable from a stored false.
+			$sentinel = '__sgbackup_undefined_' . $key;
+			$value = get_option($key, $sentinel);
+			if ($sentinel === $value) {
+				$network = get_site_option($key, $sentinel);
+				return ($sentinel !== $network) ? $network : $default;
 			}
 			return $value;
 		}

@@ -252,6 +252,7 @@ class SiteGuard_Backup_Commands {
 				'nonce'     => isset($backup['nonce']) ? $backup['nonce'] : '',
 				'service'   => isset($backup['service']) ? $backup['service'] : array('none'),
 				'always_keep' => !empty($backup['always_keep']),
+				'label'     => isset($backup['label']) ? $backup['label'] : '',
 			);
 
 			// Add entity info

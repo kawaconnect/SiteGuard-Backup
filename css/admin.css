@@ -695,6 +695,15 @@
 .sgbackup-subsite-map-table .sgbackup-subsite-dest-select,
 .sgbackup-subsite-map-table .sgbackup-subsite-dest-input { width: 100%; }
 
+/* Mirror mode include checkbox column */
+.sgbackup-subsite-map-table .sgbackup-include-col {
+	width: 50px;
+	text-align: center;
+}
+.sgbackup-subsite-map-table .sgbackup-include-col input[type="checkbox"] {
+	margin: 0;
+}
+
 /* Action badges in verify stage */
 .sgbackup-action-badge {
 	display: inline-block;

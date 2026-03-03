@@ -421,8 +421,9 @@
 				// Initialize subsite mode from site default
 				$('select[name="sgbackup_subsite_mode"]').val(sgbackup_settings.default_subsite_mode || 0);
 
-				// Show subsite mode only when DB mode = Migrate (0)
-				$('#sgbackup-subsite-mode-row').toggle($('select[name="sgbackup_db_restore_mode"]').val() === '0');
+				// Show subsite mode when DB mode = Migrate (0) or Overwrite (1) - both do full DB import
+				var initDbMode = $('select[name="sgbackup_db_restore_mode"]').val();
+				$('#sgbackup-subsite-mode-row').toggle(initDbMode === '0' || initDbMode === '1');
 
 				$('#sgbackup-restore-modal').dialog({
 					modal: true,
@@ -464,39 +465,42 @@
 				$('#sgbackup-restore-done').hide();
 			});
 
-			// Show/hide subsite mode based on DB restore mode
+			// Show/hide subsite mode based on DB restore mode (Migrate or Overwrite both need it)
 			$(document).on('change', 'select[name="sgbackup_db_restore_mode"]', function() {
-				var isMigrate = $(this).val() === '0';
-				$('#sgbackup-subsite-mode-row').toggle(isMigrate);
-				if (!isMigrate) $('#sgbackup-subsite-map-container').hide();
+				var val = $(this).val();
+				var showSubsite = (val === '0' || val === '1');
+				$('#sgbackup-subsite-mode-row').toggle(showSubsite);
+				if (!showSubsite) $('#sgbackup-subsite-map-container').hide();
 			});
 
-			// Show/hide custom mapping container based on subsite mode
+			// Show/hide subsite mapping container based on subsite mode
 			$(document).on('change', 'select[name="sgbackup_subsite_mode"]', function() {
-				var isCustom = $(this).val() === '3';
-				$('#sgbackup-subsite-map-container').toggle(isCustom);
-				if (isCustom) {
-					self.loadSubsiteMap();
+				var mode = $(this).val();
+				var showMap = (mode === '0' || mode === '1' || mode === '3');
+				$('#sgbackup-subsite-map-container').toggle(showMap);
+				if (showMap) {
+					self.loadSubsiteMap(mode);
 				}
 			});
 		},
 
 		/**
-		 * Load subsite list from the backup and build the two-sided mapping table.
-		 * Columns: Source (backup) | Action | Destination (current site or new domain)
+		 * Load subsite list from the backup and build mode-specific mapping table.
+		 * @param {string} mode - Subsite mode: '0' mirror, '1' main-only, '3' custom
 		 */
-		loadSubsiteMap: function() {
+		loadSubsiteMap: function(mode) {
+			mode = mode || '0';
 			var timestamp = $('#sgbackup-restore-modal').data('timestamp');
 			var $container = $('#sgbackup-subsite-map-container');
 
-			// Check if already populated for this timestamp
-			if ($container.data('loaded-ts') === timestamp && $container.find('table').length) return;
+			// Check if already populated for this timestamp+mode
+			if ($container.data('loaded-ts') === timestamp && $container.data('loaded-mode') === mode && $container.find('table').length) return;
 
 			$container.html('<p><em>Loading subsite list from backup...</em></p>');
 
 			this.ajax('get_backup_contents', { timestamp: timestamp }, function(data) {
 				if (!data.multisite_blogs || data.multisite_blogs.length === 0) {
-					$container.html('<p><em>No multisite blogs detected in this backup. Custom mapping requires a multisite backup.</em></p>');
+					$container.html('<p><em>No multisite blogs detected in this backup.</em></p>');
 					return;
 				}
 
@@ -529,6 +533,72 @@
 				var destBlogs = data.current_multisite_blogs || [];
 				var hasDestBlogs = destBlogs.length > 0;
 
+				var html = '';
+
+				// ===== Mode 1: Main-only preview =====
+				if (mode === '1') {
+					html += '<p><strong>Main-only mode preview:</strong></p>';
+					html += '<table class="sgbackup-subsite-map-table widefat">';
+					html += '<thead><tr><th>Source (Backup)</th><th>Action</th></tr></thead><tbody>';
+
+					for (var i = 0; i < sourceBlogs.length; i++) {
+						var src = sourceBlogs[i];
+						var isMainSite = (src.blog_id === 1);
+						var srcLabel = SGB.esc(src.domain);
+						if (src.blog_id > 0) srcLabel += ' <small style="color:#888;">#' + src.blog_id + '</small>';
+
+						html += '<tr class="sgbackup-subsite-map-row" data-source-domain="' + SGB.esc(src.domain) + '">';
+						html += '<td>' + srcLabel + '</td>';
+						if (isMainSite) {
+							html += '<td><span class="sgbackup-action-badge sgbackup-action-overwrite">RESTORE</span></td>';
+						} else {
+							html += '<td><span class="sgbackup-action-badge sgbackup-action-skip">REMOVE</span></td>';
+						}
+						html += '</tr>';
+					}
+
+					html += '</tbody></table>';
+					html += '<p class="description">Only the main site will be restored. All ' + (sourceBlogs.length - 1) + ' subsites will be removed.</p>';
+
+					$container.html(html).data('loaded-ts', timestamp).data('loaded-mode', mode);
+					return;
+				}
+
+				// ===== Mode 0: Mirror with checkboxes =====
+				if (mode === '0') {
+					html += '<p><strong>Select subsites to include in mirror:</strong></p>';
+					html += '<table class="sgbackup-subsite-map-table widefat">';
+					html += '<thead><tr><th class="sgbackup-include-col">Include</th><th>Source (Backup)</th><th>Destination (Mirror)</th></tr></thead><tbody>';
+
+					for (var i = 0; i < sourceBlogs.length; i++) {
+						var src = sourceBlogs[i];
+						var isMainSite = (src.blog_id === 1);
+						var mirrorDomain = oldHost ? src.domain.replace(new RegExp(oldHost.replace(/\./g, '\\\\.'), 'g'), newHost) : src.domain;
+						var srcLabel = SGB.esc(src.domain);
+						if (src.blog_id > 0) srcLabel += ' <small style="color:#888;">#' + src.blog_id + '</small>';
+
+						html += '<tr class="sgbackup-subsite-map-row" data-source-domain="' + SGB.esc(src.domain) + '">';
+						html += '<td class="sgbackup-include-col">';
+						if (isMainSite) {
+							html += '<input type="checkbox" class="sgbackup-subsite-include" checked disabled />';
+						} else {
+							html += '<input type="checkbox" class="sgbackup-subsite-include" checked />';
+						}
+						html += '</td>';
+						html += '<td>' + srcLabel + '</td>';
+						html += '<td>' + SGB.esc(mirrorDomain) + '</td>';
+						html += '</tr>';
+					}
+
+					html += '</tbody></table>';
+					html += '<p class="description">Uncheck subsites you don\'t want. Unchecked subsites will be removed from the destination.</p>';
+
+					$container.html(html).data('loaded-ts', timestamp).data('loaded-mode', mode);
+					return;
+				}
+
+				// ===== Mode 3: Custom mapping (existing logic) =====
+
 				// Build destination options HTML for <select>
 				var destOptionsHtml = '';
 				if (hasDestBlogs) {
@@ -539,13 +609,11 @@
 					}
 				}
 
-				// Auto-match helper: find destination blog matching the source.
-				// Supports both subdomain-style (blog.old.com → blog.new.com) and
-				// independent domain sites (shop.otherdomain.com → shop.otherdomain.com)
+				// Auto-match helper: find destination blog matching the source
 				var findDestMatch = function(srcDomain) {
 					if (!hasDestBlogs) return null;
 
-					// 1. Exact domain match (independent domains that exist on both sites)
+					// 1. Exact domain match
 					for (var d = 0; d < destBlogs.length; d++) {
 						if (destBlogs[d].domain === srcDomain) return destBlogs[d].domain;
 					}
@@ -572,7 +640,7 @@
 					return null;
 				};
 
-				var html = '<p><strong>Map each backup subsite to a destination:</strong></p>';
+				html += '<p><strong>Map each backup subsite to a destination:</strong></p>';
 				html += '<table class="sgbackup-subsite-map-table widefat">';
 				html += '<thead><tr><th>Source (Backup)</th><th>Action</th><th>Destination</th></tr></thead><tbody>';
 
@@ -622,7 +690,6 @@
 					// Destination column
 					html += '<td class="sgbackup-subsite-dest-cell">';
 					if (isMainSite) {
-						// Main site: always overwrite, show destination main site
 						var mainDestLabel = newHost || mirrorDomain;
 						if (hasDestBlogs && destBlogs[0]) {
 							mainDestLabel = destBlogs[0].domain + (destBlogs[0].blogname ? ' (' + destBlogs[0].blogname + ')' : '');
@@ -630,13 +697,10 @@
 						html += '<span>' + SGB.esc(mainDestLabel) + '</span>';
 						html += '<input type="hidden" class="sgbackup-subsite-dest-select" value="' + SGB.esc(defaultDest) + '" />';
 					} else if (defaultAction === 'overwrite' && hasDestBlogs) {
-						// Show dropdown of existing destination subsites
 						html += '<select class="sgbackup-subsite-dest-select">' + destOptionsHtml + '</select>';
-						// Also keep a text input hidden for "create" mode
 						html += '<input type="text" class="sgbackup-subsite-dest-input regular-text" value="' + SGB.esc(mirrorDomain) + '" style="display:none;width:100%;" />';
 						html += '<span class="sgbackup-subsite-skip-label" style="display:none;color:#888;font-style:italic;">Skipped</span>';
 					} else {
-						// Create mode or no dest blogs: show text input
 						html += '<select class="sgbackup-subsite-dest-select" style="display:none;">' + destOptionsHtml + '</select>';
 						html += '<input type="text" class="sgbackup-subsite-dest-input regular-text" value="' + SGB.esc(mirrorDomain) + '" style="width:100%;" />';
 						html += '<span class="sgbackup-subsite-skip-label" style="display:none;color:#888;font-style:italic;">Skipped</span>';
@@ -645,19 +709,14 @@
 					html += '</td>';
 
 					html += '</tr>';
-
-					// Pre-select the matching destination in the dropdown
-					if (!isMainSite && defaultAction === 'overwrite' && defaultDest) {
-						// Will set after DOM insertion below
-					}
 				}
 
 				html += '</tbody></table>';
 				html += '<p class="description">Choose an action for each subsite: overwrite an existing destination site, create a new site, or skip.</p>';
 
-				$container.html(html).data('loaded-ts', timestamp);
+				$container.html(html).data('loaded-ts', timestamp).data('loaded-mode', mode);
 
-				// Pre-select matched destinations and set main site destination
+				// Pre-select matched destinations
 				$container.find('.sgbackup-subsite-map-row').each(function() {
 					var $row = $(this);
 					var srcDomain = $row.data('source-domain');
@@ -842,10 +901,18 @@
 										newBlog = oldBlog.replace(new RegExp(oldHost.replace(/\./g, '\\\\.'), 'g'), newHost);
 									}
 								} else {
-									// Mirror mode
-									actionLabel = 'MIRROR';
-									actionClass = 'sgbackup-action-create';
-									newBlog = oldBlog.replace(new RegExp(oldHost.replace(/\./g, '\\\\.'), 'g'), newHost);
+									// Mirror mode - check checkbox state for skips
+									var $mirrorRow = $('.sgbackup-subsite-map-row[data-source-domain="' + oldBlog + '"]');
+									var $mirrorCb = $mirrorRow.find('.sgbackup-subsite-include');
+									if ($mirrorCb.length && !$mirrorCb.is(':checked') && !$mirrorCb.is(':disabled')) {
+										actionLabel = 'SKIP';
+										actionClass = 'sgbackup-action-skip';
+										newBlog = '\u2014';
+									} else {
+										actionLabel = 'MIRROR';
+										actionClass = 'sgbackup-action-create';
+										newBlog = oldBlog.replace(new RegExp(oldHost.replace(/\./g, '\\\\.'), 'g'), newHost);
+									}
 								}
 								var badge = '<span class="sgbackup-action-badge ' + actionClass + '">' + actionLabel + '</span>';
 								mapHtml += '<tr><td>' + SGB.esc(oldBlog) + '</td><td>' + badge + '</td>';
@@ -853,6 +920,18 @@
 							}
 							mapHtml += '</tbody></table>';
 							html += '<tr><td colspan="2">' + mapHtml + '</td></tr>';
+						}
+
+						// Count skipped subsites in mirror mode
+						if (subsiteModeVal === '0') {
+							var skipCount = 0;
+							$('.sgbackup-subsite-map-row').each(function() {
+								var $cb = $(this).find('.sgbackup-subsite-include');
+								if ($cb.length && !$cb.is(':checked') && !$cb.is(':disabled')) skipCount++;
+							});
+							if (skipCount > 0) {
+								warnings.push(skipCount + ' subsite(s) will be REMOVED (unchecked in mirror mode). Their blog entries and tables will be deleted.');
+							}
 						}
 
 						if (data.multisite_blogs.length > 1 && subsiteModeVal !== '1') {
@@ -927,7 +1006,7 @@
 			var subsiteMode = $('select[name="sgbackup_subsite_mode"]').val();
 			formData.append('subsite_mode', subsiteMode || '0');
 
-			// Collect custom subsite mapping if in custom mode
+			// Collect subsite mapping for custom mode or mirror-mode skips
 			if (subsiteMode === '3') {
 				var subsiteMap = {};
 				$('.sgbackup-subsite-map-row').each(function() {
@@ -942,6 +1021,18 @@
 					}
 				});
 				formData.append('subsite_map', JSON.stringify(subsiteMap));
+			} else if (subsiteMode === '0') {
+				// Mirror mode: collect unchecked subsites as skips
+				var mirrorSkips = {};
+				$('.sgbackup-subsite-map-row').each(function() {
+					var $cb = $(this).find('.sgbackup-subsite-include');
+					if ($cb.length && !$cb.is(':checked') && !$cb.is(':disabled')) {
+						mirrorSkips[$(this).data('source-domain')] = '__skip__';
+					}
+				});
+				if (Object.keys(mirrorSkips).length) {
+					formData.append('subsite_map', JSON.stringify(mirrorSkips));
+				}
 			}
 
 			// Gap 25: Collect include-unspecified options
@@ -1523,25 +1614,45 @@
 				var siteId = $(this).data('site-id');
 				$('#sgbackup-send-options').show().data('site-id', siteId);
 
-				// Populate the existing-backup dropdown
+				// Populate the existing-backup dropdown with rescan first
 				var $select = $('#sgbackup-send-existing-select');
-				$select.html('<option value="">Loading...</option>');
-				self.ajax('get_existing_backups', {}, function(data) {
-					var html = '<option value="">Select backup...</option>';
-					if (data && data.length) {
-						for (var i = 0; i < data.length; i++) {
-							var b = data[i];
-							var entities = [];
-							$.each(['db','plugins','themes','uploads','others','wpcore'], function(_, e) {
-								if (b[e]) entities.push(e);
-							});
-							html += '<option value="' + SGB.esc(String(b.timestamp)) + '">'
-								+ SGB.esc(b.date) + ' (' + entities.join(', ') + ')</option>';
+				$select.html('<option value="">Scanning backups...</option>');
+
+				var populateDropdown = function() {
+					self.ajax('get_existing_backups', {}, function(data) {
+						var html = '<option value="">Select backup...</option>';
+						if (data && data.length) {
+							for (var i = 0; i < data.length; i++) {
+								var b = data[i];
+								// Only show backups that have at least one entity with files on disk
+								var entities = [];
+								var hasFile = false;
+								$.each(['db','plugins','themes','uploads','others','wpcore'], function(_, e) {
+									if (b[e]) {
+										entities.push(e);
+										// Entity is an object: {files, size, exists}
+										if (b[e].exists) hasFile = true;
+									}
+								});
+								if (!hasFile) return true; // skip backups with no files on disk
+								var optLabel = b.date + ' (' + entities.join(', ') + ')';
+								if (b.label) optLabel += ' \u2014 ' + b.label;
+								html += '<option value="' + SGB.esc(String(b.timestamp)) + '">'
+									+ SGB.esc(optLabel) + '</option>';
+							}
 						}
-					}
-					$select.html(html);
+						$select.html(html);
+					}, function() {
+						$select.html('<option value="">Error loading backups</option>');
+					});
+				};
+
+				// Rescan local backup directory first to pick up untracked files
+				self.ajax('rescan_local', {}, function() {
+					populateDropdown();
 				}, function() {
-					$select.html('<option value="">Error loading backups</option>');
+					// Even if rescan fails, still populate from existing history
+					populateDropdown();
 				});
 			});
 
@@ -2632,8 +2743,11 @@
 				$('select[name="sgbackup_move_in_mode"]').val(opts.move_in_mode || 0);
 				$('select[name="sgbackup_db_restore_mode"]').val(opts.db_restore_mode || 0);
 				$('select[name="sgbackup_subsite_mode"]').val(opts.subsite_mode || 0);
-				$('#sgbackup-subsite-mode-row').toggle(String(opts.db_restore_mode || 0) === '0');
-				$('#sgbackup-subsite-map-container').toggle(String(opts.subsite_mode || 0) === '3');
+				var presetDbMode = String(opts.db_restore_mode || 0);
+				var presetSubsiteMode = String(opts.subsite_mode || 0);
+				var presetShowSubsite = (presetDbMode === '0' || presetDbMode === '1');
+				$('#sgbackup-subsite-mode-row').toggle(presetShowSubsite);
+				$('#sgbackup-subsite-map-container').toggle(presetShowSubsite && (presetSubsiteMode === '0' || presetSubsiteMode === '1' || presetSubsiteMode === '3'));
 				$('input[name="sgbackup_restore_pre_backup"]').prop('checked', opts.pre_restore_backup !== false);
 				$('input[name="sgbackup_include_unspecified_tables"]').prop('checked', opts.include_unspecified_tables !== false);
 				$('input[name="sgbackup_include_unspecified_plugins"]').prop('checked', opts.include_unspecified_plugins !== false);
@@ -2657,12 +2771,28 @@
 					db_restore_mode: $('select[name="sgbackup_db_restore_mode"]').val(),
 					subsite_mode: $('select[name="sgbackup_subsite_mode"]').val(),
 					subsite_map: (function() {
+						var sMode = $('select[name="sgbackup_subsite_mode"]').val();
 						var map = {};
-						$('.sgbackup-subsite-map-input').each(function() {
-							var old = $(this).data('old-domain');
-							var nw = $.trim($(this).val());
-							if (old && nw) map[old] = nw;
-						});
+						if (sMode === '3') {
+							$('.sgbackup-subsite-map-row').each(function() {
+								var oldDomain = $(this).data('source-domain');
+								var action = $(this).find('.sgbackup-subsite-action').val() || $(this).find('.sgbackup-subsite-action-val').val();
+								if (action === 'skip') {
+									map[oldDomain] = '__skip__';
+								} else if (action === 'overwrite') {
+									map[oldDomain] = $(this).find('.sgbackup-subsite-dest-select').val();
+								} else {
+									map[oldDomain] = $.trim($(this).find('.sgbackup-subsite-dest-input').val());
+								}
+							});
+						} else if (sMode === '0') {
+							$('.sgbackup-subsite-map-row').each(function() {
+								var $cb = $(this).find('.sgbackup-subsite-include');
+								if ($cb.length && !$cb.is(':checked') && !$cb.is(':disabled')) {
+									map[$(this).data('source-domain')] = '__skip__';
+								}
+							});
+						}
 						return Object.keys(map).length ? map : null;
 					})(),
 					pre_restore_backup: $('input[name="sgbackup_restore_pre_backup"]').is(':checked'),

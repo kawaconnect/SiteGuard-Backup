@@ -479,6 +479,13 @@ class SiteGuard_Backup_Restorer {
 		if ($this->is_migration && $this->db_restore_mode === self::DB_RESTORE_MIGRATE) {
 			$this->progress("Performing search-replace for migration");
 			$this->do_search_replace();
+		} elseif ($this->is_migration && $this->db_restore_mode === self::DB_RESTORE_OVERWRITE && is_multisite()) {
+			// Overwrite mode skips general search-replace, but multisite identity
+			// tables (wp_sitemeta.siteurl, wp_site.domain, wp_blogs blog_id=1)
+			// must still be updated or the site won't load at all.
+			$this->sgbackup->log("Migration detected in overwrite mode - fixing multisite identity tables only");
+			$this->progress("Fixing multisite identity tables for migration");
+			$this->fix_multisite_sitemeta();
 		} elseif ($this->is_migration && $this->db_restore_mode !== self::DB_RESTORE_MIGRATE) {
 			$this->sgbackup->log("Migration detected but search-replace skipped (db_restore_mode=" . $this->db_restore_mode . ")");
 			$this->progress("Search-replace skipped (not in migrate mode)");
@@ -767,13 +774,15 @@ class SiteGuard_Backup_Restorer {
 
 		// Mirror/Custom mode: build per-blog URL pairs
 		$is_custom = ($this->subsite_mode === self::SUBSITE_MODE_CUSTOM && !empty($this->subsite_map));
+		$is_selective_mirror = ($this->subsite_mode === self::SUBSITE_MODE_MIRROR && !empty($this->subsite_map));
+		$has_skip_map = ($is_custom || $is_selective_mirror);
 
 		// Read all blog domains from wp_blogs
 		$blogs_table = $wpdb->base_prefix . 'blogs';
 		$blogs = $wpdb->get_col("SELECT DISTINCT domain FROM {$blogs_table}");
 		if (empty($blogs)) return;
 
-		$mode_label = $is_custom ? 'custom-map' : 'mirror';
+		$mode_label = $is_custom ? 'custom-map' : ($is_selective_mirror ? 'selective-mirror' : 'mirror');
 		$this->sgbackup->log("Multisite migration ({$mode_label}): found " . count($blogs) . " blog domains");
 
 		$added = array();
@@ -782,13 +791,18 @@ class SiteGuard_Backup_Restorer {
 			// Skip if this blog domain doesn't contain the old domain
 			if (strpos($blog_domain, $old_domain) === false) continue;
 
-			// Compute new blog domain: custom map lookup or mirror (str_replace)
-			if ($is_custom && isset($this->subsite_map[$blog_domain])) {
+			// Compute new blog domain: custom map lookup, skip check, or mirror (str_replace)
+			if ($has_skip_map && isset($this->subsite_map[$blog_domain])) {
 				if ($this->subsite_map[$blog_domain] === self::SUBSITE_SKIP) {
-					$this->sgbackup->log("  Custom map: skipping blog domain {$blog_domain}");
+					$this->sgbackup->log("  {$mode_label}: skipping blog domain {$blog_domain}");
 					continue;
 				}
-				$new_blog_domain = $this->subsite_map[$blog_domain];
+				// For custom mode, use the mapped domain; for selective mirror, fall through to str_replace
+				if ($is_custom) {
+					$new_blog_domain = $this->subsite_map[$blog_domain];
+				} else {
+					$new_blog_domain = str_replace($old_domain, $new_domain, $blog_domain);
+				}
 			} else {
 				$new_blog_domain = str_replace($old_domain, $new_domain, $blog_domain);
 			}
@@ -928,18 +942,37 @@ class SiteGuard_Backup_Restorer {
 
 		// Mirror/Custom mode: fix ALL subsite blogs
 		$is_custom = ($this->subsite_mode === self::SUBSITE_MODE_CUSTOM && !empty($this->subsite_map));
+		$is_selective_mirror = ($this->subsite_mode === self::SUBSITE_MODE_MIRROR && !empty($this->subsite_map));
+		$has_skip_map = ($is_custom || $is_selective_mirror);
+		$mode_label = $is_custom ? 'custom-map' : ($is_selective_mirror ? 'selective-mirror' : 'mirror');
 		$all_blogs = $wpdb->get_results("SELECT blog_id, domain, path FROM {$blogs_table}");
 		$fixed_count = 0;
 		foreach ($all_blogs as $blog) {
 			if ($blog->blog_id == 1) continue; // Already fixed above
 
-			// Determine new domain: custom map lookup or mirror (str_replace)
-			if ($is_custom && isset($this->subsite_map[$blog->domain])) {
+			// Determine new domain: custom/selective map lookup or mirror (str_replace)
+			if ($has_skip_map && isset($this->subsite_map[$blog->domain])) {
 				if ($this->subsite_map[$blog->domain] === self::SUBSITE_SKIP) {
-					$this->sgbackup->log("  Custom map: skipping blog #{$blog->blog_id} ({$blog->domain})");
+					// A6: Properly remove skipped subsites - delete from wp_blogs and drop their tables
+					$wpdb->delete($blogs_table, array('blog_id' => $blog->blog_id), array('%d'));
+					$blog_prefix = $wpdb->base_prefix . $blog->blog_id . '_';
+					$subsite_tables = $wpdb->get_col($wpdb->prepare(
+						"SHOW TABLES LIKE %s", $wpdb->esc_like($blog_prefix) . '%'
+					));
+					foreach ($subsite_tables as $table) {
+						$wpdb->query("DROP TABLE IF EXISTS `{$table}`");
+					}
+					$table_count = count($subsite_tables);
+					$this->sgbackup->log("  Skipped blog #{$blog->blog_id} ({$blog->domain}): deleted from wp_blogs, dropped {$table_count} tables");
+					$this->progress("Removed skipped subsite: {$blog->domain} ({$table_count} tables dropped)");
 					continue;
 				}
-				$new_blog_domain = $this->subsite_map[$blog->domain];
+				// For custom mode, use the mapped domain; for selective mirror, fall through to str_replace
+				if ($is_custom) {
+					$new_blog_domain = $this->subsite_map[$blog->domain];
+				} else {
+					$new_blog_domain = str_replace($old_domain, $new_domain, $blog->domain);
+				}
 			} elseif (strpos($blog->domain, $old_domain) !== false) {
 				$new_blog_domain = str_replace($old_domain, $new_domain, $blog->domain);
 			} else {
@@ -990,11 +1023,10 @@ class SiteGuard_Backup_Restorer {
 				}
 			}
 			$fixed_count++;
-			if ($is_custom) {
-				$this->sgbackup->log("  Custom map: blog #{$blog->blog_id} {$blog->domain} -> {$new_blog_domain}");
+			if ($is_custom || $is_selective_mirror) {
+				$this->sgbackup->log("  {$mode_label}: blog #{$blog->blog_id} {$blog->domain} -> {$new_blog_domain}");
 			}
 		}
-		$mode_label = $is_custom ? 'custom-map' : 'mirror';
 		$this->sgbackup->log("Fixed {$fixed_count} subsite blog domains in wp_blogs + per-site options ({$mode_label})");
 		if ($fixed_count > 0) {
 			$this->progress("Fixed {$fixed_count} subsite domains for migration ({$mode_label})");
@@ -1038,9 +1070,9 @@ class SiteGuard_Backup_Restorer {
 		// Mirror/custom mode: verify all blogs have correct domains
 		$issues = array();
 
-		// In custom mode, collect domains that were intentionally skipped
+		// In custom or selective-mirror mode, collect domains that were intentionally skipped
 		$skipped_domains = array();
-		if ($this->subsite_mode === self::SUBSITE_MODE_CUSTOM && !empty($this->subsite_map)) {
+		if (($this->subsite_mode === self::SUBSITE_MODE_CUSTOM || $this->subsite_mode === self::SUBSITE_MODE_MIRROR) && !empty($this->subsite_map)) {
 			$skipped_domains = array_keys(array_filter($this->subsite_map, function($v) {
 				return $v === self::SUBSITE_SKIP;
 			}));
