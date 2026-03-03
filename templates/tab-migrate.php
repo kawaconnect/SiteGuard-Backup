@@ -198,7 +198,7 @@ $remote_sites = $opts->get_option('sgbackup_remotesites', array());
 				<label><input type="checkbox" name="sgbackup_remotesend_entity[]" value="uploads" /> <?php esc_html_e('Uploads', 'siteguardbackup'); ?></label>
 				<label><input type="checkbox" name="sgbackup_remotesend_entity[]" value="others" /> <?php esc_html_e('Others', 'siteguardbackup'); ?></label>
 				<label><input type="checkbox" name="sgbackup_remotesend_entity[]" value="wpcore" /> <?php esc_html_e('WP Core', 'siteguardbackup'); ?></label>
-				<p class="description"><?php esc_html_e('Leave all unchecked to send all entities.', 'siteguardbackup'); ?></p>
+				<p class="description"><?php esc_html_e('Database is always included. Leave all unchecked to send all file entities.', 'siteguardbackup'); ?></p>
 			</td>
 		</tr>
 		<tr>
