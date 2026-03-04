@@ -1078,7 +1078,11 @@ class SiteGuard_Backup_Restorer {
 	}
 
 	/**
-	 * Compute which tables to import, excluding tables for skipped subsites.
+	 * Compute which tables to import using a whitelist approach.
+	 *
+	 * Only imports global/main-site tables plus tables for non-skipped subsites.
+	 * This also excludes orphaned wp_N_* tables from the source whose blog_ids
+	 * aren't in wp_blogs - preventing them from overwriting destination data.
 	 *
 	 * @param array $all_tables   All table names from the SQL file.
 	 * @param array $source_blogs blog_id => domain from the source SQL.
@@ -1087,29 +1091,35 @@ class SiteGuard_Backup_Restorer {
 	private function compute_selective_tables($all_tables, $source_blogs) {
 		global $wpdb;
 		$base_prefix = $wpdb->base_prefix;
+		$prefix_pattern = '/^' . preg_quote($base_prefix, '/') . '(\d+)_/';
 
-		// Build list of blog_ids whose tables should be excluded
+		// Build whitelist of blog_ids to IMPORT (non-skipped source subsites)
+		$import_blog_ids = array();
 		$skip_blog_ids = array();
 		foreach ($source_blogs as $blog_id => $domain) {
 			if (isset($this->subsite_map[$domain]) && $this->subsite_map[$domain] === self::SUBSITE_SKIP) {
 				$skip_blog_ids[] = $blog_id;
+			} else {
+				$import_blog_ids[] = $blog_id;
 			}
 		}
 
-		if (empty($skip_blog_ids)) return $all_tables;
-
-		// Build prefix patterns for skipped blogs (e.g., "wp_2_", "wp_5_")
-		$skip_prefixes = array();
-		foreach ($skip_blog_ids as $bid) {
-			$skip_prefixes[] = $base_prefix . $bid . '_';
+		// Build prefix whitelist for imported blogs
+		$import_prefixes = array();
+		foreach ($import_blog_ids as $bid) {
+			$import_prefixes[] = $base_prefix . $bid . '_';
 		}
 
-		$this->sgbackup->log("Excluding tables for skipped blog_ids: " . implode(', ', $skip_blog_ids));
+		$this->sgbackup->log("Selective import: importing blog_ids [" . implode(',', $import_blog_ids) . "], skipping blog_ids [" . implode(',', $skip_blog_ids) . "]");
 
-		return array_values(array_filter($all_tables, function($table) use ($skip_prefixes) {
-			foreach ($skip_prefixes as $prefix) {
-				if (strpos($table, $prefix) === 0) return false;
+		return array_values(array_filter($all_tables, function($table) use ($prefix_pattern, $import_prefixes) {
+			// Check if this is a blog-specific table (wp_N_*)
+			if (preg_match($prefix_pattern, $table, $m)) {
+				// Only include if this blog_id is in the import whitelist
+				$table_prefix = $GLOBALS['wpdb']->base_prefix . $m[1] . '_';
+				return in_array($table_prefix, $import_prefixes, true);
 			}
+			// Global or blog_id=1 table - always include
 			return true;
 		}));
 	}
@@ -1723,9 +1733,13 @@ class SiteGuard_Backup_Restorer {
 			$reinserted = 0;
 			foreach ($this->pre_import_blogs as $saved_blog) {
 				if (in_array((string) $saved_blog['blog_id'], $existing_blog_ids, true)) continue;
-				$wpdb->insert($blogs_table, $saved_blog);
-				$reinserted++;
-				$this->sgbackup->log("  Re-inserted destination blog #{$saved_blog['blog_id']} ({$saved_blog['domain']})");
+				$inserted = $wpdb->insert($blogs_table, $saved_blog);
+				if ($inserted) {
+					$reinserted++;
+					$this->sgbackup->log("  Re-inserted destination blog #{$saved_blog['blog_id']} ({$saved_blog['domain']})");
+				} else {
+					$this->sgbackup->log("  Could not re-insert blog #{$saved_blog['blog_id']} ({$saved_blog['domain']}): already exists or DB error");
+				}
 			}
 			if ($reinserted > 0) {
 				$this->sgbackup->log("Re-inserted {$reinserted} destination wp_blogs entries that were not in the source backup");
