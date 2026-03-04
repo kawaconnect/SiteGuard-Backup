@@ -1401,20 +1401,50 @@ class SiteGuard_Backup_Commands {
 
 				$lines = 0;
 				$in_blogs_insert = false;
+				$in_options_insert = false;
+				$in_main_options = false;
 				$multisite_blogs = array();
+				$old_siteurl_from_main = false;
+				$base_prefix = $GLOBALS['wpdb']->base_prefix;
 				while (!($is_gz ? gzeof($fh) : feof($fh)) && $lines < 50000) {
 					$line = $is_gz ? gzgets($fh) : fgets($fh);
 					if (false === $line) break;
 					$lines++;
+					$trimmed = trim($line);
 
-					if (preg_match('/^CREATE TABLE\s+`([^`]+)`/i', trim($line), $m)) {
+					if (preg_match('/^CREATE TABLE\s+`([^`]+)`/i', $trimmed, $m)) {
 						$result['tables'][] = $m[1];
 						$in_blogs_insert = false;
+						$in_options_insert = false;
 					}
 
-					// Gap 24: Detect old siteurl from the SQL for migration detection
-					if (empty($result['old_siteurl']) && preg_match("/INSERT INTO\s+`[^`]*options`.*'siteurl'\s*,\s*'([^']+)'/i", $line, $url_m)) {
-						$result['old_siteurl'] = $url_m[1];
+					// Track multi-line INSERT INTO *options* context.
+					// Distinguishes main options (wp_options) from subsite (wp_N_options).
+					if (preg_match('/^INSERT INTO\s+`([^`]*options)`/i', $trimmed, $ins_m)) {
+						$in_options_insert = true;
+						$in_main_options = ($ins_m[1] === $base_prefix . 'options');
+					}
+					if ($in_options_insert && preg_match('/^(CREATE|DROP|INSERT INTO\s+`[^`]*(?<!options)`)/i', $trimmed)) {
+						$in_options_insert = false;
+						$in_main_options = false;
+					}
+					if ($in_options_insert && $trimmed === ';') {
+						$in_options_insert = false;
+						$in_main_options = false;
+					}
+
+					// Detect old siteurl from the SQL for migration detection.
+					// Works for both single-line (mysqldump) and multi-line (PHP dump) formats.
+					// In multisite backups, wp_N_options (subsite) may appear before wp_options
+					// alphabetically. Prefer the main options table's siteurl.
+					if ($in_options_insert || preg_match('/^INSERT INTO\s+`([^`]*options)`/i', $trimmed)) {
+						$is_main = $in_main_options;
+						if (preg_match("/'siteurl'\s*,\s*'([^']+)'/i", $trimmed, $url_m)) {
+							if (empty($result['old_siteurl']) || ($is_main && !$old_siteurl_from_main)) {
+								$result['old_siteurl'] = $url_m[1];
+								if ($is_main) $old_siteurl_from_main = true;
+							}
+						}
 					}
 
 					// Detect multisite blog domains from wp_blogs INSERT statements.

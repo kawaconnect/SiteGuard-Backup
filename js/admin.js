@@ -557,8 +557,8 @@
 				for (var i = 0; i < blogs.length; i++) {
 					var b = blogs[i];
 					if (b.blog_id === 1) continue; // Skip main site - import targets subsites only
-					var label = b.domain;
-					if (b.path && b.path !== '/') label += b.path;
+					var label = SGB.esc(b.domain);
+					if (b.path && b.path !== '/') label += SGB.esc(b.path);
 					if (b.blogname) label += ' \u2014 ' + SGB.esc(b.blogname);
 					$sel.append('<option value="' + parseInt(b.blog_id) + '" data-domain="' + SGB.esc(b.domain) + '">' + label + '</option>');
 				}
@@ -927,8 +927,8 @@
 					for (var bi = 0; bi < blogs.length; bi++) {
 						var b = blogs[bi];
 						if (b.blog_id === 1) continue; // Skip main site
-						var label = b.domain;
-						if (b.path && b.path !== '/') label += b.path;
+						var label = SGB.esc(b.domain);
+						if (b.path && b.path !== '/') label += SGB.esc(b.path);
 						if (b.blogname) label += ' \u2014 ' + SGB.esc(b.blogname);
 						$sel.append('<option value="' + parseInt(b.blog_id) + '" data-domain="' + SGB.esc(b.domain) + '">' + label + '</option>');
 					}

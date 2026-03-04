@@ -1377,42 +1377,61 @@ class SiteGuard_Backup_Restorer {
 		$max_scan = 200000; // Scan enough lines to reach wp_options in large databases
 		$found_siteurl = false;
 		$found_home = false;
+		$siteurl_from_main = false; // Whether siteurl came from the MAIN options table
+		$home_from_main = false;    // Whether home came from the MAIN options table
 		$in_options_insert = false; // Track multi-line INSERT INTO *options* context
+		$in_main_options = false;   // Whether the current INSERT is for the main options table
 		$has_main_options = false;
 		$detected_subsite_id = 0;
+		$bp = $GLOBALS['wpdb']->base_prefix;
 
 		while (!($is_gz ? gzeof($fh) : feof($fh)) && $lines_scanned < $max_scan) {
-			// Stop early once we have both URLs
-			if ($found_siteurl && $found_home) break;
+			// Stop early once we have both URLs from the MAIN options table.
+			// If we only have subsite values, keep scanning to find wp_options.
+			if ($found_siteurl && $found_home && $siteurl_from_main && $home_from_main) break;
 			$line = $is_gz ? gzgets($fh) : fgets($fh);
 			if (false === $line) break;
 
 			$lines_scanned++;
 			$trimmed = trim($line);
 
-			// Track INSERT INTO *options* context for multi-line format
-			if (preg_match('/^INSERT INTO\s+`[^`]*options`/i', $trimmed)) {
+			// Track INSERT INTO *options* context for multi-line format.
+			// Distinguish between main options (wp_options) and subsite options (wp_N_options).
+			if (preg_match('/^INSERT INTO\s+`([^`]*options)`/i', $trimmed, $ins_m)) {
 				$in_options_insert = true;
+				$in_main_options = ($ins_m[1] === $bp . 'options');
 			}
 			// New CREATE/INSERT/DROP statement ends the multi-line context
 			if ($in_options_insert && preg_match('/^(CREATE|DROP|INSERT INTO\s+`[^`]*(?<!options)`)/i', $trimmed)) {
 				$in_options_insert = false;
+				$in_main_options = false;
 			}
 			// Statement terminator on its own line ends context
 			if ($in_options_insert && $trimmed === ';') {
 				$in_options_insert = false;
+				$in_main_options = false;
 			}
 
 			// Match siteurl/home: works for single-line mysqldump format AND
-			// multi-line PHP dump format (value rows within options INSERT)
-			if ($in_options_insert || preg_match('/^INSERT INTO\s+`[^`]*options`/i', $trimmed)) {
+			// multi-line PHP dump format (value rows within options INSERT).
+			// Prefer values from wp_options (main site) over wp_N_options (subsite).
+			if ($in_options_insert || preg_match('/^INSERT INTO\s+`([^`]*options)`/i', $trimmed, $ins_m2)) {
+				// Re-check if this specific INSERT line is for main options
+				$is_main = $in_main_options;
+				if (!$in_options_insert && isset($ins_m2[1])) {
+					$is_main = ($ins_m2[1] === $bp . 'options');
+				}
+
 				if (preg_match("/'(siteurl|home)'\s*,\s*'([^']+)'/i", $trimmed, $m)) {
-					if ($m[1] === 'siteurl' && !$found_siteurl) {
+					// Accept value if: (a) not yet found, or (b) overriding subsite value with main
+					if ($m[1] === 'siteurl' && (!$found_siteurl || ($is_main && !$siteurl_from_main))) {
 						$this->old_siteurl = $m[2];
 						$found_siteurl = true;
-					} elseif ($m[1] === 'home' && !$found_home) {
+						if ($is_main) $siteurl_from_main = true;
+					} elseif ($m[1] === 'home' && (!$found_home || ($is_main && !$home_from_main))) {
 						$this->old_home = $m[2];
 						$found_home = true;
+						if ($is_main) $home_from_main = true;
 					}
 				}
 
@@ -1422,12 +1441,17 @@ class SiteGuard_Backup_Restorer {
 				}
 			}
 
-			// Detect table prefix from CREATE TABLE statements
+			// Detect table prefix from CREATE TABLE statements.
+			// Prefer the main options table prefix over subsite prefixes.
 			if (preg_match('/CREATE TABLE\s+`([a-zA-Z0-9_]+)options`/i', $trimmed, $m)) {
 				$detected_prefix = str_replace('options', '', $m[1]);
-				// Validate prefix contains only safe characters
 				if (!empty($detected_prefix) && preg_match('/^[a-zA-Z0-9_]+$/', $detected_prefix)) {
-					$this->old_table_prefix = $detected_prefix;
+					// Only set if it's the main options table or we haven't set yet.
+					// $m[1] is just the prefix (e.g. 'wp_'), $bp is 'wp_'.
+					$is_main_prefix = ($m[1] === $bp);
+					if ($is_main_prefix || empty($this->old_table_prefix)) {
+						$this->old_table_prefix = $detected_prefix;
+					}
 				}
 			}
 
