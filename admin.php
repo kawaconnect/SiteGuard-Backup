@@ -551,7 +551,7 @@ class SiteGuard_Backup_Admin {
 
 		// Subsite migration mode
 		if (isset($_POST['subsite_mode'])) {
-			$restore_options['subsite_mode'] = min(3, max(0, intval($_POST['subsite_mode'])));
+			$restore_options['subsite_mode'] = min(4, max(0, intval($_POST['subsite_mode'])));
 		}
 
 		// Target domain for subsite import
