@@ -562,6 +562,14 @@ class SiteGuard_Backup_Admin {
 			$restore_options['target_subsite_id'] = intval($_POST['target_subsite_id']);
 		}
 
+		// Server-side validation: Import-as-subsite mode requires a target
+		if (isset($restore_options['subsite_mode']) && (int) $restore_options['subsite_mode'] === 4
+			&& empty($restore_options['target_subsite_domain']) && empty($restore_options['target_subsite_id'])) {
+			echo 'RINFO:' . wp_json_encode(array('type' => 'error', 'message' => 'Please select a target subsite before restoring.')) . "\n";
+			echo 'RINFO:' . wp_json_encode(array('type' => 'complete', 'success' => false, 'errors' => array('No target subsite selected. Please choose an existing subsite or create a new one.'))) . "\n";
+			wp_die();
+		}
+
 		// Custom subsite mapping (JSON object: old_domain => new_domain)
 		if (!empty($_POST['subsite_map'])) {
 			$raw_map = wp_unslash($_POST['subsite_map']);
