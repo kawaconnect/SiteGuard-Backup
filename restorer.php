@@ -987,7 +987,8 @@ class SiteGuard_Backup_Restorer {
 
 				if ($in_users_insert) {
 					// Extract user rows: (ID, login, pass, nicename, email, ...)
-					if (preg_match_all("/\(\s*(\d+)\s*,\s*'([^']*)'\s*,\s*'([^']*)'\s*,\s*'([^']*)'\s*,\s*'([^']*)'/", $line, $matches, PREG_SET_ORDER)) {
+					// PHP dump quotes integers ('1', ...), mysqldump doesn't (1, ...)
+					if (preg_match_all("/\(\s*'?(\d+)'?\s*,\s*'([^']*)'\s*,\s*'([^']*)'\s*,\s*'([^']*)'\s*,\s*'([^']*)'/", $line, $matches, PREG_SET_ORDER)) {
 						foreach ($matches as $m) {
 							$backup_users[$m[5]] = array(
 								'old_id' => intval($m[1]),
@@ -1005,7 +1006,7 @@ class SiteGuard_Backup_Restorer {
 					// Extract capability rows: (..., user_id, 'wp_capabilities', 'a:1:{...}')
 					// Only parse lines that contain our target capability key
 					if (strpos($line, $escaped_cap_key) !== false || strpos($line, $source_cap_key) !== false) {
-						$cap_pattern = "/\(\s*\d+\s*,\s*(\d+)\s*,\s*'" . preg_quote($source_cap_key, '/') . "'\s*,\s*'((?:[^'\\\\]|\\\\.)*)'\s*\)/";
+						$cap_pattern = "/\(\s*'?\d+'?\s*,\s*'?(\d+)'?\s*,\s*'" . preg_quote($source_cap_key, '/') . "'\s*,\s*'((?:[^'\\\\]|\\\\.)*)'\s*\)/";
 						if (preg_match_all($cap_pattern, $line, $cap_matches, PREG_SET_ORDER)) {
 							foreach ($cap_matches as $cm) {
 								$backup_caps[intval($cm[1])] = stripslashes($cm[2]);
