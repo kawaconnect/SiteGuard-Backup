@@ -548,6 +548,7 @@
 				var blogs = data.current_multisite_blogs || [];
 				for (var i = 0; i < blogs.length; i++) {
 					var b = blogs[i];
+					if (b.blog_id === 1) continue; // Skip main site - import targets subsites only
 					var label = b.domain;
 					if (b.blogname) label += ' \u2014 ' + SGB.esc(b.blogname);
 					$sel.append('<option value="' + SGB.esc(b.domain) + '">' + label + '</option>');
@@ -965,7 +966,7 @@
 
 						// Show selected subsite mode
 						var subsiteModeVal = $('select[name="sgbackup_subsite_mode"]').val() || '0';
-						var subsiteModeLabels = {'0': 'Mirror all subsites', '1': 'Main site only', '2': 'Keep original domains', '3': 'Custom mapping'};
+						var subsiteModeLabels = {'0': 'Mirror all subsites', '1': 'Main site only', '2': 'Keep original domains', '3': 'Custom mapping', '4': 'Import as subsite'};
 						html += '<tr><td><strong>Subsite mode:</strong></td><td>' + SGB.esc(subsiteModeLabels[subsiteModeVal] || 'Mirror') + '</td></tr>';
 
 						if (subsiteModeVal === '1') {
@@ -1071,6 +1072,13 @@
 		},
 
 		doRestore: function(timestamp) {
+			// Capture subsite state BEFORE hiding divs (visibility check needs them shown)
+			var importPickerVisible = $('#sgbackup-subsite-import').is(':visible');
+			var subsiteMode = $('select[name="sgbackup_subsite_mode"]').val();
+			if (importPickerVisible) {
+				subsiteMode = '4';
+			}
+
 			$('#sgbackup-restore-options').hide();
 			$('#sgbackup-restore-verify').hide();
 			$('#sgbackup-restore-progress').show();
@@ -1102,11 +1110,7 @@
 			var dbRestoreMode = $('select[name="sgbackup_db_restore_mode"]').val();
 			formData.append('db_restore_mode', dbRestoreMode || '0');
 
-			// Collect subsite_mode - force IMPORT_AS (4) when subsite import picker is visible
-			var subsiteMode = $('select[name="sgbackup_subsite_mode"]').val();
-			if ($('#sgbackup-subsite-import').is(':visible')) {
-				subsiteMode = '4';
-			}
+			// Subsite mode (already captured above, before divs were hidden)
 			formData.append('subsite_mode', subsiteMode || '0');
 
 			// Collect subsite mapping for custom mode or mirror-mode skips
@@ -2857,6 +2861,7 @@
 				var presetShowSubsite = sgbackup_settings.is_multisite && (presetDbMode === '0' || presetDbMode === '1');
 				$('#sgbackup-subsite-mode-row').toggle(presetShowSubsite);
 				$('#sgbackup-subsite-map-container').toggle(presetShowSubsite && (presetSubsiteMode === '0' || presetSubsiteMode === '1' || presetSubsiteMode === '3'));
+				$('#sgbackup-subsite-import').toggle(presetShowSubsite && presetSubsiteMode === '4');
 				$('input[name="sgbackup_restore_pre_backup"]').prop('checked', opts.pre_restore_backup !== false);
 				$('input[name="sgbackup_include_unspecified_tables"]').prop('checked', opts.include_unspecified_tables !== false);
 				$('input[name="sgbackup_include_unspecified_plugins"]').prop('checked', opts.include_unspecified_plugins !== false);
