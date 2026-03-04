@@ -1080,8 +1080,13 @@ class SiteGuard_Backup_Restorer {
 	/**
 	 * Compute which tables to import using a whitelist approach.
 	 *
-	 * Only imports global/main-site tables plus tables for non-skipped subsites.
-	 * This also excludes orphaned wp_N_* tables from the source whose blog_ids
+	 * Only imports tables for non-skipped subsites. When the main site
+	 * (blog_id=1) is skipped, only multisite infrastructure tables (wp_blogs,
+	 * wp_site, wp_sitemeta) are imported from the non-prefixed set - main site
+	 * data (wp_options, wp_posts, etc.) and global user tables are excluded to
+	 * prevent obliterating the destination's existing data.
+	 *
+	 * Also excludes orphaned wp_N_* tables from the source whose blog_ids
 	 * aren't in wp_blogs - preventing them from overwriting destination data.
 	 *
 	 * @param array $all_tables   All table names from the SQL file.
@@ -1110,36 +1115,91 @@ class SiteGuard_Backup_Restorer {
 			$import_prefixes[] = $base_prefix . $bid . '_';
 		}
 
-		$this->sgbackup->log("Selective import: importing blog_ids [" . implode(',', $import_blog_ids) . "], skipping blog_ids [" . implode(',', $skip_blog_ids) . "]");
+		// Determine if the main site (blog_id=1) is being skipped.
+		// When skipped, we must NOT import main-site per-blog tables
+		// (wp_options, wp_posts, etc.) or global user tables - only
+		// multisite infrastructure tables needed for domain fixups.
+		$main_site_skipped = false;
+		if (!empty($this->old_siteurl)) {
+			$old_domain = parse_url($this->old_siteurl, PHP_URL_HOST);
+			if ($old_domain && isset($this->subsite_map[$old_domain]) && $this->subsite_map[$old_domain] === self::SUBSITE_SKIP) {
+				$main_site_skipped = true;
+			}
+		}
 
-		return array_values(array_filter($all_tables, function($table) use ($prefix_pattern, $import_prefixes) {
+		// Multisite infrastructure tables (without prefix) that must be
+		// imported even when the main site is skipped - fix_multisite_sitemeta()
+		// reads from these to perform domain remapping and blog re-insertion.
+		$multisite_infra = array('blogs', 'blogmeta', 'site', 'sitemeta');
+
+		$this->sgbackup->log("Selective import: importing blog_ids [" . implode(',', $import_blog_ids) . "], skipping blog_ids [" . implode(',', $skip_blog_ids) . "], main site skipped: " . ($main_site_skipped ? 'yes' : 'no'));
+
+		return array_values(array_filter($all_tables, function($table) use ($prefix_pattern, $import_prefixes, $main_site_skipped, $base_prefix, $multisite_infra) {
 			// Check if this is a blog-specific table (wp_N_*)
 			if (preg_match($prefix_pattern, $table, $m)) {
 				// Only include if this blog_id is in the import whitelist
 				$table_prefix = $GLOBALS['wpdb']->base_prefix . $m[1] . '_';
 				return in_array($table_prefix, $import_prefixes, true);
 			}
-			// Global or blog_id=1 table - always include
+
+			// Non-prefixed table (global or blog_id=1 per-site table)
+			if ($main_site_skipped) {
+				// Main site is skipped - only import multisite infrastructure
+				// tables needed for fixups. Exclude main site data (wp_options,
+				// wp_posts, etc.) and global tables (wp_users, wp_usermeta) to
+				// prevent overwriting destination data.
+				$base_name = substr($table, strlen($base_prefix));
+				return in_array($base_name, $multisite_infra, true);
+			}
+
+			// Main site is being imported - include all non-prefixed tables
 			return true;
 		}));
 	}
 
 	/**
 	 * Save destination's sgbackup_* options before DB import.
+	 *
+	 * On multisite, plugin options are split between wp_sitemeta (network-wide
+	 * keys like sgbackup_migrator_localkeys) and wp_options (per-site options
+	 * like sgbackup_backup_history, sgbackup_remotesites, etc.). Both must be
+	 * saved to prevent the source's values from overwriting the destination's.
 	 */
 	private function save_plugin_options_before_import() {
 		global $wpdb;
 
 		if (is_multisite()) {
-			$rows = $wpdb->get_results($wpdb->prepare(
+			// Save network-wide options from wp_sitemeta
+			$sitemeta_rows = $wpdb->get_results($wpdb->prepare(
 				"SELECT meta_key, meta_value FROM {$wpdb->sitemeta} WHERE meta_key LIKE %s",
 				$wpdb->esc_like('sgbackup_') . '%'
 			), ARRAY_A);
-			foreach ($rows as $row) {
-				// Skip transient job data and semaphores - they're ephemeral
+			$sitemeta_count = 0;
+			foreach ($sitemeta_rows as $row) {
 				if (strpos($row['meta_key'], 'sgbackup_jobdata_') === 0) continue;
 				if (strpos($row['meta_key'], 'sgbackup_sem_') === 0) continue;
-				$this->pre_import_sgbackup_options[$row['meta_key']] = $row['meta_value'];
+				$this->pre_import_sgbackup_options['sitemeta:' . $row['meta_key']] = $row['meta_value'];
+				$sitemeta_count++;
+			}
+
+			// Save per-site options from wp_options (main site)
+			$options_rows = $wpdb->get_results($wpdb->prepare(
+				"SELECT option_name, option_value, autoload FROM {$wpdb->options} WHERE option_name LIKE %s",
+				$wpdb->esc_like('sgbackup_') . '%'
+			), ARRAY_A);
+			$options_count = 0;
+			foreach ($options_rows as $row) {
+				if (strpos($row['option_name'], 'sgbackup_jobdata_') === 0) continue;
+				if (strpos($row['option_name'], 'sgbackup_sem_') === 0) continue;
+				$this->pre_import_sgbackup_options['options:' . $row['option_name']] = array(
+					'value' => $row['option_value'],
+					'autoload' => $row['autoload'],
+				);
+				$options_count++;
+			}
+
+			if ($sitemeta_count > 0 || $options_count > 0) {
+				$this->sgbackup->log("Saved {$sitemeta_count} wp_sitemeta + {$options_count} wp_options sgbackup_* options before import");
 			}
 		} else {
 			$rows = $wpdb->get_results($wpdb->prepare(
@@ -1154,10 +1214,9 @@ class SiteGuard_Backup_Restorer {
 					'autoload' => $row['autoload'],
 				);
 			}
-		}
-
-		if (!empty($this->pre_import_sgbackup_options)) {
-			$this->sgbackup->log("Saved " . count($this->pre_import_sgbackup_options) . " destination sgbackup_* options before import");
+			if (!empty($this->pre_import_sgbackup_options)) {
+				$this->sgbackup->log("Saved " . count($this->pre_import_sgbackup_options) . " destination sgbackup_* options before import");
+			}
 		}
 	}
 
@@ -2417,30 +2476,62 @@ class SiteGuard_Backup_Restorer {
 		if (empty($this->pre_import_sgbackup_options)) return;
 
 		global $wpdb;
-		$restored = 0;
+		$restored_sitemeta = 0;
+		$restored_options = 0;
 
 		if (is_multisite()) {
-			foreach ($this->pre_import_sgbackup_options as $key => $value) {
-				$exists = $wpdb->get_var($wpdb->prepare(
-					"SELECT COUNT(*) FROM {$wpdb->sitemeta} WHERE meta_key = %s", $key
-				));
-				if ($exists) {
-					$wpdb->update(
-						$wpdb->sitemeta,
-						array('meta_value' => $value),
-						array('meta_key' => $key),
-						array('%s'),
-						array('%s')
-					);
-				} else {
-					$wpdb->insert(
-						$wpdb->sitemeta,
-						array('site_id' => 1, 'meta_key' => $key, 'meta_value' => $value),
-						array('%d', '%s', '%s')
-					);
+			// On multisite, keys are prefixed with 'sitemeta:' or 'options:'
+			// to distinguish which table they came from.
+			foreach ($this->pre_import_sgbackup_options as $prefixed_key => $saved) {
+				if (strpos($prefixed_key, 'sitemeta:') === 0) {
+					$key = substr($prefixed_key, 9); // Remove 'sitemeta:' prefix
+					$exists = $wpdb->get_var($wpdb->prepare(
+						"SELECT COUNT(*) FROM {$wpdb->sitemeta} WHERE meta_key = %s", $key
+					));
+					if ($exists) {
+						$wpdb->update(
+							$wpdb->sitemeta,
+							array('meta_value' => $saved),
+							array('meta_key' => $key),
+							array('%s'),
+							array('%s')
+						);
+					} else {
+						$wpdb->insert(
+							$wpdb->sitemeta,
+							array('site_id' => 1, 'meta_key' => $key, 'meta_value' => $saved),
+							array('%d', '%s', '%s')
+						);
+					}
+					$restored_sitemeta++;
+				} elseif (strpos($prefixed_key, 'options:') === 0) {
+					$key = substr($prefixed_key, 8); // Remove 'options:' prefix
+					$opt_value = $saved['value'];
+					$opt_autoload = $saved['autoload'];
+					$exists = $wpdb->get_var($wpdb->prepare(
+						"SELECT COUNT(*) FROM {$wpdb->options} WHERE option_name = %s", $key
+					));
+					if ($exists) {
+						$wpdb->update(
+							$wpdb->options,
+							array('option_value' => $opt_value, 'autoload' => $opt_autoload),
+							array('option_name' => $key),
+							array('%s', '%s'),
+							array('%s')
+						);
+					} else {
+						$wpdb->insert(
+							$wpdb->options,
+							array('option_name' => $key, 'option_value' => $opt_value, 'autoload' => $opt_autoload),
+							array('%s', '%s', '%s')
+						);
+					}
+					$restored_options++;
 				}
-				$restored++;
 			}
+			$total = $restored_sitemeta + $restored_options;
+			$this->sgbackup->log("Restored {$total} destination sgbackup_* options ({$restored_sitemeta} sitemeta + {$restored_options} wp_options)");
+			$this->progress("Restored {$total} plugin config options (encryption keys, backup history, etc.)");
 		} else {
 			foreach ($this->pre_import_sgbackup_options as $key => $saved) {
 				$opt_value = $saved['value'];
@@ -2463,12 +2554,11 @@ class SiteGuard_Backup_Restorer {
 						array('%s', '%s', '%s')
 					);
 				}
-				$restored++;
+				$restored_options++;
 			}
+			$this->sgbackup->log("Restored {$restored_options} destination sgbackup_* options after DB import");
+			$this->progress("Restored {$restored_options} plugin config options (encryption keys, backup history, etc.)");
 		}
-
-		$this->sgbackup->log("Restored {$restored} destination sgbackup_* options after DB import");
-		$this->progress("Restored {$restored} plugin config options (encryption keys, backup history, etc.)");
 	}
 
 	/**
