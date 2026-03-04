@@ -127,9 +127,9 @@ class SiteGuard_Backup_Restorer {
 
 		// Subsite migration mode - fall back to site-wide default, clamp to valid range
 		if (isset($restore_options['subsite_mode'])) {
-			$this->subsite_mode = min(3, max(0, intval($restore_options['subsite_mode'])));
+			$this->subsite_mode = min(4, max(0, intval($restore_options['subsite_mode'])));
 		} else {
-			$this->subsite_mode = min(3, max(0, intval(SiteGuard_Backup_Options::instance()->get_option('sgbackup_default_subsite_mode', 0))));
+			$this->subsite_mode = min(4, max(0, intval(SiteGuard_Backup_Options::instance()->get_option('sgbackup_default_subsite_mode', 0))));
 		}
 
 		// Custom subsite mapping: array of old_domain => new_full_domain
@@ -163,7 +163,7 @@ class SiteGuard_Backup_Restorer {
 		// Target domain for subsite import mode
 		if (!empty($restore_options['target_subsite_domain'])) {
 			$this->target_subsite_domain = sanitize_text_field($restore_options['target_subsite_domain']);
-			if ($this->is_subsite_backup && is_multisite()) {
+			if (is_multisite()) {
 				$this->subsite_mode = self::SUBSITE_MODE_IMPORT_AS;
 			}
 		}
@@ -236,9 +236,10 @@ class SiteGuard_Backup_Restorer {
 			return $result;
 		}
 
-		// Subsite import mode: use dedicated restore path
-		if ($this->subsite_mode === self::SUBSITE_MODE_IMPORT_AS && $this->is_subsite_backup && is_multisite()) {
-			$this->progress("Restoring subsite backup as new subsite: {$this->target_subsite_domain}");
+		// Subsite import mode: use dedicated restore path (works for both
+		// per-subsite backups AND standard single-site/full-site backups).
+		if ($this->subsite_mode === self::SUBSITE_MODE_IMPORT_AS && is_multisite()) {
+			$this->progress("Restoring backup as subsite: {$this->target_subsite_domain}");
 			$subsite_result = $this->restore_as_subsite($backup_dir);
 			if (!$subsite_result['success']) {
 				$result['errors'] = array_merge($result['errors'], $subsite_result['errors']);
@@ -645,17 +646,18 @@ class SiteGuard_Backup_Restorer {
 		global $wpdb;
 
 		$result = array('success' => true, 'messages' => array(), 'errors' => array());
-		$source_id = $this->source_blog_id;
+		$source_id = $this->source_blog_id; // 0 for single-site backup, N for per-subsite backup
 		$target_domain = $this->target_subsite_domain;
 
-		if (!$source_id || empty($target_domain)) {
+		if (empty($target_domain)) {
 			$result['success'] = false;
-			$result['errors'][] = 'Missing source blog ID or target domain for subsite import.';
+			$result['errors'][] = 'Missing target domain for subsite import.';
 			return $result;
 		}
 
-		$this->sgbackup->log("Subsite import: source blog #{$source_id} -> target domain {$target_domain}");
-		$this->progress("Importing subsite backup from blog #{$source_id} to {$target_domain}");
+		$source_label = $source_id > 0 ? "subsite blog #{$source_id}" : "single-site backup";
+		$this->sgbackup->log("Subsite import: {$source_label} -> target domain {$target_domain}");
+		$this->progress("Importing {$source_label} to {$target_domain}");
 
 		// Step 1: Find or create the target subsite
 		$target_blog = get_blog_details(array('domain' => $target_domain), false);
@@ -725,7 +727,47 @@ class SiteGuard_Backup_Restorer {
 			$db_files = $this->backup_set['db'];
 			if (is_string($db_files)) $db_files = array($db_files);
 
-			$source_prefix = $wpdb->base_prefix . $source_id . '_';
+			// Detect source prefix from SQL: subsite backups have wp_N_* tables,
+			// single-site backups have wp_* (base prefix only).
+			$source_prefix = $wpdb->base_prefix; // default: single-site
+			if ($source_id > 1) {
+				$source_prefix = $wpdb->base_prefix . $source_id . '_';
+			} else {
+				// Auto-detect: scan first SQL file for table names to find the actual prefix
+				$first_file = $backup_dir . $db_files[0];
+				if (preg_match('/\.crypt$/', $first_file)) {
+					// Can't scan encrypted files here; rely on source_id
+				} else {
+					$all_tables = SiteGuard_Backup_Database_Utility::get_tables_in_sql_file($first_file);
+					$prefix_pattern = '/^' . preg_quote($wpdb->base_prefix, '/') . '(\d+)_/';
+					$detected_ids = array();
+					foreach ($all_tables as $table) {
+						if (preg_match($prefix_pattern, $table, $m)) {
+							$detected_ids[intval($m[1])] = true;
+						}
+					}
+					if (count($detected_ids) === 1) {
+						$detected_id = key($detected_ids);
+						$source_prefix = $wpdb->base_prefix . $detected_id . '_';
+						$source_id = $detected_id;
+						$this->sgbackup->log("Auto-detected subsite prefix: {$source_prefix} (blog #{$detected_id})");
+					} elseif (count($detected_ids) > 1) {
+						// Multiple blog_ids - pick the most common one
+						$id_counts = array();
+						foreach ($all_tables as $table) {
+							if (preg_match($prefix_pattern, $table, $m)) {
+								$id = intval($m[1]);
+								$id_counts[$id] = ($id_counts[$id] ?? 0) + 1;
+							}
+						}
+						arsort($id_counts);
+						$detected_id = key($id_counts);
+						$source_prefix = $wpdb->base_prefix . $detected_id . '_';
+						$source_id = $detected_id;
+						$this->sgbackup->log("Auto-detected subsite prefix from multiple blog_ids: {$source_prefix} (blog #{$detected_id})");
+					}
+				}
+			}
 			$target_prefix = $wpdb->base_prefix . $target_id . '_';
 
 			$this->progress("Importing database: remapping {$source_prefix}* -> {$target_prefix}*");
@@ -776,6 +818,15 @@ class SiteGuard_Backup_Restorer {
 
 		// Step 5: Search-replace old domain -> new domain in subsite tables only
 		$old_domain = isset($this->backup_set['subsite_domain']) ? $this->backup_set['subsite_domain'] : '';
+		// For single-site backups, subsite_domain won't be set - read from the imported options table
+		if (empty($old_domain)) {
+			$target_prefix = $wpdb->base_prefix . $target_id . '_';
+			$imported_siteurl = $wpdb->get_var("SELECT option_value FROM {$target_prefix}options WHERE option_name = 'siteurl'");
+			if ($imported_siteurl) {
+				$old_domain = parse_url($imported_siteurl, PHP_URL_HOST);
+				$this->sgbackup->log("Detected source domain from imported siteurl: {$old_domain}");
+			}
+		}
 		if (!empty($old_domain) && $old_domain !== $target_domain) {
 			$this->progress("Search-replace: {$old_domain} -> {$target_domain}");
 

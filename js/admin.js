@@ -485,7 +485,10 @@
 				var val = $(this).val();
 				var showSubsite = sgbackup_settings.is_multisite && (val === '0' || val === '1');
 				$('#sgbackup-subsite-mode-row').toggle(showSubsite);
-				if (!showSubsite) $('#sgbackup-subsite-map-container').hide();
+				if (!showSubsite) {
+					$('#sgbackup-subsite-map-container').hide();
+					$('#sgbackup-subsite-import').hide();
+				}
 			});
 
 			// Subsite import picker: show/hide "Create new" text input and sync hidden field
@@ -507,10 +510,42 @@
 			$(document).on('change', 'select[name="sgbackup_subsite_mode"]', function() {
 				var mode = $(this).val();
 				var showMap = (mode === '0' || mode === '1' || mode === '3');
+				var showImport = (mode === '4');
 				$('#sgbackup-subsite-map-container').toggle(showMap);
+				$('#sgbackup-subsite-import').toggle(showImport);
 				if (showMap) {
 					self.loadSubsiteMap(mode);
 				}
+				if (showImport) {
+					self.loadSubsiteImportPicker();
+				}
+			});
+		},
+
+		/**
+		 * Populate the subsite import picker with current destination subsites.
+		 * Used by mode 4 (Import as subsite) to let the user choose where to restore.
+		 */
+		loadSubsiteImportPicker: function() {
+			var timestamp = $('#sgbackup-restore-modal').data('timestamp');
+			var $sel = $('#sgbackup-target-subsite-select');
+
+			// Avoid re-loading if already populated for this timestamp
+			if ($sel.data('loaded-ts') === timestamp && $sel.find('option').length > 2) return;
+
+			$('#sgbackup-subsite-import-notice').text('Choose which subsite to restore this backup into:');
+			$sel.find('option:not(:first)').remove();
+
+			this.ajax('get_backup_contents', { timestamp: timestamp }, function(data) {
+				var blogs = data.current_multisite_blogs || [];
+				for (var i = 0; i < blogs.length; i++) {
+					var b = blogs[i];
+					var label = b.domain;
+					if (b.blogname) label += ' \u2014 ' + SGB.esc(b.blogname);
+					$sel.append('<option value="' + SGB.esc(b.domain) + '">' + label + '</option>');
+				}
+				$sel.append('<option value="__new__">+ Create new subsite...</option>');
+				$sel.data('loaded-ts', timestamp);
 			});
 		},
 

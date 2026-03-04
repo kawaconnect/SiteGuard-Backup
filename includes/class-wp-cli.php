@@ -205,12 +205,17 @@ class SiteGuard_Backup_CLI_Command extends WP_CLI_Command {
      * : File restore mode. Values: overwrite, backup, skip, merge.
      *
      * [--subsite-mode=<mode>]
-     * : Multisite subsite handling. Values: mirror, main-only, skip-remap, custom.
+     * : Multisite subsite handling. Values: mirror, main-only, skip-remap, custom, import-as.
      *
      * [--subsite-map=<json>]
      * : JSON mapping of old_domain => new_domain for custom subsite mode.
      *   Use "__skip__" as the destination to skip a subsite entirely.
      *   Example: '{"blog.old.com":"blog.new.com","shop.old.com":"__skip__"}'
+     *
+     * [--target-subsite-domain=<domain>]
+     * : Target subsite domain for import-as mode. The backup will be imported
+     *   as this subsite (created if it doesn't exist).
+     *   Example: 'blog.example.com'
      *
      * ## EXAMPLES
      *
@@ -220,6 +225,7 @@ class SiteGuard_Backup_CLI_Command extends WP_CLI_Command {
      *     wp siteguardbackup restore 1709283600 --db-restore-mode=migrate
      *     wp siteguardbackup restore 1709283600 --move-in-mode=skip
      *     wp siteguardbackup restore 1709283600 --subsite-mode=mirror --db-restore-mode=migrate
+     *     wp siteguardbackup restore 1709283600 --target-subsite-domain=blog.example.com
      *
      * @subcommand restore
      */
@@ -310,10 +316,11 @@ class SiteGuard_Backup_CLI_Command extends WP_CLI_Command {
                 'main-only'   => 1,
                 'skip-remap'  => 2,
                 'custom'      => 3,
+                'import-as'   => 4,
             );
             $sm = $assoc_args['subsite-mode'];
             if (!isset($subsite_mode_map[$sm])) {
-                WP_CLI::error("Invalid --subsite-mode. Valid values: mirror, main-only, skip-remap, custom");
+                WP_CLI::error("Invalid --subsite-mode. Valid values: mirror, main-only, skip-remap, custom, import-as");
             }
             $restore_options['subsite_mode'] = $subsite_mode_map[$sm];
         }
@@ -328,6 +335,14 @@ class SiteGuard_Backup_CLI_Command extends WP_CLI_Command {
             // Auto-set custom mode if map is provided but mode wasn't explicitly set
             if (!isset($restore_options['subsite_mode'])) {
                 $restore_options['subsite_mode'] = 3;
+            }
+        }
+
+        // Target subsite domain for import-as mode
+        if (isset($assoc_args['target-subsite-domain'])) {
+            $restore_options['target_subsite_domain'] = sanitize_text_field($assoc_args['target-subsite-domain']);
+            if (!isset($restore_options['subsite_mode'])) {
+                $restore_options['subsite_mode'] = 4;
             }
         }
 

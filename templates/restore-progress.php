@@ -74,6 +74,7 @@
 					<option value="1"><?php esc_html_e('Main site only - remove subsites', 'siteguardbackup'); ?></option>
 					<option value="2"><?php esc_html_e('Keep original domains (no remap)', 'siteguardbackup'); ?></option>
 					<option value="3"><?php esc_html_e('Custom mapping - choose subdomain for each site', 'siteguardbackup'); ?></option>
+					<option value="4"><?php esc_html_e('Import as subsite - choose where to restore', 'siteguardbackup'); ?></option>
 				</select>
 			</label>
 		</p>

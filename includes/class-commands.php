@@ -851,7 +851,7 @@ class SiteGuard_Backup_Commands {
 			$restore_options['db_restore_mode'] = min(3, max(0, intval($params['db_restore_mode'])));
 		}
 		if (isset($params['subsite_mode'])) {
-			$restore_options['subsite_mode'] = min(3, max(0, intval($params['subsite_mode'])));
+			$restore_options['subsite_mode'] = min(4, max(0, intval($params['subsite_mode'])));
 		}
 		if (!empty($params['subsite_map']) && is_array($params['subsite_map'])) {
 			$restore_options['subsite_map'] = $params['subsite_map'];
@@ -2678,7 +2678,7 @@ class SiteGuard_Backup_Commands {
 		}
 		$restore_options['move_in_mode'] = isset($params['move_in_mode']) ? min(3, max(0, intval($params['move_in_mode']))) : 0;
 		$restore_options['db_restore_mode'] = isset($params['db_restore_mode']) ? min(3, max(0, intval($params['db_restore_mode']))) : 0;
-		$restore_options['subsite_mode'] = isset($params['subsite_mode']) ? min(3, max(0, intval($params['subsite_mode']))) : 0;
+		$restore_options['subsite_mode'] = isset($params['subsite_mode']) ? min(4, max(0, intval($params['subsite_mode']))) : 0;
 		if (!empty($params['subsite_map']) && is_array($params['subsite_map'])) {
 			$restore_options['subsite_map'] = $params['subsite_map'];
 		}
