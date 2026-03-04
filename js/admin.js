@@ -462,6 +462,14 @@
 
 			// Gap 24: Verification stage - Proceed button
 			$(document).on('click', '#sgbackup-verify-proceed', function() {
+				// Validate: if subsite import picker is visible, a target must be selected
+				if ($('#sgbackup-subsite-import').is(':visible')) {
+					var targetDomain = $.trim($('input[name="sgbackup_target_subsite_domain"]').val());
+					if (!targetDomain) {
+						alert('Please select a target subsite before proceeding. This is a per-subsite backup and must be imported into a specific subsite.');
+						return;
+					}
+				}
 				var timestamp = $('#sgbackup-restore-modal').data('timestamp');
 				self.doRestore(timestamp);
 			});
@@ -916,7 +924,8 @@
 					$sel.append('<option value="__new__">+ Create new subsite...</option>');
 
 					$('#sgbackup-subsite-import').show();
-					// Hide normal subsite mode row - not relevant for subsite-only restore
+					// Force Import-as-subsite mode and hide normal subsite mode row
+					$('select[name="sgbackup_subsite_mode"]').val('4');
 					$('#sgbackup-subsite-mode-row').hide();
 				} else {
 					$('#sgbackup-subsite-import').hide();
@@ -1093,8 +1102,11 @@
 			var dbRestoreMode = $('select[name="sgbackup_db_restore_mode"]').val();
 			formData.append('db_restore_mode', dbRestoreMode || '0');
 
-			// Collect subsite_mode
+			// Collect subsite_mode - force IMPORT_AS (4) when subsite import picker is visible
 			var subsiteMode = $('select[name="sgbackup_subsite_mode"]').val();
+			if ($('#sgbackup-subsite-import').is(':visible')) {
+				subsiteMode = '4';
+			}
 			formData.append('subsite_mode', subsiteMode || '0');
 
 			// Collect subsite mapping for custom mode or mirror-mode skips

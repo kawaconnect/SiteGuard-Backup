@@ -222,12 +222,41 @@ class SiteGuard_Backup_Restorer {
 		}
 
 		// Phase 2: Restore each entity
+
+		// Pre-scan SQL to detect subsite backup when metadata is missing.
+		// Must run before the guard below to catch subsite backups early.
+		if (!$this->is_subsite_backup && is_multisite() && !empty($this->backup_set['db'])) {
+			$db_files = $this->backup_set['db'];
+			if (is_string($db_files)) $db_files = array($db_files);
+			$first_file = $backup_dir . $db_files[0];
+			if (!preg_match('/\.crypt$/', $first_file)) {
+				$scan_tables = SiteGuard_Backup_Database_Utility::get_tables_in_sql_file($first_file);
+				$base = $GLOBALS['wpdb']->base_prefix;
+				$has_main_options = false;
+				$detected_id = 0;
+				foreach ($scan_tables as $tbl) {
+					if ($tbl === $base . 'options' || $tbl === $base . 'blogs') {
+						$has_main_options = true;
+						break;
+					}
+					if (!$detected_id && preg_match('/^' . preg_quote($base, '/') . '(\d+)_options$/', $tbl, $sm)) {
+						$detected_id = (int) $sm[1];
+					}
+				}
+				if (!$has_main_options && $detected_id > 0) {
+					$this->is_subsite_backup = true;
+					$this->source_blog_id = $detected_id;
+					$this->sgbackup->log("Pre-scan detected subsite backup: blog #{$detected_id} (no main options table)");
+				}
+			}
+		}
+
 		// Guard: subsite backups on multisite MUST use IMPORT_AS mode.
 		// The standard restore path can't handle subsite-only SQL files correctly
 		// (no wp_options → no migration detection, no wp_blogs → no subsite entry).
 		if ($this->is_subsite_backup && is_multisite() && $this->subsite_mode !== self::SUBSITE_MODE_IMPORT_AS) {
 			$src_domain = !empty($this->backup_set['subsite_domain']) ? $this->backup_set['subsite_domain'] : 'unknown';
-			$src_id = !empty($this->backup_set['subsite_blog_id']) ? $this->backup_set['subsite_blog_id'] : '?';
+			$src_id = !empty($this->source_blog_id) ? $this->source_blog_id : (!empty($this->backup_set['subsite_blog_id']) ? $this->backup_set['subsite_blog_id'] : '?');
 			$this->progress("ERROR: This is a per-subsite backup (blog #{$src_id}, {$src_domain}). It must be restored using 'Import as subsite' mode with a target domain.");
 			$this->sgbackup->log("Subsite backup restore blocked: subsite_mode={$this->subsite_mode} but IMPORT_AS (4) required", 'error');
 			$result['success'] = false;
