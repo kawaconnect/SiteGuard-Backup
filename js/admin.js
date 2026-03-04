@@ -1089,6 +1089,16 @@
 				subsiteMode = '4';
 			}
 
+			// Validate target subsite selection for Import-as-subsite mode
+			if (subsiteMode === '4') {
+				var targetDomain = $('input[name="sgbackup_target_subsite_domain"]').val();
+				var targetId = $('input[name="sgbackup_target_subsite_id"]').val();
+				if (!targetDomain && !targetId) {
+					SGB.showNotice('Please select a target subsite before restoring. Use the dropdown to choose an existing subsite or create a new one.', 'error');
+					return;
+				}
+			}
+
 			$('#sgbackup-restore-options').hide();
 			$('#sgbackup-restore-verify').hide();
 			$('#sgbackup-restore-progress').show();

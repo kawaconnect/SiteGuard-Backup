@@ -274,7 +274,8 @@ class SiteGuard_Backup_Restorer {
 		// Subsite import mode: use dedicated restore path (works for both
 		// per-subsite backups AND standard single-site/full-site backups).
 		if ($this->subsite_mode === self::SUBSITE_MODE_IMPORT_AS && is_multisite()) {
-			$this->progress("Restoring backup as subsite: {$this->target_subsite_domain}");
+			$target_label = $this->target_subsite_domain ? $this->target_subsite_domain : ($this->target_subsite_id > 0 ? "blog #{$this->target_subsite_id}" : '(pending selection)');
+			$this->progress("Restoring backup as subsite: {$target_label}");
 			$subsite_result = $this->restore_as_subsite($backup_dir);
 			if (!$subsite_result['success']) {
 				$result['errors'] = array_merge($result['errors'], $subsite_result['errors']);
@@ -684,19 +685,10 @@ class SiteGuard_Backup_Restorer {
 		$source_id = $this->source_blog_id; // 0 for single-site backup, N for per-subsite backup
 		$target_domain = $this->target_subsite_domain;
 
-		if (empty($target_domain)) {
-			$result['success'] = false;
-			$result['errors'][] = 'Missing target domain for subsite import.';
-			return $result;
-		}
-
-		$source_label = $source_id > 0 ? "subsite blog #{$source_id}" : "single-site backup";
-		$this->sgbackup->log("Subsite import: {$source_label} -> target domain {$target_domain}");
-		$this->progress("Importing {$source_label} to {$target_domain}");
-
 		// Step 1: Find or create the target subsite
 		// Use blog_id for unambiguous lookup (required for subdirectory installs
-		// where multiple subsites share the same domain).
+		// where multiple subsites share the same domain). Do this BEFORE the
+		// empty-domain check so we can derive the domain from the blog_id.
 		$target_blog = null;
 		$target_path = '/';
 		if ($this->target_subsite_id > 0) {
@@ -707,6 +699,16 @@ class SiteGuard_Backup_Restorer {
 				$this->sgbackup->log("Looked up target by blog_id #{$this->target_subsite_id}: domain={$target_domain}, path={$target_path}");
 			}
 		}
+
+		if (empty($target_domain)) {
+			$result['success'] = false;
+			$result['errors'][] = 'Missing target domain for subsite import. Please select a target subsite from the dropdown or create a new one.';
+			return $result;
+		}
+
+		$source_label = $source_id > 0 ? "subsite blog #{$source_id}" : "single-site backup";
+		$this->sgbackup->log("Subsite import: {$source_label} -> target domain {$target_domain}");
+		$this->progress("Importing {$source_label} to {$target_domain}");
 		if (!$target_blog) {
 			$target_blog = get_blog_details(array('domain' => $target_domain), false);
 		}

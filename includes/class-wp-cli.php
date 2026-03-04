@@ -217,6 +217,10 @@ class SiteGuard_Backup_CLI_Command extends WP_CLI_Command {
      *   as this subsite (created if it doesn't exist).
      *   Example: 'blog.example.com'
      *
+     * [--target-subsite-id=<id>]
+     * : Target subsite blog ID for import-as mode. Can be used instead of
+     *   --target-subsite-domain; the domain will be derived from the blog ID.
+     *
      * ## EXAMPLES
      *
      *     wp siteguardbackup restore 1709283600
