@@ -1455,7 +1455,8 @@ class SiteGuard_Backup_Commands {
 					}
 					if ($in_blogs_insert) {
 						// Try structured extraction: (blog_id, site_id, 'domain', 'path', ...)
-						if (preg_match_all("/\(\s*(\d+)\s*,\s*\d+\s*,\s*'([a-zA-Z0-9._-]+\.[a-zA-Z]{2,})'\s*,\s*'([^']*)'/", $line, $tuple_matches, PREG_SET_ORDER)) {
+						// PHP dump quotes integers ('26', '1'), mysqldump doesn't (26, 1)
+						if (preg_match_all("/\(\s*'?(\d+)'?\s*,\s*'?\d+'?\s*,\s*'([a-zA-Z0-9._-]+\.[a-zA-Z]{2,})'\s*,\s*'([^']*)'/", $line, $tuple_matches, PREG_SET_ORDER)) {
 							foreach ($tuple_matches as $tm) {
 								$multisite_blogs[] = array(
 									'blog_id' => (int) $tm[1],

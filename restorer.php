@@ -1195,8 +1195,9 @@ class SiteGuard_Backup_Restorer {
 
 			// Extract (blog_id, site_id, domain, ...) value tuples
 			if ($in_blogs_insert) {
-				// Match value rows like (2, 1, 'sub.example.com', '/', ...)
-				if (preg_match_all('/\(\s*(\d+)\s*,\s*\d+\s*,\s*\'([^\']+)\'/', $trimmed, $matches, PREG_SET_ORDER)) {
+				// Match value rows like (2, 1, 'sub.example.com', ...) or ('2', '1', 'sub.example.com', ...)
+				// PHP dump format quotes integers, mysqldump doesn't - handle both.
+				if (preg_match_all('/\(\s*\'?(\d+)\'?\s*,\s*\'?\d+\'?\s*,\s*\'([^\']+)\'/', $trimmed, $matches, PREG_SET_ORDER)) {
 					foreach ($matches as $m) {
 						$blog_id = intval($m[1]);
 						if ($blog_id > 1) {
@@ -2063,6 +2064,7 @@ class SiteGuard_Backup_Restorer {
 		global $wpdb;
 		$blogs_table = $wpdb->base_prefix . 'blogs';
 		$removed = 0;
+		$use_filtered_mode = !empty($this->pre_import_blogs);
 
 		foreach ($this->subsite_map as $domain => $action) {
 			if ($action !== self::SUBSITE_SKIP) continue;
@@ -2077,21 +2079,50 @@ class SiteGuard_Backup_Restorer {
 			}
 
 			$wpdb->delete($blogs_table, array('blog_id' => $blog->blog_id), array('%d'));
-			$blog_prefix = $wpdb->base_prefix . $blog->blog_id . '_';
-			$subsite_tables = $wpdb->get_col($wpdb->prepare(
-				"SHOW TABLES LIKE %s", $wpdb->esc_like($blog_prefix) . '%'
-			));
-			foreach ($subsite_tables as $table) {
-				$wpdb->query("DROP TABLE IF EXISTS `{$table}`");
+
+			if ($use_filtered_mode) {
+				// Filtered import was used - tables at this blog_id belong to
+				// the destination, NOT the source. Do NOT drop them.
+				$this->sgbackup->log("Skipped subsite #{$blog->blog_id} ({$domain}): removed from wp_blogs (destination tables preserved)");
+				$this->progress("Skipped subsite: {$domain} (destination tables preserved)");
+			} else {
+				// Full atomic import - tables are the source's data. Drop them.
+				$blog_prefix = $wpdb->base_prefix . $blog->blog_id . '_';
+				$subsite_tables = $wpdb->get_col($wpdb->prepare(
+					"SHOW TABLES LIKE %s", $wpdb->esc_like($blog_prefix) . '%'
+				));
+				foreach ($subsite_tables as $table) {
+					$wpdb->query("DROP TABLE IF EXISTS `{$table}`");
+				}
+				$table_count = count($subsite_tables);
+				$this->sgbackup->log("Removed skipped subsite #{$blog->blog_id} ({$domain}): dropped {$table_count} tables");
+				$this->progress("Removed skipped subsite: {$domain} ({$table_count} tables dropped)");
 			}
-			$table_count = count($subsite_tables);
-			$this->sgbackup->log("Removed skipped subsite #{$blog->blog_id} ({$domain}): dropped {$table_count} tables");
-			$this->progress("Removed skipped subsite: {$domain} ({$table_count} tables dropped)");
 			$removed++;
 		}
 
 		if ($removed > 0) {
 			$this->sgbackup->log("apply_subsite_skips: removed {$removed} subsites");
+		}
+
+		// Re-insert preserved destination wp_blogs entries whose blog_ids
+		// are no longer present (they weren't in the source backup at all,
+		// or were deleted above because they matched a skip domain).
+		if ($use_filtered_mode) {
+			$existing_blog_ids = $wpdb->get_col("SELECT blog_id FROM {$blogs_table}");
+			$reinserted = 0;
+			foreach ($this->pre_import_blogs as $saved_blog) {
+				if (in_array((string) $saved_blog['blog_id'], $existing_blog_ids, true)) continue;
+				$inserted = $wpdb->insert($blogs_table, $saved_blog);
+				if ($inserted) {
+					$reinserted++;
+					$this->sgbackup->log("  Re-inserted destination blog #{$saved_blog['blog_id']} ({$saved_blog['domain']})");
+				}
+			}
+			if ($reinserted > 0) {
+				$this->sgbackup->log("Re-inserted {$reinserted} preserved destination blog(s)");
+				$this->progress("Preserved {$reinserted} destination subsite(s)");
+			}
 		}
 	}
 
