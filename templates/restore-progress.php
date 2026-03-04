@@ -82,26 +82,6 @@
 			<p><em><?php esc_html_e('Loading subsite list...', 'siteguardbackup'); ?></em></p>
 		</div>
 
-		<!-- Subsite import: target subsite picker -->
-		<div id="sgbackup-subsite-import" style="display:none;margin:8px 0;padding:10px;background:#e8f4fd;border:1px solid #72aee6;border-radius:3px;">
-			<p><strong id="sgbackup-subsite-import-notice"></strong></p>
-			<p>
-				<label><?php esc_html_e('Restore into subsite:', 'siteguardbackup'); ?>
-					<select name="sgbackup_target_subsite_select" id="sgbackup-target-subsite-select" style="min-width:300px;">
-						<option value=""><?php esc_html_e('- Select a subsite -', 'siteguardbackup'); ?></option>
-					</select>
-				</label>
-			</p>
-			<div id="sgbackup-subsite-newdomain-row" style="display:none;margin-top:6px;">
-				<label><?php esc_html_e('New subsite domain:', 'siteguardbackup'); ?>
-					<input type="text" name="sgbackup_target_subsite_newdomain" value="" class="regular-text"
-						placeholder="<?php esc_attr_e('e.g. blog.example.com', 'siteguardbackup'); ?>" />
-				</label>
-			</div>
-			<input type="hidden" name="sgbackup_target_subsite_domain" value="" />
-			<input type="hidden" name="sgbackup_target_subsite_id" value="" />
-		</div>
-
 		<hr />
 		<p>
 			<label><input type="checkbox" name="sgbackup_restore_pre_backup" value="1" checked />
@@ -123,6 +103,27 @@
 		</div>
 		<div id="sgbackup-verify-warnings" style="display:none;background:#fff3cd;padding:10px;border:1px solid #ffc107;border-radius:4px;margin-bottom:12px;">
 		</div>
+
+		<!-- Subsite import: target subsite picker (shown during verification for subsite backups) -->
+		<div id="sgbackup-subsite-import" style="display:none;margin:8px 0;padding:10px;background:#e8f4fd;border:1px solid #72aee6;border-radius:3px;">
+			<p><strong id="sgbackup-subsite-import-notice"></strong></p>
+			<p>
+				<label><?php esc_html_e('Restore into subsite:', 'siteguardbackup'); ?>
+					<select name="sgbackup_target_subsite_select" id="sgbackup-target-subsite-select" style="min-width:300px;">
+						<option value=""><?php esc_html_e('- Select a subsite -', 'siteguardbackup'); ?></option>
+					</select>
+				</label>
+			</p>
+			<div id="sgbackup-subsite-newdomain-row" style="display:none;margin-top:6px;">
+				<label><?php esc_html_e('New subsite domain:', 'siteguardbackup'); ?>
+					<input type="text" name="sgbackup_target_subsite_newdomain" value="" class="regular-text"
+						placeholder="<?php esc_attr_e('e.g. blog.example.com', 'siteguardbackup'); ?>" />
+				</label>
+			</div>
+			<input type="hidden" name="sgbackup_target_subsite_domain" value="" />
+			<input type="hidden" name="sgbackup_target_subsite_id" value="" />
+		</div>
+
 		<p>
 			<button type="button" class="button button-primary" id="sgbackup-verify-proceed">
 				<?php esc_html_e('Proceed with restore', 'siteguardbackup'); ?>
