@@ -554,6 +554,11 @@ class SiteGuard_Backup_Admin {
 			$restore_options['subsite_mode'] = min(3, max(0, intval($_POST['subsite_mode'])));
 		}
 
+		// Target domain for subsite import
+		if (!empty($_POST['target_subsite_domain'])) {
+			$restore_options['target_subsite_domain'] = sanitize_text_field(wp_unslash($_POST['target_subsite_domain']));
+		}
+
 		// Custom subsite mapping (JSON object: old_domain => new_domain)
 		if (!empty($_POST['subsite_map'])) {
 			$raw_map = wp_unslash($_POST['subsite_map']);

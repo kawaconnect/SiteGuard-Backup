@@ -1122,8 +1122,12 @@ class SiteGuard_Backup {
 		$timestamp = $this->jobdata_get('original_backup_timestamp', $this->backup_time);
 		$nonce = $this->jobdata_get('file_nonce', $this->nonce);
 
+		$is_subsite_backup = $this->jobdata_get('is_subsite_backup', false);
+		$subsite_blog_id = $this->jobdata_get('subsite_blog_id', 0);
+		$subsite_domain = $this->jobdata_get('subsite_domain', '');
+
 		// Nothing to send if no meaningful metadata
-		if (empty($label) && !$always_keep) return;
+		if (empty($label) && !$always_keep && !$is_subsite_backup) return;
 
 		$site_id = ($instance_id !== null) ? intval($instance_id) : 0;
 		$opts = SiteGuard_Backup_Options::instance();
@@ -1143,6 +1147,11 @@ class SiteGuard_Backup {
 		);
 		if (!empty($label)) $payload['label'] = $label;
 		if ($always_keep) $payload['always_keep'] = true;
+		if ($is_subsite_backup) {
+			$payload['is_subsite_backup'] = true;
+			$payload['subsite_blog_id'] = intval($subsite_blog_id);
+			$payload['subsite_domain'] = $subsite_domain;
+		}
 
 		$result = $rpc->send_message($sites[$site_id], 'set_backup_metadata', $payload);
 		if (is_wp_error($result)) {

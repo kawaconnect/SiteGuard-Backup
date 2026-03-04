@@ -425,6 +425,9 @@
 				$('#sgbackup-restore-progress').hide();
 				$('#sgbackup-restore-log').empty();
 				$('#sgbackup-subsite-import').hide();
+				$('#sgbackup-target-subsite-select').val('');
+				$('#sgbackup-subsite-newdomain-row').hide();
+				$('input[name="sgbackup_target_subsite_newdomain"]').val('');
 				$('input[name="sgbackup_target_subsite_domain"]').val('');
 
 				// Initialize DB restore mode dropdown from site default
@@ -483,6 +486,21 @@
 				var showSubsite = sgbackup_settings.is_multisite && (val === '0' || val === '1');
 				$('#sgbackup-subsite-mode-row').toggle(showSubsite);
 				if (!showSubsite) $('#sgbackup-subsite-map-container').hide();
+			});
+
+			// Subsite import picker: show/hide "Create new" text input and sync hidden field
+			$(document).on('change', '#sgbackup-target-subsite-select', function() {
+				var val = $(this).val();
+				if (val === '__new__') {
+					$('#sgbackup-subsite-newdomain-row').show();
+					$('input[name="sgbackup_target_subsite_domain"]').val('');
+				} else {
+					$('#sgbackup-subsite-newdomain-row').hide();
+					$('input[name="sgbackup_target_subsite_domain"]').val(val);
+				}
+			});
+			$(document).on('input', 'input[name="sgbackup_target_subsite_newdomain"]', function() {
+				$('input[name="sgbackup_target_subsite_domain"]').val($.trim($(this).val()));
 			});
 
 			// Show/hide subsite mapping container based on subsite mode
@@ -843,11 +861,28 @@
 					html += '<tr><td><strong>Backup size:</strong></td><td>' + SGB.esc(data.size) + '</td></tr>';
 				}
 
-				// Detect subsite backup and show import UI
+				// Detect subsite backup and show import UI with subsite picker
 				if (data.is_subsite_backup && sgbackup_settings.is_multisite) {
-					html += '<tr><td><strong>Subsite backup:</strong></td><td>Blog #' + SGB.esc(String(data.subsite_blog_id)) + ' (' + SGB.esc(data.subsite_domain || 'unknown') + ')</td></tr>';
-					$('#sgbackup-subsite-import-notice').text('This is a per-subsite backup from ' + (data.subsite_domain || 'blog #' + data.subsite_blog_id) + '. Enter a target domain to import it as a subsite on this multisite.');
+					var srcLabel = data.subsite_domain || ('blog #' + data.subsite_blog_id);
+					html += '<tr><td><strong>Subsite backup:</strong></td><td>' + SGB.esc(srcLabel) + '</td></tr>';
+					$('#sgbackup-subsite-import-notice').text('This is a per-subsite backup from ' + srcLabel + '. Select which subsite to restore it into:');
+
+					// Populate the subsite picker dropdown
+					var $sel = $('#sgbackup-target-subsite-select');
+					$sel.find('option:not(:first)').remove();
+					var blogs = data.current_multisite_blogs || [];
+					for (var bi = 0; bi < blogs.length; bi++) {
+						var b = blogs[bi];
+						if (b.blog_id === 1) continue; // Skip main site
+						var label = SGB.esc(b.domain + (b.path && b.path !== '/' ? b.path : ''));
+						if (b.blogname) label += ' - ' + SGB.esc(b.blogname);
+						$sel.append('<option value="' + SGB.esc(b.domain) + '">' + label + '</option>');
+					}
+					$sel.append('<option value="__new__">+ Create new subsite...</option>');
+
 					$('#sgbackup-subsite-import').show();
+					// Hide normal subsite mode row - not relevant for subsite-only restore
+					$('#sgbackup-subsite-mode-row').hide();
 				} else {
 					$('#sgbackup-subsite-import').hide();
 				}

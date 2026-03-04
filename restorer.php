@@ -88,6 +88,12 @@ class SiteGuard_Backup_Restorer {
 	private $pre_import_content_url = '';
 	private $pre_import_uploads_url = '';
 
+	/** @var array Destination wp_blogs entries saved before import (for filtered import with skips) */
+	private $pre_import_blogs = array();
+
+	/** @var array Destination sgbackup_* options saved before DB import */
+	private $pre_import_sgbackup_options = array();
+
 	/** @var bool Whether this backup is a per-subsite backup */
 	private $is_subsite_backup = false;
 
@@ -216,6 +222,20 @@ class SiteGuard_Backup_Restorer {
 		}
 
 		// Phase 2: Restore each entity
+		// Guard: subsite backups on multisite MUST use IMPORT_AS mode.
+		// The standard restore path can't handle subsite-only SQL files correctly
+		// (no wp_options → no migration detection, no wp_blogs → no subsite entry).
+		if ($this->is_subsite_backup && is_multisite() && $this->subsite_mode !== self::SUBSITE_MODE_IMPORT_AS) {
+			$src_domain = !empty($this->backup_set['subsite_domain']) ? $this->backup_set['subsite_domain'] : 'unknown';
+			$src_id = !empty($this->backup_set['subsite_blog_id']) ? $this->backup_set['subsite_blog_id'] : '?';
+			$this->progress("ERROR: This is a per-subsite backup (blog #{$src_id}, {$src_domain}). It must be restored using 'Import as subsite' mode with a target domain.");
+			$this->sgbackup->log("Subsite backup restore blocked: subsite_mode={$this->subsite_mode} but IMPORT_AS (4) required", 'error');
+			$result['success'] = false;
+			$result['errors'][] = "This is a per-subsite backup from {$src_domain}. To restore it, use 'Import as subsite' mode and provide a target domain. Standard migrate/overwrite modes cannot handle subsite-only backups.";
+			$this->sgbackup->logfile_close();
+			return $result;
+		}
+
 		// Subsite import mode: use dedicated restore path
 		if ($this->subsite_mode === self::SUBSITE_MODE_IMPORT_AS && $this->is_subsite_backup && is_multisite()) {
 			$this->progress("Restoring subsite backup as new subsite: {$this->target_subsite_domain}");
@@ -399,8 +419,39 @@ class SiteGuard_Backup_Restorer {
 		$uploads_info = wp_upload_dir();
 		$this->pre_import_uploads_url = $uploads_info['baseurl'];
 
+		// Save destination's wp_blogs entries before import, so we can re-insert
+		// them if the import uses filtered mode (custom/mirror with skips).
+		if (is_multisite()) {
+			global $wpdb;
+			$blogs_table = $wpdb->base_prefix . 'blogs';
+			$dest_blogs = $wpdb->get_results("SELECT * FROM {$blogs_table} WHERE blog_id > 1", ARRAY_A);
+			if (!empty($dest_blogs)) {
+				$this->pre_import_blogs = $dest_blogs;
+				$this->sgbackup->log("Saved " . count($dest_blogs) . " destination wp_blogs entries before import");
+			}
+		}
+
+		// Save destination's sgbackup_* options before DB import.
+		// After import these get overwritten with source values; we restore them in post_restore_cleanup().
+		$this->save_plugin_options_before_import();
+
 		// Save progress for resume support
 		$this->save_restore_progress('db', 'started');
+
+		// Detect whether custom/mirror mode has __skip__ entries - if so we must
+		// use filtered import to avoid destroying destination subsite tables.
+		$has_skips = false;
+		if (is_multisite() && !empty($this->subsite_map)) {
+			foreach ($this->subsite_map as $domain => $target) {
+				if ($target === self::SUBSITE_SKIP) {
+					$has_skips = true;
+					break;
+				}
+			}
+			if ($has_skips) {
+				$this->sgbackup->log("Custom/mirror map has __skip__ entries - will use filtered import to preserve destination subsites");
+			}
+		}
 
 		// Check for selective table restore
 		$selected_tables = null;
@@ -467,6 +518,33 @@ class SiteGuard_Backup_Restorer {
 						$this->progress("Database import: {$lines_done} lines processed");
 					}
 				);
+			} elseif ($has_skips) {
+				// Custom/mirror mode with __skip__ entries: use filtered import to
+				// avoid destroying destination subsite tables at overlapping blog_ids.
+				$source_blogs = $this->parse_blogs_from_sql($file_path);
+				$all_backup_tables = SiteGuard_Backup_Database_Utility::get_tables_in_sql_file($file_path);
+				$tables_to_import = $this->compute_selective_tables($all_backup_tables, $source_blogs);
+				$skipped_count = count($all_backup_tables) - count($tables_to_import);
+				if ($skipped_count === 0) {
+					// Nothing was actually excluded - use atomic import for crash safety
+					$this->sgbackup->log("Filtered import: no tables excluded (source blogs not matched to skip map), using atomic import");
+					$import_result = SiteGuard_Backup_Database_Utility::execute_sql_file_atomic(
+						$file_path,
+						function($lines_done) {
+							$this->progress("Database import: {$lines_done} lines processed");
+						}
+					);
+				} else {
+					$this->sgbackup->log("Filtered import: {$skipped_count} tables excluded for skipped subsites, importing " . count($tables_to_import) . " tables");
+					$this->progress("Importing " . count($tables_to_import) . " tables (skipping {$skipped_count} subsite tables)");
+					$import_result = SiteGuard_Backup_Database_Utility::execute_sql_file_filtered(
+						$file_path,
+						$tables_to_import,
+						function($lines_done) {
+							$this->progress("Database import: {$lines_done} lines processed");
+						}
+					);
+				}
 			} else {
 				// Use atomic restore (temp table → RENAME) for crash safety
 				$import_result = SiteGuard_Backup_Database_Utility::execute_sql_file_atomic(
@@ -949,6 +1027,131 @@ class SiteGuard_Backup_Restorer {
 	}
 
 	/**
+	 * Parse wp_blogs INSERT statements from a SQL file.
+	 *
+	 * Returns an associative array of blog_id => domain for all subsites
+	 * found in the SQL dump. Used to determine which tables belong to
+	 * which subsites for filtered import.
+	 *
+	 * @param string $file_path Path to SQL file (may be .gz).
+	 * @return array blog_id => domain
+	 */
+	private function parse_blogs_from_sql($file_path) {
+		$is_gz = (substr($file_path, -3) === '.gz');
+		$fh = $is_gz ? @gzopen($file_path, 'rb') : @fopen($file_path, 'r');
+		if (!$fh) return array();
+
+		$blogs = array();
+		$in_blogs_insert = false;
+
+		while (!($is_gz ? gzeof($fh) : feof($fh))) {
+			$line = $is_gz ? gzgets($fh) : fgets($fh);
+			if (false === $line) break;
+			$trimmed = trim($line);
+
+			// Detect INSERT INTO wp_blogs (or wp_N_blogs with a prefix)
+			if (preg_match('/^INSERT INTO\s+`[^`]*blogs`/i', $trimmed)) {
+				$in_blogs_insert = true;
+			}
+
+			// Extract (blog_id, site_id, domain, ...) value tuples
+			if ($in_blogs_insert) {
+				// Match value rows like (2, 1, 'sub.example.com', '/', ...)
+				if (preg_match_all('/\(\s*(\d+)\s*,\s*\d+\s*,\s*\'([^\']+)\'/', $trimmed, $matches, PREG_SET_ORDER)) {
+					foreach ($matches as $m) {
+						$blog_id = intval($m[1]);
+						if ($blog_id > 1) {
+							$blogs[$blog_id] = $m[2];
+						}
+					}
+				}
+				// End of INSERT statement
+				if (substr($trimmed, -1) === ';') {
+					$in_blogs_insert = false;
+				}
+			}
+		}
+
+		$is_gz ? gzclose($fh) : fclose($fh);
+		$this->sgbackup->log("Parsed " . count($blogs) . " subsite blogs from SQL: " . implode(', ', array_map(function($id, $d) { return "#{$id}={$d}"; }, array_keys($blogs), $blogs)));
+		return $blogs;
+	}
+
+	/**
+	 * Compute which tables to import, excluding tables for skipped subsites.
+	 *
+	 * @param array $all_tables   All table names from the SQL file.
+	 * @param array $source_blogs blog_id => domain from the source SQL.
+	 * @return array Table names to import.
+	 */
+	private function compute_selective_tables($all_tables, $source_blogs) {
+		global $wpdb;
+		$base_prefix = $wpdb->base_prefix;
+
+		// Build list of blog_ids whose tables should be excluded
+		$skip_blog_ids = array();
+		foreach ($source_blogs as $blog_id => $domain) {
+			if (isset($this->subsite_map[$domain]) && $this->subsite_map[$domain] === self::SUBSITE_SKIP) {
+				$skip_blog_ids[] = $blog_id;
+			}
+		}
+
+		if (empty($skip_blog_ids)) return $all_tables;
+
+		// Build prefix patterns for skipped blogs (e.g., "wp_2_", "wp_5_")
+		$skip_prefixes = array();
+		foreach ($skip_blog_ids as $bid) {
+			$skip_prefixes[] = $base_prefix . $bid . '_';
+		}
+
+		$this->sgbackup->log("Excluding tables for skipped blog_ids: " . implode(', ', $skip_blog_ids));
+
+		return array_values(array_filter($all_tables, function($table) use ($skip_prefixes) {
+			foreach ($skip_prefixes as $prefix) {
+				if (strpos($table, $prefix) === 0) return false;
+			}
+			return true;
+		}));
+	}
+
+	/**
+	 * Save destination's sgbackup_* options before DB import.
+	 */
+	private function save_plugin_options_before_import() {
+		global $wpdb;
+
+		if (is_multisite()) {
+			$rows = $wpdb->get_results($wpdb->prepare(
+				"SELECT meta_key, meta_value FROM {$wpdb->sitemeta} WHERE meta_key LIKE %s",
+				$wpdb->esc_like('sgbackup_') . '%'
+			), ARRAY_A);
+			foreach ($rows as $row) {
+				// Skip transient job data and semaphores - they're ephemeral
+				if (strpos($row['meta_key'], 'sgbackup_jobdata_') === 0) continue;
+				if (strpos($row['meta_key'], 'sgbackup_sem_') === 0) continue;
+				$this->pre_import_sgbackup_options[$row['meta_key']] = $row['meta_value'];
+			}
+		} else {
+			$rows = $wpdb->get_results($wpdb->prepare(
+				"SELECT option_name, option_value, autoload FROM {$wpdb->options} WHERE option_name LIKE %s",
+				$wpdb->esc_like('sgbackup_') . '%'
+			), ARRAY_A);
+			foreach ($rows as $row) {
+				if (strpos($row['option_name'], 'sgbackup_jobdata_') === 0) continue;
+				if (strpos($row['option_name'], 'sgbackup_sem_') === 0) continue;
+				$this->pre_import_sgbackup_options[$row['option_name']] = array(
+					'value' => $row['option_value'],
+					'autoload' => $row['autoload'],
+				);
+			}
+		}
+
+		if (!empty($this->pre_import_sgbackup_options)) {
+			$this->sgbackup->log("Saved " . count($this->pre_import_sgbackup_options) . " destination sgbackup_* options before import");
+		}
+	}
+
+	/**
 	 * Scan database dump for old URLs to detect migration.
 	 *
 	 * Handles both mysqldump format (all values on one line) and the PHP dump
@@ -967,6 +1170,8 @@ class SiteGuard_Backup_Restorer {
 		$found_siteurl = false;
 		$found_home = false;
 		$in_options_insert = false; // Track multi-line INSERT INTO *options* context
+		$has_main_options = false;
+		$detected_subsite_id = 0;
 
 		while (!($is_gz ? gzeof($fh) : feof($fh)) && $lines_scanned < $max_scan) {
 			// Stop early once we have both URLs
@@ -1017,9 +1222,27 @@ class SiteGuard_Backup_Restorer {
 					$this->old_table_prefix = $detected_prefix;
 				}
 			}
+
+			// Track whether this is a subsite-only backup (no main options/blogs table)
+			if (preg_match('/^CREATE TABLE\s+`([^`]+)`/i', $trimmed, $ctm)) {
+				$tbl_name = $ctm[1];
+				$bp = $GLOBALS['wpdb']->base_prefix;
+				if ($tbl_name === $bp . 'options' || $tbl_name === $bp . 'blogs') {
+					$has_main_options = true;
+				} elseif (!$detected_subsite_id && preg_match('/^' . preg_quote($bp, '/') . '(\d+)_options$/', $tbl_name, $sid)) {
+					$detected_subsite_id = (int) $sid[1];
+				}
+			}
 		}
 
 		$is_gz ? @gzclose($fh) : @fclose($fh);
+
+		// Auto-detect subsite backup when metadata is missing
+		if (!$this->is_subsite_backup && !$has_main_options && $detected_subsite_id > 0) {
+			$this->is_subsite_backup = true;
+			$this->source_blog_id = $detected_subsite_id;
+			$this->sgbackup->log("Auto-detected subsite backup: blog #{$detected_subsite_id} (no main options table in SQL)");
+		}
 
 		// Detect migration using pre-import URL (stable reference, not affected by
 		// prior DB file imports in multi-file restores or WordPress object cache)
@@ -1404,18 +1627,28 @@ class SiteGuard_Backup_Restorer {
 			// Determine new domain: custom/selective map lookup or mirror (str_replace)
 			if ($has_skip_map && isset($this->subsite_map[$blog->domain])) {
 				if ($this->subsite_map[$blog->domain] === self::SUBSITE_SKIP) {
-					// A6: Properly remove skipped subsites - delete from wp_blogs and drop their tables
+					// Remove the source's skipped blog entry from wp_blogs
 					$wpdb->delete($blogs_table, array('blog_id' => $blog->blog_id), array('%d'));
-					$blog_prefix = $wpdb->base_prefix . $blog->blog_id . '_';
-					$subsite_tables = $wpdb->get_col($wpdb->prepare(
-						"SHOW TABLES LIKE %s", $wpdb->esc_like($blog_prefix) . '%'
-					));
-					foreach ($subsite_tables as $table) {
-						$wpdb->query("DROP TABLE IF EXISTS `{$table}`");
+
+					if (!empty($this->pre_import_blogs)) {
+						// Filtered import was used - tables at this blog_id belong to
+						// the destination, NOT the source. Do NOT drop them.
+						$this->sgbackup->log("  Skipped blog #{$blog->blog_id} ({$blog->domain}): deleted from wp_blogs (destination tables preserved)");
+						$this->progress("Skipped subsite: {$blog->domain} (destination tables preserved)");
+					} else {
+						// Full atomic import was used - tables are the source's data.
+						// Drop them since the user chose to skip this subsite.
+						$blog_prefix = $wpdb->base_prefix . $blog->blog_id . '_';
+						$subsite_tables = $wpdb->get_col($wpdb->prepare(
+							"SHOW TABLES LIKE %s", $wpdb->esc_like($blog_prefix) . '%'
+						));
+						foreach ($subsite_tables as $table) {
+							$wpdb->query("DROP TABLE IF EXISTS `{$table}`");
+						}
+						$table_count = count($subsite_tables);
+						$this->sgbackup->log("  Skipped blog #{$blog->blog_id} ({$blog->domain}): deleted from wp_blogs, dropped {$table_count} tables");
+						$this->progress("Removed skipped subsite: {$blog->domain} ({$table_count} tables dropped)");
 					}
-					$table_count = count($subsite_tables);
-					$this->sgbackup->log("  Skipped blog #{$blog->blog_id} ({$blog->domain}): deleted from wp_blogs, dropped {$table_count} tables");
-					$this->progress("Removed skipped subsite: {$blog->domain} ({$table_count} tables dropped)");
 					continue;
 				}
 				// For custom mode, use the mapped domain; for selective mirror, fall through to str_replace
@@ -1481,6 +1714,23 @@ class SiteGuard_Backup_Restorer {
 		$this->sgbackup->log("Fixed {$fixed_count} subsite blog domains in wp_blogs + per-site options ({$mode_label})");
 		if ($fixed_count > 0) {
 			$this->progress("Fixed {$fixed_count} subsite domains for migration ({$mode_label})");
+		}
+
+		// Re-insert preserved destination wp_blogs entries whose blog_ids
+		// are no longer present (they weren't in the source backup at all).
+		if (!empty($this->pre_import_blogs)) {
+			$existing_blog_ids = $wpdb->get_col("SELECT blog_id FROM {$blogs_table}");
+			$reinserted = 0;
+			foreach ($this->pre_import_blogs as $saved_blog) {
+				if (in_array((string) $saved_blog['blog_id'], $existing_blog_ids, true)) continue;
+				$wpdb->insert($blogs_table, $saved_blog);
+				$reinserted++;
+				$this->sgbackup->log("  Re-inserted destination blog #{$saved_blog['blog_id']} ({$saved_blog['domain']})");
+			}
+			if ($reinserted > 0) {
+				$this->sgbackup->log("Re-inserted {$reinserted} destination wp_blogs entries that were not in the source backup");
+				$this->progress("Preserved {$reinserted} existing destination subsites");
+			}
 		}
 	}
 
@@ -1710,6 +1960,17 @@ class SiteGuard_Backup_Restorer {
 			// Filter extracted items if selective restore is requested
 			if ($selected_items !== null) {
 				$this->filter_extracted_items($temp_dir, $selected_items, $entity);
+			}
+
+			// Exclude our own plugin directory during migration to prevent
+			// overwriting destination's encryption keys, config, and version.
+			if ($entity === 'plugins' && $this->is_migration) {
+				$self_dir = $temp_dir . 'siteguardbackup';
+				if (is_dir($self_dir)) {
+					$this->remove_temp_dir($self_dir);
+					$this->sgbackup->log("Migration: excluded siteguardbackup/ from plugin restore to preserve destination config");
+					$this->progress("Excluded SiteGuard Backup plugin from restore (preserving destination config)");
+				}
 			}
 
 			// Move files to destination
@@ -2034,6 +2295,10 @@ class SiteGuard_Backup_Restorer {
 		// Clear object cache
 		wp_cache_delete('alloptions', 'options');
 
+		// Restore destination's sgbackup_* options that were overwritten by the
+		// source DB import (encryption keys, migration keys, backup history, etc.)
+		$this->restore_plugin_options();
+
 		// Clean up imported cron events and job state from the source site.
 		// After a DB import, the cron table contains events from the source
 		// site (e.g., sgbackup_backup_resume) that would fire on page loads
@@ -2073,8 +2338,41 @@ class SiteGuard_Backup_Restorer {
 			if (is_multisite() && defined('DOMAIN_CURRENT_SITE')) {
 				$new_domain = parse_url($this->pre_import_siteurl, PHP_URL_HOST);
 				if ($new_domain && DOMAIN_CURRENT_SITE !== $new_domain) {
-					$this->sgbackup->log("WARNING: DOMAIN_CURRENT_SITE in wp-config.php is '" . DOMAIN_CURRENT_SITE . "' but should be '{$new_domain}'. Update wp-config.php to fix network admin access.", 'warning');
-					$this->progress("WARNING: wp-config.php DOMAIN_CURRENT_SITE needs manual update to '{$new_domain}'");
+					$dcs_msg = "wp-config.php DOMAIN_CURRENT_SITE is '" . DOMAIN_CURRENT_SITE . "' but should be '{$new_domain}'. Update wp-config.php to fix network admin access.";
+					$this->sgbackup->log("WARNING: {$dcs_msg}", 'warning');
+					if (defined('DOING_AJAX') && DOING_AJAX) {
+						echo 'RINFO:' . json_encode(array('type' => 'error', 'message' => $dcs_msg)) . "\n";
+						if (ob_get_level()) @ob_flush();
+						@flush();
+					}
+				}
+			}
+
+			// Auth warning: after a full DB import from a different site, the
+			// user table has been replaced. The current session cookie will be
+			// invalid after this response completes.
+			$old_host = parse_url($this->old_siteurl, PHP_URL_HOST);
+			$auth_msg = "The database was replaced with data from {$old_host}. You will need to log in using the admin credentials from {$old_host}. Your current session will expire after this page reloads.";
+			$this->sgbackup->log("[Restore] AUTH WARNING: {$auth_msg}");
+			if (defined('DOING_AJAX') && DOING_AJAX) {
+				echo 'RINFO:' . json_encode(array('type' => 'warning', 'message' => $auth_msg)) . "\n";
+				if (ob_get_level()) @ob_flush();
+				@flush();
+			}
+
+			// Multisite subsite DNS/infrastructure warning
+			if (is_multisite()) {
+				global $wpdb;
+				$blog_count = (int) $wpdb->get_var("SELECT COUNT(*) FROM {$wpdb->base_prefix}blogs WHERE blog_id > 1");
+				if ($blog_count > 0) {
+					$new_host = parse_url($this->pre_import_siteurl, PHP_URL_HOST);
+					$dns_msg = "{$blog_count} subsites were migrated. They require wildcard DNS (*.{$new_host}) and web server configuration to accept subdomains before they can be accessed.";
+					$this->sgbackup->log("[Restore] DNS NOTE: {$dns_msg}");
+					if (defined('DOING_AJAX') && DOING_AJAX) {
+						echo 'RINFO:' . json_encode(array('type' => 'warning', 'message' => $dns_msg)) . "\n";
+						if (ob_get_level()) @ob_flush();
+						@flush();
+					}
 				}
 			}
 		}
@@ -2091,6 +2389,72 @@ class SiteGuard_Backup_Restorer {
 		));
 
 		$this->progress("Post-restore cleanup complete");
+	}
+
+	/**
+	 * Restore destination's sgbackup_* options that were saved before DB import.
+	 *
+	 * After a DB import from a different site, encryption keys, migration keys,
+	 * backup history, remote storage credentials, and other plugin config from
+	 * the source site overwrite the destination's values. This method writes
+	 * the destination's original values back.
+	 */
+	private function restore_plugin_options() {
+		if (empty($this->pre_import_sgbackup_options)) return;
+
+		global $wpdb;
+		$restored = 0;
+
+		if (is_multisite()) {
+			foreach ($this->pre_import_sgbackup_options as $key => $value) {
+				$exists = $wpdb->get_var($wpdb->prepare(
+					"SELECT COUNT(*) FROM {$wpdb->sitemeta} WHERE meta_key = %s", $key
+				));
+				if ($exists) {
+					$wpdb->update(
+						$wpdb->sitemeta,
+						array('meta_value' => $value),
+						array('meta_key' => $key),
+						array('%s'),
+						array('%s')
+					);
+				} else {
+					$wpdb->insert(
+						$wpdb->sitemeta,
+						array('site_id' => 1, 'meta_key' => $key, 'meta_value' => $value),
+						array('%d', '%s', '%s')
+					);
+				}
+				$restored++;
+			}
+		} else {
+			foreach ($this->pre_import_sgbackup_options as $key => $saved) {
+				$opt_value = $saved['value'];
+				$opt_autoload = $saved['autoload'];
+				$exists = $wpdb->get_var($wpdb->prepare(
+					"SELECT COUNT(*) FROM {$wpdb->options} WHERE option_name = %s", $key
+				));
+				if ($exists) {
+					$wpdb->update(
+						$wpdb->options,
+						array('option_value' => $opt_value, 'autoload' => $opt_autoload),
+						array('option_name' => $key),
+						array('%s', '%s'),
+						array('%s')
+					);
+				} else {
+					$wpdb->insert(
+						$wpdb->options,
+						array('option_name' => $key, 'option_value' => $opt_value, 'autoload' => $opt_autoload),
+						array('%s', '%s', '%s')
+					);
+				}
+				$restored++;
+			}
+		}
+
+		$this->sgbackup->log("Restored {$restored} destination sgbackup_* options after DB import");
+		$this->progress("Restored {$restored} plugin config options (encryption keys, backup history, etc.)");
 	}
 
 	/**

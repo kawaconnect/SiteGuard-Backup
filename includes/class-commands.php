@@ -1464,6 +1464,31 @@ class SiteGuard_Backup_Commands {
 			$result['multisite_blogs'] = $normalized;
 		}
 
+		// Auto-detect subsite backup from SQL tables when metadata is missing.
+		// A subsite backup has wp_N_* tables but no wp_options or wp_blogs.
+		if (empty($result['is_subsite_backup']) && !empty($result['tables'])) {
+			global $wpdb;
+			$base = $wpdb->base_prefix;
+			$has_main_options = false;
+			$subsite_id = 0;
+			foreach ($result['tables'] as $tbl) {
+				if ($tbl === $base . 'options' || $tbl === $base . 'blogs') {
+					$has_main_options = true;
+					break;
+				}
+				if (!$subsite_id && preg_match('/^' . preg_quote($base, '/') . '(\d+)_options$/', $tbl, $sm)) {
+					$subsite_id = (int) $sm[1];
+				}
+			}
+			if (!$has_main_options && $subsite_id > 0) {
+				$result['is_subsite_backup'] = true;
+				$result['subsite_blog_id'] = $subsite_id;
+				if (empty($result['subsite_domain']) && !empty($result['old_siteurl'])) {
+					$result['subsite_domain'] = parse_url($result['old_siteurl'], PHP_URL_HOST);
+				}
+			}
+		}
+
 		// M8: Add multisite blog grouping for tables
 		if (is_multisite() && !empty($result['tables'])) {
 			global $wpdb;
