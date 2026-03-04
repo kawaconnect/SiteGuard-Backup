@@ -338,9 +338,15 @@ class SiteGuard_Backup_CLI_Command extends WP_CLI_Command {
             }
         }
 
-        // Target subsite domain for import-as mode
+        // Target subsite domain/blog_id for import-as mode
         if (isset($assoc_args['target-subsite-domain'])) {
             $restore_options['target_subsite_domain'] = sanitize_text_field($assoc_args['target-subsite-domain']);
+            if (!isset($restore_options['subsite_mode'])) {
+                $restore_options['subsite_mode'] = 4;
+            }
+        }
+        if (isset($assoc_args['target-subsite-id'])) {
+            $restore_options['target_subsite_id'] = intval($assoc_args['target-subsite-id']);
             if (!isset($restore_options['subsite_mode'])) {
                 $restore_options['subsite_mode'] = 4;
             }

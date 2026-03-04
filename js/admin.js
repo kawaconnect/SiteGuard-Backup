@@ -429,6 +429,7 @@
 				$('#sgbackup-subsite-newdomain-row').hide();
 				$('input[name="sgbackup_target_subsite_newdomain"]').val('');
 				$('input[name="sgbackup_target_subsite_domain"]').val('');
+				$('input[name="sgbackup_target_subsite_id"]').val('');
 
 				// Initialize DB restore mode dropdown from site default
 				$('select[name="sgbackup_db_restore_mode"]').val(sgbackup_settings.default_db_restore_mode || 0);
@@ -499,15 +500,22 @@
 				}
 			});
 
-			// Subsite import picker: show/hide "Create new" text input and sync hidden field
+			// Subsite import picker: show/hide "Create new" text input and sync hidden fields
 			$(document).on('change', '#sgbackup-target-subsite-select', function() {
 				var val = $(this).val();
 				if (val === '__new__') {
 					$('#sgbackup-subsite-newdomain-row').show();
 					$('input[name="sgbackup_target_subsite_domain"]').val('');
+					$('input[name="sgbackup_target_subsite_id"]').val('');
+				} else if (val) {
+					$('#sgbackup-subsite-newdomain-row').hide();
+					var domain = $(this).find(':selected').data('domain') || '';
+					$('input[name="sgbackup_target_subsite_domain"]').val(domain);
+					$('input[name="sgbackup_target_subsite_id"]').val(val);
 				} else {
 					$('#sgbackup-subsite-newdomain-row').hide();
-					$('input[name="sgbackup_target_subsite_domain"]').val(val);
+					$('input[name="sgbackup_target_subsite_domain"]').val('');
+					$('input[name="sgbackup_target_subsite_id"]').val('');
 				}
 			});
 			$(document).on('input', 'input[name="sgbackup_target_subsite_newdomain"]', function() {
@@ -550,8 +558,9 @@
 					var b = blogs[i];
 					if (b.blog_id === 1) continue; // Skip main site - import targets subsites only
 					var label = b.domain;
+					if (b.path && b.path !== '/') label += b.path;
 					if (b.blogname) label += ' \u2014 ' + SGB.esc(b.blogname);
-					$sel.append('<option value="' + SGB.esc(b.domain) + '">' + label + '</option>');
+					$sel.append('<option value="' + parseInt(b.blog_id) + '" data-domain="' + SGB.esc(b.domain) + '">' + label + '</option>');
 				}
 				$sel.append('<option value="__new__">+ Create new subsite...</option>');
 				$sel.data('loaded-ts', timestamp);
@@ -918,9 +927,10 @@
 					for (var bi = 0; bi < blogs.length; bi++) {
 						var b = blogs[bi];
 						if (b.blog_id === 1) continue; // Skip main site
-						var label = SGB.esc(b.domain + (b.path && b.path !== '/' ? b.path : ''));
-						if (b.blogname) label += ' - ' + SGB.esc(b.blogname);
-						$sel.append('<option value="' + SGB.esc(b.domain) + '">' + label + '</option>');
+						var label = b.domain;
+						if (b.path && b.path !== '/') label += b.path;
+						if (b.blogname) label += ' \u2014 ' + SGB.esc(b.blogname);
+						$sel.append('<option value="' + parseInt(b.blog_id) + '" data-domain="' + SGB.esc(b.domain) + '">' + label + '</option>');
 					}
 					$sel.append('<option value="__new__">+ Create new subsite...</option>');
 
@@ -1142,10 +1152,14 @@
 				}
 			}
 
-			// Target domain for subsite import
+			// Target domain/blog_id for subsite import
 			var targetSubsiteDomain = $('input[name="sgbackup_target_subsite_domain"]').val();
+			var targetSubsiteId = $('input[name="sgbackup_target_subsite_id"]').val();
 			if (targetSubsiteDomain) {
 				formData.append('target_subsite_domain', targetSubsiteDomain);
+			}
+			if (targetSubsiteId) {
+				formData.append('target_subsite_id', targetSubsiteId);
 			}
 
 			// Gap 25: Collect include-unspecified options

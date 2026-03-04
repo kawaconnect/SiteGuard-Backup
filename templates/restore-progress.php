@@ -99,6 +99,7 @@
 				</label>
 			</div>
 			<input type="hidden" name="sgbackup_target_subsite_domain" value="" />
+			<input type="hidden" name="sgbackup_target_subsite_id" value="" />
 		</div>
 
 		<hr />

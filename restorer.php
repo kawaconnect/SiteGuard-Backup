@@ -103,6 +103,9 @@ class SiteGuard_Backup_Restorer {
 	/** @var string Target domain for subsite import */
 	private $target_subsite_domain = '';
 
+	/** @var int Target blog ID for subsite import (unambiguous for subdirectory installs) */
+	private $target_subsite_id = 0;
+
 	/**
 	 * @param array $backup_set     Backup set from history.
 	 * @param array $restore_options What to restore: ['db' => bool, 'plugins' => bool, etc.]
@@ -160,7 +163,10 @@ class SiteGuard_Backup_Restorer {
 			$this->source_blog_id = intval($backup_set['subsite_blog_id']);
 		}
 
-		// Target domain for subsite import mode
+		// Target domain/blog_id for subsite import mode
+		if (!empty($restore_options['target_subsite_id'])) {
+			$this->target_subsite_id = intval($restore_options['target_subsite_id']);
+		}
 		if (!empty($restore_options['target_subsite_domain'])) {
 			$this->target_subsite_domain = sanitize_text_field($restore_options['target_subsite_domain']);
 			if (is_multisite()) {
@@ -689,12 +695,27 @@ class SiteGuard_Backup_Restorer {
 		$this->progress("Importing {$source_label} to {$target_domain}");
 
 		// Step 1: Find or create the target subsite
-		$target_blog = get_blog_details(array('domain' => $target_domain), false);
+		// Use blog_id for unambiguous lookup (required for subdirectory installs
+		// where multiple subsites share the same domain).
+		$target_blog = null;
+		$target_path = '/';
+		if ($this->target_subsite_id > 0) {
+			$target_blog = get_blog_details($this->target_subsite_id, false);
+			if ($target_blog) {
+				$target_domain = $target_blog->domain;
+				$target_path = $target_blog->path;
+				$this->sgbackup->log("Looked up target by blog_id #{$this->target_subsite_id}: domain={$target_domain}, path={$target_path}");
+			}
+		}
+		if (!$target_blog) {
+			$target_blog = get_blog_details(array('domain' => $target_domain), false);
+		}
 		$target_id = null;
 
 		if ($target_blog) {
 			$target_id = (int) $target_blog->blog_id;
-			$this->sgbackup->log("Target subsite exists: blog #{$target_id} ({$target_domain})");
+			$target_path = $target_blog->path;
+			$this->sgbackup->log("Target subsite exists: blog #{$target_id} ({$target_domain}{$target_path})");
 			$this->progress("Target subsite already exists (blog #{$target_id}), will overwrite tables");
 
 			// Drop existing subsite tables so we can import fresh
@@ -733,7 +754,8 @@ class SiteGuard_Backup_Restorer {
 				return $result;
 			}
 
-			$this->sgbackup->log("Created new subsite: blog #{$target_id} ({$target_domain}{$path})");
+			$target_path = $path;
+			$this->sgbackup->log("Created new subsite: blog #{$target_id} ({$target_domain}{$target_path})");
 			$this->progress("Created new subsite blog #{$target_id}");
 
 			// Drop the auto-created tables (we'll import from backup)
@@ -856,8 +878,12 @@ class SiteGuard_Backup_Restorer {
 				$this->sgbackup->log("Detected source domain from imported siteurl: {$old_domain}");
 			}
 		}
+		// Build the target URL: domain + path (handles subdirectory installs)
+		$new_scheme = parse_url(get_option('siteurl'), PHP_URL_SCHEME);
+		$target_url_base = $new_scheme . '://' . $target_domain . rtrim($target_path, '/');
+
 		if (!empty($old_domain) && $old_domain !== $target_domain) {
-			$this->progress("Search-replace: {$old_domain} -> {$target_domain}");
+			$this->progress("Search-replace: {$old_domain} -> {$target_domain}" . ($target_path !== '/' ? $target_path : ''));
 
 			require_once SGBACKUP_DIR . 'includes/class-search-replace.php';
 
@@ -867,14 +893,12 @@ class SiteGuard_Backup_Restorer {
 			$search = array();
 			$replace = array();
 
-			// Full URL replacements (both protocols)
-			$new_scheme = parse_url(get_option('siteurl'), PHP_URL_SCHEME);
-			$new_url = $new_scheme . '://' . $target_domain;
+			// Full URL replacements (both protocols) - includes path for subdirectory installs
 			$search[] = 'https://' . $old_domain;
-			$replace[] = $new_url;
+			$replace[] = $target_url_base;
 			$search[] = 'http://' . $old_domain;
-			$replace[] = $new_url;
-			// Bare domain catch-all
+			$replace[] = $target_url_base;
+			// Bare domain catch-all (domain-only, no path - safer for non-URL contexts)
 			$search[] = $old_domain;
 			$replace[] = $target_domain;
 
@@ -884,13 +908,12 @@ class SiteGuard_Backup_Restorer {
 			$this->sgbackup->log("Subsite search-replace: {$report['changes']} changes across {$report['tables']} tables");
 			$this->progress("Search-replace: {$report['changes']} changes in {$report['tables']} tables");
 
-			$result['messages'][] = "Search-replace: {$report['changes']} changes ({$old_domain} -> {$target_domain})";
+			$result['messages'][] = "Search-replace: {$report['changes']} changes ({$old_domain} -> {$target_domain}" . ($target_path !== '/' ? $target_path : '') . ")";
 		}
 
 		// Step 6: Fix subsite options (siteurl, home)
 		$target_prefix = $wpdb->base_prefix . $target_id . '_';
-		$new_scheme = parse_url(get_option('siteurl'), PHP_URL_SCHEME);
-		$new_siteurl = $new_scheme . '://' . $target_domain;
+		$new_siteurl = $target_url_base;
 
 		$wpdb->update(
 			$target_prefix . 'options',
@@ -912,6 +935,10 @@ class SiteGuard_Backup_Restorer {
 	/**
 	 * Merge users from a subsite backup into the existing multisite user base.
 	 * Matches by email - reuses existing users, inserts new ones.
+	 *
+	 * Capabilities are parsed from the SQL dump (wp_usermeta is skipped during
+	 * remap import so they won't be in the live DB). For per-subsite backups
+	 * where wp_usermeta is absent, users default to subscriber role.
 	 */
 	private function merge_subsite_users($source_id, $target_id, $backup_dir) {
 		global $wpdb;
@@ -922,11 +949,17 @@ class SiteGuard_Backup_Restorer {
 		$base_prefix = $wpdb->base_prefix;
 		$users_table = $base_prefix . 'users';
 		$usermeta_table = $base_prefix . 'usermeta';
-		$source_cap_key = $base_prefix . $source_id . '_capabilities';
+		// blog_id 1 and single-site (0) both use wp_capabilities (no numeric prefix)
+		$source_cap_key = ($source_id > 1) ? $base_prefix . $source_id . '_capabilities' : $base_prefix . 'capabilities';
 		$target_cap_key = $base_prefix . $target_id . '_capabilities';
 
-		// Read users from the SQL dump
+		// Read users and capabilities from the SQL dump.
+		// wp_usermeta is skipped during remap import, so we parse caps directly
+		// from the SQL file instead of querying the live database.
 		$backup_users = array(); // email => array of user data
+		$backup_caps = array();  // old_user_id => serialized capabilities string
+		$escaped_cap_key = addslashes($source_cap_key);
+
 		foreach ($db_files as $db_file) {
 			$file_path = $backup_dir . $db_file;
 			if (preg_match('/\.crypt$/', $db_file)) continue;
@@ -936,6 +969,7 @@ class SiteGuard_Backup_Restorer {
 			if (!$fh) continue;
 
 			$in_users_insert = false;
+			$in_usermeta_insert = false;
 			while (!($is_gz ? gzeof($fh) : feof($fh))) {
 				$line = $is_gz ? gzgets($fh) : fgets($fh);
 				if (false === $line) break;
@@ -943,6 +977,12 @@ class SiteGuard_Backup_Restorer {
 				// Detect INSERT INTO wp_users
 				if (preg_match("/INSERT INTO\s+`{$users_table}`/i", $line)) {
 					$in_users_insert = true;
+					$in_usermeta_insert = false;
+				}
+				// Detect INSERT INTO wp_usermeta
+				if (preg_match("/INSERT INTO\s+`{$usermeta_table}`/i", $line)) {
+					$in_usermeta_insert = true;
+					$in_users_insert = false;
 				}
 
 				if ($in_users_insert) {
@@ -960,6 +1000,22 @@ class SiteGuard_Backup_Restorer {
 						$in_users_insert = false;
 					}
 				}
+
+				if ($in_usermeta_insert) {
+					// Extract capability rows: (..., user_id, 'wp_capabilities', 'a:1:{...}')
+					// Only parse lines that contain our target capability key
+					if (strpos($line, $escaped_cap_key) !== false || strpos($line, $source_cap_key) !== false) {
+						$cap_pattern = "/\(\s*\d+\s*,\s*(\d+)\s*,\s*'" . preg_quote($source_cap_key, '/') . "'\s*,\s*'((?:[^'\\\\]|\\\\.)*)'\s*\)/";
+						if (preg_match_all($cap_pattern, $line, $cap_matches, PREG_SET_ORDER)) {
+							foreach ($cap_matches as $cm) {
+								$backup_caps[intval($cm[1])] = stripslashes($cm[2]);
+							}
+						}
+					}
+					if (strpos($line, ';') !== false) {
+						$in_usermeta_insert = false;
+					}
+				}
 			}
 			$is_gz ? @gzclose($fh) : @fclose($fh);
 		}
@@ -969,7 +1025,11 @@ class SiteGuard_Backup_Restorer {
 			return;
 		}
 
-		$this->sgbackup->log("Subsite user merge: " . count($backup_users) . " users in backup");
+		$caps_found = count($backup_caps);
+		$this->sgbackup->log("Subsite user merge: " . count($backup_users) . " users, {$caps_found} capability entries (key: {$source_cap_key})");
+		if ($caps_found === 0) {
+			$this->sgbackup->log("Subsite user merge: no capabilities found in SQL dump (per-subsite backups exclude wp_usermeta). Users will be added as subscribers.");
+		}
 
 		// Map old user IDs to new (existing or matching) user IDs
 		$id_map = array();
@@ -990,17 +1050,16 @@ class SiteGuard_Backup_Restorer {
 		// For users that exist, add them to the target subsite with their capabilities
 		$target_prefix = $base_prefix . $target_id . '_';
 		foreach ($id_map as $old_id => $new_id) {
-			// Read capabilities from the imported subsite usermeta
-			$caps = $wpdb->get_var($wpdb->prepare(
-				"SELECT meta_value FROM {$usermeta_table} WHERE user_id = %d AND meta_key = %s",
-				$old_id, $source_cap_key
-			));
-
-			if ($caps) {
-				// Set on target subsite
-				update_user_meta($new_id, $target_cap_key, maybe_unserialize($caps));
+			// Read capabilities from the parsed SQL dump data
+			if (isset($backup_caps[$old_id])) {
+				$caps = maybe_unserialize($backup_caps[$old_id]);
+				if (is_array($caps)) {
+					update_user_meta($new_id, $target_cap_key, $caps);
+				} else {
+					add_user_to_blog($target_id, $new_id, 'subscriber');
+				}
 			} else {
-				// Default: subscriber role
+				// No capability data available - default to subscriber
 				add_user_to_blog($target_id, $new_id, 'subscriber');
 			}
 		}

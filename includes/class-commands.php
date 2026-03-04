@@ -859,6 +859,9 @@ class SiteGuard_Backup_Commands {
 		if (!empty($params['target_subsite_domain'])) {
 			$restore_options['target_subsite_domain'] = sanitize_text_field($params['target_subsite_domain']);
 		}
+		if (!empty($params['target_subsite_id'])) {
+			$restore_options['target_subsite_id'] = intval($params['target_subsite_id']);
+		}
 		if (!empty($params['pre_restore_backup'])) {
 			$restore_options['pre_restore_backup'] = true;
 		}
