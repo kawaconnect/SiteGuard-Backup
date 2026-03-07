@@ -306,12 +306,35 @@ class SiteGuard_Backup_Database_Utility {
 			}
 		}
 
-		$offset = 0;
-		while ($offset < $total_rows) {
-			$rows = $wpdb->get_results(
-				$wpdb->prepare("SELECT * FROM `{$table}`{$where_sql} LIMIT %d OFFSET %d", $batch_size, $offset),
-				ARRAY_A
-			);
+		// Use primary-key-based pagination when possible (much faster than
+		// LIMIT/OFFSET on large tables - avoids scanning N rows to skip them)
+		$primary_key = null;
+		foreach ($columns as $col) {
+			if ($col['Key'] === 'PRI') {
+				$primary_key = $col['Field'];
+				break;
+			}
+		}
+
+		$last_pk = 0;
+		$rows_done = 0;
+		while ($rows_done < $total_rows) {
+			if ($primary_key && empty($where_clause)) {
+				// Primary key pagination: WHERE pk > last_pk ORDER BY pk LIMIT batch
+				$rows = $wpdb->get_results(
+					$wpdb->prepare(
+						"SELECT * FROM `{$table}` WHERE `{$primary_key}` > %s ORDER BY `{$primary_key}` ASC LIMIT %d",
+						$last_pk, $batch_size
+					),
+					ARRAY_A
+				);
+			} else {
+				// Fallback to OFFSET pagination for tables without PK or with WHERE
+				$rows = $wpdb->get_results(
+					$wpdb->prepare("SELECT * FROM `{$table}`{$where_sql} LIMIT %d OFFSET %d", $batch_size, $rows_done),
+					ARRAY_A
+				);
+			}
 
 			if (empty($rows)) break;
 
@@ -330,10 +353,15 @@ class SiteGuard_Backup_Database_Utility {
 					}
 				}
 				$row_strings[] = '(' . implode(', ', $values) . ')';
+
+				// Track last PK for keyset pagination
+				if ($primary_key && isset($row[$primary_key])) {
+					$last_pk = $row[$primary_key];
+				}
 			}
 			$write(implode(",\n", $row_strings) . ";\n\n");
 
-			$offset += $batch_size;
+			$rows_done += count($rows);
 
 			// Adaptive batch sizing based on memory
 			$mem_usage = memory_get_usage(true);
@@ -896,6 +924,31 @@ class SiteGuard_Backup_Database_Utility {
 		$wpdb->query('SET FOREIGN_KEY_CHECKS = 0');
 		$wpdb->query("SET SQL_MODE = 'NO_AUTO_VALUE_ON_ZERO'");
 
+		// Query max_allowed_packet to split oversized INSERT statements
+		$max_packet = 16777216; // 16MB default
+		$packet_row = $wpdb->get_row("SHOW VARIABLES LIKE 'max_allowed_packet'");
+		if ($packet_row && isset($packet_row->Value)) {
+			$max_packet = (int) $packet_row->Value;
+		}
+
+		// Cache supported charsets/engines for compatibility rewriting
+		$supported_charsets = array();
+		$charset_rows = $wpdb->get_results("SHOW CHARACTER SET");
+		if ($charset_rows) {
+			foreach ($charset_rows as $cr) {
+				$supported_charsets[strtolower($cr->Charset)] = true;
+			}
+		}
+		$supported_engines = array();
+		$engine_rows = $wpdb->get_results("SHOW ENGINES");
+		if ($engine_rows) {
+			foreach ($engine_rows as $er) {
+				if (in_array($er->Support, array('DEFAULT', 'YES'))) {
+					$supported_engines[strtolower($er->Engine)] = true;
+				}
+			}
+		}
+
 		while (!($is_gz ? gzeof($fh) : feof($fh))) {
 			$line = $is_gz ? gzgets($fh) : fgets($fh);
 			if (false === $line) break;
@@ -963,6 +1016,57 @@ class SiteGuard_Backup_Database_Utility {
 						continue;
 					}
 
+					// Handle SET NAMES: verify charset is supported
+					if (preg_match('/^\s*(?:\/\*!\d+\s*)?SET\s+NAMES\s+[\'"]?(\w+)/i', $query, $charset_m)) {
+						$requested_charset = strtolower($charset_m[1]);
+						if (!isset($supported_charsets[$requested_charset])) {
+							// Fall back to utf8 if requested charset not supported
+							$fallback = isset($supported_charsets['utf8mb4']) ? 'utf8mb4' : 'utf8';
+							$query = preg_replace('/SET\s+NAMES\s+[\'"]?\w+[\'"]?/i', "SET NAMES {$fallback}", $query);
+						}
+					}
+
+					// Engine compatibility: replace unsupported engines in CREATE TABLE
+					if (preg_match('/^CREATE\s+TABLE/i', $query) && preg_match('/ENGINE\s*=\s*(\w+)/i', $query, $eng_m)) {
+						$engine = strtolower($eng_m[1]);
+						if (!isset($supported_engines[$engine])) {
+							$fallback_engine = isset($supported_engines['innodb']) ? 'InnoDB' : 'MyISAM';
+							$query = preg_replace('/ENGINE\s*=\s*\w+/i', 'ENGINE=' . $fallback_engine, $query);
+						}
+					}
+
+					// Split oversized INSERT statements at row boundaries
+					if (preg_match('/^INSERT\s+INTO/i', $query) && strlen($query) > ($max_packet - 1024)) {
+						$insert_prefix = '';
+						if (preg_match('/^(INSERT\s+INTO\s+`[^`]+`\s*(?:\([^)]+\))?\s*VALUES\s*)/is', $query, $pfx_m)) {
+							$insert_prefix = $pfx_m[1];
+						}
+						if ($insert_prefix) {
+							$values_part = substr($query, strlen($insert_prefix));
+							$chunks = self::split_insert_values($values_part, $max_packet - strlen($insert_prefix) - 1024);
+							foreach ($chunks as $chunk) {
+								$sub_query = $insert_prefix . $chunk;
+								$sub_res = $wpdb->query($sub_query);
+								if (false === $sub_res) {
+									$result['errors'][] = "SQL error (split INSERT) on line {$line_count}: " . $wpdb->last_error;
+								}
+							}
+							// Skip the normal execution below since we handled it
+							if (preg_match('/^CREATE\s+TABLE/i', $query)) {
+								$result['tables_restored']++;
+							}
+							if ($progress_callback && ($line_count % 500 === 0)) {
+								call_user_func($progress_callback, $line_count, 0);
+							}
+							continue;
+						}
+					}
+
+					// Reconnect if MySQL connection was lost
+					if (method_exists($wpdb, 'check_connection')) {
+						$wpdb->check_connection(false);
+					}
+
 					$res = $wpdb->query($query);
 
 					if (false === $res) {
@@ -1000,6 +1104,59 @@ class SiteGuard_Backup_Database_Utility {
 		}
 
 		return $result;
+	}
+
+	/**
+	 * Split INSERT VALUES clause into chunks that fit within max_allowed_packet.
+	 *
+	 * @param string $values_str The VALUES portion: "(row1),(row2),(row3)"
+	 * @param int    $max_size   Maximum byte size per chunk.
+	 * @return array Array of value strings, each small enough for one query.
+	 */
+	private static function split_insert_values($values_str, $max_size) {
+		$chunks = array();
+		$current = '';
+		$depth = 0;
+		$in_string = false;
+		$string_char = '';
+		$len = strlen($values_str);
+		$row_start = 0;
+
+		for ($i = 0; $i < $len; $i++) {
+			$ch = $values_str[$i];
+
+			if ($in_string) {
+				if ($ch === '\\') { $i++; continue; }
+				if ($ch === $string_char) { $in_string = false; }
+				continue;
+			}
+
+			if ($ch === "'" || $ch === '"') {
+				$in_string = true;
+				$string_char = $ch;
+			} elseif ($ch === '(') {
+				if ($depth === 0) $row_start = $i;
+				$depth++;
+			} elseif ($ch === ')') {
+				$depth--;
+				if ($depth === 0) {
+					// End of a row value group
+					$row = substr($values_str, $row_start, $i - $row_start + 1);
+					if (strlen($current) + strlen($row) + 2 > $max_size && !empty($current)) {
+						$chunks[] = $current;
+						$current = $row;
+					} else {
+						$current .= (empty($current) ? '' : ',') . $row;
+					}
+				}
+			}
+		}
+
+		if (!empty($current)) {
+			$chunks[] = $current;
+		}
+
+		return !empty($chunks) ? $chunks : array($values_str);
 	}
 
 	/**

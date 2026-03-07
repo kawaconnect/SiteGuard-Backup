@@ -1047,11 +1047,13 @@ class SiteGuard_Backup_Engine {
 		$bytes_written = 0;
 		$write_error = false;
 
-		// Header
+		// Header with charset declaration for cross-server restore compatibility
+		$db_charset = defined('DB_CHARSET') ? DB_CHARSET : 'utf8mb4';
 		$header = "-- SiteGuard Backup database dump\n";
 		$header .= "-- Generated: " . gmdate('Y-m-d H:i:s') . " UTC\n";
 		$header .= "-- WordPress DB prefix: " . $GLOBALS['wpdb']->prefix . "\n";
 		$header .= "-- Database: " . DB_NAME . "\n\n";
+		$header .= "/*!40101 SET NAMES {$db_charset} */;\n";
 		$header .= "SET FOREIGN_KEY_CHECKS = 0;\n";
 		$header .= "SET SQL_MODE = 'NO_AUTO_VALUE_ON_ZERO';\n\n";
 		$w = gzwrite($out, $header);
