@@ -2,7 +2,7 @@
 /**
  * Plugin Name: SiteGuard Backup
  * Description: Complete WordPress backup, restore, and migration solution with scheduled, incremental, and site-to-site migration support.
- * Version: 1.3.1
+ * Version: 1.3.4
  * Author: SiteGuard
  * License: GPL-2.0-or-later
  * Requires at least: 5.6
