@@ -390,30 +390,57 @@
 
 				html += '<div class="sgbackup-job' + (job.has_errors ? ' sgbackup-job-error' : '') + '">';
 				html += '<button type="button" class="sgbackup-abort-btn" data-nonce="' + SGB.esc(nonce) + '">Abort</button>';
-				html += '<div class="sgbackup-job-title">' + SGB.esc(job.job_type) + ' backup [' + SGB.esc(nonce) + ']</div>';
-				html += '<div class="sgbackup-job-phase">' + SGB.esc(job.phase || job.jobstatus) + (elapsed ? ' (' + elapsed + ')' : '') + '</div>';
+				html += '<div class="sgbackup-job-title">' + SGB.esc(job.job_type) + ' backup [' + SGB.esc(nonce) + '] (' + elapsed + ')</div>';
 
-				// Show progress details (file count or table count)
-				var progressDetail = '';
-				if (job.files_total_count > 0 && !job.files_phase_complete) {
-					progressDetail = 'Files: ' + job.files_added_count + ' / ' + job.files_total_count;
-				} else if (job.db_tables_total > 0 && !job.db_phase_complete) {
-					progressDetail = 'Tables: ' + job.db_tables_done + ' / ' + job.db_tables_total;
+				// Progress bar
+				var pct = 0;
+				var progressText = '';
+				if (!job.files_phase_complete && job.files_total_count > 0) {
+					pct = Math.round((job.files_added_count / job.files_total_count) * 100);
+					progressText = 'Files: ' + job.files_added_count + ' / ' + job.files_total_count + ' (' + pct + '%)';
+				} else if (job.files_phase_complete && !job.db_phase_complete && job.db_tables_total > 0) {
+					pct = Math.round((job.db_tables_done / job.db_tables_total) * 100);
+					progressText = 'Tables: ' + job.db_tables_done + ' / ' + job.db_tables_total + ' (' + pct + '%)';
+				} else if (job.files_phase_complete && job.db_phase_complete && !job.upload_phase_complete) {
+					pct = 75;
+					progressText = 'Uploading to remote storage...';
+				} else if (job.files_phase_complete && job.db_phase_complete) {
+					pct = 100;
+					progressText = 'Finalizing...';
 				}
-				if (progressDetail) {
-					html += '<div class="sgbackup-job-progress">' + SGB.esc(progressDetail) + '</div>';
+				if (progressText) {
+					html += '<div style="background:#e0e0e0;border-radius:3px;height:20px;margin:6px 0;overflow:hidden;">';
+					html += '<div style="background:#2271b1;height:100%;width:' + pct + '%;min-width:2%;transition:width 0.3s;line-height:20px;color:#fff;font-size:11px;padding:0 6px;white-space:nowrap;">' + SGB.esc(progressText) + '</div>';
+					html += '</div>';
 				}
 
+				// Current activity
+				html += '<div class="sgbackup-job-phase" style="font-weight:600;">' + SGB.esc(job.phase || job.jobstatus) + '</div>';
 				if (job.last_activity) {
-					html += '<div class="sgbackup-job-log">' + SGB.esc(job.last_activity) + '</div>';
+					html += '<div class="sgbackup-job-log" style="color:#666;font-size:12px;">' + SGB.esc(job.last_activity) + '</div>';
 				} else if (job.last_log) {
-					html += '<div class="sgbackup-job-log">' + SGB.esc(job.last_log) + '</div>';
+					html += '<div class="sgbackup-job-log" style="color:#666;font-size:12px;">' + SGB.esc(job.last_log) + '</div>';
 				}
-				html += '<div class="sgbackup-job-steps">' + steps.join(' &rarr; ') + '</div>';
+
+				// Phase steps
+				html += '<div class="sgbackup-job-steps" style="margin-top:4px;">' + steps.join(' &rarr; ') + '</div>';
 				html += entityDetail;
+
+				// Errors
 				if (job.has_errors && job.errors && job.errors.length) {
-					html += '<div class="sgbackup-job-error-msg">' + SGB.esc(job.errors[job.errors.length - 1]) + '</div>';
+					html += '<div class="sgbackup-job-error-msg" style="color:#d63638;margin-top:4px;">';
+					for (var ei = 0; ei < job.errors.length; ei++) {
+						html += SGB.esc(job.errors[ei]) + '<br>';
+					}
+					html += '</div>';
 				}
+
+				// View log button
+				html += '<div style="margin-top:6px;">';
+				html += '<button type="button" class="button button-small sgbackup-viewlog-btn" data-nonce="' + SGB.esc(nonce) + '">View Log</button>';
+				html += '</div>';
+				html += '<div id="sgbackup-live-log-' + SGB.esc(nonce) + '" style="display:none;margin-top:6px;"></div>';
+
 				html += '</div>';
 			});
 			$('#sgbackup-active-jobs-list').html(html);
@@ -422,6 +449,26 @@
 			$('.sgbackup-abort-btn').off('click').on('click', function() {
 				var nonce = $(this).data('nonce');
 				self.ajax('activejobs_delete', { job_id: nonce });
+			});
+
+			// Bind view-log buttons
+			$('.sgbackup-viewlog-btn').off('click').on('click', function() {
+				var nonce = $(this).data('nonce');
+				var $logDiv = $('#sgbackup-live-log-' + nonce);
+				if ($logDiv.is(':visible')) {
+					$logDiv.slideUp(200);
+					$(this).text('View Log');
+				} else {
+					$(this).text('Hide Log');
+					$logDiv.slideDown(200);
+					self.ajax('get_log', { nonce: nonce }, function(data) {
+						if (data && data.log) {
+							var logHtml = SGB.esc(data.log).replace(/\n/g, '<br>');
+							$logDiv.html('<div style="max-height:300px;overflow-y:auto;background:#1d2327;color:#c3c4c7;padding:10px;font-family:monospace;font-size:11px;border-radius:3px;word-break:break-all;">' + logHtml + '</div>');
+							$logDiv.find('div').scrollTop($logDiv.find('div')[0].scrollHeight);
+						}
+					});
+				}
 			});
 		},
 

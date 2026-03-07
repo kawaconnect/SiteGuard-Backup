@@ -855,6 +855,31 @@ class SiteGuard_Backup {
 
 		$semaphore->unlock();
 		$this->logfile_close();
+
+		// If more work is needed, try to continue directly in this PHP process
+		// instead of relying solely on WP-Cron (which may not fire on Azure,
+		// hosts with DISABLE_WP_CRON, or sites with no traffic).
+		// Skip this in WP-CLI mode (CLI has its own resume loop).
+		$jobstatus = $this->jobdata_get('jobstatus', '');
+		$terminal_statuses = array('complete', 'finished', 'error', 'aborted', 'failed', 'warning');
+		if (!defined('WP_CLI') && !in_array($jobstatus, $terminal_statuses, true)) {
+			$time_this_run = microtime(true) - $this->job_time_ms;
+
+			// Continue directly if we have time budget remaining (stay under 50%
+			// of PHP's max_execution_time to leave headroom for remaining work)
+			$max_time = (int) ini_get('max_execution_time');
+			if ($max_time <= 0) $max_time = SGBACKUP_SET_TIME_LIMIT;
+			$can_continue = ($time_this_run < ($max_time * 0.5));
+
+			if ($can_continue && $resumption_no < 50) {
+				// Also spawn cron as safety net in case this process dies
+				if (function_exists('spawn_cron')) {
+					spawn_cron();
+				}
+				$this->backup_resume($resumption_no + 1, $bnonce);
+				return;
+			}
+		}
 	}
 
 	/**
