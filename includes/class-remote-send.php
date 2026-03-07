@@ -316,31 +316,42 @@ class SiteGuard_Backup_Remote_Send {
 		$tmp_file = $backup_dir . $filename . '.tmp';
 		$final_file = $backup_dir . $filename;
 
+		// Use database-backed lock instead of flock() - CIFS/SMB mounts
+		// (Azure App Service, NAS) don't support POSIX file locking.
+		$chunk_lock_key = 'sgbackup_chunk_' . md5($filename);
+		$lock_acquired = false;
+		for ($attempt = 0; $attempt < 5; $attempt++) {
+			if (false === get_transient($chunk_lock_key)) {
+				set_transient($chunk_lock_key, time(), 30);
+				$lock_acquired = true;
+				break;
+			}
+			usleep(200000); // 200ms
+		}
+		if (!$lock_acquired) {
+			return new WP_Error('file_lock', 'Cannot acquire chunk write lock.');
+		}
+
 		$fh = fopen($tmp_file, 'c+b');
 		if (!$fh) {
+			delete_transient($chunk_lock_key);
 			return new WP_Error('file_open', 'Cannot open temp file for writing.');
 		}
 
-		// Exclusive lock to prevent concurrent chunk writes from corrupting the file
-		if (!flock($fh, LOCK_EX)) {
-			fclose($fh);
-			return new WP_Error('file_lock', 'Cannot lock temp file for writing.');
-		}
-
-		// Track expected next offset AFTER acquiring lock to avoid TOCTOU race
+		// Track expected next offset
 		clearstatcache(true, $tmp_file);
 		$expected_offset = filesize($tmp_file);
 		if ($expected_offset === false) $expected_offset = 0;
 		if ($start !== $expected_offset) {
-			flock($fh, LOCK_UN);
 			fclose($fh);
+			delete_transient($chunk_lock_key);
 			return new WP_Error('out_of_sequence', sprintf('Out-of-sequence write: expected offset %d but got %d.', $expected_offset, $start));
 		}
 
 		fseek($fh, $start);
 		$written = fwrite($fh, $chunk_data);
-		flock($fh, LOCK_UN);
 		fclose($fh);
+		delete_transient($chunk_lock_key);
 
 		if (false === $written) {
 			return new WP_Error('file_write', 'Failed to write chunk data.');
@@ -356,8 +367,11 @@ class SiteGuard_Backup_Remote_Send {
 			if (file_exists($final_file)) {
 				@unlink($final_file);
 			}
-			if (!rename($tmp_file, $final_file)) {
-				return new WP_Error('rename_failed', 'Failed to finalize uploaded file: rename from .tmp failed.');
+			if (!@rename($tmp_file, $final_file)) {
+				// rename fails across mount points (e.g. /tmp to /home on Azure)
+				if (!@copy($tmp_file, $final_file) || !@unlink($tmp_file)) {
+					return new WP_Error('rename_failed', 'Failed to finalize uploaded file.');
+				}
 			}
 
 			$result['status'] = 1; // 1 = complete

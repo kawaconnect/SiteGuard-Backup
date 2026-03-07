@@ -1327,10 +1327,11 @@ class SiteGuard_Backup {
 			$backup_data['db'] = $db_files;
 		}
 
-		// Calculate total size
+		// Calculate total size - clear stat cache for accurate sizes on CIFS mounts
 		$total_size = 0;
 		$backup_dir = $this->get_backup_dir();
 		$all_files = array_merge($backup_array, $db_files);
+		clearstatcache();
 		foreach ($all_files as $file) {
 			$path = $backup_dir . $file;
 			if (file_exists($path)) {
@@ -1850,6 +1851,7 @@ class SiteGuard_Backup {
 
 		$total_size = 0;
 		$backup_dir = $this->get_backup_dir();
+		clearstatcache();
 		foreach ($all_files as $file) {
 			$path = $backup_dir . $file;
 			if (file_exists($path)) {

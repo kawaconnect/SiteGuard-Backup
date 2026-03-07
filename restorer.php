@@ -1110,7 +1110,7 @@ class SiteGuard_Backup_Restorer {
 			$temp_extract = $backup_dir . 'temp_uploads_' . time() . '/';
 			wp_mkdir_p($temp_extract);
 
-			$extract_ok = SiteGuard_Backup_Filesystem::extract_zip($zip_path, $temp_extract);
+			$extract_ok = $this->unzip($zip_path, $temp_extract);
 			if (!$extract_ok) {
 				$this->sgbackup->log("Failed to extract uploads zip: {$zip_file}", 'error');
 				$this->remove_dir_recursive($temp_extract);

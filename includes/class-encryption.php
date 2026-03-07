@@ -324,10 +324,13 @@ class SiteGuard_Backup_Encryption {
 		fclose($in);
 		fclose($out);
 
-		// Rename temp file to final path on success
-		if (!rename($tmp_file, $decrypted_file)) {
+		// Rename temp file to final path (with copy+unlink fallback for cross-mount)
+		if (!@rename($tmp_file, $decrypted_file)) {
+			if (!@copy($tmp_file, $decrypted_file)) {
+				@unlink($tmp_file);
+				return false;
+			}
 			@unlink($tmp_file);
-			return false;
 		}
 
 		return $decrypted_file;
@@ -418,10 +421,13 @@ class SiteGuard_Backup_Encryption {
 		fclose($in);
 		fclose($out);
 
-		// Rename temp file to final path on success
-		if (!rename($tmp_file, $decrypted_file)) {
+		// Rename temp file to final path (with copy+unlink fallback for cross-mount)
+		if (!@rename($tmp_file, $decrypted_file)) {
+			if (!@copy($tmp_file, $decrypted_file)) {
+				@unlink($tmp_file);
+				return false;
+			}
 			@unlink($tmp_file);
-			return false;
 		}
 
 		return $decrypted_file;
