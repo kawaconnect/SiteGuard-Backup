@@ -328,9 +328,16 @@ class SiteGuard_Backup_Engine {
 			// Check batch limits
 			if ($this->zipfiles_batched >= $maxbatch || $this->zipfiles_batched >= $maxbatch_ceiling) {
 				// Save progress and request resumption
+				$total_files = count($files);
+				$pct = round($i / $total_files * 100);
 				$this->sgbackup->jobdata_set("entity_{$entity}_last_file_index", $i);
-				$this->sgbackup->log("Batch limit reached at file {$i}/" . count($files) .
-					" (" . SiteGuard_Backup_Filesystem::format_bytes($this->zipfiles_batched) . ")");
+				$this->sgbackup->jobdata_set('files_added_count', $i);
+				$this->sgbackup->jobdata_set('files_total_count', $total_files);
+				$this->sgbackup->jobdata_set('last_activity',
+					"{$entity}: {$pct}% ({$i}/{$total_files} files, " .
+					SiteGuard_Backup_Filesystem::format_bytes($this->zipfiles_batched) . " batched)");
+				$this->sgbackup->log("Batch limit reached at file {$i}/{$total_files} " .
+					"({$pct}%, " . SiteGuard_Backup_Filesystem::format_bytes($this->zipfiles_batched) . ")");
 
 				// Close current zip before returning for resumption
 				$this->close_ziparchive();
@@ -367,15 +374,20 @@ class SiteGuard_Backup_Engine {
 				$this->zipfiles_batched += $file['size'];
 			}
 
-			// Periodic check-in and progress update
+			// Progress update - write to jobdata so the polling UI can show real-time progress.
+			// Update on first file, every 20 files, and on check-in intervals.
+			if ($this->zipfiles_added === 1 || $this->zipfiles_added % 20 === 0) {
+				$total_files = count($files);
+				$this->sgbackup->jobdata_set('files_added_count', $i + 1);
+				$this->sgbackup->jobdata_set('files_total_count', $total_files);
+				$pct = round(($i + 1) / $total_files * 100);
+				$this->sgbackup->jobdata_set('last_activity',
+					"{$entity}: {$pct}% ({$i}/{$total_files} files, " .
+					SiteGuard_Backup_Filesystem::format_bytes($this->zipfiles_batched) . " batched)");
+			}
 			if ($this->zipfiles_added > 0 && $this->zipfiles_added % 500 === 0) {
 				SiteGuard_Backup_Job_Scheduler::something_useful_happened();
 				SiteGuard_Backup_Job_Scheduler::record_still_alive();
-			}
-			if ($this->zipfiles_added > 0 && $this->zipfiles_added % 100 === 0) {
-				$this->sgbackup->jobdata_set('files_added_count', ($this->sgbackup->jobdata_get('files_added_count', 0) + 100));
-				$this->sgbackup->jobdata_set('files_total_count', count($files));
-				$this->sgbackup->jobdata_set('last_activity', "Adding files to {$entity}: {$i}/" . count($files));
 			}
 		}
 

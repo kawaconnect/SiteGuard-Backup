@@ -1100,7 +1100,11 @@ class SiteGuard_Backup {
 			$this->log("Uploading to {$service}");
 
 			$service_all_ok = true;
+			$upload_index = 0;
+			$upload_total = count($all_files);
 			foreach ($all_files as $file) {
+				$upload_index++;
+				$this->jobdata_set('last_activity', "Uploading {$upload_index}/{$upload_total}: {$file}");
 				// Prevent path traversal via tainted jobdata filenames
 				if (basename($file) !== $file || strpos($file, '..') !== false) {
 					$this->log("Rejected unsafe filename in upload: {$file}", 'error');
