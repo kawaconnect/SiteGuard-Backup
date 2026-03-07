@@ -1431,7 +1431,7 @@ class SiteGuard_Backup_Commands {
 				$multisite_blogs = array();
 				$old_siteurl_from_main = false;
 				$base_prefix = $GLOBALS['wpdb']->base_prefix;
-				while (!($is_gz ? gzeof($fh) : feof($fh)) && $lines < 50000) {
+				while (!($is_gz ? gzeof($fh) : feof($fh))) {
 					$line = $is_gz ? gzgets($fh) : fgets($fh);
 					if (false === $line) break;
 					$lines++;

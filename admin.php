@@ -710,6 +710,9 @@ class SiteGuard_Backup_Admin {
 		while (ob_get_level()) ob_end_clean();
 		header('Content-Type: text/plain; charset=utf-8');
 		header('X-Accel-Buffering: no');
+		// Pad past nginx fastcgi_buffer_size to force streaming
+		echo str_repeat(' ', 33 * 1024) . "\n";
+		flush();
 
 		$timestamp = isset($_POST['timestamp']) ? intval($_POST['timestamp']) : 0;
 		if (!$timestamp) {
