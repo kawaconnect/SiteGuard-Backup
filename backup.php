@@ -267,16 +267,27 @@ class SiteGuard_Backup_Engine {
 			$excludes = array_merge($excludes, SiteGuard_Backup_Filesystem::wp_others_excludes());
 		}
 
-		// Enumerate files
-		$files = SiteGuard_Backup_Filesystem::enumerate_files($source_path, $excludes, $altered_since);
+		// Enumerate files - cache the list in a temp file to avoid re-scanning
+		// the entire directory tree on every resumption (saves ~2s per cycle on CIFS)
 		$last_index = $this->sgbackup->jobdata_get("entity_{$entity}_last_file_index", 0);
-		if ($last_index === 0) {
+		$cache_file = $this->backup_dir . 'filecache_' . $this->sgbackup->nonce . '_' . $entity . '.php';
+
+		if ($last_index > 0 && file_exists($cache_file)) {
+			$files = @unserialize(@file_get_contents($cache_file));
+			if (!is_array($files)) $files = array(); // corrupt cache - will re-enumerate below
+		}
+
+		if (empty($files)) {
+			$files = SiteGuard_Backup_Filesystem::enumerate_files($source_path, $excludes, $altered_since);
 			$this->sgbackup->log("Enumerated " . count($files) . " files in {$entity}");
+			// Cache for subsequent resumptions
+			@file_put_contents($cache_file, serialize($files));
 		}
 
 		if (empty($files)) return true;
 
-		// Gap 18: Warn about large files
+		// Gap 18: Warn about large files (only on first pass)
+		if ($last_index === 0) {
 		foreach ($files as $file_info) {
 			if (isset($file_info['size']) && $file_info['size'] > SGBACKUP_WARN_FILE_SIZE) {
 				$this->sgbackup->log(
@@ -286,9 +297,17 @@ class SiteGuard_Backup_Engine {
 				);
 			}
 		}
+		} // end if ($last_index === 0) for large file warnings
 
 		// Create zip(s)
-		return $this->create_zips($files, $source_path, $entity);
+		$result = $this->create_zips($files, $source_path, $entity);
+
+		// Clean up file cache when entity is complete
+		if (is_array($result) && file_exists($cache_file)) {
+			@unlink($cache_file);
+		}
+
+		return $result;
 	}
 
 	/**
