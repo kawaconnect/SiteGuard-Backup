@@ -619,14 +619,36 @@ class SiteGuard_Backup_Restorer {
 		// cached option values stale (they still hold the pre-import data).
 		wp_cache_flush();
 
+		// Capture imported siteurl/home BEFORE overwriting - needed for migration
+		// detection below. After the safety-net write, get_option returns destination.
+		$imported_siteurl = get_option('siteurl');
+		$imported_home = get_option('home');
+
+		// Safety net: immediately restore the destination's siteurl/home after
+		// DB import. The import overwrites wp_options with source values, making
+		// the site unreachable if search-replace fails, times out, or doesn't
+		// apply. This ensures the site always stays loadable.
+		if (!empty($this->pre_import_siteurl) && $imported_siteurl !== $this->pre_import_siteurl) {
+			update_option('siteurl', $this->pre_import_siteurl);
+			update_option('home', $this->pre_import_home);
+			$this->sgbackup->log("Safety: restored destination siteurl/home ({$this->pre_import_siteurl}) after DB import");
+			if (is_multisite()) {
+				global $wpdb;
+				$new_domain = parse_url($this->pre_import_siteurl, PHP_URL_HOST);
+				$new_scheme = parse_url($this->pre_import_siteurl, PHP_URL_SCHEME);
+				if ($new_domain) {
+					$wpdb->update($wpdb->base_prefix . 'sitemeta', array('meta_value' => $new_scheme . '://' . $new_domain . '/'), array('meta_key' => 'siteurl'), array('%s'), array('%s'));
+					$wpdb->update($wpdb->base_prefix . 'site', array('domain' => $new_domain), array('id' => 1), array('%s'), array('%d'));
+					$wpdb->update($wpdb->base_prefix . 'blogs', array('domain' => $new_domain), array('blog_id' => 1), array('%s'), array('%d'));
+					$this->sgbackup->log("Safety: restored multisite identity tables (domain={$new_domain})");
+				}
+			}
+			wp_cache_flush();
+		}
+
 		// AUTHORITATIVE migration detection from the actual imported database.
-		// The SQL scan may have picked up a subsite's siteurl (e.g.,
-		// wp_10_options appears before wp_options alphabetically), giving us
-		// the wrong base domain. Reading from wp_options after import gives
-		// the correct main site URL.
+		// Uses $imported_siteurl captured BEFORE the safety-net write above.
 		if ($this->db_restore_mode === self::DB_RESTORE_MIGRATE) {
-			$imported_siteurl = get_option('siteurl');
-			$imported_home = get_option('home');
 			if (!empty($imported_siteurl) && !empty($this->pre_import_siteurl) && $imported_siteurl !== $this->pre_import_siteurl) {
 				if ($this->is_migration && $this->old_siteurl !== $imported_siteurl) {
 					$this->sgbackup->log("Correcting old_siteurl from SQL scan ({$this->old_siteurl}) to actual imported value ({$imported_siteurl})");
@@ -1546,7 +1568,14 @@ class SiteGuard_Backup_Restorer {
 		$current_content = $this->pre_import_content_url;
 		$current_uploads = $this->pre_import_uploads_url;
 
+		// Save the REAL destination URLs before any keep-protocol rewrite.
+		// These are used for writing to wp_options - the site must respond
+		// on its actual protocol regardless of keep_protocol.
+		$real_dest_siteurl = $current_siteurl;
+		$real_dest_home = $current_home;
+
 		// Keep original protocol: rewrite destination URLs to use the source scheme
+		// for SEARCH-REPLACE PAIRS ONLY. Does not affect DB identity writes.
 		if ($this->keep_protocol && !empty($this->old_siteurl)) {
 			$old_scheme = parse_url($this->old_siteurl, PHP_URL_SCHEME);
 			$new_scheme = parse_url($current_siteurl, PHP_URL_SCHEME);
@@ -1556,8 +1585,6 @@ class SiteGuard_Backup_Restorer {
 				$current_home = preg_replace('/^' . preg_quote($new_scheme, '/') . '/', $old_scheme, $current_home);
 				if ($current_content) $current_content = preg_replace('/^' . preg_quote($new_scheme, '/') . '/', $old_scheme, $current_content);
 				if ($current_uploads) $current_uploads = preg_replace('/^' . preg_quote($new_scheme, '/') . '/', $old_scheme, $current_uploads);
-				// Also update pre_import_siteurl so build_multisite_replacements uses the kept protocol
-				$this->pre_import_siteurl = $current_siteurl;
 			}
 		}
 
@@ -1596,13 +1623,14 @@ class SiteGuard_Backup_Restorer {
 
 		// Multisite: enumerate all blogs and build per-blog replacements
 		if (is_multisite()) {
-			$this->build_multisite_replacements($search, $replace);
+			$sr_scheme = $this->keep_protocol ? parse_url($current_siteurl, PHP_URL_SCHEME) : null;
+			$this->build_multisite_replacements($search, $replace, $sr_scheme);
 		}
 
-		// First, restore the destination siteurl/home in the DB so the site
-		// functions correctly after search-replace completes.
-		update_option('siteurl', $current_siteurl);
-		update_option('home', $current_home);
+		// Write the REAL destination siteurl/home (before any keep-protocol rewrite).
+		// The site must respond on its actual protocol regardless of keep_protocol.
+		update_option('siteurl', $real_dest_siteurl);
+		update_option('home', $real_dest_home);
 		wp_cache_delete('alloptions', 'options');
 
 		$this->sgbackup->log("Search-replace: " . count($search) . " replacements");
@@ -1667,7 +1695,7 @@ class SiteGuard_Backup_Restorer {
 	 * cases where subsites use a different protocol than the main site.
 	 * Specific (longer) replacements are added first; bare domain goes last.
 	 */
-	private function build_multisite_replacements(&$search, &$replace) {
+	private function build_multisite_replacements(&$search, &$replace, $scheme_override = null) {
 		global $wpdb;
 
 		// Skip remap mode: don't modify search-replace pairs for subsites
@@ -1680,7 +1708,7 @@ class SiteGuard_Backup_Restorer {
 		$new_domain = parse_url($this->pre_import_siteurl, PHP_URL_HOST);
 		if (!$old_domain || !$new_domain || $old_domain === $new_domain) return;
 
-		$new_scheme = parse_url($this->pre_import_siteurl, PHP_URL_SCHEME);
+		$new_scheme = $scheme_override ?: parse_url($this->pre_import_siteurl, PHP_URL_SCHEME);
 
 		// Main-only mode: only build main site URL pairs, skip subsite pairs
 		if ($this->subsite_mode === self::SUBSITE_MODE_MAIN_ONLY) {
