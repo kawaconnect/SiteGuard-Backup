@@ -511,10 +511,11 @@ class SiteGuard_Backup_Remote_Send {
 
 		if (!$timestamp) $timestamp = time();
 
-		// Determine entity type
+		// Determine entity type - match entity suffix after the nonce.
+		// Format: backup_{date}_{site}_{nonce}-{entity}.ext or ...-{entity}-{N}.ext
 		$entity = 'unknown';
-		foreach (array('plugins', 'themes', 'uploads', 'others', 'db', 'wpcore') as $e) {
-			if (strpos($filename, "-{$e}") !== false) {
+		foreach (array('plugins', 'themes', 'uploads', 'others', 'wpcore', 'db') as $e) {
+			if (preg_match('/-' . preg_quote($e, '/') . '[\.\-]/', $filename)) {
 				$entity = $e;
 				break;
 			}

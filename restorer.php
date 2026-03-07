@@ -559,8 +559,13 @@ class SiteGuard_Backup_Restorer {
 				// Custom/mirror mode with __skip__ entries: use filtered import to
 				// avoid destroying destination subsite tables at overlapping blog_ids.
 				$source_blogs = $this->parse_blogs_from_sql($file_path);
+				if (empty($source_blogs)) {
+					// Safety: if we couldn't parse blog entries, fall back to atomic import
+					// rather than risk silently excluding all subsite tables.
+					$this->sgbackup->log("Warning: could not parse blogs from SQL file - falling back to atomic import for safety");
+				}
 				$all_backup_tables = SiteGuard_Backup_Database_Utility::get_tables_in_sql_file($file_path);
-				$tables_to_import = $this->compute_selective_tables($all_backup_tables, $source_blogs);
+				$tables_to_import = empty($source_blogs) ? $all_backup_tables : $this->compute_selective_tables($all_backup_tables, $source_blogs);
 				$skipped_count = count($all_backup_tables) - count($tables_to_import);
 				if ($skipped_count === 0) {
 					// Nothing was actually excluded - use atomic import for crash safety
@@ -1452,7 +1457,7 @@ class SiteGuard_Backup_Restorer {
 				if (!empty($detected_prefix) && preg_match('/^[a-zA-Z0-9_]+$/', $detected_prefix)) {
 					// Only set if it's the main options table or we haven't set yet.
 					// $m[1] is just the prefix (e.g. 'wp_'), $bp is 'wp_'.
-					$is_main_prefix = ($m[1] === $bp);
+					$is_main_prefix = ($detected_prefix === $bp);
 					if ($is_main_prefix || empty($this->old_table_prefix)) {
 						$this->old_table_prefix = $detected_prefix;
 					}

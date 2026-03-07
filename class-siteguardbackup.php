@@ -26,6 +26,7 @@ class SiteGuard_Backup {
 	private $logfile_name = '';
 	private $opened_log_time;
 	private $backup_dir;
+	private $_process_start;
 
 	/**
 	 * Available backup storage methods.
@@ -829,7 +830,7 @@ class SiteGuard_Backup {
 
 		try {
 			$this->do_backup_work($resumption_no, $semaphore);
-		} catch (Exception $e) {
+		} catch (\Throwable $e) {
 			$this->jobdata_set('jobstatus', 'failed');
 			$this->log("Exception during backup: " . $e->getMessage(), 'error');
 			SiteGuard_Backup_Webhook::fire('backup_failed', array(
@@ -883,9 +884,9 @@ class SiteGuard_Backup {
 
 		// Verify database connection is alive (can drop on Azure/long-running processes)
 		if (method_exists($wpdb, 'check_connection') && !$wpdb->check_connection(false)) {
-			$this->log("Database connection lost - scheduling retry in 60s", 'warning');
-			SiteGuard_Backup_Job_Scheduler::schedule_resumption($resumption_no, $this->nonce, 60);
-			SiteGuard_Backup_Job_Scheduler::record_still_alive();
+			$this->log("Database connection lost - will retry on next resumption", 'warning');
+			// Don't try to schedule via DB (it's down). The safety-net cron event
+			// from the direct-chain caller or a previously scheduled resumption will retry.
 			return;
 		}
 
@@ -896,6 +897,8 @@ class SiteGuard_Backup {
 				$this->log("Aborting backup: disk space critically low (" .
 					SiteGuard_Backup_Filesystem::format_bytes($available_bytes) . " available). " .
 					"Less than 20MB free - backup cannot proceed safely.", 'error');
+				$this->jobdata_set('jobstatus', 'error');
+				SiteGuard_Backup_Job_Scheduler::clear_scheduled_events($this->nonce);
 				return;
 			} elseif ($available_bytes < 104857600) { // < 100MB
 				$this->log("Warning: disk space is low (" .

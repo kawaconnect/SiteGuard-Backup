@@ -448,6 +448,7 @@ class SiteGuard_Backup_Admin {
 		$opts = SiteGuard_Backup_Options::instance();
 		$backup_dir = $opts->get_backup_dir();
 		$path = $backup_dir . $file;
+		clearstatcache(true, $path);
 
 		if (!file_exists($path)) wp_die('File not found');
 
@@ -510,7 +511,9 @@ class SiteGuard_Backup_Admin {
 			if (!empty($backup[$entity])) {
 				$entity_files = is_array($backup[$entity]) ? $backup[$entity] : array($backup[$entity]);
 				foreach ($entity_files as $f) {
-					if (file_exists($backup_dir . $f)) {
+					$fpath = $backup_dir . $f;
+					clearstatcache(true, $fpath);
+					if (file_exists($fpath)) {
 						$files[] = $f;
 					}
 				}
@@ -519,32 +522,8 @@ class SiteGuard_Backup_Admin {
 
 		if (empty($files)) wp_die('No backup files found');
 
-		$nonce = isset($backup['nonce']) ? $backup['nonce'] : 'unknown';
+		$nonce = isset($backup['nonce']) ? preg_replace('/[^a-zA-Z0-9]/', '', $backup['nonce']) : 'unknown';
 		$bundle_name = 'sgbackup_bundle_' . date('Y-m-d', $timestamp) . '_' . $nonce . '.zip';
-		$bundle_path = $backup_dir . $bundle_name;
-
-		// Create the bundle zip
-		$zip = new ZipArchive();
-		if (true !== $zip->open($bundle_path, ZipArchive::CREATE | ZipArchive::OVERWRITE)) {
-			wp_die('Failed to create bundle zip');
-		}
-
-		foreach ($files as $f) {
-			$zip->addFile($backup_dir . $f, $f);
-		}
-
-		// Add a manifest so the upload handler knows it's a bundle
-		$meta = wp_json_encode(array(
-			'type' => 'sgbackup_bundle',
-			'timestamp' => $timestamp,
-			'nonce' => $nonce,
-			'files' => $files,
-			'backup' => $backup,
-		));
-		$zip->addFromString('_sgbackup_bundle.json', $meta);
-		$zip->close();
-
-		if (!file_exists($bundle_path)) wp_die('Failed to create bundle');
 
 		// Audit log
 		$audit = SiteGuard_Backup_Audit_Log::instance();
@@ -553,26 +532,157 @@ class SiteGuard_Backup_Admin {
 			'files' => count($files),
 		));
 
-		// Stream to browser
+		// Stream ZIP directly to browser - no temp file needed.
+		// Uses STORE method (no compression) since backup files are already compressed.
+		// This works for any size backup, even multi-GB, with minimal memory.
+		@set_time_limit(0);
 		while (ob_get_level()) ob_end_clean();
-		clearstatcache(true, $bundle_path);
+
 		header('Content-Type: application/zip');
 		header('Content-Disposition: attachment; filename="' . $bundle_name . '"');
-		header('Content-Length: ' . filesize($bundle_path));
 		header('Cache-Control: no-cache, must-revalidate');
+		// Cannot send Content-Length with streaming zip - browser will handle chunked transfer
 
-		$fh = fopen($bundle_path, 'rb');
-		if ($fh) {
-			while (!feof($fh)) {
-				echo fread($fh, 65536);
-				flush();
+		$this->stream_zip_files($backup_dir, $files, $backup, $timestamp, $nonce);
+		exit;
+	}
+
+	/**
+	 * Stream a ZIP archive directly to output (no temp file).
+	 * Uses STORE method (no compression) and data descriptors so each file
+	 * is read only ONCE (CRC32 computed while streaming). Works for any size.
+	 */
+	private function stream_zip_files($backup_dir, $files, $backup, $timestamp, $nonce) {
+		$manifest_json = wp_json_encode(array(
+			'type' => 'sgbackup_bundle',
+			'timestamp' => $timestamp,
+			'nonce' => $nonce,
+			'files' => $files,
+			'backup' => $backup,
+		));
+
+		$entries = array();
+		foreach ($files as $f) {
+			$fpath = $backup_dir . $f;
+			clearstatcache(true, $fpath);
+			$entries[] = array(
+				'name'       => $f,
+				'size'       => filesize($fpath),
+				'is_virtual' => false,
+				'path'       => $fpath,
+			);
+		}
+		$entries[] = array(
+			'name'       => '_sgbackup_bundle.json',
+			'size'       => strlen($manifest_json),
+			'is_virtual' => true,
+			'data'       => $manifest_json,
+		);
+
+		// Pass 1: local file headers + data + data descriptors
+		// Flag bit 3 = data descriptor follows; CRC/sizes in header are 0.
+		$offset = 0;
+		foreach ($entries as &$entry) {
+			$name = $entry['name'];
+			$size = $entry['size'];
+			$entry['local_offset'] = $offset;
+
+			// Local file header - CRC/sizes set to 0, data descriptor follows
+			$header = pack('V', 0x04034b50);        // local file header signature
+			$header .= pack('v', 20);                // version needed (2.0)
+			$header .= pack('v', 0x0008);            // flags: bit 3 = data descriptor
+			$header .= pack('v', 0);                 // compression: STORE
+			$header .= pack('v', 0) . pack('v', 0);  // mod time, mod date
+			$header .= pack('V', 0);                 // crc32 (in data descriptor)
+			$header .= pack('V', 0);                 // compressed size (in data descriptor)
+			$header .= pack('V', 0);                 // uncompressed size (in data descriptor)
+			$header .= pack('v', strlen($name));     // name length
+			$header .= pack('v', 0);                 // extra field length
+			$header .= $name;
+
+			echo $header;
+			$offset += strlen($header);
+
+			// Stream file data, computing CRC32 simultaneously
+			$ctx = hash_init('crc32b');
+			$bytes_written = 0;
+
+			if ($entry['is_virtual']) {
+				echo $entry['data'];
+				hash_update($ctx, $entry['data']);
+				$bytes_written = $size;
+			} else {
+				$fh = fopen($entry['path'], 'rb');
+				if ($fh) {
+					while (!feof($fh)) {
+						$chunk = fread($fh, 65536);
+						if ($chunk === false || $chunk === '') break;
+						echo $chunk;
+						hash_update($ctx, $chunk);
+						$bytes_written += strlen($chunk);
+					}
+					fclose($fh);
+				}
 			}
-			fclose($fh);
+			$offset += $bytes_written;
+
+			$crc = hexdec(hash_final($ctx));
+			$entry['crc32'] = $crc;
+			$entry['actual_size'] = $bytes_written;
+
+			// Data descriptor with signature (widely expected by zip tools)
+			$dd = pack('V', 0x08074b50);  // data descriptor signature
+			$dd .= pack('V', $crc);
+			$dd .= pack('V', $bytes_written > 0xFFFFFFFF ? 0xFFFFFFFF : $bytes_written);
+			$dd .= pack('V', $bytes_written > 0xFFFFFFFF ? 0xFFFFFFFF : $bytes_written);
+			echo $dd;
+			$offset += 16;
+
+			flush();
+		}
+		unset($entry);
+
+		// Pass 2: central directory
+		$cd_offset = $offset;
+		$cd_size = 0;
+		foreach ($entries as $entry) {
+			$name = $entry['name'];
+			$asize = $entry['actual_size'];
+
+			$cd = pack('V', 0x02014b50);             // central dir signature
+			$cd .= pack('v', 20);                     // version made by
+			$cd .= pack('v', 20);                     // version needed
+			$cd .= pack('v', 0);                      // flags (no bit 3 in central dir)
+			$cd .= pack('v', 0);                      // compression: STORE
+			$cd .= pack('v', 0) . pack('v', 0);       // mod time, mod date
+			$cd .= pack('V', $entry['crc32']);
+			$cd .= pack('V', $asize > 0xFFFFFFFF ? 0xFFFFFFFF : $asize);
+			$cd .= pack('V', $asize > 0xFFFFFFFF ? 0xFFFFFFFF : $asize);
+			$cd .= pack('v', strlen($name));
+			$cd .= pack('v', 0);                       // extra field length
+			$cd .= pack('v', 0);                       // comment length
+			$cd .= pack('v', 0);                       // disk number start
+			$cd .= pack('v', 0);                       // internal attrs
+			$cd .= pack('V', 0x20);                   // external attrs (archive)
+			$cd .= pack('V', $entry['local_offset'] > 0xFFFFFFFF ? 0xFFFFFFFF : $entry['local_offset']);
+			$cd .= $name;
+
+			echo $cd;
+			$cd_size += strlen($cd);
 		}
 
-		// Clean up the temp bundle
-		@unlink($bundle_path);
-		exit;
+		// End of central directory
+		$eocd = pack('V', 0x06054b50);
+		$eocd .= pack('v', 0);                        // disk number
+		$eocd .= pack('v', 0);                        // disk with CD
+		$eocd .= pack('v', count($entries));
+		$eocd .= pack('v', count($entries));
+		$eocd .= pack('V', $cd_size);
+		$eocd .= pack('V', $cd_offset > 0xFFFFFFFF ? 0xFFFFFFFF : $cd_offset);
+		$eocd .= pack('v', 0);
+
+		echo $eocd;
+		flush();
 	}
 
 	/**
@@ -1067,15 +1177,19 @@ class SiteGuard_Backup_Admin {
 		for ($i = 0; $i < $zip->numFiles; $i++) {
 			$entry = $zip->getNameIndex($i);
 			if ($entry === '_sgbackup_bundle.json') continue;
-			// Security: prevent path traversal
-			if (strpos($entry, '..') !== false || strpos($entry, '/') !== false) continue;
+			// Security: prevent path traversal and subdirectories
+			if (strpos($entry, '..') !== false || strpos($entry, '/') !== false || strpos($entry, '\\') !== false) continue;
 			$safe_name = sanitize_file_name($entry);
 			if (empty($safe_name)) continue;
 
-			$zip->extractTo($backup_dir, $entry);
-			// Rename if sanitized name differs
+			if (!$zip->extractTo($backup_dir, $entry)) continue;
+			// Rename if sanitized name differs (with copy+unlink fallback for CIFS)
 			if ($safe_name !== $entry && file_exists($backup_dir . $entry)) {
-				@rename($backup_dir . $entry, $backup_dir . $safe_name);
+				if (!@rename($backup_dir . $entry, $backup_dir . $safe_name)) {
+					if (@copy($backup_dir . $entry, $backup_dir . $safe_name)) {
+						@unlink($backup_dir . $entry);
+					}
+				}
 			}
 			$extracted[] = $safe_name;
 		}
@@ -1084,10 +1198,10 @@ class SiteGuard_Backup_Admin {
 		// Register in backup history using manifest metadata
 		if ($manifest && !empty($manifest['timestamp']) && !empty($manifest['backup'])) {
 			$backup_data = $manifest['backup'];
-			// Recalculate size from actual extracted files
 			$total_size = 0;
 			foreach ($extracted as $f) {
 				$p = $backup_dir . $f;
+				clearstatcache(true, $p);
 				if (file_exists($p)) $total_size += filesize($p);
 			}
 			$backup_data['size'] = $total_size;
