@@ -122,11 +122,18 @@ class SiteGuard_Backup_Method_Remotesend extends SiteGuard_Backup_Module {
 
 			if (is_wp_error($result)) {
 				$errors++;
-				$sgbackup->log("Chunk send error at offset {$offset}: " . $result->get_error_message(), 'warning');
+				$err_msg = $result->get_error_message();
+				$sgbackup->log("Chunk send error at offset {$offset}: " . $err_msg, 'warning');
 
-				// Reduce chunk size on error
-				$this->chunk_size = max(524288, intval($this->chunk_size / 2)); // Min 512KB
-				$opts->set_transient('sgbackup_remotesend_chunk_' . $site_id, $this->chunk_size, 3600);
+				// Back off on rate limit errors to let the window reset
+				if (stripos($err_msg, 'rate limit') !== false) {
+					$sgbackup->log("Rate limited - waiting 10 seconds before retry");
+					sleep(10);
+				} else {
+					// Reduce chunk size on other errors
+					$this->chunk_size = max(524288, intval($this->chunk_size / 2)); // Min 512KB
+					$opts->set_transient('sgbackup_remotesend_chunk_' . $site_id, $this->chunk_size, 3600);
+				}
 
 				if ($errors > 5) {
 					fclose($fh);

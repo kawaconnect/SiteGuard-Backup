@@ -57,20 +57,24 @@ class SiteGuard_Backup_Remote_Send {
 			return;
 		}
 
-		// Rate limiting: max 600 requests per minute per IP.
-		// Backup transfers send many chunks (100MB file / 2MB chunk = 50 requests per file),
-		// so the limit must accommodate multi-file transfers in a single resumption window.
-		// Use CF-Connecting-IP behind Cloudflare, fall back to REMOTE_ADDR
+		// Rate limiting: max 600 requests per 60-second sliding window per IP.
+		// Uses a stored window start time so the counter resets properly even
+		// during sustained transfers (set_transient alone resets TTL on every
+		// call, which would make the counter never expire).
 		$ip = isset($_SERVER['HTTP_CF_CONNECTING_IP'])
 			? sanitize_text_field($_SERVER['HTTP_CF_CONNECTING_IP'])
 			: (isset($_SERVER['REMOTE_ADDR']) ? sanitize_text_field($_SERVER['REMOTE_ADDR']) : 'unknown');
 		$rate_key = 'sgbackup_rpc_rate_' . md5($ip);
-		$rate_count = (int) get_transient($rate_key);
-		if ($rate_count >= 600) {
+		$rate_data = get_transient($rate_key);
+		if (!is_array($rate_data) || !isset($rate_data['t']) || (time() - $rate_data['t']) >= 60) {
+			$rate_data = array('c' => 0, 't' => time());
+		}
+		$rate_data['c']++;
+		if ($rate_data['c'] > 600) {
 			wp_send_json_error(array('message' => 'Rate limit exceeded. Try again later.'));
 			return;
 		}
-		set_transient($rate_key, $rate_count + 1, 60);
+		set_transient($rate_key, $rate_data, 120);
 
 		$name_hash = isset($_POST['name_hash']) ? sanitize_text_field($_POST['name_hash']) : '';
 
@@ -167,12 +171,16 @@ class SiteGuard_Backup_Remote_Send {
 			? sanitize_text_field($_SERVER['HTTP_CF_CONNECTING_IP'])
 			: (isset($_SERVER['REMOTE_ADDR']) ? sanitize_text_field($_SERVER['REMOTE_ADDR']) : 'unknown');
 		$rate_key = 'sgbackup_rpc_rate_' . md5($ip);
-		$rate_count = (int) get_transient($rate_key);
-		if ($rate_count >= 600) {
+		$rate_data = get_transient($rate_key);
+		if (!is_array($rate_data) || !isset($rate_data['t']) || (time() - $rate_data['t']) >= 60) {
+			$rate_data = array('c' => 0, 't' => time());
+		}
+		$rate_data['c']++;
+		if ($rate_data['c'] > 600) {
 			wp_send_json_error(array('message' => 'Rate limit exceeded. Try again later.'));
 			return;
 		}
-		set_transient($rate_key, $rate_count + 1, 60);
+		set_transient($rate_key, $rate_data, 120);
 
 		$key_data = $local_keys[$name_hash];
 
