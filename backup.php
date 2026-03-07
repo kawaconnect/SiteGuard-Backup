@@ -770,6 +770,7 @@ class SiteGuard_Backup_Engine {
 
 		// Check which tables are already done
 		$completed_tables = $this->sgbackup->jobdata_get('db_completed_tables', array());
+		$failed_tables = $this->sgbackup->jobdata_get('db_failed_tables', array());
 
 		// Output file
 		$db_filename = $this->zip_basename . '-db.gz';
@@ -797,8 +798,15 @@ class SiteGuard_Backup_Engine {
 			}
 			if ($orphaned > 0) {
 				$this->sgbackup->log("Found {$orphaned} completed tables with missing dump files - will re-dump them");
+				// Identify which tables lost their dump files so we can clear
+				// any stale failed_tables entries for them (gives a fresh attempt)
+				$orphaned_names = array_diff($completed_tables, $valid_completed);
 				$completed_tables = $valid_completed;
 				$this->sgbackup->jobdata_set('db_completed_tables', $completed_tables);
+				if (!empty($failed_tables) && !empty($orphaned_names)) {
+					$failed_tables = array_diff($failed_tables, $orphaned_names);
+					$this->sgbackup->jobdata_set('db_failed_tables', $failed_tables);
+				}
 			}
 		}
 
@@ -813,6 +821,7 @@ class SiteGuard_Backup_Engine {
 
 		foreach ($tables as $table) {
 			if (in_array($table, $completed_tables)) continue;
+			if (in_array($table, $failed_tables)) continue;
 
 			// Gap 21: Check if this table is structure-only
 			$structure_only = false;
@@ -863,6 +872,13 @@ class SiteGuard_Backup_Engine {
 				SiteGuard_Backup_Job_Scheduler::something_useful_happened();
 			} else {
 				$this->sgbackup->log("Failed to backup table: {$table}", 'error');
+				// Track permanently failed tables to prevent infinite retry loops.
+				// A table that fails both mysqldump and PHP fallback likely has a
+				// real issue (dropped, permissions, corruption) - don't retry.
+				if (!in_array($table, $failed_tables)) {
+					$failed_tables[] = $table;
+					$this->sgbackup->jobdata_set('db_failed_tables', $failed_tables);
+				}
 			}
 
 			// Check time limit
@@ -873,36 +889,44 @@ class SiteGuard_Backup_Engine {
 			}
 		}
 
-		// Dump views and stored routines
+		// Dump views and stored routines (once only - skip if already done on a prior resumption)
 		$extras_file = $temp_dir . '_views_routines.sql';
-		SiteGuard_Backup_Database_Utility::dump_views($table_prefix, $extras_file);
-		SiteGuard_Backup_Database_Utility::dump_routines($extras_file);
+		if (!file_exists($extras_file)) {
+			SiteGuard_Backup_Database_Utility::dump_views($table_prefix, $extras_file);
+			SiteGuard_Backup_Database_Utility::dump_routines($extras_file);
+		}
 
-		// Log per-table dump stats and check disk space before stitching
-		clearstatcache();
+		// Pre-stitch verification: ensure every table has a dump file or is known-failed.
+		// This catches dump files that vanished between resumptions (Azure CIFS, container
+		// restarts). Tables that permanently failed to dump are accepted as losses.
+		$failed_tables = $this->sgbackup->jobdata_get('db_failed_tables', array());
 		$total_dump_size = 0;
 		$dump_count = 0;
-		foreach ($tables as $table) {
-			$tf = $temp_dir . $table . '.sql.gz';
-			if (file_exists($tf)) {
+		$unattempted = 0;
+		$stitch_tables = array();
+		foreach ($tables as $t) {
+			$tf = $temp_dir . $t . '.sql.gz';
+			clearstatcache(true, $tf);
+			if (file_exists($tf) && filesize($tf) > 0) {
 				$total_dump_size += filesize($tf);
 				$dump_count++;
+				$stitch_tables[] = $t;
+			} elseif (!in_array($t, $failed_tables)) {
+				$unattempted++;
 			}
 		}
-		// Safety check: if many tables are missing dump files, re-dump them instead of stitching an incomplete backup
-		$missing_count = count($tables) - $dump_count;
-		if ($missing_count > 0 && $dump_count < count($tables)) {
-			$this->sgbackup->log("WARNING: {$missing_count}/" . count($tables) . " tables have no dump file - re-dumping missing tables");
-			// Clear completed_tables so missing ones get re-dumped on next resumption
-			$valid = array();
-			foreach ($tables as $t) {
-				$tf = $temp_dir . $t . '.sql.gz';
-				if (file_exists($tf) && filesize($tf) > 0) {
-					$valid[] = $t;
-				}
-			}
-			$this->sgbackup->jobdata_set('db_completed_tables', $valid);
+		if ($unattempted > 0) {
+			$this->sgbackup->log("WARNING: {$unattempted}/" . count($tables) . " tables have no dump file and haven't failed - re-dumping");
+			$this->sgbackup->jobdata_set('db_completed_tables', $stitch_tables);
 			return 'needs_resumption';
+		}
+		if (!empty($failed_tables)) {
+			$relevant_failed = array_intersect($failed_tables, $tables);
+			if (!empty($relevant_failed)) {
+				$this->sgbackup->log("WARNING: " . count($relevant_failed) . " tables could not be dumped: " .
+					implode(', ', array_slice($relevant_failed, 0, 20)) .
+					(count($relevant_failed) > 20 ? '...' : ''), 'warning');
+			}
 		}
 
 		$this->sgbackup->log("Stitching {$dump_count}/" . count($tables) . " table dumps (" .
@@ -915,7 +939,7 @@ class SiteGuard_Backup_Engine {
 				SiteGuard_Backup_Filesystem::format_bytes($total_dump_size) . " in dumps", 'warning');
 		}
 
-		$result = $this->stitch_db_files($temp_dir, $db_path, $tables);
+		$result = $this->stitch_db_files($temp_dir, $db_path, $stitch_tables);
 
 		$db_backup_files = array();
 		if ($result) {
@@ -1051,11 +1075,33 @@ class SiteGuard_Backup_Engine {
 		}
 
 		$completed_tables = $this->sgbackup->jobdata_get('db_completed_tables', array());
+		$failed_tables = $this->sgbackup->jobdata_get('db_failed_tables', array());
 		$all_tables = $subsite_tables;
+
+		// Verify completed table dump files still exist on disk
+		if (!empty($completed_tables)) {
+			$valid_completed = array();
+			$orphaned = 0;
+			foreach ($completed_tables as $ct) {
+				$ct_file = $temp_dir . $ct . '.sql.gz';
+				clearstatcache(true, $ct_file);
+				if (file_exists($ct_file) && filesize($ct_file) > 0) {
+					$valid_completed[] = $ct;
+				} else {
+					$orphaned++;
+				}
+			}
+			if ($orphaned > 0) {
+				$this->sgbackup->log("Found {$orphaned} completed tables with missing dump files - will re-dump them");
+				$completed_tables = $valid_completed;
+				$this->sgbackup->jobdata_set('db_completed_tables', $completed_tables);
+			}
+		}
 
 		// Dump subsite tables
 		foreach ($subsite_tables as $table) {
 			if (in_array($table, $completed_tables)) continue;
+			if (in_array($table, $failed_tables)) continue;
 
 			$this->sgbackup->log("Backing up table: {$table}");
 			$table_file = $temp_dir . $table . '.sql.gz';
@@ -1070,6 +1116,10 @@ class SiteGuard_Backup_Engine {
 				SiteGuard_Backup_Job_Scheduler::something_useful_happened();
 			} else {
 				$this->sgbackup->log("Failed to backup table: {$table}", 'error');
+				if (!in_array($table, $failed_tables)) {
+					$failed_tables[] = $table;
+					$this->sgbackup->jobdata_set('db_failed_tables', $failed_tables);
+				}
 			}
 
 			$elapsed = microtime(true) - $this->sgbackup->job_time_ms;
@@ -1083,7 +1133,7 @@ class SiteGuard_Backup_Engine {
 			$users_table = $base_prefix . 'users';
 			$usermeta_table = $base_prefix . 'usermeta';
 
-			if (!in_array($users_table, $completed_tables)) {
+			if (!in_array($users_table, $completed_tables) && !in_array($users_table, $failed_tables)) {
 				$users_file = $temp_dir . $users_table . '.sql.gz';
 				$id_list = implode(',', array_map('intval', $user_ids));
 				$success = SiteGuard_Backup_Database_Utility::php_dump_table($users_table, $users_file, 1000, false, "ID IN ({$id_list})");
@@ -1091,10 +1141,16 @@ class SiteGuard_Backup_Engine {
 					$completed_tables[] = $users_table;
 					$this->sgbackup->jobdata_set('db_completed_tables', $completed_tables);
 					$this->sgbackup->log("Backed up {$users_table} (filtered: " . count($user_ids) . " users)");
+				} else {
+					$this->sgbackup->log("Failed to backup table: {$users_table}", 'error');
+					if (!in_array($users_table, $failed_tables)) {
+						$failed_tables[] = $users_table;
+						$this->sgbackup->jobdata_set('db_failed_tables', $failed_tables);
+					}
 				}
 			}
 
-			if (!in_array($usermeta_table, $completed_tables)) {
+			if (!in_array($usermeta_table, $completed_tables) && !in_array($usermeta_table, $failed_tables)) {
 				$usermeta_file = $temp_dir . $usermeta_table . '.sql.gz';
 				$id_list = implode(',', array_map('intval', $user_ids));
 				$success = SiteGuard_Backup_Database_Utility::php_dump_table($usermeta_table, $usermeta_file, 1000, false, "user_id IN ({$id_list})");
@@ -1102,12 +1158,38 @@ class SiteGuard_Backup_Engine {
 					$completed_tables[] = $usermeta_table;
 					$this->sgbackup->jobdata_set('db_completed_tables', $completed_tables);
 					$this->sgbackup->log("Backed up {$usermeta_table} (filtered: " . count($user_ids) . " users)");
+				} else {
+					$this->sgbackup->log("Failed to backup table: {$usermeta_table}", 'error');
+					if (!in_array($usermeta_table, $failed_tables)) {
+						$failed_tables[] = $usermeta_table;
+						$this->sgbackup->jobdata_set('db_failed_tables', $failed_tables);
+					}
 				}
 			}
 		}
 
 		// Stitch all per-table files into single .gz
 		$all_dump_tables = array_merge($subsite_tables, !empty($user_ids) ? array($base_prefix . 'users', $base_prefix . 'usermeta') : array());
+
+		// Pre-stitch verification: ensure all dump files exist
+		$dump_count = 0;
+		$unattempted = 0;
+		$valid_completed = array();
+		foreach ($all_dump_tables as $t) {
+			$tf = $temp_dir . $t . '.sql.gz';
+			if (file_exists($tf) && filesize($tf) > 0) {
+				$dump_count++;
+				$valid_completed[] = $t;
+			} elseif (!in_array($t, $failed_tables)) {
+				$unattempted++;
+			}
+		}
+		if ($unattempted > 0) {
+			$this->sgbackup->log("WARNING: {$unattempted}/" . count($all_dump_tables) . " subsite tables have no dump file - re-dumping");
+			$this->sgbackup->jobdata_set('db_completed_tables', $valid_completed);
+			return 'needs_resumption';
+		}
+
 		$this->sgbackup->log("Stitching subsite database backup into {$db_filename}");
 		$result = $this->stitch_db_files($temp_dir, $db_path, $all_dump_tables);
 
