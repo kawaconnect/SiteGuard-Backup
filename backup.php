@@ -304,6 +304,22 @@ class SiteGuard_Backup_Engine {
 		$zip_filename = $this->get_zip_filename($entity, $this->index);
 		$zip_path = $this->backup_dir . $zip_filename;
 
+		// Detect if another process is actively writing to this zip's temp file
+		$tmp_path = $zip_path . '.tmp';
+		if (file_exists($tmp_path)) {
+			clearstatcache(true, $tmp_path);
+			$tmp_mtime = filemtime($tmp_path);
+			$time_now = time();
+			if ($tmp_mtime > 100 && ($time_now - $tmp_mtime) < 30) {
+				$this->sgbackup->log("Zip temp file {$zip_filename}.tmp was modified " .
+					($time_now - $tmp_mtime) . "s ago - another process may be active. Backing off.");
+				SiteGuard_Backup_Job_Scheduler::terminate_due_to_activity(
+					"active zip temp file: {$zip_filename}", $time_now, $tmp_mtime
+				);
+				return 'needs_resumption';
+			}
+		}
+
 		$this->sgbackup->log("Creating zip: {$zip_filename}");
 
 		for ($i = $last_file_index; $i < count($files); $i++) {

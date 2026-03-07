@@ -811,9 +811,12 @@ class SiteGuard_Backup {
 		if ($resumption_no > 0 && !isset($useful_checkins[$resumption_no - 1])) {
 			$maxzipbatch = $this->jobdata_get('maxzipbatch', 26214400);
 			$new_batch = max(5242880, intval($maxzipbatch * 0.75)); // 75%, min 5MB
-			$this->jobdata_set('maxzipbatch', $new_batch);
-			$this->log("Previous resumption had no checkin - reduced maxzipbatch to " .
-				SiteGuard_Backup_Filesystem::format_bytes($new_batch));
+			if ($new_batch < $maxzipbatch) {
+				$this->jobdata_set('maxzipbatch', $new_batch);
+				$this->jobdata_set('maxzipbatch_ceiling', $new_batch);
+				$this->log("Previous resumption had no checkin - reduced maxzipbatch + ceiling to " .
+					SiteGuard_Backup_Filesystem::format_bytes($new_batch));
+			}
 		}
 
 		try {
@@ -858,8 +861,18 @@ class SiteGuard_Backup {
 	 * Perform the actual backup work for a resumption.
 	 */
 	private function do_backup_work($resumption_no, $semaphore) {
+		global $wpdb;
+
 		$backup_files = $this->jobdata_get('backup_files') === 'yes';
 		$backup_database = $this->jobdata_get('backup_database') === 'yes';
+
+		// Verify database connection is alive (can drop on Azure/long-running processes)
+		if (method_exists($wpdb, 'check_connection') && !$wpdb->check_connection(false)) {
+			$this->log("Database connection lost - scheduling retry in 60s", 'warning');
+			SiteGuard_Backup_Job_Scheduler::schedule_resumption($resumption_no, $this->nonce, 60);
+			SiteGuard_Backup_Job_Scheduler::record_still_alive();
+			return;
+		}
 
 		// Check disk space before starting (cPanel quota or disk_free_space)
 		$available_bytes = $this->check_cpanel_quota();
