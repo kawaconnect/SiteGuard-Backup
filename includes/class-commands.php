@@ -157,22 +157,38 @@ class SiteGuard_Backup_Commands {
 				}
 			}
 
-			// Get last log message for this job
+			// Get last meaningful log message for this job
 			$last_activity = isset($jobdata['last_activity']) ? $jobdata['last_activity'] : '';
 			$last_log_line = '';
 			$log_nonce = isset($jobdata['nonce']) ? $jobdata['nonce'] : $nonce;
 			$logfile = $sgbackup->get_logfile_name($log_nonce);
 			if (file_exists($logfile)) {
-				// Read last 512 bytes to find last log line
+				// Read last 1024 bytes to find last meaningful log line
 				$fh = @fopen($logfile, 'r');
 				if ($fh) {
+					clearstatcache(true, $logfile);
 					$fsize = filesize($logfile);
-					if ($fsize > 512) fseek($fh, -512, SEEK_END);
-					$tail = fread($fh, 512);
+					if ($fsize > 1024) fseek($fh, -1024, SEEK_END);
+					$tail = fread($fh, 1024);
 					fclose($fh);
 					$lines = explode("\n", trim($tail));
-					$last_log_line = end($lines);
+					// Skip noise lines to find the last useful message
+					for ($li = count($lines) - 1; $li >= 0; $li--) {
+						$l = trim($lines[$li]);
+						if (empty($l)) continue;
+						if (strpos($l, '=== Log closed') !== false) continue;
+						if (strpos($l, '=== Log opened') !== false) continue;
+						if (strpos($l, '=== Resumption') !== false) continue;
+						if (strpos($l, 'Memory:') !== false && strpos($l, 'MB') !== false && strlen($l) < 40) continue;
+						if (strpos($l, 'Scheduled resumption') !== false) continue;
+						$last_log_line = $l;
+						break;
+					}
 				}
+			}
+			// Prefer jobdata last_activity over log tail (more current between resumptions)
+			if (!empty($last_activity) && (empty($last_log_line) || strpos($last_log_line, 'Log closed') !== false)) {
+				$last_log_line = $last_activity;
 			}
 
 			// Collect error messages from jobdata

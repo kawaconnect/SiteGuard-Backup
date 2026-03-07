@@ -392,7 +392,21 @@
 				html += '<button type="button" class="sgbackup-abort-btn" data-nonce="' + SGB.esc(nonce) + '">Abort</button>';
 				html += '<div class="sgbackup-job-title">' + SGB.esc(job.job_type) + ' backup [' + SGB.esc(nonce) + ']</div>';
 				html += '<div class="sgbackup-job-phase">' + SGB.esc(job.phase || job.jobstatus) + (elapsed ? ' (' + elapsed + ')' : '') + '</div>';
-				if (job.last_log) {
+
+				// Show progress details (file count or table count)
+				var progressDetail = '';
+				if (job.files_total_count > 0 && !job.files_phase_complete) {
+					progressDetail = 'Files: ' + job.files_added_count + ' / ' + job.files_total_count;
+				} else if (job.db_tables_total > 0 && !job.db_phase_complete) {
+					progressDetail = 'Tables: ' + job.db_tables_done + ' / ' + job.db_tables_total;
+				}
+				if (progressDetail) {
+					html += '<div class="sgbackup-job-progress">' + SGB.esc(progressDetail) + '</div>';
+				}
+
+				if (job.last_activity) {
+					html += '<div class="sgbackup-job-log">' + SGB.esc(job.last_activity) + '</div>';
+				} else if (job.last_log) {
 					html += '<div class="sgbackup-job-log">' + SGB.esc(job.last_log) + '</div>';
 				}
 				html += '<div class="sgbackup-job-steps">' + steps.join(' &rarr; ') + '</div>';
