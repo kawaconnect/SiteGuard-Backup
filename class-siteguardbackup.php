@@ -1020,8 +1020,12 @@ class SiteGuard_Backup {
 			}
 		}
 
+		// Check for failed entities - mark backup as having errors
+		$failed_entities = $this->jobdata_get('failed_entities', array());
+		$has_entity_failures = !empty($failed_entities);
+
 		// All phases complete
-		$this->backup_finish(true, true);
+		$this->backup_finish(true, true, false, $has_entity_failures);
 	}
 
 	/**
@@ -1178,25 +1182,33 @@ class SiteGuard_Backup {
 	/**
 	 * Finalize a backup job.
 	 *
-	 * @param bool $do_cleanup   Whether to clean up job data.
-	 * @param bool $allow_email  Whether to send email report.
-	 * @param bool $force_abort  Whether this is an abort.
+	 * @param bool $do_cleanup        Whether to clean up job data.
+	 * @param bool $allow_email       Whether to send email report.
+	 * @param bool $force_abort       Whether this is an abort.
+	 * @param bool $has_entity_errors Whether any file entities failed.
 	 */
-	public function backup_finish($do_cleanup, $allow_email, $force_abort = false) {
+	public function backup_finish($do_cleanup, $allow_email, $force_abort = false, $has_entity_errors = false) {
 		if ($force_abort) {
 			$this->jobdata_set('jobstatus', 'aborted');
 			$this->log("Backup aborted");
 		} else {
-			$this->jobdata_set('jobstatus', 'complete');
-			$this->log("Backup complete");
+			if ($has_entity_errors) {
+				$failed = $this->jobdata_get('failed_entities', array());
+				$this->jobdata_set('jobstatus', 'warning');
+				$this->log("Backup finished with ERRORS - missing entities: " . implode(', ', $failed), 'error');
+			} else {
+				$this->jobdata_set('jobstatus', 'complete');
+				$this->log("Backup complete");
+			}
 
-			// Save to backup history
+			// Save to backup history (even with warnings, so partial backup is available)
 			$this->save_to_history();
 
 			SiteGuard_Backup_Webhook::fire('backup_complete', array(
 				'nonce'    => $this->nonce,
 				'job_type' => $this->jobdata_get('job_type', 'backup'),
 				'entities' => array_keys($this->jobdata_get('job_file_entities', array())),
+				'has_errors' => $has_entity_errors,
 			));
 		}
 
@@ -1384,8 +1396,15 @@ class SiteGuard_Backup {
 			$backup_data['manifest'] = $manifest_filename;
 		}
 
+		// Record failed entities so UI can show warnings
+		$failed_entities = $this->jobdata_get('failed_entities', array());
+		if (!empty($failed_entities)) {
+			$backup_data['failed_entities'] = $failed_entities;
+		}
+
 		SiteGuard_Backup_History::add_backup($this->backup_time, $backup_data);
-		$this->log("Saved to backup history. Size: " . SiteGuard_Backup_Filesystem::format_bytes($total_size));
+		$status_suffix = !empty($failed_entities) ? ' (INCOMPLETE - missing: ' . implode(', ', $failed_entities) . ')' : '';
+		$this->log("Saved to backup history. Size: " . SiteGuard_Backup_Filesystem::format_bytes($total_size) . $status_suffix);
 	}
 
 	/**

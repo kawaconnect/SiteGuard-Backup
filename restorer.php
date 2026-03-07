@@ -1145,7 +1145,7 @@ class SiteGuard_Backup_Restorer {
 
 		foreach ($iterator as $item) {
 			$target = $dest . DIRECTORY_SEPARATOR . $iterator->getSubPathname();
-			if ($item->isDir()) {
+			if ($item->isDir() || is_dir($item->getPathname())) {
 				if (!is_dir($target)) wp_mkdir_p($target);
 			} else {
 				@copy($item->getPathname(), $target);
@@ -1163,7 +1163,7 @@ class SiteGuard_Backup_Restorer {
 			RecursiveIteratorIterator::CHILD_FIRST
 		);
 		foreach ($files as $file) {
-			$file->isDir() ? @rmdir($file->getPathname()) : @unlink($file->getPathname());
+			($file->isDir() || is_dir($file->getPathname())) ? @rmdir($file->getPathname()) : @unlink($file->getPathname());
 		}
 		@rmdir($dir);
 	}
@@ -2481,7 +2481,7 @@ class SiteGuard_Backup_Restorer {
 			$relative = substr($item->getPathname(), strlen($source));
 			$target = $dest . $relative;
 
-			if ($item->isDir()) {
+			if ($item->isDir() || is_dir($item->getPathname())) {
 				if (!is_dir($target)) {
 					wp_mkdir_p($target);
 				}
@@ -2535,7 +2535,7 @@ class SiteGuard_Backup_Restorer {
 			RecursiveIteratorIterator::CHILD_FIRST
 		);
 		foreach ($iterator as $item) {
-			if ($item->isDir()) {
+			if ($item->isDir() || is_dir($item->getPathname())) {
 				@rmdir($item->getPathname());
 			} else {
 				@unlink($item->getPathname());

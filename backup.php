@@ -227,6 +227,11 @@ class SiteGuard_Backup_Engine {
 		$this->sgbackup->jobdata_set('files_enumerated_at', time());
 		$this->sgbackup->jobdata_set('backup_files_array', $backup_files_array);
 
+		// Store failed entities in jobdata so backup_finish can report them
+		if (!empty($failed_entities)) {
+			$this->sgbackup->jobdata_set('failed_entities', $failed_entities);
+		}
+
 		return true;
 	}
 
@@ -544,13 +549,21 @@ class SiteGuard_Backup_Engine {
 
 	/**
 	 * Close the persistent ZipArchive handle.
+	 *
+	 * @return bool True if close succeeded or no handle was open.
 	 */
 	public function close_ziparchive() {
 		if ($this->ziparchive_handle !== null) {
-			$this->ziparchive_handle->close();
+			$result = $this->ziparchive_handle->close();
+			$path = $this->ziparchive_path;
 			$this->ziparchive_handle = null;
 			$this->ziparchive_path = null;
+			if (!$result) {
+				$this->sgbackup->log("ZipArchive::close() failed for {$path} - zip may be corrupt", 'error');
+				return false;
+			}
 		}
+		return true;
 	}
 
 	private function recursive_rmdir($dir) {
@@ -566,7 +579,7 @@ class SiteGuard_Backup_Engine {
 			RecursiveIteratorIterator::CHILD_FIRST
 		);
 		foreach ($items as $item) {
-			$item->isDir() ? @rmdir($item->getPathname()) : @unlink($item->getPathname());
+			($item->isDir() || is_dir($item->getPathname())) ? @rmdir($item->getPathname()) : @unlink($item->getPathname());
 		}
 		@rmdir($dir);
 	}
@@ -1131,14 +1144,22 @@ class SiteGuard_Backup_Engine {
 			return false;
 		}
 
+		$write_error = false;
 		while (!feof($in)) {
-			$chunk = fread($in, 65536);
+			$chunk = fread($in, 262144);
 			if (false === $chunk) break;
-			gzwrite($out, $chunk);
+			$w = gzwrite($out, $chunk);
+			if (false === $w) { $write_error = true; break; }
 		}
 
 		fclose($in);
 		gzclose($out);
+
+		if ($write_error) {
+			$this->sgbackup->log("gzip_file: write failed for {$source}", 'error');
+			@unlink($dest);
+			return false;
+		}
 
 		return true;
 	}
@@ -1159,7 +1180,7 @@ class SiteGuard_Backup_Engine {
 			RecursiveIteratorIterator::CHILD_FIRST
 		);
 		foreach ($iterator as $item) {
-			if ($item->isDir()) {
+			if ($item->isDir() || is_dir($item->getPathname())) {
 				@rmdir($item->getPathname());
 			} else {
 				@unlink($item->getPathname());

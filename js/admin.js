@@ -306,7 +306,7 @@
 						self.pollTimer = null;
 						self._activeJobNonce = null;
 
-						// Check last known jobs for errors
+						// Check last known jobs for errors or warnings
 						var hadErrors = false;
 						$.each(self.lastKnownJobs, function(nonce, job) {
 							if (job.jobstatus === 'error' || job.jobstatus === 'failed' || job.jobstatus === 'aborted' || job.has_errors) {
@@ -318,6 +318,13 @@
 									errMsg = job.last_log;
 								}
 								self.showNotice(errMsg, 'error');
+							} else if (job.jobstatus === 'warning') {
+								hadErrors = true;
+								var warnMsg = 'Backup finished with errors - some entities failed. Check the log for details.';
+								if (job.errors && job.errors.length) {
+									warnMsg = job.errors[job.errors.length - 1];
+								}
+								self.showNotice(warnMsg, 'error');
 							}
 						});
 

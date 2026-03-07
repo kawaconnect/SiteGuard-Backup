@@ -85,7 +85,7 @@ class SiteGuard_Backup_Filesystem {
 		);
 
 		foreach ($iterator as $file) {
-			if ($file->isFile()) {
+			if ($file->isFile() && !is_dir($file->getPathname())) {
 				$size += $file->getSize();
 			}
 		}
@@ -200,14 +200,15 @@ class SiteGuard_Backup_Filesystem {
 			$name = $file->getFilename();
 
 			// Clean temp directories (ziptemp_*, dbtemp_*)
-			if ($file->isDir() && preg_match('/^(ziptemp_|dbtemp_)/', $name)) {
+			$is_directory = $file->isDir() || is_dir($file->getPathname());
+			if ($is_directory && preg_match('/^(ziptemp_|dbtemp_)/', $name)) {
 				if (($now - $file->getMTime()) > $max_age) {
 					self::rmdir_recursive($file->getPathname());
 				}
 				continue;
 			}
 
-			if ($file->isDir()) continue;
+			if ($is_directory) continue;
 
 			// Only clean temp files
 			if (preg_match('/\.(tmp|partial|gz\.tmp)$/', $name)) {
@@ -243,7 +244,7 @@ class SiteGuard_Backup_Filesystem {
 			RecursiveIteratorIterator::CHILD_FIRST
 		);
 		foreach ($items as $item) {
-			if ($item->isDir()) {
+			if ($item->isDir() || is_dir($item->getPathname())) {
 				@rmdir($item->getPathname());
 			} else {
 				@unlink($item->getPathname());
