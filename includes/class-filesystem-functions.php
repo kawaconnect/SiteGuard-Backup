@@ -118,6 +118,10 @@ class SiteGuard_Backup_Filesystem {
 			$iterator->setMaxDepth(32); // Prevent infinite loops from circular symlinks
 
 			foreach ($iterator as $item) {
+				// Skip directories - use is_dir() as primary check because
+				// SplFileInfo::isFile() incorrectly returns true for directories
+				// on CIFS/SMB mounts (Azure App Service, NAS storage, etc.)
+				if ($item->isDir() || is_dir($item->getPathname())) continue;
 				if (!$item->isFile() && !$item->isLink()) continue;
 
 				$full_path = $item->getPathname();

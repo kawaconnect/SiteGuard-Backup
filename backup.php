@@ -401,6 +401,9 @@ class SiteGuard_Backup_Engine {
 	 * @return bool
 	 */
 	private function add_to_zip($zip_path, $file_path, $archive_name, $file_size) {
+		// Guard against directories misreported as files (CIFS/SMB mounts)
+		if (is_dir($file_path)) return false;
+
 		$is_symlink = is_link($file_path);
 		$resolved = $is_symlink ? realpath($file_path) : $file_path;
 		if (false === $resolved || !file_exists($resolved) || !is_readable($resolved)) {
