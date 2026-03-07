@@ -780,6 +780,28 @@ class SiteGuard_Backup_Engine {
 			wp_mkdir_p($temp_dir);
 		}
 
+		// Verify completed table dump files still exist on disk.
+		// On Azure CIFS or after container restarts, temp files can vanish.
+		// Remove orphaned entries so those tables get re-dumped.
+		if (!empty($completed_tables)) {
+			$valid_completed = array();
+			$orphaned = 0;
+			foreach ($completed_tables as $ct) {
+				$ct_file = $temp_dir . $ct . '.sql.gz';
+				clearstatcache(true, $ct_file);
+				if (file_exists($ct_file) && filesize($ct_file) > 0) {
+					$valid_completed[] = $ct;
+				} else {
+					$orphaned++;
+				}
+			}
+			if ($orphaned > 0) {
+				$this->sgbackup->log("Found {$orphaned} completed tables with missing dump files - will re-dump them");
+				$completed_tables = $valid_completed;
+				$this->sgbackup->jobdata_set('db_completed_tables', $completed_tables);
+			}
+		}
+
 		// Try mysqldump first (only when anonymisation is not enabled, since mysqldump
 		// cannot apply per-row anonymisation)
 		$use_mysqldump = (!$anonymiser) && SiteGuard_Backup_Database_Utility::has_mysqldump();
@@ -867,6 +889,22 @@ class SiteGuard_Backup_Engine {
 				$dump_count++;
 			}
 		}
+		// Safety check: if many tables are missing dump files, re-dump them instead of stitching an incomplete backup
+		$missing_count = count($tables) - $dump_count;
+		if ($missing_count > 0 && $dump_count < count($tables)) {
+			$this->sgbackup->log("WARNING: {$missing_count}/" . count($tables) . " tables have no dump file - re-dumping missing tables");
+			// Clear completed_tables so missing ones get re-dumped on next resumption
+			$valid = array();
+			foreach ($tables as $t) {
+				$tf = $temp_dir . $t . '.sql.gz';
+				if (file_exists($tf) && filesize($tf) > 0) {
+					$valid[] = $t;
+				}
+			}
+			$this->sgbackup->jobdata_set('db_completed_tables', $valid);
+			return 'needs_resumption';
+		}
+
 		$this->sgbackup->log("Stitching {$dump_count}/" . count($tables) . " table dumps (" .
 			SiteGuard_Backup_Filesystem::format_bytes($total_dump_size) . " compressed) into {$db_filename}");
 
