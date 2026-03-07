@@ -221,6 +221,7 @@ class SiteGuard_Backup_Database_Utility {
 			}
 			@unlink($stderr_file);
 
+			clearstatcache(true, $outfile);
 			return (0 === $return && file_exists($outfile) && filesize($outfile) > 0);
 		} finally {
 			@unlink($opts_file);

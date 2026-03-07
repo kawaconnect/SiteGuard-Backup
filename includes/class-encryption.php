@@ -252,6 +252,7 @@ class SiteGuard_Backup_Encryption {
 
 		// We need to verify HMAC before trusting decrypted data
 		// First pass: collect all chunk data and compute HMAC
+		clearstatcache(true, $file);
 		$file_size = filesize($file);
 		$hmac_size = 32;
 		$data_end = $file_size - $hmac_size;

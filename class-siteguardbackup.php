@@ -1587,6 +1587,7 @@ class SiteGuard_Backup {
 
 			foreach ($all_files as $file) {
 				$fpath = $backup_dir . $file;
+				clearstatcache(true, $fpath);
 				$fsize = file_exists($fpath) ? filesize($fpath) : 0;
 				$total_size += $fsize;
 				$size_str = file_exists($fpath) ? SiteGuard_Backup_Filesystem::format_bytes($fsize) : '?';
@@ -2063,6 +2064,7 @@ class SiteGuard_Backup {
 
 		foreach ($all_files as $file) {
 			$path = $backup_dir . $file;
+			clearstatcache(true, $path);
 			$manifest['files'][] = array(
 				'name' => $file,
 				'size' => file_exists($path) ? filesize($path) : 0,

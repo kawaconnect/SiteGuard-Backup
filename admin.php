@@ -468,6 +468,7 @@ class SiteGuard_Backup_Admin {
 		));
 
 		// Clear output buffers for streaming
+		@set_time_limit(0);
 		while (ob_get_level()) ob_end_clean();
 
 		$safe_filename = preg_replace('/[^a-zA-Z0-9._\-]/', '_', basename($file));
@@ -620,6 +621,7 @@ class SiteGuard_Backup_Admin {
 						echo $chunk;
 						hash_update($ctx, $chunk);
 						$bytes_written += strlen($chunk);
+						flush();
 					}
 					fclose($fh);
 				}
@@ -850,6 +852,7 @@ class SiteGuard_Backup_Admin {
 		if (!move_uploaded_file($file['tmp_name'], $dest)) {
 			wp_send_json_error(array('message' => 'Failed to save uploaded file'));
 		}
+		clearstatcache(true, $dest);
 
 		// Handle bundle zip files (created by "Download" button)
 		if (strpos($filename, 'sgbackup_bundle_') === 0 && strtolower($ext) === 'zip') {
@@ -1183,6 +1186,7 @@ class SiteGuard_Backup_Admin {
 			if (empty($safe_name)) continue;
 
 			if (!$zip->extractTo($backup_dir, $entry)) continue;
+			clearstatcache(true, $backup_dir . $entry);
 			// Rename if sanitized name differs (with copy+unlink fallback for CIFS)
 			if ($safe_name !== $entry && file_exists($backup_dir . $entry)) {
 				if (!@rename($backup_dir . $entry, $backup_dir . $safe_name)) {

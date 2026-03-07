@@ -857,6 +857,7 @@ class SiteGuard_Backup_Engine {
 		SiteGuard_Backup_Database_Utility::dump_routines($extras_file);
 
 		// Log per-table dump stats and check disk space before stitching
+		clearstatcache();
 		$total_dump_size = 0;
 		$dump_count = 0;
 		foreach ($tables as $table) {
@@ -1119,6 +1120,7 @@ class SiteGuard_Backup_Engine {
 			if ($write_error) break;
 
 			$table_file = $temp_dir . $table . '.sql.gz';
+			clearstatcache(true, $table_file);
 			if (!file_exists($table_file)) {
 				$tables_skipped++;
 				continue;
@@ -1205,6 +1207,7 @@ class SiteGuard_Backup_Engine {
 		$this->sgbackup->log("Stitch complete: {$tables_stitched} tables, {$tables_skipped} skipped, " .
 			SiteGuard_Backup_Filesystem::format_bytes($bytes_written) . " uncompressed data");
 
+		clearstatcache(true, $output_path);
 		return file_exists($output_path) && filesize($output_path) > 0;
 	}
 

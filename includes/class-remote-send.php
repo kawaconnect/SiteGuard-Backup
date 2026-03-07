@@ -364,6 +364,7 @@ class SiteGuard_Backup_Remote_Send {
 			return new WP_Error('file_write', 'Failed to write chunk data.');
 		}
 
+		clearstatcache(true, $tmp_file);
 		$result = array(
 			'size'   => filesize($tmp_file),
 			'status' => 0, // 0 = incomplete
@@ -382,6 +383,7 @@ class SiteGuard_Backup_Remote_Send {
 			}
 
 			$result['status'] = 1; // 1 = complete
+			clearstatcache(true, $final_file);
 			$result['size'] = filesize($final_file);
 
 			// Register in backup history
@@ -411,10 +413,12 @@ class SiteGuard_Backup_Remote_Send {
 		$tmp_file = $backup_dir . $filename . '.tmp';
 		$final_file = $backup_dir . $filename;
 
+		clearstatcache(true, $final_file);
 		if (file_exists($final_file)) {
 			return array('size' => filesize($final_file), 'status' => 1);
 		}
 
+		clearstatcache(true, $tmp_file);
 		if (file_exists($tmp_file)) {
 			return array('size' => filesize($tmp_file), 'status' => 0);
 		}

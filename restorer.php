@@ -2969,6 +2969,7 @@ class SiteGuard_Backup_Restorer {
 			foreach ($tables as $table) {
 				$table_file = $temp_dir . $table . '.sql.gz';
 				$result = SiteGuard_Backup_Database_Utility::php_dump_table($table, $table_file);
+				clearstatcache(true, $table_file);
 				if (!$result || !file_exists($table_file) || filesize($table_file) === 0) {
 					$this->sgbackup->log("Pre-restore backup: skipping table {$table} (dump failed)", 'warning');
 					@unlink($table_file);
@@ -2996,6 +2997,7 @@ class SiteGuard_Backup_Restorer {
 			// Clean up temp dir
 			SiteGuard_Backup_Filesystem::rmdir_recursive($temp_dir);
 
+			clearstatcache(true, $db_path);
 			if (file_exists($db_path) && filesize($db_path) > 0) {
 				$backup_data = array(
 					'nonce'       => $nonce,
