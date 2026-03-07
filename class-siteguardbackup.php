@@ -907,7 +907,7 @@ class SiteGuard_Backup {
 		if ($backup_files) {
 			$files_status = $this->jobdata_get('files_phase_complete', false);
 			if (!$files_status) {
-				$this->log("Starting file backup phase");
+				if ($resumption_no === 0) $this->log("Starting file backup phase");
 				require_once SGBACKUP_DIR . 'backup.php';
 				$engine = new SiteGuard_Backup_Engine($this);
 				$result = $engine->backup_files();

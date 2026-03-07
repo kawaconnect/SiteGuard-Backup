@@ -176,7 +176,10 @@ class SiteGuard_Backup_Engine {
 		foreach ($entities as $entity => $info) {
 			if (isset($info['status']) && $info['status'] === 'complete') continue;
 
-			$this->sgbackup->log("Backing up entity: {$entity}");
+			$is_continuation = isset($info['status']) && $info['status'] === 'partial';
+			if (!$is_continuation) {
+				$this->sgbackup->log("Backing up entity: {$entity}");
+			}
 			$this->index = isset($info['index']) ? $info['index'] : 0;
 			$this->zipfiles_added = 0;
 			$this->zipfiles_batched = 0;
@@ -266,7 +269,10 @@ class SiteGuard_Backup_Engine {
 
 		// Enumerate files
 		$files = SiteGuard_Backup_Filesystem::enumerate_files($source_path, $excludes, $altered_since);
-		$this->sgbackup->log("Enumerated " . count($files) . " files in {$entity}");
+		$last_index = $this->sgbackup->jobdata_get("entity_{$entity}_last_file_index", 0);
+		if ($last_index === 0) {
+			$this->sgbackup->log("Enumerated " . count($files) . " files in {$entity}");
+		}
 
 		if (empty($files)) return true;
 
@@ -298,6 +304,16 @@ class SiteGuard_Backup_Engine {
 		$maxbatch = $this->sgbackup->jobdata_get('maxzipbatch', 26214400);
 		$maxbatch_ceiling = $this->sgbackup->jobdata_get('maxzipbatch_ceiling', 209715200);
 
+		// On hosts with generous execution time (>= 300s), increase batch limits.
+		// The default 25MB was designed for shared hosting with 30s timeouts.
+		// ZipArchive stores paths (not data), so memory is not the concern -
+		// only disk I/O time during close() matters.
+		$max_exec = (int) ini_get('max_execution_time');
+		if ($max_exec <= 0 || $max_exec >= 300) {
+			$maxbatch = max($maxbatch, 104857600);        // 100MB min
+			$maxbatch_ceiling = max($maxbatch_ceiling, 209715200); // 200MB ceiling
+		}
+
 		// Resume from last file index if partial
 		$last_file_index = $this->sgbackup->jobdata_get("entity_{$entity}_last_file_index", 0);
 
@@ -321,7 +337,9 @@ class SiteGuard_Backup_Engine {
 		}
 
 		$total_files = count($files);
-		$this->sgbackup->log("Creating zip: {$zip_filename}");
+		if ($last_file_index === 0) {
+			$this->sgbackup->log("Creating zip: {$zip_filename}");
+		}
 
 		// Set progress immediately so the UI shows counts from the start
 		$this->sgbackup->jobdata_set('files_added_count', $last_file_index);
