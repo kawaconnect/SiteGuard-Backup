@@ -57,14 +57,16 @@ class SiteGuard_Backup_Remote_Send {
 			return;
 		}
 
-		// Rate limiting: max 60 requests per minute per IP
+		// Rate limiting: max 600 requests per minute per IP.
+		// Backup transfers send many chunks (100MB file / 2MB chunk = 50 requests per file),
+		// so the limit must accommodate multi-file transfers in a single resumption window.
 		// Use CF-Connecting-IP behind Cloudflare, fall back to REMOTE_ADDR
 		$ip = isset($_SERVER['HTTP_CF_CONNECTING_IP'])
 			? sanitize_text_field($_SERVER['HTTP_CF_CONNECTING_IP'])
 			: (isset($_SERVER['REMOTE_ADDR']) ? sanitize_text_field($_SERVER['REMOTE_ADDR']) : 'unknown');
 		$rate_key = 'sgbackup_rpc_rate_' . md5($ip);
 		$rate_count = (int) get_transient($rate_key);
-		if ($rate_count >= 60) {
+		if ($rate_count >= 600) {
 			wp_send_json_error(array('message' => 'Rate limit exceeded. Try again later.'));
 			return;
 		}
@@ -160,13 +162,13 @@ class SiteGuard_Backup_Remote_Send {
 		if (empty($_SERVER['HTTP_X_SGBACKUP_RPC'])) return;
 		if (empty($_POST['encrypted']) || empty($_POST['key'])) return;
 
-		// Rate limiting
+		// Rate limiting (shares counter with authenticated path above)
 		$ip = isset($_SERVER['HTTP_CF_CONNECTING_IP'])
 			? sanitize_text_field($_SERVER['HTTP_CF_CONNECTING_IP'])
 			: (isset($_SERVER['REMOTE_ADDR']) ? sanitize_text_field($_SERVER['REMOTE_ADDR']) : 'unknown');
 		$rate_key = 'sgbackup_rpc_rate_' . md5($ip);
 		$rate_count = (int) get_transient($rate_key);
-		if ($rate_count >= 60) {
+		if ($rate_count >= 600) {
 			wp_send_json_error(array('message' => 'Rate limit exceeded. Try again later.'));
 			return;
 		}
