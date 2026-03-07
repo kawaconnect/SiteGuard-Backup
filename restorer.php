@@ -73,6 +73,9 @@ class SiteGuard_Backup_Restorer {
 	/** @var array Custom subsite domain mapping: old_domain => new_domain */
 	private $subsite_map = array();
 
+	/** @var bool Keep original protocol (skip HTTP/HTTPS conversion) */
+	private $keep_protocol = false;
+
 	/** @var bool Whether to include unspecified tables in restore */
 	private $include_unspecified_tables = true;
 
@@ -155,6 +158,11 @@ class SiteGuard_Backup_Restorer {
 		}
 		if (isset($restore_options['include_unspecified_themes'])) {
 			$this->include_unspecified_themes = (bool) $restore_options['include_unspecified_themes'];
+		}
+
+		// Keep original protocol (skip HTTP/HTTPS conversion)
+		if (!empty($restore_options['keep_protocol'])) {
+			$this->keep_protocol = true;
 		}
 
 		// Detect subsite backup from metadata
@@ -1535,6 +1543,21 @@ class SiteGuard_Backup_Restorer {
 		$current_home = $this->pre_import_home;
 		$current_content = $this->pre_import_content_url;
 		$current_uploads = $this->pre_import_uploads_url;
+
+		// Keep original protocol: rewrite destination URLs to use the source scheme
+		if ($this->keep_protocol && !empty($this->old_siteurl)) {
+			$old_scheme = parse_url($this->old_siteurl, PHP_URL_SCHEME);
+			$new_scheme = parse_url($current_siteurl, PHP_URL_SCHEME);
+			if ($old_scheme && $new_scheme && $old_scheme !== $new_scheme) {
+				$this->sgbackup->log("Keep-protocol: rewriting destination URLs from {$new_scheme} to {$old_scheme}");
+				$current_siteurl = preg_replace('/^' . preg_quote($new_scheme, '/') . '/', $old_scheme, $current_siteurl);
+				$current_home = preg_replace('/^' . preg_quote($new_scheme, '/') . '/', $old_scheme, $current_home);
+				if ($current_content) $current_content = preg_replace('/^' . preg_quote($new_scheme, '/') . '/', $old_scheme, $current_content);
+				if ($current_uploads) $current_uploads = preg_replace('/^' . preg_quote($new_scheme, '/') . '/', $old_scheme, $current_uploads);
+				// Also update pre_import_siteurl so build_multisite_replacements uses the kept protocol
+				$this->pre_import_siteurl = $current_siteurl;
+			}
+		}
 
 		$search = array();
 		$replace = array();

@@ -1076,6 +1076,7 @@
 						} else if (oldScheme === 'https' && newScheme === 'http') {
 							warnings.push('Security downgrade: HTTPS to HTTP. Data will be transmitted unencrypted.');
 						}
+						warnings.push('<label><input type="checkbox" id="sgbackup-keep-protocol" value="1" /> Keep original protocol (' + oldScheme.toUpperCase() + ') - do not convert URLs to ' + newScheme.toUpperCase() + '</label>');
 					}
 
 					// Multisite blog mapping
@@ -1242,6 +1243,11 @@
 
 			// Subsite mode (already captured above, before divs were hidden)
 			formData.append('subsite_mode', subsiteMode || '0');
+
+			// Keep original protocol (skip HTTP/HTTPS conversion)
+			if ($('#sgbackup-keep-protocol').is(':checked')) {
+				formData.append('keep_protocol', '1');
+			}
 
 			// Collect subsite mapping for custom mode or mirror-mode skips
 			if (subsiteMode === '3') {
