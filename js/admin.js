@@ -1076,7 +1076,8 @@
 						} else if (oldScheme === 'https' && newScheme === 'http') {
 							warnings.push('Security downgrade: HTTPS to HTTP. Data will be transmitted unencrypted.');
 						}
-						warnings.push('<label><input type="checkbox" id="sgbackup-keep-protocol" value="1" /> Keep original protocol (' + oldScheme.toUpperCase() + ') - do not convert URLs to ' + newScheme.toUpperCase() + '</label>');
+						var keepChecked = sgbackup_settings.default_keep_protocol ? ' checked' : '';
+						warnings.push('<label><input type="checkbox" id="sgbackup-keep-protocol" value="1"' + keepChecked + ' /> Keep original protocol (' + oldScheme.toUpperCase() + ') - do not convert URLs to ' + newScheme.toUpperCase() + '</label>');
 					}
 
 					// Multisite blog mapping

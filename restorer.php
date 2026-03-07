@@ -160,9 +160,11 @@ class SiteGuard_Backup_Restorer {
 			$this->include_unspecified_themes = (bool) $restore_options['include_unspecified_themes'];
 		}
 
-		// Keep original protocol (skip HTTP/HTTPS conversion)
-		if (!empty($restore_options['keep_protocol'])) {
-			$this->keep_protocol = true;
+		// Keep original protocol (skip HTTP/HTTPS conversion) - per-restore or saved default
+		if (isset($restore_options['keep_protocol'])) {
+			$this->keep_protocol = !empty($restore_options['keep_protocol']);
+		} else {
+			$this->keep_protocol = !empty(SiteGuard_Backup_Options::instance()->get_option('sgbackup_default_keep_protocol', 0));
 		}
 
 		// Detect subsite backup from metadata

@@ -360,6 +360,11 @@ class SiteGuard_Backup_CLI_Command extends WP_CLI_Command {
             }
         }
 
+        // Keep original protocol
+        if (isset($assoc_args['keep-protocol'])) {
+            $restore_options['keep_protocol'] = true;
+        }
+
         WP_CLI::confirm('This will restore the backup. Continue?');
 
         WP_CLI::log('Starting restore...');

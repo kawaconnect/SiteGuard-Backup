@@ -293,6 +293,16 @@ $period_labels = array(
 			</td>
 		</tr>
 		<?php endif; ?>
+		<tr>
+			<th><?php esc_html_e('Keep Original Protocol', 'siteguardbackup'); ?></th>
+			<td>
+				<label>
+					<input type="checkbox" name="default_keep_protocol" value="1" <?php checked(!empty($settings['default_keep_protocol'])); ?> />
+					<?php esc_html_e('Do not convert HTTP/HTTPS during migration restores', 'siteguardbackup'); ?>
+				</label>
+				<p class="description"><?php esc_html_e('When restoring a backup from a site with a different protocol, keep the original protocol instead of converting URLs. Useful when the destination does not have SSL configured.', 'siteguardbackup'); ?></p>
+			</td>
+		</tr>
 		<tr class="sgbackup-anonymise-mode-row" style="<?php echo empty($settings['db_anonymise']) ? 'display:none;' : ''; ?>">
 			<th><?php esc_html_e('Anonymisation Mode', 'siteguardbackup'); ?></th>
 			<td>

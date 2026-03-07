@@ -141,6 +141,7 @@ class SiteGuard_Backup_Admin {
 			'current_blog_id' => get_current_blog_id(),
 			'default_db_restore_mode' => intval(SiteGuard_Backup_Options::instance()->get_option('sgbackup_default_db_restore_mode', 0)),
 			'default_subsite_mode' => intval(SiteGuard_Backup_Options::instance()->get_option('sgbackup_default_subsite_mode', 0)),
+			'default_keep_protocol' => intval(SiteGuard_Backup_Options::instance()->get_option('sgbackup_default_keep_protocol', 0)),
 			'configured_methods' => $this->get_configured_methods(),
 			'strings'   => array(
 				'backup_started'   => __('Backup started...', 'siteguardbackup'),

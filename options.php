@@ -296,6 +296,7 @@ class SiteGuard_Backup_Options {
 			'failover_production_url' => '',
 			'default_db_restore_mode' => 0,
 			'default_subsite_mode' => 0,
+			'default_keep_protocol' => 0,
 		);
 	}
 

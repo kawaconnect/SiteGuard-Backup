@@ -400,6 +400,7 @@ class SiteGuard_Backup_Commands {
 			'db_anonymise', 'db_anonymise_mode',
 			'default_db_restore_mode',
 			'default_subsite_mode',
+			'default_keep_protocol',
 			'extra_dirs', 'max_incrementals_before_full',
 			'ssl_disableverify', 'ssl_useservercerts',
 			'auto_update',
@@ -589,7 +590,7 @@ class SiteGuard_Backup_Commands {
 			if (isset($params[$key])) {
 				$value = $params[$key];
 				// Sanitize
-				if (in_array($key, array('retain', 'retain_db', 'split_every', 'max_split', 'delete_local', 'debug_mode', 'encryption_enabled', 'syslog_enabled', 'lock_admin', 'lock_admin_session_length', 'backupdb_nonwp', 'db_anonymise', 'max_incrementals_before_full', 'ssl_disableverify', 'ssl_useservercerts', 'auto_update', 'encrypt_credentials', 'failover_enabled', 'default_db_restore_mode', 'default_subsite_mode'))) {
+				if (in_array($key, array('retain', 'retain_db', 'split_every', 'max_split', 'delete_local', 'debug_mode', 'encryption_enabled', 'syslog_enabled', 'lock_admin', 'lock_admin_session_length', 'backupdb_nonwp', 'db_anonymise', 'max_incrementals_before_full', 'ssl_disableverify', 'ssl_useservercerts', 'auto_update', 'encrypt_credentials', 'failover_enabled', 'default_db_restore_mode', 'default_subsite_mode', 'default_keep_protocol'))) {
 					$value = intval($value);
 				} elseif ($key === 'email') {
 					$value = sanitize_email($value);
@@ -885,6 +886,9 @@ class SiteGuard_Backup_Commands {
 		}
 		if (!empty($params['pre_restore_backup'])) {
 			$restore_options['pre_restore_backup'] = true;
+		}
+		if (!empty($params['keep_protocol'])) {
+			$restore_options['keep_protocol'] = true;
 		}
 
 		// Gap 25: Include-unspecified options
