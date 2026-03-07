@@ -201,7 +201,7 @@ class SiteGuard_Backup_Engine {
 				$entities[$entity]['status'] = 'complete';
 				$this->sgbackup->log("Entity {$entity} complete (no files to backup)");
 			} else {
-				$this->sgbackup->log("Entity {$entity} failed", 'error');
+				$this->sgbackup->log("Entity {$entity} FAILED - backup will be incomplete!", 'error');
 				$entities[$entity]['status'] = 'error';
 			}
 
@@ -209,6 +209,18 @@ class SiteGuard_Backup_Engine {
 			// Persist after each entity so files aren't lost on resumption
 			$this->sgbackup->jobdata_set('backup_files_array', $backup_files_array);
 			SiteGuard_Backup_Job_Scheduler::something_useful_happened();
+		}
+
+		// Check for any failed entities
+		$failed_entities = array();
+		foreach ($entities as $ent_name => $ent_info) {
+			if (isset($ent_info['status']) && $ent_info['status'] === 'error') {
+				$failed_entities[] = $ent_name;
+			}
+		}
+		if (!empty($failed_entities)) {
+			$this->sgbackup->log("WARNING: " . count($failed_entities) . " entity/entities failed: " .
+				implode(', ', $failed_entities) . " - backup is INCOMPLETE", 'error');
 		}
 
 		// Record enumeration time for incremental reference
@@ -389,9 +401,9 @@ class SiteGuard_Backup_Engine {
 	 * @return bool
 	 */
 	private function add_to_zip($zip_path, $file_path, $archive_name, $file_size) {
-		// Resolve symlinks to get the real file
-		$resolved = is_link($file_path) ? realpath($file_path) : $file_path;
-		if (!file_exists($resolved) || !is_readable($resolved)) {
+		$is_symlink = is_link($file_path);
+		$resolved = $is_symlink ? realpath($file_path) : $file_path;
+		if (false === $resolved || !file_exists($resolved) || !is_readable($resolved)) {
 			if (!isset($this->_zip_skip_logged)) $this->_zip_skip_logged = 0;
 			if ($this->_zip_skip_logged < 3) {
 				$this->sgbackup->log("Zip skip: file not found/readable: {$file_path}", 'warning');
@@ -399,16 +411,20 @@ class SiteGuard_Backup_Engine {
 			}
 			return false;
 		}
-		// Verify resolved symlink stays within ABSPATH to prevent directory escape
-		$real_resolved = realpath($resolved);
-		$real_abspath = realpath(ABSPATH);
-		if ($real_resolved && $real_abspath && strpos($real_resolved, $real_abspath) !== 0) {
-			if (!isset($this->_zip_abspath_logged)) $this->_zip_abspath_logged = 0;
-			if ($this->_zip_abspath_logged < 3) {
-				$this->sgbackup->log("Zip skip: resolved path outside ABSPATH: {$real_resolved} (ABSPATH={$real_abspath})", 'warning');
-				$this->_zip_abspath_logged++;
+		// Only check ABSPATH containment for actual symlinks - regular files inside
+		// symlinked parent directories (e.g. uploads on a separate mount) are safe
+		// because they were found by iterating from a known WordPress entity path.
+		if ($is_symlink) {
+			$real_resolved = realpath($resolved);
+			$real_abspath = realpath(ABSPATH);
+			if ($real_resolved && $real_abspath && strpos($real_resolved, $real_abspath) !== 0) {
+				if (!isset($this->_zip_abspath_logged)) $this->_zip_abspath_logged = 0;
+				if ($this->_zip_abspath_logged < 3) {
+					$this->sgbackup->log("Zip skip: symlink target outside ABSPATH: {$real_resolved} (ABSPATH={$real_abspath})", 'warning');
+					$this->_zip_abspath_logged++;
+				}
+				return false;
 			}
-			return false;
 		}
 		$file_path = $resolved;
 
