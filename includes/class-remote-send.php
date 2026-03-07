@@ -316,25 +316,32 @@ class SiteGuard_Backup_Remote_Send {
 		$tmp_file = $backup_dir . $filename . '.tmp';
 		$final_file = $backup_dir . $filename;
 
-		// Use database-backed lock instead of flock() - CIFS/SMB mounts
+		// Atomic database-backed lock instead of flock() - CIFS/SMB mounts
 		// (Azure App Service, NAS) don't support POSIX file locking.
+		// Uses INSERT ... ON DUPLICATE KEY UPDATE for atomicity (no TOCTOU race).
+		global $wpdb;
 		$chunk_lock_key = 'sgbackup_chunk_' . md5($filename);
-		$lock_acquired = false;
-		for ($attempt = 0; $attempt < 5; $attempt++) {
-			if (false === get_transient($chunk_lock_key)) {
-				set_transient($chunk_lock_key, time(), 30);
-				$lock_acquired = true;
-				break;
-			}
-			usleep(200000); // 200ms
-		}
-		if (!$lock_acquired) {
+		$lock_value = wp_generate_password(12, false);
+		$now = time();
+		$wpdb->query($wpdb->prepare(
+			"INSERT INTO {$wpdb->options} (option_name, option_value, autoload)
+			 VALUES (%s, %s, 'no')
+			 ON DUPLICATE KEY UPDATE option_value = IF(
+			   CAST(SUBSTRING_INDEX(option_value, '|', -1) AS UNSIGNED) < %d,
+			   VALUES(option_value), option_value
+			 )",
+			$chunk_lock_key, $lock_value . '|' . $now, $now - 30
+		));
+		wp_cache_delete($chunk_lock_key, 'options');
+		$check = get_option($chunk_lock_key);
+		$check_val = is_string($check) ? substr($check, 0, strrpos($check, '|')) : '';
+		if ($check_val !== $lock_value) {
 			return new WP_Error('file_lock', 'Cannot acquire chunk write lock.');
 		}
 
 		$fh = fopen($tmp_file, 'c+b');
 		if (!$fh) {
-			delete_transient($chunk_lock_key);
+			delete_option($chunk_lock_key);
 			return new WP_Error('file_open', 'Cannot open temp file for writing.');
 		}
 
@@ -344,7 +351,7 @@ class SiteGuard_Backup_Remote_Send {
 		if ($expected_offset === false) $expected_offset = 0;
 		if ($start !== $expected_offset) {
 			fclose($fh);
-			delete_transient($chunk_lock_key);
+			delete_option($chunk_lock_key);
 			return new WP_Error('out_of_sequence', sprintf('Out-of-sequence write: expected offset %d but got %d.', $expected_offset, $start));
 		}
 

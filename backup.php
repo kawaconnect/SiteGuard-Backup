@@ -1079,10 +1079,14 @@ class SiteGuard_Backup_Engine {
 
 			$tables_stitched++;
 
-			// Log progress every 50 tables
+			// Reset time limit per table to prevent timeout during large stitches
+			@set_time_limit(SGBACKUP_SET_TIME_LIMIT);
+
+			// Log progress every 50 tables and signal activity
 			if ($tables_stitched % 50 === 0) {
 				$this->sgbackup->log("Stitch progress: {$tables_stitched} tables, " .
 					SiteGuard_Backup_Filesystem::format_bytes($bytes_written) . " uncompressed written");
+				SiteGuard_Backup_Job_Scheduler::something_useful_happened();
 			}
 		}
 

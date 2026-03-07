@@ -13,8 +13,9 @@ class SiteGuard_Backup_Search_Replace {
 	/** @var int Maximum recursion depth */
 	private $max_recursion = 20;
 
-	/** @var int Page size for batched processing */
-	private $page_size = 5000;
+	/** @var int Page size for batched processing (kept conservative for tables
+	 *  with wide rows like wp_posts with page builder content on memory-limited hosts) */
+	private $page_size = 1000;
 
 	/** @var array Report statistics */
 	private $report;
