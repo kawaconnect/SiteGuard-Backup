@@ -67,6 +67,7 @@
 			this.bindMassActions();
 			this.bindPagination();
 			this.bindUploadToRemote();
+			this.bindDownloadAll();
 			this.bindRescan();
 			this.bindSiteSize();
 			this.bindDbSize();
@@ -2446,6 +2447,29 @@
 			});
 		},
 
+		// ===== Download All =====
+		bindDownloadAll: function() {
+			$(document).on('click', '.sgbackup-download-all-btn', function() {
+				var files = $(this).data('files');
+				var nonce = $(this).data('nonce');
+				if (!files || !files.length) return;
+
+				// Download each file with a small delay so the browser doesn't block multiple downloads
+				var baseUrl = sgbackup_settings.ajax_url + '?action=sgbackup_download&_wpnonce=' + encodeURIComponent(nonce) + '&file=';
+				$.each(files, function(i, file) {
+					setTimeout(function() {
+						var link = document.createElement('a');
+						link.href = baseUrl + encodeURIComponent(file);
+						link.download = file;
+						link.style.display = 'none';
+						document.body.appendChild(link);
+						link.click();
+						document.body.removeChild(link);
+					}, i * 500); // 500ms between each to avoid browser blocking
+				});
+			});
+		},
+
 		// ===== Gap 37: Upload to Remote =====
 		bindUploadToRemote: function() {
 			var self = this;
@@ -2453,15 +2477,37 @@
 			$(document).on('click', '.sgbackup-upload-remote-btn', function() {
 				var timestamp = $(this).data('timestamp');
 
-				// Build a modal with checkboxes for each configured storage method
-				var methods = ['email', 'ftp', 'sftp', 's3', 'googledrive', 'dropbox', 'onedrive', 'webdav', 'azure', 'gcs', 'pcloud'];
+				// Only show methods that are actually configured (have settings saved)
+				var allMethods = {
+					's3': 'Amazon S3',
+					's3generic': 'S3-Compatible',
+					'googledrive': 'Google Drive',
+					'dropbox': 'Dropbox',
+					'onedrive': 'OneDrive',
+					'azure': 'Microsoft Azure',
+					'gcs': 'Google Cloud Storage',
+					'pcloud': 'pCloud',
+					'ftp': 'FTP',
+					'sftp': 'SFTP / SCP',
+					'webdav': 'WebDAV',
+					'openstack': 'OpenStack',
+					'email': 'Email'
+				};
+				// Get configured methods from localized settings
+				var configured = sgbackup_settings.configured_methods || [];
 				var html = '<div id="sgbackup-upload-remote-dialog" title="Upload to Remote Storage">';
-				html += '<p>Select storage destinations:</p>';
-				for (var i = 0; i < methods.length; i++) {
-					html += '<label style="display:block;margin:4px 0;">';
-					html += '<input type="checkbox" class="sgbackup-remote-method-check" value="' + SGB.esc(methods[i]) + '" /> ';
-					html += SGB.esc(methods[i].charAt(0).toUpperCase() + methods[i].slice(1));
-					html += '</label>';
+				if (configured.length === 0) {
+					html += '<p>No remote storage methods are configured. Go to Settings to set one up.</p>';
+				} else {
+					html += '<p>Select storage destinations:</p>';
+					for (var i = 0; i < configured.length; i++) {
+						var m = configured[i];
+						var label = allMethods[m] || m;
+						html += '<label style="display:block;margin:4px 0;">';
+						html += '<input type="checkbox" class="sgbackup-remote-method-check" value="' + SGB.esc(m) + '" /> ';
+						html += SGB.esc(label);
+						html += '</label>';
+					}
 				}
 				html += '<div id="sgbackup-upload-remote-status" class="sgbackup-status" style="margin-top:10px;"></div>';
 				html += '</div>';

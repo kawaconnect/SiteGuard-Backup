@@ -85,6 +85,26 @@ if (empty($history)): ?>
 			</td>
 			<?php endforeach; ?>
 			<td class="sgbackup-actions">
+				<?php
+				// Build "Download All" URL list for this backup
+				$dl_files = array();
+				foreach (array('db', 'plugins', 'themes', 'uploads', 'others', 'wpcore') as $_dl_ent) {
+					if (!empty($backup[$_dl_ent])) {
+						$_dl_arr = is_array($backup[$_dl_ent]) ? $backup[$_dl_ent] : array($backup[$_dl_ent]);
+						foreach ($_dl_arr as $_dl_f) {
+							if (file_exists($backup_dir . $_dl_f)) {
+								$dl_files[] = $_dl_f;
+							}
+						}
+					}
+				}
+				if (!empty($dl_files)): ?>
+				<a href="<?php echo esc_url(admin_url('admin-ajax.php') . '?action=sgbackup_download_bundle&timestamp=' . intval($timestamp) . '&_wpnonce=' . wp_create_nonce('sgbackup-download')); ?>"
+				   class="button button-small button-primary"
+				   title="<?php esc_attr_e('Download complete backup as a single file (can be uploaded to another site)', 'siteguardbackup'); ?>">
+					<?php esc_html_e('Download', 'siteguardbackup'); ?>
+				</a>
+				<?php endif; ?>
 				<button type="button" class="button button-small sgbackup-restore-btn" data-timestamp="<?php echo esc_attr($timestamp); ?>">
 					<?php esc_html_e('Restore', 'siteguardbackup'); ?>
 				</button>
@@ -96,9 +116,6 @@ if (empty($history)): ?>
 				</button>
 				<button type="button" class="button button-small sgbackup-keep-btn" data-timestamp="<?php echo esc_attr($timestamp); ?>" data-keep="<?php echo !empty($backup['always_keep']) ? '1' : '0'; ?>">
 					<?php echo !empty($backup['always_keep']) ? esc_html__('Unkeep', 'siteguardbackup') : esc_html__('Keep', 'siteguardbackup'); ?>
-				</button>
-				<button type="button" class="button button-small sgbackup-verify-btn" data-timestamp="<?php echo esc_attr($timestamp); ?>">
-					<?php esc_html_e('Verify', 'siteguardbackup'); ?>
 				</button>
 				<button type="button" class="button button-small sgbackup-upload-remote-btn" data-timestamp="<?php echo esc_attr($timestamp); ?>">
 					<?php esc_html_e('Upload to Remote', 'siteguardbackup'); ?>

@@ -31,6 +31,7 @@ class SiteGuard_Backup_Admin {
 		add_action('admin_enqueue_scripts', array($this, 'enqueue_scripts'));
 		add_action('wp_ajax_sgbackup_ajax', array($this, 'ajax_handler'));
 		add_action('wp_ajax_sgbackup_download', array($this, 'ajax_download'));
+		add_action('wp_ajax_sgbackup_download_bundle', array($this, 'ajax_download_bundle'));
 		add_action('wp_ajax_sgbackup_restore', array($this, 'ajax_restore'));
 		add_action('wp_ajax_sgbackup_upload', array($this, 'ajax_upload'));
 		add_action('wp_ajax_sgbackup_oauth_callback', array($this, 'ajax_oauth_callback'));
@@ -136,6 +137,7 @@ class SiteGuard_Backup_Admin {
 			'current_blog_id' => get_current_blog_id(),
 			'default_db_restore_mode' => intval(SiteGuard_Backup_Options::instance()->get_option('sgbackup_default_db_restore_mode', 0)),
 			'default_subsite_mode' => intval(SiteGuard_Backup_Options::instance()->get_option('sgbackup_default_subsite_mode', 0)),
+			'configured_methods' => $this->get_configured_methods(),
 			'strings'   => array(
 				'backup_started'   => __('Backup started...', 'siteguardbackup'),
 				'backup_complete'  => __('Backup complete!', 'siteguardbackup'),
@@ -487,6 +489,93 @@ class SiteGuard_Backup_Admin {
 	}
 
 	/**
+	 * Download all backup files for a timestamp as a single zip bundle.
+	 */
+	public function ajax_download_bundle() {
+		if (!$this->verify_ajax('GET', 'sgbackup-download')) wp_die();
+
+		$timestamp = isset($_GET['timestamp']) ? intval($_GET['timestamp']) : 0;
+		if (!$timestamp) wp_die('Missing timestamp');
+
+		$history = SiteGuard_Backup_History::get_history();
+		if (!isset($history[$timestamp])) wp_die('Backup not found');
+
+		$backup = $history[$timestamp];
+		$opts = SiteGuard_Backup_Options::instance();
+		$backup_dir = $opts->get_backup_dir();
+
+		// Collect all files for this backup
+		$files = array();
+		foreach (array('db', 'plugins', 'themes', 'uploads', 'others', 'wpcore', 'manifest') as $entity) {
+			if (!empty($backup[$entity])) {
+				$entity_files = is_array($backup[$entity]) ? $backup[$entity] : array($backup[$entity]);
+				foreach ($entity_files as $f) {
+					if (file_exists($backup_dir . $f)) {
+						$files[] = $f;
+					}
+				}
+			}
+		}
+
+		if (empty($files)) wp_die('No backup files found');
+
+		$nonce = isset($backup['nonce']) ? $backup['nonce'] : 'unknown';
+		$bundle_name = 'sgbackup_bundle_' . date('Y-m-d', $timestamp) . '_' . $nonce . '.zip';
+		$bundle_path = $backup_dir . $bundle_name;
+
+		// Create the bundle zip
+		$zip = new ZipArchive();
+		if (true !== $zip->open($bundle_path, ZipArchive::CREATE | ZipArchive::OVERWRITE)) {
+			wp_die('Failed to create bundle zip');
+		}
+
+		foreach ($files as $f) {
+			$zip->addFile($backup_dir . $f, $f);
+		}
+
+		// Add a manifest so the upload handler knows it's a bundle
+		$meta = wp_json_encode(array(
+			'type' => 'sgbackup_bundle',
+			'timestamp' => $timestamp,
+			'nonce' => $nonce,
+			'files' => $files,
+			'backup' => $backup,
+		));
+		$zip->addFromString('_sgbackup_bundle.json', $meta);
+		$zip->close();
+
+		if (!file_exists($bundle_path)) wp_die('Failed to create bundle');
+
+		// Audit log
+		$audit = SiteGuard_Backup_Audit_Log::instance();
+		$audit->log('download_bundle', 'Downloaded backup bundle: ' . $bundle_name, array(
+			'timestamp' => $timestamp,
+			'files' => count($files),
+		));
+
+		// Stream to browser
+		while (ob_get_level()) ob_end_clean();
+		clearstatcache(true, $bundle_path);
+		header('Content-Type: application/zip');
+		header('Content-Disposition: attachment; filename="' . $bundle_name . '"');
+		header('Content-Length: ' . filesize($bundle_path));
+		header('Cache-Control: no-cache, must-revalidate');
+
+		$fh = fopen($bundle_path, 'rb');
+		if ($fh) {
+			while (!feof($fh)) {
+				echo fread($fh, 65536);
+				flush();
+			}
+			fclose($fh);
+		}
+
+		// Clean up the temp bundle
+		@unlink($bundle_path);
+		exit;
+	}
+
+	/**
 	 * Handle streaming restore AJAX.
 	 */
 	public function ajax_restore() {
@@ -652,6 +741,28 @@ class SiteGuard_Backup_Admin {
 			wp_send_json_error(array('message' => 'Failed to save uploaded file'));
 		}
 
+		// Handle bundle zip files (created by "Download" button)
+		if (strpos($filename, 'sgbackup_bundle_') === 0 && strtolower($ext) === 'zip') {
+			$extracted_files = $this->extract_bundle($dest, $backup_dir);
+			@unlink($dest); // Remove the bundle zip after extraction
+			if (is_wp_error($extracted_files)) {
+				wp_send_json_error(array('message' => $extracted_files->get_error_message()));
+			}
+
+			$audit = SiteGuard_Backup_Audit_Log::instance();
+			$audit->log('upload_bundle', 'Uploaded and extracted backup bundle: ' . $filename, array(
+				'files' => count($extracted_files),
+			));
+
+			wp_send_json_success(array(
+				'filename' => $filename,
+				'bundle'   => true,
+				'files'    => count($extracted_files),
+				'message'  => sprintf('Bundle extracted: %d backup files imported.', count($extracted_files)),
+			));
+			return;
+		}
+
 		// Try to register in backup history if it looks like a full backup
 		if (preg_match('/^backup_(\d{4}-\d{2}-\d{2}-\d{4})_[^_]+_([a-zA-Z0-9]+)/', $filename, $m)) {
 			$timestamp = strtotime(str_replace('-', '', substr($m[1], 0, 10)) . ' ' . substr($m[1], 11, 2) . ':' . substr($m[1], 13, 2));
@@ -672,7 +783,6 @@ class SiteGuard_Backup_Admin {
 				'service' => array('none'),
 				'size' => filesize($dest),
 			);
-			// Use add_backup() which handles locking, merging, and raw history correctly
 			SiteGuard_Backup_History::add_backup($timestamp, $backup_data);
 		}
 
@@ -934,6 +1044,79 @@ class SiteGuard_Backup_Admin {
 
 		wp_send_json_error(array('message' => 'Invalid security token. Please reload the page.'));
 		return false;
+	}
+
+	/**
+	 * Extract a backup bundle zip and register its contents in backup history.
+	 *
+	 * @param string $bundle_path Path to the bundle zip file.
+	 * @param string $backup_dir  Backup directory to extract into.
+	 * @return array|WP_Error     Array of extracted filenames or error.
+	 */
+	private function extract_bundle($bundle_path, $backup_dir) {
+		$zip = new ZipArchive();
+		if (true !== $zip->open($bundle_path)) {
+			return new WP_Error('zip_open', 'Failed to open bundle zip.');
+		}
+
+		// Look for bundle manifest
+		$manifest_json = $zip->getFromName('_sgbackup_bundle.json');
+		$manifest = $manifest_json ? json_decode($manifest_json, true) : null;
+
+		$extracted = array();
+		for ($i = 0; $i < $zip->numFiles; $i++) {
+			$entry = $zip->getNameIndex($i);
+			if ($entry === '_sgbackup_bundle.json') continue;
+			// Security: prevent path traversal
+			if (strpos($entry, '..') !== false || strpos($entry, '/') !== false) continue;
+			$safe_name = sanitize_file_name($entry);
+			if (empty($safe_name)) continue;
+
+			$zip->extractTo($backup_dir, $entry);
+			// Rename if sanitized name differs
+			if ($safe_name !== $entry && file_exists($backup_dir . $entry)) {
+				@rename($backup_dir . $entry, $backup_dir . $safe_name);
+			}
+			$extracted[] = $safe_name;
+		}
+		$zip->close();
+
+		// Register in backup history using manifest metadata
+		if ($manifest && !empty($manifest['timestamp']) && !empty($manifest['backup'])) {
+			$backup_data = $manifest['backup'];
+			// Recalculate size from actual extracted files
+			$total_size = 0;
+			foreach ($extracted as $f) {
+				$p = $backup_dir . $f;
+				if (file_exists($p)) $total_size += filesize($p);
+			}
+			$backup_data['size'] = $total_size;
+			$backup_data['service'] = array('none');
+			SiteGuard_Backup_History::add_backup(intval($manifest['timestamp']), $backup_data);
+		}
+
+		return $extracted;
+	}
+
+	/**
+	 * Get list of storage methods that have been configured (have saved settings).
+	 */
+	private function get_configured_methods() {
+		$opts = SiteGuard_Backup_Options::instance();
+		$all_methods = array('s3', 's3generic', 'googledrive', 'dropbox', 'onedrive', 'azure', 'gcs', 'pcloud', 'ftp', 'sftp', 'webdav', 'openstack', 'email');
+		$configured = array();
+		foreach ($all_methods as $method) {
+			$settings = $opts->get_option('sgbackup_' . $method, array());
+			if (!empty($settings)) {
+				$configured[] = $method;
+			}
+		}
+		// RemoteSend is configured separately via remote sites
+		$remote_sites = $opts->get_option('sgbackup_remotesites', array());
+		if (!empty($remote_sites)) {
+			$configured[] = 'remotesend';
+		}
+		return $configured;
 	}
 
 	/**
