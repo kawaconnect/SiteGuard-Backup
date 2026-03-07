@@ -728,6 +728,12 @@ class SiteGuard_Backup {
 		@set_time_limit(SGBACKUP_SET_TIME_LIMIT);
 		@ignore_user_abort(true);
 
+		// Track the wall-clock start of the entire PHP process (not per-resumption)
+		// for the direct-chain time budget check at the end.
+		if (!isset($this->_process_start)) {
+			$this->_process_start = microtime(true);
+		}
+
 		$this->current_resumption = $resumption_no;
 		$this->nonce = $bnonce;
 		$this->something_useful_happened = false;
@@ -737,6 +743,13 @@ class SiteGuard_Backup {
 		$this->load_jobdata();
 		if (empty($this->jobdata)) {
 			error_log("SiteGuard Backup: no job data for nonce {$bnonce}");
+			return;
+		}
+
+		// Don't run if job is already in a terminal state
+		$jobstatus = $this->jobdata_get('jobstatus', '');
+		$terminal = array('complete', 'finished', 'error', 'aborted', 'failed', 'warning');
+		if (in_array($jobstatus, $terminal, true)) {
 			return;
 		}
 
@@ -752,6 +765,7 @@ class SiteGuard_Backup {
 		// Check for abort
 		if (SiteGuard_Backup_Job_Scheduler::is_abort_requested($bnonce)) {
 			$this->log("Abort requested - cleaning up");
+			SiteGuard_Backup_Job_Scheduler::clear_scheduled_events($bnonce);
 			$this->backup_finish(true, false, true);
 			return;
 		}
@@ -759,7 +773,7 @@ class SiteGuard_Backup {
 		// Infinite loop prevention: if multiple consecutive resumptions
 		// produced no useful work, abort to avoid looping forever.
 		$useful_checkins = $this->jobdata_get('useful_checkins', array());
-		$max_no_progress = apply_filters('sgbackup_max_resumptions_no_progress', 5);
+		$max_no_progress = apply_filters('sgbackup_max_resumptions_no_progress', 8);
 		if ($resumption_no >= $max_no_progress) {
 			$consecutive_idle = 0;
 			for ($r = $resumption_no - 1; $r >= 0 && $r >= $resumption_no - $max_no_progress; $r--) {
@@ -770,11 +784,11 @@ class SiteGuard_Backup {
 				}
 			}
 			if ($consecutive_idle >= $max_no_progress) {
-				$this->log("Aborting: {$consecutive_idle} consecutive resumptions with no progress (fail_on_resume). " .
-					"This indicates the backup is stuck in an infinite loop.", 'error');
+				$this->log("Aborting: {$consecutive_idle} consecutive resumptions with no progress. " .
+					"This indicates the backup is stuck.", 'error');
 				$this->jobdata_set('jobstatus', 'error');
 				$this->jobdata_set('fail_reason', 'no_progress_loop');
-				SiteGuard_Backup_Job_Scheduler::clear_scheduled_events($this->nonce);
+				SiteGuard_Backup_Job_Scheduler::clear_scheduled_events($bnonce);
 				SiteGuard_Backup_Webhook::fire('backup_failed', array(
 					'nonce'   => $this->nonce,
 					'message' => "Backup aborted after {$consecutive_idle} resumptions with no progress",
@@ -787,10 +801,11 @@ class SiteGuard_Backup {
 		// Semaphore - prevent overlapping runs
 		$semaphore = new SiteGuard_Backup_Semaphore('sgbackup_sem_' . $bnonce);
 		if (!$semaphore->lock()) {
-			$this->log("Could not acquire semaphore - another resumption may be running");
-			// Schedule retry
-			if ($resumption_no < 50) {
-				SiteGuard_Backup_Job_Scheduler::schedule_resumption($resumption_no + 1, $bnonce, 120);
+			// Don't log or reschedule - the direct chain handles this.
+			// Only reschedule if there's no other resumption in the cron queue.
+			$active = SiteGuard_Backup_Job_Scheduler::get_active_jobs();
+			if (empty($active) || !isset($active[$bnonce])) {
+				SiteGuard_Backup_Job_Scheduler::schedule_resumption($resumption_no, $bnonce, 120);
 			}
 			$this->logfile_close();
 			return;
@@ -799,13 +814,6 @@ class SiteGuard_Backup {
 		// Update job status
 		$this->jobdata_set('jobstatus', 'running');
 		$this->jobdata_set('current_resumption', $resumption_no);
-
-		// Schedule next resumption as insurance
-		$resume_interval = $this->jobdata_get('resume_interval', 300);
-		if ($resumption_no < 50) {
-			SiteGuard_Backup_Job_Scheduler::schedule_resumption($resumption_no + 1, $bnonce, $resume_interval);
-			$this->newresumption_scheduled = true;
-		}
 
 		// Auto-adjust batch size if previous resumption didn't check in
 		if ($resumption_no > 0 && !isset($useful_checkins[$resumption_no - 1])) {
@@ -828,59 +836,36 @@ class SiteGuard_Backup {
 				'nonce'   => $this->nonce,
 				'message' => $e->getMessage(),
 			));
+			SiteGuard_Backup_Job_Scheduler::clear_scheduled_events($bnonce);
 			$semaphore->unlock();
 			$this->logfile_close();
 			return;
 		}
 
-		// Runtime-based resume interval auto-tuning: if this resumption
-		// ran fast and made progress, reduce the interval for faster backups.
+		// Runtime tracking for auto-tuning
 		$run_time = microtime(true) - $this->job_time_ms;
 		$run_times = $this->jobdata_get('run_times', array());
 		$run_times[$resumption_no] = $run_time;
 		$this->jobdata_set('run_times', $run_times);
 
-		if ($this->something_useful_happened && count($run_times) >= 2) {
-			$recent = array_slice($run_times, -3, 3, true);
-			$avg_run = array_sum($recent) / count($recent);
-			$current_interval = $this->jobdata_get('resume_interval', 300);
-
-			// Set interval to 2x average runtime, clamped between 30s and 600s
-			$optimal = max(30, min(600, intval($avg_run * 2)));
-			if ($optimal < $current_interval && $optimal >= 30) {
-				$this->jobdata_set('resume_interval', $optimal);
-				$this->log("Auto-tuned resume interval: {$current_interval}s -> {$optimal}s (avg runtime: " . round($avg_run, 1) . "s)");
-			}
-		}
-
 		$semaphore->unlock();
 		$this->logfile_close();
 
-		// If more work is needed, try to continue directly in this PHP process
-		// instead of relying solely on WP-Cron (which may not fire on Azure,
-		// hosts with DISABLE_WP_CRON, or sites with no traffic).
-		// Skip this in WP-CLI mode (CLI has its own resume loop).
+		// Direct chain: continue in this PHP process if time permits.
+		// Skip in WP-CLI (has its own loop) and when job is done.
 		$jobstatus = $this->jobdata_get('jobstatus', '');
-		$terminal_statuses = array('complete', 'finished', 'error', 'aborted', 'failed', 'warning');
-		if (!defined('WP_CLI') && !in_array($jobstatus, $terminal_statuses, true)) {
-			$time_this_run = microtime(true) - $this->job_time_ms;
-
-			// Continue directly if we have time budget remaining (stay under 50%
-			// of PHP's max_execution_time to leave headroom for remaining work)
+		if (!defined('WP_CLI') && !in_array($jobstatus, $terminal, true)) {
+			// Use process wall-clock time (not per-resumption) for the budget
+			$process_elapsed = microtime(true) - $this->_process_start;
 			$max_time = (int) ini_get('max_execution_time');
 			if ($max_time <= 0) $max_time = SGBACKUP_SET_TIME_LIMIT;
-			$can_continue = ($time_this_run < ($max_time * 0.5));
 
-			if ($can_continue && $resumption_no < 50) {
-				// Clear ALL old cron events for this job to prevent semaphore
-				// spam from stale resumptions firing alongside the direct chain
+			if ($process_elapsed < ($max_time * 0.7) && $resumption_no < 50) {
+				// Clear stale cron events, schedule one safety net
 				SiteGuard_Backup_Job_Scheduler::clear_scheduled_events($bnonce);
-
-				// Schedule one insurance event far out in case this process dies
 				SiteGuard_Backup_Job_Scheduler::schedule_resumption(
 					$resumption_no + 1, $bnonce, 300
 				);
-
 				$this->backup_resume($resumption_no + 1, $bnonce);
 				return;
 			}
