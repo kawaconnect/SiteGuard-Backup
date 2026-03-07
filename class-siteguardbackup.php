@@ -872,10 +872,15 @@ class SiteGuard_Backup {
 			$can_continue = ($time_this_run < ($max_time * 0.5));
 
 			if ($can_continue && $resumption_no < 50) {
-				// Also spawn cron as safety net in case this process dies
-				if (function_exists('spawn_cron')) {
-					spawn_cron();
-				}
+				// Clear ALL old cron events for this job to prevent semaphore
+				// spam from stale resumptions firing alongside the direct chain
+				SiteGuard_Backup_Job_Scheduler::clear_scheduled_events($bnonce);
+
+				// Schedule one insurance event far out in case this process dies
+				SiteGuard_Backup_Job_Scheduler::schedule_resumption(
+					$resumption_no + 1, $bnonce, 300
+				);
+
 				$this->backup_resume($resumption_no + 1, $bnonce);
 				return;
 			}

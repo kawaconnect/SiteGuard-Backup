@@ -347,6 +347,17 @@
 		renderActiveJobs: function(data) {
 			var self = this;
 			$('#sgbackup-active-jobs').show();
+
+			// Remember which log viewers are open so we can restore them after re-render
+			var openLogs = {};
+			$('.sgbackup-viewlog-btn').each(function() {
+				var n = $(this).data('nonce');
+				var $logDiv = $('#sgbackup-live-log-' + n);
+				if ($logDiv.is(':visible')) {
+					openLogs[n] = true;
+				}
+			});
+
 			var html = '';
 			$.each(data, function(nonce, job) {
 				// Build progress bar sections
@@ -454,22 +465,33 @@
 			// Bind view-log buttons
 			$('.sgbackup-viewlog-btn').off('click').on('click', function() {
 				var nonce = $(this).data('nonce');
-				var $logDiv = $('#sgbackup-live-log-' + nonce);
-				if ($logDiv.is(':visible')) {
-					$logDiv.slideUp(200);
-					$(this).text('View Log');
-				} else {
-					$(this).text('Hide Log');
-					$logDiv.slideDown(200);
-					self.ajax('get_log', { nonce: nonce }, function(data) {
-						if (data && data.log) {
-							var logHtml = SGB.esc(data.log).replace(/\n/g, '<br>');
-							$logDiv.html('<div style="max-height:300px;overflow-y:auto;background:#1d2327;color:#c3c4c7;padding:10px;font-family:monospace;font-size:11px;border-radius:3px;word-break:break-all;">' + logHtml + '</div>');
-							$logDiv.find('div').scrollTop($logDiv.find('div')[0].scrollHeight);
-						}
-					});
-				}
+				self._toggleLog(nonce);
 			});
+
+			// Restore previously open log viewers and auto-refresh them
+			$.each(openLogs, function(nonce) {
+				self._toggleLog(nonce);
+			});
+		},
+
+		_toggleLog: function(nonce) {
+			var self = this;
+			var $logDiv = $('#sgbackup-live-log-' + nonce);
+			var $btn = $('.sgbackup-viewlog-btn[data-nonce="' + nonce + '"]');
+			if ($logDiv.is(':visible') && !$logDiv.data('refreshing')) {
+				$logDiv.slideUp(200);
+				$btn.text('View Log');
+			} else {
+				$btn.text('Hide Log');
+				$logDiv.show().data('refreshing', false);
+				self.ajax('get_log', { nonce: nonce }, function(data) {
+					if (data && data.log) {
+						var logHtml = SGB.esc(data.log).replace(/\n/g, '<br>');
+						$logDiv.html('<div style="max-height:300px;overflow-y:auto;background:#1d2327;color:#c3c4c7;padding:10px;font-family:monospace;font-size:11px;border-radius:3px;word-break:break-all;">' + logHtml + '</div>');
+						$logDiv.find('div').scrollTop($logDiv.find('div')[0].scrollHeight);
+					}
+				});
+			}
 		},
 
 		refreshBackupsList: function() {
