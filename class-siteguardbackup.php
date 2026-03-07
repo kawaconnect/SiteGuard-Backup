@@ -19,6 +19,7 @@ class SiteGuard_Backup {
 	public $current_resumption = 0;
 	public $something_useful_happened = false;
 	public $newresumption_scheduled = false;
+	public $boot_error = '';
 
 	private $jobdata = array();
 	private $logfile_handle = false;
@@ -554,9 +555,22 @@ class SiteGuard_Backup {
 	private function boot_backup($backup_files, $backup_database, $options = array()) {
 		@set_time_limit(SGBACKUP_SET_TIME_LIMIT);
 
+		// Check if another backup job is already running
+		require_once SGBACKUP_DIR . 'includes/class-job-scheduler.php';
+		$active_jobs = SiteGuard_Backup_Job_Scheduler::get_active_jobs();
+		if (!empty($active_jobs)) {
+			$existing_nonce = key($active_jobs);
+			$existing = $active_jobs[$existing_nonce];
+			$msg = "Cannot start backup: another job is already running (nonce: {$existing_nonce}, resumption: {$existing['resumption']})";
+			error_log('SiteGuard Backup: ' . $msg);
+			$this->boot_error = $msg;
+			return;
+		}
+
 		// Prevent parallel job creation
 		$sem = new SiteGuard_Backup_Semaphore('sgbackup_boot');
 		if (!$sem->lock()) {
+			$this->boot_error = 'Another backup is already being initialized. Please wait a moment and try again.';
 			error_log('SiteGuard Backup: Another backup is already being initialized');
 			return;
 		}

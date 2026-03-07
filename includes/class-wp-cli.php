@@ -92,6 +92,10 @@ class SiteGuard_Backup_CLI_Command extends WP_CLI_Command {
         WP_CLI::log('Starting backup...');
         $sgbackup->backup_all($options);
 
+        if (!empty($sgbackup->boot_error)) {
+            WP_CLI::error($sgbackup->boot_error);
+        }
+
         // Run backup synchronously via resume loop (cron doesn't run in CLI)
         $nonce = $sgbackup->nonce;
         $max_resumptions = 50;

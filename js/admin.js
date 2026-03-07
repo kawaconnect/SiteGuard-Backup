@@ -182,6 +182,12 @@
 		},
 
 		doBackupNow: function() {
+			// Prevent launching a second backup while one is running
+			if (this._activeJobNonce) {
+				SGB.showNotice('A backup is already running (job: ' + this._activeJobNonce + '). Please wait for it to finish before starting another.', 'error');
+				return;
+			}
+
 			var modal = $('#sgbackup-backupnow-modal');
 			var params = {};
 			var includeFiles = $('input[name="sgbackup_include_files"]').is(':checked');
@@ -272,9 +278,12 @@
 				if ($.isEmptyObject(data)) {
 					$('#sgbackup-active-jobs').hide();
 					$('#sgbackup-active-jobs-list').empty();
+					self._activeJobNonce = null;
 					if (callback) callback(false);
 					return;
 				}
+				// Track first active job nonce to prevent concurrent starts
+				self._activeJobNonce = Object.keys(data)[0];
 				self.renderActiveJobs(data);
 				if (callback) callback(true);
 			}, function() {
@@ -295,6 +304,7 @@
 						$('#sgbackup-backup-status').text('').removeClass('success error');
 						clearInterval(self.pollTimer);
 						self.pollTimer = null;
+						self._activeJobNonce = null;
 
 						// Check last known jobs for errors
 						var hadErrors = false;
@@ -319,6 +329,7 @@
 						return;
 					}
 					self.lastKnownJobs = data;
+					self._activeJobNonce = Object.keys(data)[0];
 					self.renderActiveJobs(data);
 				}, function() {
 					// Silently ignore errors during polling

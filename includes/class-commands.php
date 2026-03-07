@@ -88,6 +88,11 @@ class SiteGuard_Backup_Commands {
 
 		$sgbackup->backup_all($options);
 
+		// Check if boot_backup failed (e.g., another job already running)
+		if (!empty($sgbackup->boot_error)) {
+			return new WP_Error('backup_blocked', $sgbackup->boot_error);
+		}
+
 		// Audit log
 		$audit = SiteGuard_Backup_Audit_Log::instance();
 		$entities = isset($options['entities']) ? implode(', ', $options['entities']) : 'all';
