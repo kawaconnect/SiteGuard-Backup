@@ -320,9 +320,17 @@ class SiteGuard_Backup_Engine {
 			}
 		}
 
+		$total_files = count($files);
 		$this->sgbackup->log("Creating zip: {$zip_filename}");
 
-		for ($i = $last_file_index; $i < count($files); $i++) {
+		// Set progress immediately so the UI shows counts from the start
+		$this->sgbackup->jobdata_set('files_added_count', $last_file_index);
+		$this->sgbackup->jobdata_set('files_total_count', $total_files);
+		$pct = $total_files > 0 ? round($last_file_index / $total_files * 100) : 0;
+		$this->sgbackup->jobdata_set('last_activity',
+			"{$entity}: {$pct}% ({$last_file_index}/{$total_files} files)");
+
+		for ($i = $last_file_index; $i < $total_files; $i++) {
 			$file = $files[$i];
 
 			// Check batch limits
@@ -375,9 +383,7 @@ class SiteGuard_Backup_Engine {
 			}
 
 			// Progress update - write to jobdata so the polling UI can show real-time progress.
-			// Update on first file, every 20 files, and on check-in intervals.
 			if ($this->zipfiles_added === 1 || $this->zipfiles_added % 20 === 0) {
-				$total_files = count($files);
 				$this->sgbackup->jobdata_set('files_added_count', $i + 1);
 				$this->sgbackup->jobdata_set('files_total_count', $total_files);
 				$pct = round(($i + 1) / $total_files * 100);
