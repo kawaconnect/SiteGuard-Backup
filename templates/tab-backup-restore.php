@@ -52,6 +52,15 @@ $opts = SiteGuard_Backup_Options::instance();
 	<div id="sgbackup-active-jobs-list"></div>
 </div>
 
+<div class="sgbackup-section" id="sgbackup-log-panel" style="display:none;">
+	<h2>
+		<?php esc_html_e('Backup Log', 'siteguardbackup'); ?>
+		<button type="button" class="button button-small" id="sgbackup-log-refresh" style="margin-left:8px;"><?php esc_html_e('Refresh', 'siteguardbackup'); ?></button>
+		<button type="button" class="button button-small" id="sgbackup-log-close" style="margin-left:4px;"><?php esc_html_e('Close', 'siteguardbackup'); ?></button>
+	</h2>
+	<div id="sgbackup-log-content" style="max-height:400px;overflow-y:auto;background:#1d2327;color:#c3c4c7;padding:12px;font-family:monospace;font-size:11px;border-radius:3px;word-break:break-all;line-height:1.5;"></div>
+</div>
+
 <div class="sgbackup-section">
 	<h2><?php esc_html_e('Existing Backups', 'siteguardbackup'); ?></h2>
 	<div id="sgbackup-existing-backups">

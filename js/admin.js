@@ -347,17 +347,6 @@
 		renderActiveJobs: function(data) {
 			var self = this;
 			$('#sgbackup-active-jobs').show();
-
-			// Remember which log viewers are open so we can restore them after re-render
-			var openLogs = {};
-			$('.sgbackup-viewlog-btn').each(function() {
-				var n = $(this).data('nonce');
-				var $logDiv = $('#sgbackup-live-log-' + n);
-				if ($logDiv.is(':visible')) {
-					openLogs[n] = true;
-				}
-			});
-
 			var html = '';
 			$.each(data, function(nonce, job) {
 				// Build progress bar sections
@@ -450,7 +439,6 @@
 				html += '<div style="margin-top:6px;">';
 				html += '<button type="button" class="button button-small sgbackup-viewlog-btn" data-nonce="' + SGB.esc(nonce) + '">View Log</button>';
 				html += '</div>';
-				html += '<div id="sgbackup-live-log-' + SGB.esc(nonce) + '" style="display:none;margin-top:6px;"></div>';
 
 				html += '</div>';
 			});
@@ -462,36 +450,49 @@
 				self.ajax('activejobs_delete', { job_id: nonce });
 			});
 
-			// Bind view-log buttons
+			// Bind view-log buttons - opens the separate log panel below
 			$('.sgbackup-viewlog-btn').off('click').on('click', function() {
 				var nonce = $(this).data('nonce');
-				self._toggleLog(nonce);
-			});
-
-			// Restore previously open log viewers and auto-refresh them
-			$.each(openLogs, function(nonce) {
-				self._toggleLog(nonce);
+				self._openLogPanel(nonce);
 			});
 		},
 
-		_toggleLog: function(nonce) {
+		_logPanelNonce: null,
+
+		_openLogPanel: function(nonce) {
 			var self = this;
-			var $logDiv = $('#sgbackup-live-log-' + nonce);
-			var $btn = $('.sgbackup-viewlog-btn[data-nonce="' + nonce + '"]');
-			if ($logDiv.is(':visible') && !$logDiv.data('refreshing')) {
-				$logDiv.slideUp(200);
-				$btn.text('View Log');
-			} else {
-				$btn.text('Hide Log');
-				$logDiv.show().data('refreshing', false);
-				self.ajax('get_log', { nonce: nonce }, function(data) {
-					if (data && data.log) {
-						var logHtml = SGB.esc(data.log).replace(/\n/g, '<br>');
-						$logDiv.html('<div style="max-height:300px;overflow-y:auto;background:#1d2327;color:#c3c4c7;padding:10px;font-family:monospace;font-size:11px;border-radius:3px;word-break:break-all;">' + logHtml + '</div>');
-						$logDiv.find('div').scrollTop($logDiv.find('div')[0].scrollHeight);
+			this._logPanelNonce = nonce;
+			var $panel = $('#sgbackup-log-panel');
+			var $content = $('#sgbackup-log-content');
+
+			$panel.show();
+			$content.html('<em>Loading log...</em>');
+
+			this._fetchLog(nonce);
+
+			// Bind refresh and close (only once)
+			$('#sgbackup-log-refresh').off('click').on('click', function() {
+				self._fetchLog(self._logPanelNonce);
+			});
+			$('#sgbackup-log-close').off('click').on('click', function() {
+				$('#sgbackup-log-panel').hide();
+				self._logPanelNonce = null;
+			});
+		},
+
+		_fetchLog: function(nonce) {
+			var $content = $('#sgbackup-log-content');
+			this.ajax('get_log', { nonce: nonce }, function(data) {
+				if (data && data.log) {
+					var logHtml = SGB.esc(data.log).replace(/\n/g, '<br>');
+					$content.html(logHtml);
+					// Only auto-scroll if user is near the bottom (within 100px)
+					var el = $content[0];
+					if (el.scrollHeight - el.scrollTop - el.clientHeight < 100) {
+						el.scrollTop = el.scrollHeight;
 					}
-				});
-			}
+				}
+			});
 		},
 
 		refreshBackupsList: function() {
