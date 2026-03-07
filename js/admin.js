@@ -482,14 +482,16 @@
 
 		_fetchLog: function(nonce) {
 			var $content = $('#sgbackup-log-content');
+			// Capture scroll state BEFORE replacing content
+			var el = $content[0];
+			var wasNearBottom = !el || (el.scrollHeight - el.scrollTop - el.clientHeight < 100);
+
 			this.ajax('get_log', { nonce: nonce }, function(data) {
 				if (data && data.log) {
 					var logHtml = SGB.esc(data.log).replace(/\n/g, '<br>');
 					$content.html(logHtml);
-					// Only auto-scroll if user is near the bottom (within 100px)
-					var el = $content[0];
-					if (el.scrollHeight - el.scrollTop - el.clientHeight < 100) {
-						el.scrollTop = el.scrollHeight;
+					if (wasNearBottom) {
+						$content[0].scrollTop = $content[0].scrollHeight;
 					}
 				}
 			});

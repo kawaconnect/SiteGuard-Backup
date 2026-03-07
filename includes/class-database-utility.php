@@ -743,6 +743,23 @@ class SiteGuard_Backup_Database_Utility {
 		$wpdb->query('SET FOREIGN_KEY_CHECKS = 0');
 		$wpdb->query("SET SQL_MODE = 'NO_AUTO_VALUE_ON_ZERO'");
 
+		// max_allowed_packet for INSERT splitting
+		$max_packet = 16777216;
+		$packet_row = $wpdb->get_row("SHOW VARIABLES LIKE 'max_allowed_packet'");
+		if ($packet_row && isset($packet_row->Value)) {
+			$max_packet = (int) $packet_row->Value;
+		}
+
+		// Supported charsets and engines for cross-version compatibility
+		$supported_charsets = array();
+		$cr_rows = $wpdb->get_results("SHOW CHARACTER SET");
+		if ($cr_rows) foreach ($cr_rows as $cr) $supported_charsets[strtolower($cr->Charset)] = true;
+		$supported_engines = array();
+		$er_rows = $wpdb->get_results("SHOW ENGINES");
+		if ($er_rows) foreach ($er_rows as $er) {
+			if (in_array($er->Support, array('DEFAULT', 'YES'))) $supported_engines[strtolower($er->Engine)] = true;
+		}
+
 		while (!($is_gz ? gzeof($fh) : feof($fh))) {
 			$line = $is_gz ? gzgets($fh) : fgets($fh);
 			if (false === $line) break;
@@ -810,6 +827,15 @@ class SiteGuard_Backup_Database_Utility {
 					continue;
 				}
 
+				// Handle SET NAMES: verify charset is supported
+				if (preg_match('/^\s*(?:\/\*!\d+\s*)?SET\s+NAMES\s+[\'"]?(\w+)/i', $query, $charset_m)) {
+					$req_charset = strtolower($charset_m[1]);
+					if (!isset($supported_charsets[$req_charset])) {
+						$fb = isset($supported_charsets['utf8mb4']) ? 'utf8mb4' : 'utf8';
+						$query = preg_replace('/SET\s+NAMES\s+[\'"]?\w+[\'"]?/i', "SET NAMES {$fb}", $query);
+					}
+				}
+
 				// Rewrite table names to use temp prefix
 				if (preg_match('/^(DROP TABLE\s+IF\s+EXISTS\s+)`([^`]+)`/i', $query, $m)) {
 					$original = $m[2];
@@ -821,6 +847,13 @@ class SiteGuard_Backup_Database_Utility {
 					$temp = $temp_prefix . $original;
 					$tables_created[$original] = $temp;
 					$query = str_replace('`' . $original . '`', '`' . $temp . '`', $query);
+					// Engine compatibility
+					if (preg_match('/ENGINE\s*=\s*(\w+)/i', $query, $eng_m)) {
+						if (!isset($supported_engines[strtolower($eng_m[1])])) {
+							$fb_eng = isset($supported_engines['innodb']) ? 'InnoDB' : 'MyISAM';
+							$query = preg_replace('/ENGINE\s*=\s*\w+/i', 'ENGINE=' . $fb_eng, $query);
+						}
+					}
 				} elseif (preg_match('/^(INSERT\s+INTO\s+)`([^`]+)`/i', $query, $m)) {
 					$original = $m[2];
 					if (isset($tables_created[$original])) {
@@ -831,6 +864,33 @@ class SiteGuard_Backup_Database_Utility {
 				if (self::is_dangerous_sql($query)) {
 					$result['errors'][] = "Blocked dangerous SQL on line {$line_count}";
 					continue;
+				}
+
+				// Split oversized INSERT statements at row boundaries
+				if (preg_match('/^INSERT\s+INTO/i', $query) && strlen($query) > ($max_packet - 1024)) {
+					$insert_prefix = '';
+					if (preg_match('/^(INSERT\s+INTO\s+`[^`]+`\s*(?:\([^)]+\))?\s*VALUES\s*)/is', $query, $pfx_m)) {
+						$insert_prefix = $pfx_m[1];
+					}
+					if ($insert_prefix) {
+						$values_part = substr($query, strlen($insert_prefix));
+						$chunks = self::split_insert_values($values_part, $max_packet - strlen($insert_prefix) - 1024);
+						foreach ($chunks as $chunk) {
+							$sub_res = $wpdb->query($insert_prefix . $chunk);
+							if (false === $sub_res) {
+								$result['errors'][] = "SQL error (split INSERT) on line {$line_count}: " . $wpdb->last_error;
+							}
+						}
+						if ($progress_callback && ($line_count % 500 === 0)) {
+							call_user_func($progress_callback, $line_count, 0);
+						}
+						continue;
+					}
+				}
+
+				// Reconnect if needed
+				if (method_exists($wpdb, 'check_connection')) {
+					$wpdb->check_connection(false);
 				}
 
 				$res = $wpdb->query($query);
@@ -844,6 +904,17 @@ class SiteGuard_Backup_Database_Utility {
 
 				if ($progress_callback && ($line_count % 500 === 0)) {
 					call_user_func($progress_callback, $line_count, 0);
+				}
+			}
+		}
+
+		// Handle any remaining buffer (e.g. final statement without trailing delimiter)
+		if (!empty(trim($buffer))) {
+			$query = trim(rtrim($buffer, $delimiter));
+			if (!empty($query) && !self::is_dangerous_sql($query)) {
+				$res = $wpdb->query($query);
+				if (false === $res) {
+					$result['errors'][] = "SQL error at end: " . $wpdb->last_error;
 				}
 			}
 		}
