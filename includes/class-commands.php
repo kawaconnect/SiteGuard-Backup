@@ -1431,7 +1431,9 @@ class SiteGuard_Backup_Commands {
 				$in_blogs_insert = false;
 				$in_options_insert = false;
 				$in_main_options = false;
+				$current_options_blog_id = 0;
 				$multisite_blogs = array();
+				$subsite_urls = array(); // fallback: blog_id => siteurl from wp_N_options
 				$old_siteurl_from_main = false;
 				$base_prefix = $GLOBALS['wpdb']->base_prefix;
 				while (!($is_gz ? gzeof($fh) : feof($fh))) {
@@ -1451,14 +1453,21 @@ class SiteGuard_Backup_Commands {
 					if (preg_match('/^INSERT INTO\s+`([^`]*options)`/i', $trimmed, $ins_m)) {
 						$in_options_insert = true;
 						$in_main_options = ($ins_m[1] === $base_prefix . 'options');
+						// Extract blog_id from subsite options table name (e.g. wp_23_options → 23)
+						$current_options_blog_id = 0;
+						if (preg_match('/^' . preg_quote($base_prefix, '/') . '(\d+)_options$/', $ins_m[1], $bid_m)) {
+							$current_options_blog_id = (int) $bid_m[1];
+						}
 					}
 					if ($in_options_insert && preg_match('/^(CREATE|DROP|INSERT INTO\s+`[^`]*(?<!options)`)/i', $trimmed)) {
 						$in_options_insert = false;
 						$in_main_options = false;
+						$current_options_blog_id = 0;
 					}
 					if ($in_options_insert && $trimmed === ';') {
 						$in_options_insert = false;
 						$in_main_options = false;
+						$current_options_blog_id = 0;
 					}
 
 					// Detect old siteurl from the SQL for migration detection.
@@ -1471,6 +1480,10 @@ class SiteGuard_Backup_Commands {
 							if (empty($result['old_siteurl']) || ($is_main && !$old_siteurl_from_main)) {
 								$result['old_siteurl'] = $url_m[1];
 								if ($is_main) $old_siteurl_from_main = true;
+							}
+							// Capture per-subsite siteurl as fallback for when wp_blogs is missing
+							if ($current_options_blog_id > 1 && !isset($subsite_urls[$current_options_blog_id])) {
+								$subsite_urls[$current_options_blog_id] = $url_m[1];
 							}
 						}
 					}
@@ -1505,6 +1518,35 @@ class SiteGuard_Backup_Commands {
 					}
 				}
 				$is_gz ? @gzclose($fh) : @fclose($fh);
+
+				// Fallback: if wp_blogs table was missing from the dump, infer blogs
+				// from subsite options tables (wp_N_options siteurl values) and table prefixes.
+				if (empty($multisite_blogs) && !empty($subsite_urls)) {
+					foreach ($subsite_urls as $blog_id => $siteurl) {
+						$parsed = parse_url($siteurl);
+						$domain = isset($parsed['host']) ? $parsed['host'] : '';
+						$path = isset($parsed['path']) ? $parsed['path'] : '/';
+						if (!empty($domain)) {
+							$multisite_blogs[] = array(
+								'blog_id' => $blog_id,
+								'domain'  => $domain,
+								'path'    => $path,
+							);
+						}
+					}
+					// Also add main site (blog_id=1) from old_siteurl if available
+					if (!empty($result['old_siteurl'])) {
+						$main_parsed = parse_url($result['old_siteurl']);
+						$main_domain = isset($main_parsed['host']) ? $main_parsed['host'] : '';
+						if (!empty($main_domain)) {
+							array_unshift($multisite_blogs, array(
+								'blog_id' => 1,
+								'domain'  => $main_domain,
+								'path'    => isset($main_parsed['path']) ? $main_parsed['path'] : '/',
+							));
+						}
+					}
+				}
 
 				if (!empty($multisite_blogs)) {
 					if (!isset($result['multisite_blogs'])) $result['multisite_blogs'] = array();
