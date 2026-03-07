@@ -1017,7 +1017,7 @@ class SiteGuard_Backup {
 		$services = $this->jobdata_get('service', array('none'));
 		$backup_array = $this->jobdata_get('backup_files_array', array());
 		$db_files = $this->jobdata_get('db_backup_files', array());
-		$all_files = array_merge($backup_array, $db_files);
+		$all_files = array_values(array_unique(array_merge($backup_array, $db_files)));
 
 		if (empty($all_files)) return true;
 

@@ -304,8 +304,10 @@ class SiteGuard_Backup_Engine {
 				if ($this->zipfiles_added > 0) {
 					$created_files[] = $zip_filename;
 				}
-				$this->sgbackup->jobdata_set('backup_files_array',
-					array_merge($this->sgbackup->jobdata_get('backup_files_array', array()), $created_files));
+				// Deduplicate: the same zip filename is appended on every resumption
+				$existing = $this->sgbackup->jobdata_get('backup_files_array', array());
+				$merged = array_values(array_unique(array_merge($existing, $created_files)));
+				$this->sgbackup->jobdata_set('backup_files_array', $merged);
 
 				return 'needs_resumption';
 			}
@@ -349,6 +351,12 @@ class SiteGuard_Backup_Engine {
 			$created_files[] = $zip_filename;
 		}
 
+		if ($this->zipfiles_added === 0 && count($files) > 0) {
+			$this->sgbackup->log("WARNING: {$entity} had " . count($files) .
+				" files enumerated but 0 were added to zip. Check file permissions and " .
+				"whether the files resolve within ABSPATH (" . ABSPATH . ")", 'warning');
+		}
+
 		// Clear progress tracker
 		$this->sgbackup->jobdata_set("entity_{$entity}_last_file_index", 0);
 
@@ -383,11 +391,23 @@ class SiteGuard_Backup_Engine {
 	private function add_to_zip($zip_path, $file_path, $archive_name, $file_size) {
 		// Resolve symlinks to get the real file
 		$resolved = is_link($file_path) ? realpath($file_path) : $file_path;
-		if (!file_exists($resolved) || !is_readable($resolved)) return false;
+		if (!file_exists($resolved) || !is_readable($resolved)) {
+			if (!isset($this->_zip_skip_logged)) $this->_zip_skip_logged = 0;
+			if ($this->_zip_skip_logged < 3) {
+				$this->sgbackup->log("Zip skip: file not found/readable: {$file_path}", 'warning');
+				$this->_zip_skip_logged++;
+			}
+			return false;
+		}
 		// Verify resolved symlink stays within ABSPATH to prevent directory escape
 		$real_resolved = realpath($resolved);
 		$real_abspath = realpath(ABSPATH);
 		if ($real_resolved && $real_abspath && strpos($real_resolved, $real_abspath) !== 0) {
+			if (!isset($this->_zip_abspath_logged)) $this->_zip_abspath_logged = 0;
+			if ($this->_zip_abspath_logged < 3) {
+				$this->sgbackup->log("Zip skip: resolved path outside ABSPATH: {$real_resolved} (ABSPATH={$real_abspath})", 'warning');
+				$this->_zip_abspath_logged++;
+			}
 			return false;
 		}
 		$file_path = $resolved;
@@ -733,8 +753,26 @@ class SiteGuard_Backup_Engine {
 		SiteGuard_Backup_Database_Utility::dump_views($table_prefix, $extras_file);
 		SiteGuard_Backup_Database_Utility::dump_routines($extras_file);
 
-		// Stitch per-table files into single .gz
-		$this->sgbackup->log("Stitching database backup into {$db_filename}");
+		// Log per-table dump stats and check disk space before stitching
+		$total_dump_size = 0;
+		$dump_count = 0;
+		foreach ($tables as $table) {
+			$tf = $temp_dir . $table . '.sql.gz';
+			if (file_exists($tf)) {
+				$total_dump_size += filesize($tf);
+				$dump_count++;
+			}
+		}
+		$this->sgbackup->log("Stitching {$dump_count}/" . count($tables) . " table dumps (" .
+			SiteGuard_Backup_Filesystem::format_bytes($total_dump_size) . " compressed) into {$db_filename}");
+
+		$free_space = @disk_free_space($this->backup_dir);
+		if (false !== $free_space && $free_space < $total_dump_size * 2) {
+			$this->sgbackup->log("WARNING: Low disk space for stitch - " .
+				SiteGuard_Backup_Filesystem::format_bytes($free_space) . " free, " .
+				SiteGuard_Backup_Filesystem::format_bytes($total_dump_size) . " in dumps", 'warning');
+		}
+
 		$result = $this->stitch_db_files($temp_dir, $db_path, $tables);
 
 		$db_backup_files = array();
@@ -951,7 +989,15 @@ class SiteGuard_Backup_Engine {
 	 */
 	private function stitch_db_files($temp_dir, $output_path, $tables) {
 		$out = @gzopen($output_path, 'wb9');
-		if (!$out) return false;
+		if (!$out) {
+			$this->sgbackup->log("stitch_db_files: failed to open output file: {$output_path}", 'error');
+			return false;
+		}
+
+		$tables_stitched = 0;
+		$tables_skipped = 0;
+		$bytes_written = 0;
+		$write_error = false;
 
 		// Header
 		$header = "-- SiteGuard Backup database dump\n";
@@ -960,25 +1006,61 @@ class SiteGuard_Backup_Engine {
 		$header .= "-- Database: " . DB_NAME . "\n\n";
 		$header .= "SET FOREIGN_KEY_CHECKS = 0;\n";
 		$header .= "SET SQL_MODE = 'NO_AUTO_VALUE_ON_ZERO';\n\n";
-		gzwrite($out, $header);
+		$w = gzwrite($out, $header);
+		if (false === $w) { $write_error = true; }
+		else { $bytes_written += $w; }
 
 		foreach ($tables as $table) {
+			if ($write_error) break;
+
 			$table_file = $temp_dir . $table . '.sql.gz';
-			if (!file_exists($table_file)) continue;
+			if (!file_exists($table_file)) {
+				$tables_skipped++;
+				continue;
+			}
 
 			$in = @gzopen($table_file, 'rb');
-			if (!$in) continue;
+			if (!$in) {
+				$this->sgbackup->log("stitch_db_files: cannot open table file: {$table}", 'warning');
+				$tables_skipped++;
+				continue;
+			}
 
-			gzwrite($out, "\n-- Table: {$table}\n");
+			$w = gzwrite($out, "\n-- Table: {$table}\n");
+			if (false === $w) { $write_error = true; gzclose($in); break; }
+			$bytes_written += $w;
 
 			while (!gzeof($in)) {
-				$chunk = gzread($in, 65536);
-				if (false === $chunk) break;
-				gzwrite($out, $chunk);
+				$chunk = gzread($in, 262144);
+				if (false === $chunk || strlen($chunk) === 0) break;
+				$w = gzwrite($out, $chunk);
+				if (false === $w) { $write_error = true; break; }
+				$bytes_written += $w;
 			}
 
 			gzclose($in);
-			gzwrite($out, "\n");
+			if ($write_error) break;
+
+			$w = gzwrite($out, "\n");
+			if (false === $w) { $write_error = true; break; }
+			$bytes_written += $w;
+
+			$tables_stitched++;
+
+			// Log progress every 50 tables
+			if ($tables_stitched % 50 === 0) {
+				$this->sgbackup->log("Stitch progress: {$tables_stitched} tables, " .
+					SiteGuard_Backup_Filesystem::format_bytes($bytes_written) . " uncompressed written");
+			}
+		}
+
+		if ($write_error) {
+			$this->sgbackup->log("stitch_db_files: gzwrite failed after {$tables_stitched} tables and " .
+				SiteGuard_Backup_Filesystem::format_bytes($bytes_written) . " written. " .
+				"Possible causes: disk full, memory exhausted, or gzip stream error.", 'error');
+			gzclose($out);
+			@unlink($output_path);
+			return false;
 		}
 
 		// Append views and routines if they exist
@@ -987,17 +1069,32 @@ class SiteGuard_Backup_Engine {
 			$efh = @fopen($extras_file, 'r');
 			if ($efh) {
 				while (!feof($efh)) {
-					$chunk = fread($efh, 65536);
+					$chunk = fread($efh, 262144);
 					if (false !== $chunk && strlen($chunk) > 0) {
-						gzwrite($out, $chunk);
+						$w = gzwrite($out, $chunk);
+						if (false === $w) {
+							$this->sgbackup->log("stitch_db_files: gzwrite failed during views/routines", 'error');
+							$write_error = true;
+							break;
+						}
+						$bytes_written += $w;
 					}
 				}
 				fclose($efh);
 			}
 		}
 
-		gzwrite($out, "\nSET FOREIGN_KEY_CHECKS = 1;\n");
+		$w = gzwrite($out, "\nSET FOREIGN_KEY_CHECKS = 1;\n");
+		if (false === $w) { $write_error = true; }
 		gzclose($out);
+
+		if ($write_error) {
+			@unlink($output_path);
+			return false;
+		}
+
+		$this->sgbackup->log("Stitch complete: {$tables_stitched} tables, {$tables_skipped} skipped, " .
+			SiteGuard_Backup_Filesystem::format_bytes($bytes_written) . " uncompressed data");
 
 		return file_exists($output_path) && filesize($output_path) > 0;
 	}
