@@ -13,7 +13,7 @@
 if (!defined('ABSPATH')) die('No direct access.');
 
 // Core constants
-define('SGBACKUP_VERSION', '1.3.2');
+define('SGBACKUP_VERSION', '1.3.4');
 define('SGBACKUP_DIR', plugin_dir_path(__FILE__));
 define('SGBACKUP_URL', plugin_dir_url(__FILE__));
 define('SGBACKUP_PLUGIN_SLUG', plugin_basename(__FILE__));

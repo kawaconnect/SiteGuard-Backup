@@ -131,8 +131,12 @@ class SiteGuard_Backup_Admin {
 				'delete_restore_preset' => wp_create_nonce('sgbackup-delete_restore_preset'),
 				'save_remotesend_schedule' => wp_create_nonce('sgbackup-save_remotesend_schedule'),
 				'get_remotesend_schedule'  => wp_create_nonce('sgbackup-get_remotesend_schedule'),
+				'upload_chunk'             => wp_create_nonce('sgbackup-upload_chunk'),
+				'upload_chunk_status'      => wp_create_nonce('sgbackup-upload_chunk_status'),
+				'upload_chunk_cancel'      => wp_create_nonce('sgbackup-upload_chunk_cancel'),
 			),
 			'max_upload_size' => wp_max_upload_size(),
+			'chunk_size' => min(2 * 1024 * 1024, intval(0.9 * wp_max_upload_size())),
 			'is_multisite' => is_multisite(),
 			'current_blog_id' => get_current_blog_id(),
 			'default_db_restore_mode' => intval(SiteGuard_Backup_Options::instance()->get_option('sgbackup_default_db_restore_mode', 0)),
@@ -339,7 +343,7 @@ class SiteGuard_Backup_Admin {
 		}
 
 		// Enforce settings lock on all mutating commands except activejobs_list (read-only status check)
-		$read_only_commands = array('activejobs_list', 'get_existing_backups', 'get_log', 'get_settings', 'get_sysinfo', 'get_remotesites', 'get_migrator_keys', 'get_backup_contents', 'get_database_tables', 'get_audit_log', 'failover_status', 'get_restore_presets', 'get_remotesend_schedule');
+		$read_only_commands = array('activejobs_list', 'get_existing_backups', 'get_log', 'get_settings', 'get_sysinfo', 'get_remotesites', 'get_migrator_keys', 'get_backup_contents', 'get_database_tables', 'get_audit_log', 'failover_status', 'get_restore_presets', 'get_remotesend_schedule', 'upload_chunk_status');
 		if (!in_array($subaction, $read_only_commands, true) && $this->is_settings_locked()) {
 			wp_send_json_error(array('message' => 'Settings are locked. Please unlock first.'));
 		}
@@ -401,6 +405,9 @@ class SiteGuard_Backup_Admin {
 			'delete_restore_preset',
 			'save_remotesend_schedule',
 			'get_remotesend_schedule',
+			'upload_chunk',
+			'upload_chunk_status',
+			'upload_chunk_cancel',
 		);
 
 		if (!in_array($subaction, $allowed_commands, true)) {
@@ -427,10 +434,15 @@ class SiteGuard_Backup_Admin {
 		$result = $this->commands->$subaction($params);
 
 		if (is_wp_error($result)) {
-			wp_send_json_error(array(
+			$error_response = array(
 				'message'    => $result->get_error_message(),
 				'error_code' => $result->get_error_code(),
-			));
+			);
+			$error_data = $result->get_error_data();
+			if (!empty($error_data)) {
+				$error_response['error_data'] = $error_data;
+			}
+			wp_send_json_error($error_response);
 		}
 
 		wp_send_json_success($result);
@@ -1166,7 +1178,7 @@ class SiteGuard_Backup_Admin {
 	 * @param string $backup_dir  Backup directory to extract into.
 	 * @return array|WP_Error     Array of extracted filenames or error.
 	 */
-	private function extract_bundle($bundle_path, $backup_dir) {
+	public function extract_bundle($bundle_path, $backup_dir) {
 		$zip = new ZipArchive();
 		if (true !== $zip->open($bundle_path)) {
 			return new WP_Error('zip_open', 'Failed to open bundle zip.');

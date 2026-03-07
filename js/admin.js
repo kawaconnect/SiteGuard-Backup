@@ -7,6 +7,7 @@
 	var SGB = {
 		pollTimer: null,
 		lastKnownJobs: {},
+		uploadAbortController: null,
 
 		// HTML escape utility to prevent XSS
 		esc: function(str) {
@@ -79,8 +80,12 @@
 			this.bindRemoteSendSchedule();
 			this.pollActiveJobs();
 
-			$(window).on('beforeunload', function() {
+			$(window).on('beforeunload', function(e) {
 				if (SGB.pollTimer) { clearInterval(SGB.pollTimer); SGB.pollTimer = null; }
+				if (SGB.uploadAbortController) {
+					e.preventDefault();
+					return 'A file upload is in progress. Are you sure you want to leave?';
+				}
 			});
 		},
 
@@ -1700,83 +1705,278 @@
 		},
 
 		// ===== Upload =====
+		formatBytes: function(bytes) {
+			if (bytes === 0) return '0 B';
+			var units = ['B', 'KB', 'MB', 'GB', 'TB'];
+			var i = Math.floor(Math.log(bytes) / Math.log(1024));
+			return (bytes / Math.pow(1024, i)).toFixed(i > 0 ? 1 : 0) + ' ' + units[i];
+		},
+
 		bindUpload: function() {
 			var self = this;
+
 			$('#sgbackup-upload-btn').on('click', function() {
 				var files = $('#sgbackup-upload-input')[0].files;
 				if (!files.length) return;
+				var file = files[0];
 
-				var completed = 0;
-				$('#sgbackup-upload-status').text(sgbackup_settings.strings.uploading);
-
-				for (var i = 0; i < files.length; i++) {
-					(function(file) {
-						var formData = new FormData();
-						formData.append('action', 'sgbackup_upload');
-						formData.append('nonce', sgbackup_settings.nonce);
-						formData.append('sgbackup_file', file);
-
-						$.ajax({
-							url: sgbackup_settings.ajax_url,
-							type: 'POST',
-							data: formData,
-							processData: false,
-							contentType: false,
-							success: function(response) {
-								completed++;
-								if (completed === files.length) {
-									// L7: Check if uploaded file looks like a foreign backup
-									var fname = response.data ? response.data.filename : file.name;
-									var isSgBackup = /^backup_\d{4}-\d{2}-\d{2}-\d{4}_[^_]+_[a-zA-Z0-9]+/.test(fname);
-									if (!isSgBackup && fname) {
-										// Detect format first, then offer import
-										self.ajax('import_foreign_backup', { file: fname, detect_only: true }, function(detectData) {
-											var detections = detectData.detections || [];
-											var detected = detections.length > 0 && detections[0].detected;
-											var formatLabel = detected ? detections[0].label : 'Unknown';
-											var entities = detected && detections[0].entities ? detections[0].entities.join(', ') : '';
-											var msg = 'Detected format: ' + formatLabel;
-											if (entities) msg += ' (entities: ' + entities + ')';
-											msg += '\n\nWould you like to import it as a foreign backup?';
-											if (confirm(msg)) {
-												self.ajax('import_foreign_backup', { file: fname }, function(importData) {
-													var importMsg = 'Imported as ' + (importData.label || importData.format || 'backup') + '!';
-													$('#sgbackup-upload-status').text(importMsg).addClass('success');
-													$('#sgbackup-upload-input').val('');
-													setTimeout(function() { location.reload(); }, 1500);
-												}, function(importErr) {
-													$('#sgbackup-upload-status').text('Import error: ' + importErr).addClass('error');
-												});
-												return;
-											}
-										}, function() {
-											// Detection failed, fall back to basic prompt
-											if (confirm('This file does not match the SiteGuard Backup naming pattern.\n\nWould you like to import it as a foreign backup?')) {
-												self.ajax('import_foreign_backup', { file: fname }, function(importData) {
-													$('#sgbackup-upload-status').text('Imported as backup!').addClass('success');
-													$('#sgbackup-upload-input').val('');
-													setTimeout(function() { location.reload(); }, 1500);
-												}, function(importErr) {
-													$('#sgbackup-upload-status').text('Import error: ' + importErr).addClass('error');
-												});
-												return;
-											}
-										});
-										return;
-									}
-									$('#sgbackup-upload-status').text('Upload complete!').addClass('success');
-									$('#sgbackup-upload-input').val('');
-									setTimeout(function() { location.reload(); }, 1500);
-								}
-							},
-							error: function() {
-								completed++;
-								$('#sgbackup-upload-status').text('Upload error for: ' + file.name).addClass('error');
-							}
-						});
-					})(files[i]);
+				// Validate extension client-side
+				var ext = file.name.split('.').pop().toLowerCase();
+				if (['zip', 'gz', 'sql', 'crypt'].indexOf(ext) === -1) {
+					self.showNotice('Only .zip, .gz, .sql, .crypt files are allowed.', 'error');
+					return;
 				}
+
+				var chunkSize = parseInt(sgbackup_settings.chunk_size, 10) || (2 * 1024 * 1024);
+
+				// Check for existing partial upload
+				self.ajax('upload_chunk_status', { filename: file.name }, function(statusData) {
+					if (statusData.status === 1) {
+						// Already fully uploaded
+						self.showNotice('This file has already been uploaded.', 'warning');
+						return;
+					}
+					if (statusData.status === 0 && statusData.size > 0) {
+						// Partial upload exists - offer resume
+						var resumeMsg = 'A partial upload exists (' + self.formatBytes(statusData.size) + ' of ' + self.formatBytes(file.size) + ').\n\nResume upload?';
+						if (confirm(resumeMsg)) {
+							self.startChunkedUpload(file, chunkSize, statusData.size);
+						} else {
+							// Cancel existing and start fresh
+							self.ajax('upload_chunk_cancel', { filename: file.name }, function() {
+								self.startChunkedUpload(file, chunkSize, 0);
+							});
+						}
+						return;
+					}
+					// No existing upload - start fresh
+					self.startChunkedUpload(file, chunkSize, 0);
+				}, function() {
+					// Status check failed - start fresh
+					self.startChunkedUpload(file, chunkSize, 0);
+				});
 			});
+
+			// Cancel button
+			$('#sgbackup-upload-cancel-btn').on('click', function() {
+				var files = $('#sgbackup-upload-input')[0].files;
+				var filename = files.length ? files[0].name : '';
+				if (self.uploadAbortController) {
+					self.uploadAbortController.abort();
+					self.uploadAbortController = null;
+				}
+				if (filename) {
+					self.ajax('upload_chunk_cancel', { filename: filename });
+				}
+				self.uploadReset('Upload cancelled.');
+			});
+		},
+
+		startChunkedUpload: function(file, chunkSize, startOffset) {
+			var self = this;
+			var offset = startOffset;
+			var retries = 0;
+			var maxRetries = 3;
+			var startTime = Date.now();
+			var startBytes = startOffset;
+			var cancelled = false;
+
+			// Set up abort controller
+			self.uploadAbortController = { abort: function() { cancelled = true; } };
+
+			// UI state
+			$('#sgbackup-upload-btn').prop('disabled', true);
+			$('#sgbackup-upload-input').prop('disabled', true);
+			$('#sgbackup-upload-cancel-btn').show();
+			$('#sgbackup-upload-progress-wrap').show();
+			$('#sgbackup-upload-status').text('').removeClass('success error');
+
+			self.updateUploadProgress(offset, file.size, startTime, startBytes);
+
+			function sendNextChunk() {
+				if (cancelled) return;
+
+				var end = Math.min(offset + chunkSize, file.size);
+				var chunk = file.slice(offset, end);
+				var isLast = (end >= file.size);
+
+				var formData = new FormData();
+				formData.append('action', 'sgbackup_ajax');
+				formData.append('subaction', 'upload_chunk');
+				formData.append('nonce', (sgbackup_settings.nonces && sgbackup_settings.nonces.upload_chunk) || sgbackup_settings.nonce);
+				formData.append('data', JSON.stringify({
+					filename: file.name,
+					offset: offset,
+					total_size: file.size,
+					is_last: isLast ? 1 : 0
+				}));
+				formData.append('chunk_data', chunk, 'chunk');
+
+				$.ajax({
+					url: sgbackup_settings.ajax_url,
+					type: 'POST',
+					data: formData,
+					processData: false,
+					contentType: false,
+					timeout: 60000,
+					success: function(response) {
+						if (cancelled) return;
+						if (!response.success) {
+							var errMsg = response.data && response.data.message ? response.data.message : 'Upload error';
+							// Handle out-of-sequence by re-syncing offset
+							if (response.data && response.data.error_code === 'out_of_sequence' && response.data.error_data && typeof response.data.error_data.expected !== 'undefined') {
+								offset = response.data.error_data.expected;
+								retries = 0;
+								sendNextChunk();
+								return;
+							}
+							retryOrFail(errMsg);
+							return;
+						}
+
+						retries = 0;
+						var data = response.data;
+						offset = data.size; // Use server-reported size as next offset
+
+						if (data.status === 1) {
+							// Upload complete
+							self.uploadAbortController = null;
+							self.updateUploadProgress(file.size, file.size, startTime, startBytes);
+							self.uploadComplete(file.name, data);
+							return;
+						}
+
+						self.updateUploadProgress(offset, file.size, startTime, startBytes);
+						sendNextChunk();
+					},
+					error: function(xhr, status, errorThrown) {
+						if (cancelled) return;
+						if (status === 'abort') return;
+						retryOrFail('Network error (' + status + ')');
+					}
+				});
+			}
+
+			function retryOrFail(errMsg) {
+				retries++;
+				if (retries > maxRetries) {
+					self.uploadReset('Upload failed: ' + errMsg, true);
+					return;
+				}
+				// Exponential backoff: 1s, 2s, 4s
+				var delay = Math.pow(2, retries - 1) * 1000;
+				$('#sgbackup-upload-progress-text').text('Retrying in ' + (delay / 1000) + 's... (' + errMsg + ')');
+				setTimeout(function() {
+					if (cancelled) return;
+					// Re-sync offset from server before retry
+					self.ajax('upload_chunk_status', { filename: file.name }, function(statusData) {
+						if (statusData.status === 0 && statusData.size > 0) {
+							offset = statusData.size;
+						}
+						sendNextChunk();
+					}, function() {
+						sendNextChunk();
+					});
+				}, delay);
+			}
+
+			sendNextChunk();
+		},
+
+		updateUploadProgress: function(uploaded, total, startTime, startBytes) {
+			var pct = total > 0 ? (uploaded / total * 100) : 0;
+			$('#sgbackup-upload-progress-bar').css('width', pct.toFixed(1) + '%');
+
+			var elapsed = (Date.now() - startTime) / 1000;
+			var bytesThisSession = uploaded - startBytes;
+			var speed = elapsed > 0 ? bytesThisSession / elapsed : 0;
+			var remaining = total - uploaded;
+			var eta = speed > 0 ? remaining / speed : 0;
+
+			var etaStr = '';
+			if (eta > 3600) {
+				etaStr = Math.floor(eta / 3600) + 'h ' + Math.floor((eta % 3600) / 60) + 'm';
+			} else if (eta > 60) {
+				etaStr = Math.floor(eta / 60) + 'm ' + Math.floor(eta % 60) + 's';
+			} else if (eta > 0) {
+				etaStr = Math.floor(eta) + 's';
+			}
+
+			var text = pct.toFixed(1) + '% | ' + this.formatBytes(uploaded) + ' / ' + this.formatBytes(total);
+			if (speed > 0) text += ' | ' + this.formatBytes(speed) + '/s';
+			if (etaStr && uploaded < total) text += ' | ETA: ' + etaStr;
+
+			$('#sgbackup-upload-progress-text').text(text);
+		},
+
+		uploadComplete: function(filename, data) {
+			var self = this;
+			$('#sgbackup-upload-cancel-btn').hide();
+
+			if (data.bundle) {
+				$('#sgbackup-upload-status').text(data.message || 'Bundle extracted!').addClass('success');
+				$('#sgbackup-upload-input').val('');
+				setTimeout(function() { location.reload(); }, 1500);
+				return;
+			}
+
+			// Check for foreign backup format
+			var isSgBackup = /^backup_\d{4}-\d{2}-\d{2}-\d{4}_[^_]+_[a-zA-Z0-9]+/.test(filename);
+			if (!isSgBackup && filename) {
+				self.ajax('import_foreign_backup', { file: filename, detect_only: true }, function(detectData) {
+					var detections = detectData.detections || [];
+					var detected = detections.length > 0 && detections[0].detected;
+					var formatLabel = detected ? detections[0].label : 'Unknown';
+					var entities = detected && detections[0].entities ? detections[0].entities.join(', ') : '';
+					var msg = 'Detected format: ' + formatLabel;
+					if (entities) msg += ' (entities: ' + entities + ')';
+					msg += '\n\nWould you like to import it as a foreign backup?';
+					if (confirm(msg)) {
+						self.ajax('import_foreign_backup', { file: filename }, function(importData) {
+							var importMsg = 'Imported as ' + (importData.label || importData.format || 'backup') + '!';
+							$('#sgbackup-upload-status').text(importMsg).addClass('success');
+							$('#sgbackup-upload-input').val('');
+							setTimeout(function() { location.reload(); }, 1500);
+						}, function(importErr) {
+							self.uploadReset('Import error: ' + importErr);
+						});
+					} else {
+						self.uploadReset('Upload complete.');
+					}
+				}, function() {
+					if (confirm('This file does not match the SiteGuard Backup naming pattern.\n\nWould you like to import it as a foreign backup?')) {
+						self.ajax('import_foreign_backup', { file: filename }, function() {
+							$('#sgbackup-upload-status').text('Imported as backup!').addClass('success');
+							$('#sgbackup-upload-input').val('');
+							setTimeout(function() { location.reload(); }, 1500);
+						}, function(importErr) {
+							self.uploadReset('Import error: ' + importErr);
+						});
+					} else {
+						self.uploadReset('Upload complete.');
+					}
+				});
+				return;
+			}
+
+			$('#sgbackup-upload-status').text('Upload complete!').addClass('success');
+			$('#sgbackup-upload-input').val('');
+			setTimeout(function() { location.reload(); }, 1500);
+		},
+
+		uploadReset: function(errorMsg, keepProgress) {
+			this.uploadAbortController = null;
+			$('#sgbackup-upload-btn').prop('disabled', false);
+			$('#sgbackup-upload-input').prop('disabled', false);
+			$('#sgbackup-upload-cancel-btn').hide();
+			if (!keepProgress) {
+				$('#sgbackup-upload-progress-wrap').hide();
+				$('#sgbackup-upload-progress-bar').css('width', '0');
+				$('#sgbackup-upload-progress-text').text('');
+			}
+			if (errorMsg) {
+				$('#sgbackup-upload-status').text(errorMsg).addClass('error');
+			}
 		},
 
 		// ===== Migration =====

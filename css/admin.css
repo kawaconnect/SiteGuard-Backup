@@ -129,6 +129,47 @@
 	margin-right: 10px;
 }
 
+/* Upload progress bar */
+.sgbackup-upload-progress-wrap {
+	margin-top: 12px;
+	display: none;
+}
+
+.sgbackup-upload-progress-track {
+	width: 100%;
+	height: 20px;
+	background: #dcdcde;
+	border-radius: 10px;
+	overflow: hidden;
+}
+
+.sgbackup-upload-progress-bar {
+	height: 100%;
+	width: 0;
+	background: #2271b1;
+	border-radius: 10px;
+	transition: width 0.3s ease;
+}
+
+.sgbackup-upload-progress-text {
+	font-size: 12px;
+	color: #666;
+	margin-top: 4px;
+}
+
+.sgbackup-upload-cancel-btn {
+	color: #dc3232;
+	border-color: #dc3232;
+	margin-left: 8px;
+}
+
+.sgbackup-upload-cancel-btn:hover,
+.sgbackup-upload-cancel-btn:focus {
+	color: #fff;
+	background: #dc3232;
+	border-color: #dc3232;
+}
+
 /* Active jobs */
 .sgbackup-job {
 	background: #f0f6fc;

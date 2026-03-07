@@ -72,8 +72,15 @@ $opts = SiteGuard_Backup_Options::instance();
 	<h2><?php esc_html_e('Upload Backup Files', 'siteguardbackup'); ?></h2>
 	<p><?php esc_html_e('Upload backup files or a downloaded backup bundle (.zip) to restore on this site.', 'siteguardbackup'); ?></p>
 	<div id="sgbackup-upload-area" class="sgbackup-upload-area">
-		<input type="file" id="sgbackup-upload-input" accept=".zip,.gz,.sql,.crypt" multiple />
+		<input type="file" id="sgbackup-upload-input" accept=".zip,.gz,.sql,.crypt" />
 		<button type="button" class="button" id="sgbackup-upload-btn"><?php esc_html_e('Upload', 'siteguardbackup'); ?></button>
+		<button type="button" class="button sgbackup-upload-cancel-btn" id="sgbackup-upload-cancel-btn" style="display:none;"><?php esc_html_e('Cancel', 'siteguardbackup'); ?></button>
 		<span id="sgbackup-upload-status" class="sgbackup-status"></span>
+		<div id="sgbackup-upload-progress-wrap" class="sgbackup-upload-progress-wrap">
+			<div class="sgbackup-upload-progress-track">
+				<div id="sgbackup-upload-progress-bar" class="sgbackup-upload-progress-bar"></div>
+			</div>
+			<div id="sgbackup-upload-progress-text" class="sgbackup-upload-progress-text"></div>
+		</div>
 	</div>
 </div>

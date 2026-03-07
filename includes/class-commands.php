@@ -2856,4 +2856,268 @@ class SiteGuard_Backup_Commands {
 			'next'         => wp_next_scheduled('sgbackup_backup_remotesend'),
 		);
 	}
+
+	/**
+	 * Receive a chunked file upload piece.
+	 * Adapted from class-remote-send.php::cmd_send_chunk() - same DB-backed
+	 * locking, sequential offset validation, .tmp staging, CIFS-safe ops.
+	 */
+	public function upload_chunk($params) {
+		if (empty($params['filename']) || !isset($params['offset']) || !isset($params['total_size'])) {
+			return new WP_Error('missing_params', 'Missing required parameters.');
+		}
+
+		// Read binary chunk from uploaded file
+		if (empty($_FILES['chunk_data']) || empty($_FILES['chunk_data']['tmp_name'])) {
+			return new WP_Error('no_chunk', 'No chunk data received.');
+		}
+
+		$chunk_data = file_get_contents($_FILES['chunk_data']['tmp_name']);
+		if (false === $chunk_data || strlen($chunk_data) === 0) {
+			return new WP_Error('read_failed', 'Failed to read chunk data.');
+		}
+
+		// Cap chunk size server-side
+		$max_chunk = min(2 * 1024 * 1024, intval(0.9 * wp_max_upload_size()));
+		if (strlen($chunk_data) > $max_chunk) {
+			return new WP_Error('chunk_too_large', 'Chunk exceeds maximum size.');
+		}
+
+		$filename = sanitize_file_name(basename($params['filename']));
+		$offset = intval($params['offset']);
+		$total_size = intval($params['total_size']);
+		$is_last = !empty($params['is_last']);
+
+		// Validate filename
+		if (strlen($filename) > 255) {
+			return new WP_Error('filename_too_long', 'Filename exceeds maximum length.');
+		}
+		if (strpos($filename, '..') !== false) {
+			return new WP_Error('invalid_filename', 'Invalid filename.');
+		}
+		$ext = strtolower(pathinfo($filename, PATHINFO_EXTENSION));
+		if (!in_array($ext, array('zip', 'gz', 'sql', 'crypt'), true)) {
+			return new WP_Error('invalid_extension', 'Only .zip, .gz, .sql, .crypt files are allowed.');
+		}
+		if ($offset < 0) {
+			return new WP_Error('invalid_offset', 'Offset must be non-negative.');
+		}
+
+		$opts = SiteGuard_Backup_Options::instance();
+		$backup_dir = $opts->get_backup_dir();
+		$tmp_file = $backup_dir . $filename . '.tmp';
+		$final_file = $backup_dir . $filename;
+
+		// Atomic database-backed lock (CIFS-safe, same pattern as cmd_send_chunk).
+		// Release sets timestamp to 0 (expired) rather than deleting the row,
+		// to avoid poisoning WordPress's 'notoptions' object cache.
+		global $wpdb;
+		$chunk_lock_key = 'sgbackup_chunk_' . md5($filename);
+		$lock_value = wp_generate_password(12, false);
+		$now = time();
+		$wpdb->query($wpdb->prepare(
+			"INSERT INTO {$wpdb->options} (option_name, option_value, autoload)
+			 VALUES (%s, %s, 'no')
+			 ON DUPLICATE KEY UPDATE option_value = IF(
+			   CAST(SUBSTRING_INDEX(option_value, '|', -1) AS UNSIGNED) < %d,
+			   VALUES(option_value), option_value
+			 )",
+			$chunk_lock_key, $lock_value . '|' . $now, $now - 30
+		));
+		wp_cache_delete($chunk_lock_key, 'options');
+		$notoptions = wp_cache_get('notoptions', 'options');
+		if (is_array($notoptions) && isset($notoptions[$chunk_lock_key])) {
+			unset($notoptions[$chunk_lock_key]);
+			wp_cache_set('notoptions', $notoptions, 'options');
+		}
+		$check = get_option($chunk_lock_key);
+		$check_val = is_string($check) ? substr($check, 0, strrpos($check, '|')) : '';
+		if ($check_val !== $lock_value) {
+			return new WP_Error('file_lock', 'Cannot acquire chunk write lock. Another upload may be in progress.');
+		}
+
+		$fh = fopen($tmp_file, 'c+b');
+		if (!$fh) {
+			$this->release_chunk_lock($chunk_lock_key);
+			return new WP_Error('file_open', 'Cannot open temp file for writing.');
+		}
+
+		// Sequential offset validation
+		clearstatcache(true, $tmp_file);
+		$expected_offset = filesize($tmp_file);
+		if ($expected_offset === false) $expected_offset = 0;
+		if ($offset !== $expected_offset) {
+			fclose($fh);
+			$this->release_chunk_lock($chunk_lock_key);
+			return new WP_Error('out_of_sequence', sprintf('Out-of-sequence: expected offset %d but got %d.', $expected_offset, $offset), array('expected' => $expected_offset));
+		}
+
+		fseek($fh, $offset);
+		$written = fwrite($fh, $chunk_data);
+		fclose($fh);
+		$this->release_chunk_lock($chunk_lock_key);
+
+		if (false === $written) {
+			return new WP_Error('file_write', 'Failed to write chunk data.');
+		}
+
+		clearstatcache(true, $tmp_file);
+		$current_size = filesize($tmp_file);
+		$result = array(
+			'received' => strlen($chunk_data),
+			'size'     => $current_size,
+			'total'    => $total_size,
+			'status'   => 0,
+			'filename' => $filename,
+		);
+
+		// On last chunk, finalize the file
+		if ($is_last) {
+			// Validate total size
+			if (abs($current_size - $total_size) > 1024) {
+				@unlink($tmp_file);
+				return new WP_Error('size_mismatch', sprintf('Size mismatch: received %d, expected %d.', $current_size, $total_size));
+			}
+
+			if (file_exists($final_file)) {
+				@unlink($final_file);
+			}
+			// Rename with copy+unlink fallback for CIFS
+			if (!@rename($tmp_file, $final_file)) {
+				if (!@copy($tmp_file, $final_file) || !@unlink($tmp_file)) {
+					return new WP_Error('rename_failed', 'Failed to finalize uploaded file.');
+				}
+			}
+
+			$result['status'] = 1;
+			clearstatcache(true, $final_file);
+			$result['size'] = filesize($final_file);
+
+			// Handle bundle zips
+			if (strpos($filename, 'sgbackup_bundle_') === 0 && $ext === 'zip') {
+				$admin = SiteGuard_Backup_Admin::instance();
+				$extracted = $admin->extract_bundle($final_file, $backup_dir);
+				@unlink($final_file);
+				if (is_wp_error($extracted)) {
+					return $extracted;
+				}
+				$result['bundle'] = true;
+				$result['files'] = count($extracted);
+				$result['message'] = sprintf('Bundle extracted: %d backup files imported.', count($extracted));
+
+				$audit = SiteGuard_Backup_Audit_Log::instance();
+				$audit->log('upload_bundle', 'Chunked upload and extracted bundle: ' . $filename, array(
+					'files' => count($extracted),
+					'size' => $total_size,
+				));
+			} else {
+				// Register individual backup files in history
+				if (preg_match('/^backup_(\d{4}-\d{2}-\d{2}-\d{4})_[^_]+_([a-zA-Z0-9]+)/', $filename, $m)) {
+					$timestamp = strtotime(str_replace('-', '', substr($m[1], 0, 10)) . ' ' . substr($m[1], 11, 2) . ':' . substr($m[1], 13, 2));
+					$nonce = $m[2];
+
+					$entity = 'unknown';
+					foreach (array('plugins', 'themes', 'uploads', 'others', 'db', 'wpcore') as $e) {
+						if (strpos($filename, "-{$e}") !== false) {
+							$entity = $e;
+							break;
+						}
+					}
+
+					$backup_data = array(
+						'nonce' => $nonce,
+						$entity => array($filename),
+						'service' => array('none'),
+						'size' => $result['size'],
+					);
+					SiteGuard_Backup_History::add_backup($timestamp, $backup_data);
+				}
+
+				$audit = SiteGuard_Backup_Audit_Log::instance();
+				$audit->log('upload_backup', 'Chunked upload complete: ' . $filename, array(
+					'filename' => $filename,
+					'size' => $result['size'],
+				));
+			}
+		}
+
+		return $result;
+	}
+
+	/**
+	 * Check status of a chunked upload (complete, partial, or not started).
+	 */
+	public function upload_chunk_status($params) {
+		if (empty($params['filename'])) {
+			return new WP_Error('missing_params', 'Missing filename.');
+		}
+
+		$filename = sanitize_file_name(basename($params['filename']));
+		$ext = strtolower(pathinfo($filename, PATHINFO_EXTENSION));
+		if (!in_array($ext, array('zip', 'gz', 'sql', 'crypt'), true)) {
+			return new WP_Error('invalid_extension', 'Invalid file type.');
+		}
+
+		$opts = SiteGuard_Backup_Options::instance();
+		$backup_dir = $opts->get_backup_dir();
+		$tmp_file = $backup_dir . $filename . '.tmp';
+		$final_file = $backup_dir . $filename;
+
+		clearstatcache(true, $final_file);
+		if (file_exists($final_file) && !is_dir($final_file)) {
+			return array('size' => filesize($final_file), 'status' => 1);
+		}
+
+		clearstatcache(true, $tmp_file);
+		if (file_exists($tmp_file) && !is_dir($tmp_file)) {
+			return array('size' => filesize($tmp_file), 'status' => 0);
+		}
+
+		return array('size' => 0, 'status' => -1);
+	}
+
+	/**
+	 * Cancel a chunked upload - delete .tmp file and lock option.
+	 */
+	public function upload_chunk_cancel($params) {
+		if (empty($params['filename'])) {
+			return new WP_Error('missing_params', 'Missing filename.');
+		}
+
+		$filename = sanitize_file_name(basename($params['filename']));
+		$ext = strtolower(pathinfo($filename, PATHINFO_EXTENSION));
+		if (!in_array($ext, array('zip', 'gz', 'sql', 'crypt'), true)) {
+			return new WP_Error('invalid_extension', 'Invalid file type.');
+		}
+
+		$opts = SiteGuard_Backup_Options::instance();
+		$backup_dir = $opts->get_backup_dir();
+		$tmp_file = $backup_dir . $filename . '.tmp';
+
+		clearstatcache(true, $tmp_file);
+		if (file_exists($tmp_file)) {
+			@unlink($tmp_file);
+		}
+
+		// Clean up lock option
+		$this->release_chunk_lock('sgbackup_chunk_' . md5($filename));
+
+		return array('cancelled' => true);
+	}
+
+	/**
+	 * Release a chunk write lock by setting its timestamp to 0 (expired).
+	 * Uses update_option instead of delete_option to avoid poisoning
+	 * WordPress's 'notoptions' object cache (important with persistent
+	 * object caches like Redis and within same-process calls).
+	 */
+	private function release_chunk_lock($lock_key) {
+		global $wpdb;
+		$wpdb->update(
+			$wpdb->options,
+			array('option_value' => 'released|0'),
+			array('option_name' => $lock_key)
+		);
+		wp_cache_delete($lock_key, 'options');
+	}
 }
