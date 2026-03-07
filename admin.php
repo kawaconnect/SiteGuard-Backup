@@ -768,7 +768,7 @@ class SiteGuard_Backup_Admin {
 
 		// Subsite migration mode
 		if (isset($_POST['subsite_mode'])) {
-			$restore_options['subsite_mode'] = min(4, max(0, intval($_POST['subsite_mode'])));
+			$restore_options['subsite_mode'] = min(5, max(0, intval($_POST['subsite_mode'])));
 		}
 
 		// Keep original protocol (skip HTTP/HTTPS conversion during search-replace)
@@ -800,6 +800,40 @@ class SiteGuard_Backup_Admin {
 			}
 			if (is_array($raw_map)) {
 				$restore_options['subsite_map'] = $raw_map;
+			}
+		}
+
+		// Batch subsite map (mode 5: array of source_blog_id/action/target entries)
+		if (!empty($_POST['batch_subsite_map'])) {
+			$raw = wp_unslash($_POST['batch_subsite_map']);
+			if (is_string($raw)) $raw = json_decode($raw, true);
+			if (is_array($raw)) {
+				$clean = array();
+				foreach ($raw as $entry) {
+					$clean[] = array(
+						'source_blog_id' => intval($entry['source_blog_id']),
+						'source_domain'  => sanitize_text_field($entry['source_domain']),
+						'action'         => in_array($entry['action'], array('overwrite', 'create', 'skip')) ? $entry['action'] : 'skip',
+						'target_blog_id' => isset($entry['target_blog_id']) ? intval($entry['target_blog_id']) : 0,
+						'target_domain'  => isset($entry['target_domain']) ? sanitize_text_field($entry['target_domain']) : '',
+					);
+				}
+				$restore_options['batch_subsite_map'] = $clean;
+			}
+		}
+
+		// Server-side validation: Batch subsite mode requires a non-empty map
+		if (isset($restore_options['subsite_mode']) && (int) $restore_options['subsite_mode'] === 5) {
+			$has_non_skip = false;
+			if (!empty($restore_options['batch_subsite_map'])) {
+				foreach ($restore_options['batch_subsite_map'] as $entry) {
+					if ($entry['action'] !== 'skip') { $has_non_skip = true; break; }
+				}
+			}
+			if (!$has_non_skip) {
+				echo 'RINFO:' . wp_json_encode(array('type' => 'error', 'message' => 'No subsites selected for batch import.')) . "\n";
+				echo 'RINFO:' . wp_json_encode(array('type' => 'complete', 'success' => false, 'errors' => array('No subsites selected for batch import. Please select at least one subsite to overwrite or create.'))) . "\n";
+				wp_die();
 			}
 		}
 

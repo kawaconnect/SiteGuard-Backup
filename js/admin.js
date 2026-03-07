@@ -635,7 +635,7 @@
 			// Show/hide subsite mapping container based on subsite mode
 			$(document).on('change', 'select[name="sgbackup_subsite_mode"]', function() {
 				var mode = $(this).val();
-				var showMap = (mode === '0' || mode === '1' || mode === '3');
+				var showMap = (mode === '0' || mode === '1' || mode === '3' || mode === '5');
 				var showImport = (mode === '4');
 				$('#sgbackup-subsite-map-container').toggle(showMap);
 				$('#sgbackup-subsite-import').toggle(showImport);
@@ -787,6 +787,141 @@
 					html += '<p class="description">Uncheck subsites you don\'t want. Unchecked subsites will be removed from the destination.</p>';
 
 					$container.html(html).data('loaded-ts', timestamp).data('loaded-mode', mode);
+					return;
+				}
+
+				// ===== Mode 5: Batch subsite import =====
+				if (mode === '5') {
+					// Build destination options with blog_id values (for overwrite)
+					var destBlogOptionsHtml = '';
+					if (hasDestBlogs) {
+						for (var d = 0; d < destBlogs.length; d++) {
+							var db = destBlogs[d];
+							if (db.blog_id === 1) continue; // skip main site
+							var label = db.domain + (db.blogname ? ' (' + db.blogname + ')' : '') + ' #' + db.blog_id;
+							destBlogOptionsHtml += '<option value="' + parseInt(db.blog_id) + '" data-domain="' + SGB.esc(db.domain) + '">' + SGB.esc(label) + '</option>';
+						}
+					}
+
+					// Auto-match helper for mode 5
+					var findDestMatchBatch = function(srcDomain) {
+						if (!hasDestBlogs) return null;
+						for (var d = 0; d < destBlogs.length; d++) {
+							if (destBlogs[d].blog_id === 1) continue;
+							if (destBlogs[d].domain === srcDomain) return destBlogs[d];
+						}
+						if (oldHost && newHost) {
+							var oldHostEsc = oldHost.replace(/\./g, '\\.');
+							var prefixMatch = srcDomain.match(new RegExp('^(.+)\\.' + oldHostEsc + '$'));
+							if (prefixMatch) {
+								var srcPrefix = prefixMatch[1];
+								var newHostEsc = newHost.replace(/\./g, '\\.');
+								for (var d = 0; d < destBlogs.length; d++) {
+									if (destBlogs[d].blog_id === 1) continue;
+									var dMatch = destBlogs[d].domain.match(new RegExp('^(.+)\\.' + newHostEsc + '$'));
+									if (dMatch && dMatch[1] === srcPrefix) return destBlogs[d];
+								}
+							}
+						}
+						return null;
+					};
+
+					html += '<p><strong>Select subsites to import (main site is protected):</strong></p>';
+					html += '<table class="sgbackup-subsite-map-table widefat">';
+					html += '<thead><tr><th>Source (Backup)</th><th>Action</th><th>Destination</th></tr></thead><tbody>';
+
+					for (var i = 0; i < sourceBlogs.length; i++) {
+						var src = sourceBlogs[i];
+						var isMainSite = (src.blog_id === 1);
+						var mirrorDomain = oldHost ? src.domain.replace(new RegExp(oldHost.replace(/\./g, '\\\\.'), 'g'), newHost) : src.domain;
+						var srcLabel = SGB.esc(src.domain);
+						if (src.blog_id > 0) srcLabel += ' <small style="color:#888;">#' + src.blog_id + '</small>';
+
+						html += '<tr class="sgbackup-subsite-map-row" data-source-domain="' + SGB.esc(src.domain) + '" data-source-blog-id="' + (src.blog_id || 0) + '">';
+						html += '<td>' + srcLabel + '</td>';
+
+						if (isMainSite) {
+							// Main site is always protected
+							html += '<td><span class="sgbackup-action-badge sgbackup-action-skip" style="background:#e8f4fd;color:#0073aa;">PROTECTED</span></td>';
+							html += '<td style="color:#888;font-style:italic;">Not imported</td>';
+						} else {
+							// Determine default action
+							var destMatch = findDestMatchBatch(src.domain);
+							var defaultAction = destMatch ? 'overwrite' : 'create';
+
+							html += '<td>';
+							html += '<select class="sgbackup-subsite-action">';
+							if (destBlogOptionsHtml) {
+								html += '<option value="overwrite"' + (defaultAction === 'overwrite' ? ' selected' : '') + '>Overwrite existing</option>';
+							}
+							html += '<option value="create"' + (defaultAction === 'create' ? ' selected' : '') + '>Create new site</option>';
+							html += '<option value="skip">Skip</option>';
+							html += '</select>';
+							html += '</td>';
+
+							// Destination column
+							html += '<td class="sgbackup-subsite-dest-cell">';
+							if (defaultAction === 'overwrite' && destBlogOptionsHtml) {
+								html += '<select class="sgbackup-subsite-dest-select">' + destBlogOptionsHtml + '</select>';
+								html += '<input type="text" class="sgbackup-subsite-dest-input regular-text" value="' + SGB.esc(mirrorDomain) + '" style="display:none;width:100%;" />';
+								html += '<span class="sgbackup-subsite-skip-label" style="display:none;color:#888;font-style:italic;">Skipped</span>';
+							} else {
+								html += '<select class="sgbackup-subsite-dest-select" style="display:none;">' + destBlogOptionsHtml + '</select>';
+								html += '<input type="text" class="sgbackup-subsite-dest-input regular-text" value="' + SGB.esc(mirrorDomain) + '" style="width:100%;" />';
+								html += '<span class="sgbackup-subsite-skip-label" style="display:none;color:#888;font-style:italic;">Skipped</span>';
+							}
+							html += '<span class="sgbackup-collision-warning" style="display:none;"> Collision!</span>';
+							html += '</td>';
+						}
+						html += '</tr>';
+					}
+
+					html += '</tbody></table>';
+					html += '<p class="description">Main site tables (wp_options, wp_users, etc.) are never imported. Only selected subsites will be restored.</p>';
+
+					$container.html(html).data('loaded-ts', timestamp).data('loaded-mode', mode);
+
+					// Pre-select matched destinations
+					$container.find('.sgbackup-subsite-map-row').each(function() {
+						var $row = $(this);
+						var srcDomain = $row.data('source-domain');
+						var blogId = parseInt($row.data('source-blog-id'));
+						if (blogId === 1) return;
+						var destMatch = findDestMatchBatch(srcDomain);
+						if (destMatch) {
+							$row.find('.sgbackup-subsite-dest-select').val(destMatch.blog_id);
+						}
+					});
+
+					// Bind action change events (reuse same handler as mode 3)
+					$container.on('change', '.sgbackup-subsite-action', function() {
+						var $row = $(this).closest('.sgbackup-subsite-map-row');
+						var action = $(this).val();
+						var $destSelect = $row.find('.sgbackup-subsite-dest-select');
+						var $destInput = $row.find('.sgbackup-subsite-dest-input');
+						var $skipLabel = $row.find('.sgbackup-subsite-skip-label');
+
+						if (action === 'overwrite') {
+							$destSelect.show();
+							$destInput.hide();
+							$skipLabel.hide();
+						} else if (action === 'create') {
+							$destSelect.hide();
+							$destInput.show();
+							$skipLabel.hide();
+						} else {
+							$destSelect.hide();
+							$destInput.hide();
+							$skipLabel.show();
+						}
+						SGB.checkSubsiteCollisions();
+					});
+
+					$container.on('change', '.sgbackup-subsite-dest-select, .sgbackup-subsite-dest-input', function() {
+						SGB.checkSubsiteCollisions();
+					});
+
+					SGB.checkSubsiteCollisions();
 					return;
 				}
 
@@ -1088,11 +1223,48 @@
 
 						// Show selected subsite mode
 						var subsiteModeVal = $('select[name="sgbackup_subsite_mode"]').val() || '0';
-						var subsiteModeLabels = {'0': 'Mirror all subsites', '1': 'Main site only', '2': 'Keep original domains', '3': 'Custom mapping', '4': 'Import as subsite'};
+						var subsiteModeLabels = {'0': 'Mirror all subsites', '1': 'Main site only', '2': 'Keep original domains', '3': 'Custom mapping', '4': 'Import as subsite', '5': 'Batch subsite import (main site protected)'};
 						html += '<tr><td><strong>Subsite mode:</strong></td><td>' + SGB.esc(subsiteModeLabels[subsiteModeVal] || 'Mirror') + '</td></tr>';
 
 						if (subsiteModeVal === '1') {
 							warnings.push('Main-only mode: ' + (data.multisite_blogs.length - 1) + ' subsites will be REMOVED from wp_blogs after restore.');
+						} else if (subsiteModeVal === '5') {
+							// Batch mode verification summary
+							var batchHtml = '<table class="widefat" style="margin-top:10px;"><thead><tr><th>Source</th><th>Action</th><th>Destination</th></tr></thead><tbody>';
+							var batchCount = 0;
+							$('.sgbackup-subsite-map-row').each(function() {
+								var blogId = parseInt($(this).data('source-blog-id'));
+								var srcDomain = $(this).data('source-domain');
+								var actionLabel, actionClass, destLabel;
+								if (blogId === 1) {
+									actionLabel = 'PROTECTED';
+									actionClass = 'sgbackup-action-skip';
+									destLabel = 'Not imported';
+								} else {
+									var action = $(this).find('.sgbackup-subsite-action').val();
+									if (action === 'skip') {
+										actionLabel = 'SKIP';
+										actionClass = 'sgbackup-action-skip';
+										destLabel = '\u2014';
+									} else if (action === 'overwrite') {
+										actionLabel = 'OVERWRITE';
+										actionClass = 'sgbackup-action-overwrite';
+										destLabel = $(this).find('.sgbackup-subsite-dest-select option:selected').text();
+										batchCount++;
+									} else {
+										actionLabel = 'CREATE';
+										actionClass = 'sgbackup-action-create';
+										destLabel = $.trim($(this).find('.sgbackup-subsite-dest-input').val());
+										batchCount++;
+									}
+								}
+								var badge = '<span class="sgbackup-action-badge ' + actionClass + '">' + actionLabel + '</span>';
+								batchHtml += '<tr><td>' + SGB.esc(srcDomain) + '</td><td>' + badge + '</td>';
+								batchHtml += '<td>' + (destLabel === '\u2014' ? '\u2014' : SGB.esc(destLabel)) + '</td></tr>';
+							});
+							batchHtml += '</tbody></table>';
+							html += '<tr><td colspan="2">' + batchHtml + '</td></tr>';
+							warnings.push('Batch mode: ' + batchCount + ' subsite(s) will be imported. Main site tables are never touched.');
 						} else if (subsiteModeVal === '0' || subsiteModeVal === '3') {
 							var mapHtml = '<table class="widefat" style="margin-top:10px;"><thead><tr><th>Source</th><th>Action</th><th>Destination</th></tr></thead><tbody>';
 							for (var b = 0; b < data.multisite_blogs.length; b++) {
@@ -1277,6 +1449,36 @@
 				if (Object.keys(mirrorSkips).length) {
 					formData.append('subsite_map', JSON.stringify(mirrorSkips));
 				}
+			}
+
+			// Mode 5: Batch subsite map
+			if (subsiteMode === '5') {
+				var batchMap = [];
+				$('.sgbackup-subsite-map-row').each(function() {
+					var srcBlogId = parseInt($(this).data('source-blog-id'));
+					var srcDomain = $(this).data('source-domain');
+					if (!srcBlogId || srcBlogId === 1) return; // skip main site
+					var action = $(this).find('.sgbackup-subsite-action').val();
+					if (!action || action === 'skip') return;
+					var entry = {
+						source_blog_id: srcBlogId,
+						source_domain: srcDomain,
+						action: action
+					};
+					if (action === 'overwrite') {
+						entry.target_blog_id = parseInt($(this).find('.sgbackup-subsite-dest-select').val());
+					} else if (action === 'create') {
+						entry.target_domain = $.trim($(this).find('.sgbackup-subsite-dest-input').val());
+					}
+					batchMap.push(entry);
+				});
+				if (batchMap.length === 0) {
+					SGB.showNotice('No subsites selected for batch import. Please select at least one subsite to overwrite or create.', 'error');
+					$('#sgbackup-restore-options').show();
+					$('#sgbackup-restore-progress').hide();
+					return;
+				}
+				formData.append('batch_subsite_map', JSON.stringify(batchMap));
 			}
 
 			// Target domain/blog_id for subsite import

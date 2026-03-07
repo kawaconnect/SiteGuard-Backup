@@ -27,6 +27,7 @@ class SiteGuard_Backup_Restorer {
 	const SUBSITE_MODE_SKIP_REMAP = 2; // Import subsite data but don't remap domains
 	const SUBSITE_MODE_CUSTOM = 3;     // Custom per-subsite domain mapping
 	const SUBSITE_MODE_IMPORT_AS = 4;  // Import a subsite backup into a multisite as a new/existing subsite
+	const SUBSITE_MODE_BATCH = 5;      // Batch import: selected subsites only, main site untouched
 
 	const SUBSITE_SKIP = '__skip__';   // Sentinel: skip this subsite in custom mapping
 
@@ -133,9 +134,9 @@ class SiteGuard_Backup_Restorer {
 
 		// Subsite migration mode - fall back to site-wide default, clamp to valid range
 		if (isset($restore_options['subsite_mode'])) {
-			$this->subsite_mode = min(4, max(0, intval($restore_options['subsite_mode'])));
+			$this->subsite_mode = min(5, max(0, intval($restore_options['subsite_mode'])));
 		} else {
-			$this->subsite_mode = min(4, max(0, intval(SiteGuard_Backup_Options::instance()->get_option('sgbackup_default_subsite_mode', 0))));
+			$this->subsite_mode = min(5, max(0, intval(SiteGuard_Backup_Options::instance()->get_option('sgbackup_default_subsite_mode', 0))));
 		}
 
 		// Custom subsite mapping: array of old_domain => new_full_domain
@@ -294,6 +295,22 @@ class SiteGuard_Backup_Restorer {
 			$result['messages'] = array_merge($result['messages'], $subsite_result['messages']);
 
 			// Phase 3: Post-restore
+			$this->post_restore_cleanup();
+			$result['messages'] = array_merge($this->progress, $result['messages']);
+			$this->sgbackup->logfile_close();
+			return $result;
+		}
+
+		// Batch subsite import: import only selected subsites, main site untouched
+		if ($this->subsite_mode === self::SUBSITE_MODE_BATCH && is_multisite()) {
+			$this->progress("Batch subsite import: importing selected subsites");
+			$batch_result = $this->restore_batch_subsites($backup_dir);
+			if (!$batch_result['success']) {
+				$result['errors'] = array_merge($result['errors'], $batch_result['errors']);
+				$result['success'] = false;
+			}
+			$result['messages'] = array_merge($result['messages'], $batch_result['messages']);
+
 			$this->post_restore_cleanup();
 			$result['messages'] = array_merge($this->progress, $result['messages']);
 			$this->sgbackup->logfile_close();
@@ -862,6 +879,7 @@ class SiteGuard_Backup_Restorer {
 
 			$this->progress("Importing database: remapping {$source_prefix}* -> {$target_prefix}*");
 
+			$resolved_db_paths = array();
 			foreach ($db_files as $db_file) {
 				$file_path = $backup_dir . $db_file;
 
@@ -874,6 +892,8 @@ class SiteGuard_Backup_Restorer {
 						continue;
 					}
 				}
+
+				$resolved_db_paths[] = $file_path;
 
 				$import_result = SiteGuard_Backup_Database_Utility::execute_sql_file_remap_prefix(
 					$file_path,
@@ -892,7 +912,7 @@ class SiteGuard_Backup_Restorer {
 			}
 
 			// Step 3: Merge users - match by email
-			$this->merge_subsite_users($source_id, $target_id, $backup_dir);
+			$this->merge_subsite_users($source_id, $target_id, $backup_dir, $resolved_db_paths);
 		}
 
 		// Step 4: Move uploaded files
@@ -908,12 +928,14 @@ class SiteGuard_Backup_Restorer {
 
 		// Step 5: Search-replace old domain -> new domain in subsite tables only
 		$old_domain = isset($this->backup_set['subsite_domain']) ? $this->backup_set['subsite_domain'] : '';
+		$old_url_base = ''; // Full old URL base for path-aware comparison
 		// For single-site backups, subsite_domain won't be set - read from the imported options table
 		if (empty($old_domain)) {
 			$target_prefix = $wpdb->base_prefix . $target_id . '_';
 			$imported_siteurl = $wpdb->get_var("SELECT option_value FROM {$target_prefix}options WHERE option_name = 'siteurl'");
 			if ($imported_siteurl) {
 				$old_domain = parse_url($imported_siteurl, PHP_URL_HOST);
+				$old_url_base = rtrim($imported_siteurl, '/');
 				$this->sgbackup->log("Detected source domain from imported siteurl: {$old_domain}");
 			}
 		}
@@ -921,7 +943,15 @@ class SiteGuard_Backup_Restorer {
 		$new_scheme = parse_url(get_option('siteurl'), PHP_URL_SCHEME);
 		$target_url_base = $new_scheme . '://' . $target_domain . rtrim($target_path, '/');
 
-		if (!empty($old_domain) && $old_domain !== $target_domain) {
+		// Compare full URL bases to catch subdirectory-only path changes
+		// (e.g., example.com/shop -> example.com/store where domain is the same)
+		$needs_sr = !empty($old_domain) && $old_domain !== $target_domain;
+		if (!$needs_sr && !empty($old_url_base) && $old_url_base !== $target_url_base) {
+			$needs_sr = true;
+			$this->sgbackup->log("Same domain but different path/scheme detected: {$old_url_base} -> {$target_url_base}");
+		}
+
+		if ($needs_sr) {
 			$this->progress("Search-replace: {$old_domain} -> {$target_domain}" . ($target_path !== '/' ? $target_path : ''));
 
 			require_once SGBACKUP_DIR . 'includes/class-search-replace.php';
@@ -932,14 +962,26 @@ class SiteGuard_Backup_Restorer {
 			$search = array();
 			$replace = array();
 
-			// Full URL replacements (both protocols) - includes path for subdirectory installs
-			$search[] = 'https://' . $old_domain;
-			$replace[] = $target_url_base;
-			$search[] = 'http://' . $old_domain;
-			$replace[] = $target_url_base;
+			// If we have the full old URL base, use it for precise path replacement
+			if (!empty($old_url_base)) {
+				$old_url_https = preg_replace('/^https?/', 'https', $old_url_base);
+				$old_url_http = preg_replace('/^https?/', 'http', $old_url_base);
+				$search[] = $old_url_https;
+				$replace[] = $target_url_base;
+				$search[] = $old_url_http;
+				$replace[] = $target_url_base;
+			} else {
+				// Fallback: domain-only replacement (both protocols)
+				$search[] = 'https://' . $old_domain;
+				$replace[] = $target_url_base;
+				$search[] = 'http://' . $old_domain;
+				$replace[] = $target_url_base;
+			}
 			// Bare domain catch-all (domain-only, no path - safer for non-URL contexts)
-			$search[] = $old_domain;
-			$replace[] = $target_domain;
+			if ($old_domain !== $target_domain) {
+				$search[] = $old_domain;
+				$replace[] = $target_domain;
+			}
 
 			$sr = new SiteGuard_Backup_Search_Replace();
 			$report = $sr->run($search, $replace, $tables);
@@ -972,18 +1014,300 @@ class SiteGuard_Backup_Restorer {
 	}
 
 	/**
+	 * Batch import selected subsites from a full-site backup.
+	 *
+	 * Streams through the SQL once, importing only mapped subsite tables with
+	 * prefix remapping. Main-site tables are never touched.
+	 *
+	 * @param string $backup_dir Path to backup directory.
+	 * @return array ['success' => bool, 'messages' => array, 'errors' => array]
+	 */
+	private function restore_batch_subsites($backup_dir) {
+		global $wpdb;
+
+		$result = array('success' => true, 'messages' => array(), 'errors' => array());
+		$batch_map = isset($this->restore_options['batch_subsite_map']) ? $this->restore_options['batch_subsite_map'] : array();
+
+		// Filter out skip entries
+		$batch_map = array_filter($batch_map, function($entry) {
+			return isset($entry['action']) && $entry['action'] !== 'skip';
+		});
+
+		if (empty($batch_map)) {
+			$result['success'] = false;
+			$result['errors'][] = 'No subsites selected for batch import.';
+			return $result;
+		}
+
+		$base_prefix = $wpdb->base_prefix;
+
+		// Step 1: Prepare targets and build prefix map
+		$prefix_map = array();
+		$target_map = array(); // source_blog_id => target_blog_id
+		$source_domains = array(); // source_blog_id => source_domain
+
+		foreach ($batch_map as $entry) {
+			$source_id = intval($entry['source_blog_id']);
+			if ($source_id <= 1) {
+				$this->sgbackup->log("Batch: skipping blog #{$source_id} - main site cannot be batch-imported");
+				continue;
+			}
+			$source_domain = isset($entry['source_domain']) ? $entry['source_domain'] : '';
+			$action = $entry['action'];
+			$source_prefix = $base_prefix . $source_id . '_';
+
+			$source_domains[$source_id] = $source_domain;
+
+			if ($action === 'overwrite') {
+				$target_id = intval($entry['target_blog_id']);
+				$target_blog = get_blog_details($target_id, false);
+				if (!$target_blog) {
+					$result['errors'][] = "Target blog #{$target_id} not found for source #{$source_id}";
+					continue;
+				}
+
+				// Drop existing subsite tables
+				$target_prefix = $base_prefix . $target_id . '_';
+				$existing_tables = SiteGuard_Backup_Database_Utility::get_tables($target_prefix);
+				if (!empty($existing_tables)) {
+					$wpdb->query('SET FOREIGN_KEY_CHECKS = 0');
+					foreach ($existing_tables as $table) {
+						$safe = SiteGuard_Backup_Database_Utility::sanitize_table_name($table);
+						if ($safe) {
+							$wpdb->query("DROP TABLE IF EXISTS `{$safe}`");
+						}
+					}
+					$wpdb->query('SET FOREIGN_KEY_CHECKS = 1');
+					$this->sgbackup->log("Batch: dropped " . count($existing_tables) . " existing tables for target blog #{$target_id}");
+				}
+
+				$prefix_map[$source_prefix] = $target_prefix;
+				$target_map[$source_id] = $target_id;
+				$this->progress("Subsite #{$source_id} ({$source_domain}) -> overwrite blog #{$target_id}");
+
+			} elseif ($action === 'create') {
+				$target_domain = isset($entry['target_domain']) ? $entry['target_domain'] : '';
+				if (empty($target_domain)) {
+					$result['errors'][] = "Missing target domain for source #{$source_id}";
+					continue;
+				}
+
+				$network = get_network();
+				$path = '/';
+				$create_domain = $target_domain;
+
+				if (is_subdomain_install()) {
+					$path = '/';
+				} else {
+					$path = '/' . trim(str_replace($network->domain, '', $target_domain), './ ') . '/';
+					if ($path === '//') $path = '/';
+					$create_domain = $network->domain;
+				}
+
+				$target_id = wpmu_create_blog($create_domain, $path, 'Imported subsite', get_current_user_id(), array('public' => 1), $network->id);
+				if (is_wp_error($target_id)) {
+					$result['errors'][] = "Failed to create subsite for {$target_domain}: " . $target_id->get_error_message();
+					continue;
+				}
+				$this->sgbackup->log("Batch: created new subsite blog #{$target_id} ({$target_domain})");
+
+				// Drop auto-created tables
+				$target_prefix = $base_prefix . $target_id . '_';
+				$auto_tables = SiteGuard_Backup_Database_Utility::get_tables($target_prefix);
+				if (!empty($auto_tables)) {
+					$wpdb->query('SET FOREIGN_KEY_CHECKS = 0');
+					foreach ($auto_tables as $table) {
+						$safe = SiteGuard_Backup_Database_Utility::sanitize_table_name($table);
+						if ($safe) {
+							$wpdb->query("DROP TABLE IF EXISTS `{$safe}`");
+						}
+					}
+					$wpdb->query('SET FOREIGN_KEY_CHECKS = 1');
+				}
+
+				$prefix_map[$source_prefix] = $target_prefix;
+				$target_map[$source_id] = $target_id;
+				$this->progress("Subsite #{$source_id} ({$source_domain}) -> new blog #{$target_id} ({$target_domain})");
+			}
+		}
+
+		if (empty($prefix_map)) {
+			$result['success'] = false;
+			$result['errors'][] = 'No valid subsite mappings could be prepared.';
+			return $result;
+		}
+
+		// Step 2: SQL import with multi-prefix remapping
+		if (!empty($this->restore_options['db']) && !empty($this->backup_set['db'])) {
+			$db_files = $this->backup_set['db'];
+			if (is_string($db_files)) $db_files = array($db_files);
+
+			$this->progress("Importing database: " . count($prefix_map) . " subsite prefix mappings");
+			$this->sgbackup->log("Batch prefix map: " . json_encode($prefix_map));
+
+			$resolved_db_paths = array();
+			foreach ($db_files as $db_file) {
+				$file_path = $backup_dir . $db_file;
+
+				// Decrypt if needed
+				if (preg_match('/\.crypt$/', $db_file)) {
+					$file_path = $this->decrypt_file($file_path);
+					if (!$file_path) {
+						$result['errors'][] = "Failed to decrypt: {$db_file}";
+						$result['success'] = false;
+						continue;
+					}
+				}
+
+				$resolved_db_paths[] = $file_path;
+
+				$import_result = SiteGuard_Backup_Database_Utility::execute_sql_file_multi_remap(
+					$file_path,
+					$prefix_map,
+					$base_prefix,
+					function($lines_done) {
+						$this->progress("Database import: {$lines_done} lines processed");
+					}
+				);
+
+				$result['messages'][] = "Database: {$import_result['tables_restored']} tables imported across " . count($prefix_map) . " subsites";
+				if (!empty($import_result['errors'])) {
+					$result['errors'] = array_merge($result['errors'], $import_result['errors']);
+				}
+				if (!$import_result['success']) {
+					$result['success'] = false;
+				}
+			}
+
+			// Step 3: User merge for each subsite
+			foreach ($target_map as $source_id => $target_id) {
+				$this->progress("Merging users for subsite #{$source_id} -> #{$target_id}");
+				$this->merge_subsite_users($source_id, $target_id, $backup_dir, $resolved_db_paths);
+			}
+
+			// Step 4: Per-subsite search-replace
+			require_once SGBACKUP_DIR . 'includes/class-search-replace.php';
+
+			foreach ($target_map as $source_id => $target_id) {
+				$target_prefix = $base_prefix . $target_id . '_';
+				$old_domain = isset($source_domains[$source_id]) ? $source_domains[$source_id] : '';
+				$old_url_base = '';
+
+				// If no source domain provided, read from imported options
+				if (empty($old_domain)) {
+					$imported_siteurl = $wpdb->get_var("SELECT option_value FROM {$target_prefix}options WHERE option_name = 'siteurl'");
+					if ($imported_siteurl) {
+						$old_domain = parse_url($imported_siteurl, PHP_URL_HOST);
+						$old_url_base = rtrim($imported_siteurl, '/');
+					}
+				}
+
+				$target_blog = get_blog_details($target_id, false);
+				if (!$target_blog) continue;
+
+				$new_domain = $target_blog->domain;
+				$target_path = $target_blog->path;
+				$new_scheme = parse_url(get_option('siteurl'), PHP_URL_SCHEME);
+				$target_url_base = $new_scheme . '://' . $new_domain . rtrim($target_path, '/');
+
+				// Compare full URL bases to catch subdirectory-only path changes
+				$needs_sr = !empty($old_domain) && $old_domain !== $new_domain;
+				if (!$needs_sr && !empty($old_url_base) && $old_url_base !== $target_url_base) {
+					$needs_sr = true;
+					$this->sgbackup->log("Batch blog #{$target_id}: same domain but different path/scheme: {$old_url_base} -> {$target_url_base}");
+				}
+
+				if ($needs_sr) {
+					$this->progress("Search-replace for blog #{$target_id}: {$old_domain} -> {$new_domain}" . ($target_path !== '/' ? $target_path : ''));
+
+					$tables = SiteGuard_Backup_Database_Utility::get_tables($target_prefix);
+					$search = array();
+					$replace = array();
+
+					if (!empty($old_url_base)) {
+						$old_url_https = preg_replace('/^https?/', 'https', $old_url_base);
+						$old_url_http = preg_replace('/^https?/', 'http', $old_url_base);
+						$search[] = $old_url_https;
+						$replace[] = $target_url_base;
+						$search[] = $old_url_http;
+						$replace[] = $target_url_base;
+					} else {
+						$search[] = 'https://' . $old_domain;
+						$replace[] = $target_url_base;
+						$search[] = 'http://' . $old_domain;
+						$replace[] = $target_url_base;
+					}
+					if ($old_domain !== $new_domain) {
+						$search[] = $old_domain;
+						$replace[] = $new_domain;
+					}
+
+					$sr = new SiteGuard_Backup_Search_Replace();
+					$report = $sr->run($search, $replace, $tables);
+
+					$this->sgbackup->log("Batch SR blog #{$target_id}: {$report['changes']} changes across {$report['tables']} tables");
+					$this->progress("Search-replace blog #{$target_id}: {$report['changes']} changes");
+					$result['messages'][] = "Search-replace blog #{$target_id}: {$report['changes']} changes ({$old_domain} -> {$new_domain}" . ($target_path !== '/' ? $target_path : '') . ")";
+				}
+
+				// Fix subsite options (siteurl, home)
+				$new_siteurl = $target_url_base;
+				$wpdb->update($target_prefix . 'options', array('option_value' => $new_siteurl), array('option_name' => 'siteurl'));
+				$wpdb->update($target_prefix . 'options', array('option_value' => $new_siteurl), array('option_name' => 'home'));
+				$this->sgbackup->log("Batch: fixed siteurl/home for blog #{$target_id} -> {$new_siteurl}");
+			}
+		}
+
+		// Step 5: Upload files for each mapped subsite
+		if (!empty($this->restore_options['uploads']) && !empty($this->backup_set['uploads'])) {
+			foreach ($target_map as $source_id => $target_id) {
+				$this->progress("Restoring uploads for subsite #{$source_id} -> #{$target_id}");
+				$this->restore_subsite_uploads($backup_dir, $source_id, $target_id);
+			}
+			$result['messages'][] = "Uploads restored for " . count($target_map) . " subsites";
+		}
+
+		$result['messages'][] = "Batch subsite import complete: " . count($target_map) . " subsites imported";
+		return $result;
+	}
+
+	/**
 	 * Merge users from a subsite backup into the existing multisite user base.
 	 * Matches by email - reuses existing users, inserts new ones.
 	 *
 	 * Capabilities are parsed from the SQL dump (wp_usermeta is skipped during
 	 * remap import so they won't be in the live DB). For per-subsite backups
 	 * where wp_usermeta is absent, users default to subscriber role.
+	 *
+	 * @param int    $source_id      Source blog ID.
+	 * @param int    $target_id      Target blog ID.
+	 * @param string $backup_dir     Path to backup directory.
+	 * @param array  $resolved_paths Optional pre-resolved file paths (already decrypted). If empty, reads from backup_set['db'].
 	 */
-	private function merge_subsite_users($source_id, $target_id, $backup_dir) {
+	private function merge_subsite_users($source_id, $target_id, $backup_dir, $resolved_paths = array()) {
 		global $wpdb;
 
-		$db_files = $this->backup_set['db'];
-		if (is_string($db_files)) $db_files = array($db_files);
+		// Use pre-resolved paths if provided (handles encrypted files that were already decrypted)
+		if (!empty($resolved_paths)) {
+			$file_paths = $resolved_paths;
+		} else {
+			$db_files = $this->backup_set['db'];
+			if (is_string($db_files)) $db_files = array($db_files);
+			$file_paths = array();
+			foreach ($db_files as $db_file) {
+				$file_path = $backup_dir . $db_file;
+				if (preg_match('/\.crypt$/', $db_file)) {
+					$decrypted = $this->decrypt_file($file_path);
+					if ($decrypted) {
+						$file_paths[] = $decrypted;
+					} else {
+						$this->sgbackup->log("User merge: failed to decrypt {$db_file}, skipping");
+					}
+				} else {
+					$file_paths[] = $file_path;
+				}
+			}
+		}
 
 		$base_prefix = $wpdb->base_prefix;
 		$users_table = $base_prefix . 'users';
@@ -999,9 +1323,7 @@ class SiteGuard_Backup_Restorer {
 		$backup_caps = array();  // old_user_id => serialized capabilities string
 		$escaped_cap_key = addslashes($source_cap_key);
 
-		foreach ($db_files as $db_file) {
-			$file_path = $backup_dir . $db_file;
-			if (preg_match('/\.crypt$/', $db_file)) continue;
+		foreach ($file_paths as $file_path) {
 
 			$is_gz = (substr($file_path, -3) === '.gz');
 			$fh = $is_gz ? @gzopen($file_path, 'rb') : @fopen($file_path, 'r');

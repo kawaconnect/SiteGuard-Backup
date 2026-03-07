@@ -209,12 +209,17 @@ class SiteGuard_Backup_CLI_Command extends WP_CLI_Command {
      * : File restore mode. Values: overwrite, backup, skip, merge.
      *
      * [--subsite-mode=<mode>]
-     * : Multisite subsite handling. Values: mirror, main-only, skip-remap, custom, import-as.
+     * : Multisite subsite handling. Values: mirror, main-only, skip-remap, custom, import-as, batch.
      *
      * [--subsite-map=<json>]
      * : JSON mapping of old_domain => new_domain for custom subsite mode.
      *   Use "__skip__" as the destination to skip a subsite entirely.
      *   Example: '{"blog.old.com":"blog.new.com","shop.old.com":"__skip__"}'
+     *
+     * [--batch-subsite-map=<json>]
+     * : JSON array for batch subsite import (mode 5). Each entry specifies a
+     *   source blog_id, action (overwrite/create), and target.
+     *   Example: '[{"source_blog_id":2,"source_domain":"shop.old.com","action":"overwrite","target_blog_id":5}]'
      *
      * [--target-subsite-domain=<domain>]
      * : Target subsite domain for import-as mode. The backup will be imported
@@ -325,10 +330,11 @@ class SiteGuard_Backup_CLI_Command extends WP_CLI_Command {
                 'skip-remap'  => 2,
                 'custom'      => 3,
                 'import-as'   => 4,
+                'batch'       => 5,
             );
             $sm = $assoc_args['subsite-mode'];
             if (!isset($subsite_mode_map[$sm])) {
-                WP_CLI::error("Invalid --subsite-mode. Valid values: mirror, main-only, skip-remap, custom, import-as");
+                WP_CLI::error("Invalid --subsite-mode. Valid values: mirror, main-only, skip-remap, custom, import-as, batch");
             }
             $restore_options['subsite_mode'] = $subsite_mode_map[$sm];
         }
@@ -343,6 +349,18 @@ class SiteGuard_Backup_CLI_Command extends WP_CLI_Command {
             // Auto-set custom mode if map is provided but mode wasn't explicitly set
             if (!isset($restore_options['subsite_mode'])) {
                 $restore_options['subsite_mode'] = 3;
+            }
+        }
+
+        // Batch subsite map (JSON array for mode 5)
+        if (isset($assoc_args['batch-subsite-map'])) {
+            $batch_map = json_decode($assoc_args['batch-subsite-map'], true);
+            if (!is_array($batch_map) || empty($batch_map)) {
+                WP_CLI::error("Invalid --batch-subsite-map: must be a valid JSON array of subsite mapping entries.");
+            }
+            $restore_options['batch_subsite_map'] = $batch_map;
+            if (!isset($restore_options['subsite_mode'])) {
+                $restore_options['subsite_mode'] = 5;
             }
         }
 

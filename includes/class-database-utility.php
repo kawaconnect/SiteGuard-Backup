@@ -1428,6 +1428,7 @@ class SiteGuard_Backup_Database_Utility {
 					continue;
 				}
 
+				$wpdb->check_connection();
 				$res = $wpdb->query($query);
 				if (false === $res) {
 					$result['errors'][] = "SQL error on line {$line_count}: " . $wpdb->last_error;
@@ -1444,6 +1445,7 @@ class SiteGuard_Backup_Database_Utility {
 			if (!empty($query) && !$skipping_table) {
 				$query = self::remap_table_prefix_in_query($query, $source_prefix, $target_prefix);
 				if (!self::is_dangerous_sql($query)) {
+					$wpdb->check_connection();
 					$res = $wpdb->query($query);
 					if (false === $res) {
 						$result['errors'][] = "SQL error at end: " . $wpdb->last_error;
@@ -1463,13 +1465,176 @@ class SiteGuard_Backup_Database_Utility {
 	}
 
 	/**
-	 * Remap table prefix in a SQL statement.
+	 * Import a SQL file with multi-prefix remapping (batch subsite import).
 	 *
-	 * @param string $query         The SQL statement.
-	 * @param string $source_prefix Source prefix (e.g. "wp_2_").
-	 * @param string $target_prefix Target prefix (e.g. "wp_5_").
-	 * @return string Modified query.
+	 * Single-pass streaming: routes each SQL statement to the correct target
+	 * prefix based on $prefix_map, skips main-site and unmapped tables entirely.
+	 *
+	 * @param string   $sql_file          Path to SQL file (.sql or .sql.gz).
+	 * @param array    $prefix_map        Source prefix => target prefix, e.g. ['wp_2_' => 'wp_5_', 'wp_3_' => 'wp_7_'].
+	 * @param string   $base_prefix       WordPress base prefix (e.g. 'wp_') for identifying global/main-site tables.
+	 * @param callable $progress_callback Optional callback($lines_done) for progress reporting.
+	 * @return array ['success' => bool, 'errors' => array, 'tables_restored' => int]
 	 */
+	public static function execute_sql_file_multi_remap($sql_file, $prefix_map, $base_prefix, $progress_callback = null) {
+		global $wpdb;
+
+		$result = array('success' => true, 'errors' => array(), 'tables_restored' => 0);
+
+		$is_gz = (substr($sql_file, -3) === '.gz');
+		$fh = $is_gz ? @gzopen($sql_file, 'rb') : @fopen($sql_file, 'r');
+		if (!$fh) {
+			$result['success'] = false;
+			$result['errors'][] = "Failed to open SQL file: {$sql_file}";
+			return $result;
+		}
+
+		// Build set of source prefixes we're importing
+		$source_prefixes = array_keys($prefix_map);
+
+		// Tables to always skip (global multisite tables)
+		$global_skip = array(
+			$base_prefix . 'users',
+			$base_prefix . 'usermeta',
+		);
+
+		$buffer = '';
+		$line_count = 0;
+		$in_string = false;
+		$string_char = '';
+		$current_table = '';
+		$current_action = ''; // 'remap', 'skip'
+		$current_remap_src = '';
+		$current_remap_dst = '';
+
+		$wpdb->query('SET FOREIGN_KEY_CHECKS = 0');
+		$wpdb->query("SET SQL_MODE = 'NO_AUTO_VALUE_ON_ZERO'");
+
+		while (!($is_gz ? gzeof($fh) : feof($fh))) {
+			$line = $is_gz ? gzgets($fh) : fgets($fh);
+			if (false === $line) break;
+
+			$line_count++;
+			$trimmed = trim($line);
+
+			if (!$in_string) {
+				if (empty($trimmed)) continue;
+				if (empty($buffer) && (0 === strpos($trimmed, '--') || 0 === strpos($trimmed, '#') || 0 === strpos($trimmed, '/*'))) continue;
+				if (preg_match('/^(LOCK\s+TABLES|UNLOCK\s+TABLES)/i', $trimmed)) continue;
+
+				// Detect table name from DDL/DML
+				$detected_table = '';
+				if (preg_match('/^(?:DROP TABLE|CREATE TABLE)\s+(?:IF\s+(?:NOT\s+)?EXISTS\s+)?`([^`]+)`/i', $trimmed, $m)) {
+					$detected_table = $m[1];
+				} elseif (preg_match('/^INSERT\s+INTO\s+`([^`]+)`/i', $trimmed, $m)) {
+					$detected_table = $m[1];
+				}
+
+				if (!empty($detected_table)) {
+					$current_table = $detected_table;
+					$current_action = 'skip'; // default: skip unknown tables
+					$current_remap_src = '';
+					$current_remap_dst = '';
+
+					// Check if this table belongs to a mapped source prefix
+					foreach ($source_prefixes as $src_pfx) {
+						if (strpos($current_table, $src_pfx) === 0) {
+							$current_action = 'remap';
+							$current_remap_src = $src_pfx;
+							$current_remap_dst = $prefix_map[$src_pfx];
+							break;
+						}
+					}
+
+					// Also skip global tables even if they somehow match
+					if (in_array($current_table, $global_skip, true)) {
+						$current_action = 'skip';
+					}
+				}
+			}
+
+			// Track string state (even when skipping, to stay in sync)
+			$len = strlen($trimmed);
+			for ($ci = 0; $ci < $len; $ci++) {
+				$ch = $trimmed[$ci];
+				if ($in_string) {
+					if ($ch === '\\') { $ci++; }
+					elseif ($ch === $string_char) {
+						if ($ci + 1 < $len && $trimmed[$ci + 1] === $string_char) { $ci++; }
+						else { $in_string = false; }
+					}
+				} else {
+					if ($ch === "'" || $ch === '"') { $in_string = true; $string_char = $ch; }
+				}
+			}
+
+			// Progress callback - fires for ALL lines (including skipped) so
+			// callers see progress even when most of the file is being skipped.
+			if ($progress_callback && $line_count % 5000 === 0) {
+				call_user_func($progress_callback, $line_count, 0);
+			}
+
+			if ($current_action === 'skip') {
+				continue;
+			}
+
+			$buffer .= $line;
+
+			if (!$in_string && substr($trimmed, -1) === ';') {
+				$query = trim(rtrim($buffer, ';'));
+				$buffer = '';
+
+				if (empty($query)) continue;
+
+				// Remap table prefix
+				if (!empty($current_remap_src) && !empty($current_remap_dst)) {
+					$query = self::remap_table_prefix_in_query($query, $current_remap_src, $current_remap_dst);
+				}
+
+				if (self::is_dangerous_sql($query)) {
+					$result['errors'][] = "Blocked dangerous SQL on line {$line_count}";
+					continue;
+				}
+
+				$wpdb->check_connection();
+				$res = $wpdb->query($query);
+				if (false === $res) {
+					$result['errors'][] = "SQL error on line {$line_count}: " . $wpdb->last_error;
+				}
+
+				if (preg_match('/^CREATE\s+TABLE/i', $query)) {
+					$result['tables_restored']++;
+				}
+			}
+		}
+
+		// Flush remaining buffer
+		if (!empty(trim($buffer)) && $current_action !== 'skip') {
+			$query = trim(rtrim($buffer, ';'));
+			if (!empty($query)) {
+				if (!empty($current_remap_src) && !empty($current_remap_dst)) {
+					$query = self::remap_table_prefix_in_query($query, $current_remap_src, $current_remap_dst);
+				}
+				if (!self::is_dangerous_sql($query)) {
+					$wpdb->check_connection();
+					$res = $wpdb->query($query);
+					if (false === $res) {
+						$result['errors'][] = "SQL error at end: " . $wpdb->last_error;
+					}
+				}
+			}
+		}
+
+		$wpdb->query('SET FOREIGN_KEY_CHECKS = 1');
+		$is_gz ? @gzclose($fh) : @fclose($fh);
+
+		if (!empty($result['errors'])) {
+			$result['success'] = false;
+		}
+
+		return $result;
+	}
+
 	private static function remap_table_prefix_in_query($query, $source_prefix, $target_prefix) {
 		// Replace backtick-quoted table names
 		$escaped_source = preg_quote($source_prefix, '/');

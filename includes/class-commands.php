@@ -873,10 +873,13 @@ class SiteGuard_Backup_Commands {
 			$restore_options['db_restore_mode'] = min(3, max(0, intval($params['db_restore_mode'])));
 		}
 		if (isset($params['subsite_mode'])) {
-			$restore_options['subsite_mode'] = min(4, max(0, intval($params['subsite_mode'])));
+			$restore_options['subsite_mode'] = min(5, max(0, intval($params['subsite_mode'])));
 		}
 		if (!empty($params['subsite_map']) && is_array($params['subsite_map'])) {
 			$restore_options['subsite_map'] = $params['subsite_map'];
+		}
+		if (!empty($params['batch_subsite_map']) && is_array($params['batch_subsite_map'])) {
+			$restore_options['batch_subsite_map'] = $params['batch_subsite_map'];
 		}
 		if (!empty($params['target_subsite_domain'])) {
 			$restore_options['target_subsite_domain'] = sanitize_text_field($params['target_subsite_domain']);
@@ -2737,9 +2740,12 @@ class SiteGuard_Backup_Commands {
 		}
 		$restore_options['move_in_mode'] = isset($params['move_in_mode']) ? min(3, max(0, intval($params['move_in_mode']))) : 0;
 		$restore_options['db_restore_mode'] = isset($params['db_restore_mode']) ? min(3, max(0, intval($params['db_restore_mode']))) : 0;
-		$restore_options['subsite_mode'] = isset($params['subsite_mode']) ? min(4, max(0, intval($params['subsite_mode']))) : 0;
+		$restore_options['subsite_mode'] = isset($params['subsite_mode']) ? min(5, max(0, intval($params['subsite_mode']))) : 0;
 		if (!empty($params['subsite_map']) && is_array($params['subsite_map'])) {
 			$restore_options['subsite_map'] = $params['subsite_map'];
+		}
+		if (!empty($params['batch_subsite_map']) && is_array($params['batch_subsite_map'])) {
+			$restore_options['batch_subsite_map'] = $params['batch_subsite_map'];
 		}
 		$restore_options['pre_restore_backup'] = !empty($params['pre_restore_backup']);
 		$restore_options['include_unspecified_tables'] = !empty($params['include_unspecified_tables']);
