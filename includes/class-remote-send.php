@@ -358,7 +358,7 @@ class SiteGuard_Backup_Remote_Send {
 		fseek($fh, $start);
 		$written = fwrite($fh, $chunk_data);
 		fclose($fh);
-		delete_transient($chunk_lock_key);
+		delete_option($chunk_lock_key);
 
 		if (false === $written) {
 			return new WP_Error('file_write', 'Failed to write chunk data.');

@@ -738,6 +738,7 @@ class SiteGuard_Backup_Database_Utility {
 		$result = array('success' => true, 'errors' => array(), 'tables_restored' => 0);
 		$in_string = false;
 		$string_char = '';
+		$delimiter = ';';
 
 		$wpdb->query('SET FOREIGN_KEY_CHECKS = 0');
 		$wpdb->query("SET SQL_MODE = 'NO_AUTO_VALUE_ON_ZERO'");
@@ -764,6 +765,7 @@ class SiteGuard_Backup_Database_Utility {
 				}
 				// Handle DELIMITER changes (for routines/views)
 				if (preg_match('/^DELIMITER\s+(\S+)/i', $trimmed, $dm)) {
+					$delimiter = $dm[1];
 					continue;
 				}
 				// Skip LOCK/UNLOCK TABLES - incompatible with atomic temp-table approach
@@ -789,8 +791,9 @@ class SiteGuard_Backup_Database_Utility {
 				}
 			}
 
-			if (!$in_string && substr($trimmed, -1) === ';') {
-				$query = trim(rtrim($buffer, ';'));
+			$delim_len = strlen($delimiter);
+			if (!$in_string && substr($trimmed, -$delim_len) === $delimiter) {
+				$query = trim(substr(trim($buffer), 0, -$delim_len));
 				$buffer = '';
 
 				if (empty($query)) continue;
@@ -854,21 +857,38 @@ class SiteGuard_Backup_Database_Utility {
 			foreach ($tables_created as $original => $temp) {
 				$original = self::sanitize_table_name($original);
 				$temp = self::sanitize_table_name($temp);
-				$old_backup = '_sgb_old_' . substr($original, 0, 50);
-				// Rename original to backup and temp to original in one atomic statement
-				$rename_parts[] = "`{$original}` TO `{$old_backup}`, `{$temp}` TO `{$original}`";
+				// Use hash to avoid name collisions on long table names
+				$old_backup = '_sgb_old_' . substr(md5($original), 0, 8) . '_' . substr($original, 0, 40);
 				$old_tables[] = $old_backup;
+			}
+
+			// Drop any leftover _sgb_old_ tables from previous crashed restores
+			foreach ($old_tables as $old_tbl) {
+				$wpdb->query("DROP TABLE IF EXISTS `{$old_tbl}`");
+			}
+
+			$rename_parts = array();
+			$old_idx = 0;
+			foreach ($tables_created as $original => $temp) {
+				$original = self::sanitize_table_name($original);
+				$temp = self::sanitize_table_name($temp);
+				$old_backup = $old_tables[$old_idx++];
+				$rename_parts[] = "`{$original}` TO `{$old_backup}`, `{$temp}` TO `{$original}`";
 			}
 
 			if (!empty($rename_parts)) {
 				$rename_sql = "RENAME TABLE " . implode(', ', $rename_parts);
 				$rename_result = $wpdb->query($rename_sql);
 				if (false === $rename_result) {
-					// Fallback: rename one by one (must drop original first in this path)
+					// Fallback: two-step rename per table (original→old, temp→original)
+					$old_idx = 0;
 					foreach ($tables_created as $original => $temp) {
 						$original = self::sanitize_table_name($original);
 						$temp = self::sanitize_table_name($temp);
-						$wpdb->query("DROP TABLE IF EXISTS `{$original}`");
+						$old_backup = $old_tables[$old_idx++];
+						$wpdb->query("DROP TABLE IF EXISTS `{$old_backup}`");
+						// Try rename original→old first to preserve data
+						$wpdb->query("RENAME TABLE `{$original}` TO `{$old_backup}`");
 						$wpdb->query("RENAME TABLE `{$temp}` TO `{$original}`");
 					}
 				}
@@ -1185,8 +1205,6 @@ class SiteGuard_Backup_Database_Utility {
 			'/\bSET\s+GLOBAL\b/i',
 			'/^\s*CALL\s/i',
 			'/^\s*EXECUTE\s/i',
-			'/^\s*CREATE\s+PROCEDURE\b/i',
-			'/^\s*CREATE\s+FUNCTION\b/i',
 		);
 
 		foreach ($dangerous_patterns as $pattern) {

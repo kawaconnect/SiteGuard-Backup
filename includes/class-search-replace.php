@@ -94,6 +94,7 @@ class SiteGuard_Backup_Search_Replace {
 
 		if (!$primary_key) {
 			// No primary key - skip this table (can't do reliable updates)
+			$this->report['skipped_no_pk'][] = $table;
 			return;
 		}
 
