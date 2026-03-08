@@ -5,7 +5,12 @@
  * Commands: backup, list, restore, status, verify, export, import, prefailover,
  * healthcheck, cleanup, sites, schedule, postfailover, prune, lock,
  * backup_progress, get_latest_full_backup, rescan_storage, create_migration_key,
- * search_replace, get_most_recently_modified_log, audit_log
+ * search_replace, get_most_recently_modified_log, audit_log, import_foreign,
+ * force_resume, delete, keep, get_log, abort, settings, remote_test,
+ * remote_upload, migrate_add_destination, migrate_ping, migrate_send,
+ * migrate_clone, migrate_destinations, migrate_keys, inspect, db_tables,
+ * site_size, db_size, sysinfo, cron_events, resume_restore, presets,
+ * test_webhook, failover_status
  */
 
 if (!defined('ABSPATH')) die('No direct access.');
@@ -38,12 +43,25 @@ class SiteGuard_Backup_CLI_Command extends WP_CLI_Command {
      * [--subsite-only]
      * : Backup only the current subsite's data (multisite only, requires --url for a subsite).
      *
+     * [--include-tables=<tables>]
+     * : Comma-separated list of database tables to include.
+     *
+     * [--include-nonwp-tables]
+     * : Include non-WordPress-prefixed tables in the backup.
+     *
+     * [--anonymise]
+     * : Anonymise personal data in the database backup.
+     *
+     * [--anonymise-mode=<mode>]
+     * : Anonymisation mode: all, non_staff, wc_orders. Default: all.
+     *
      * ## EXAMPLES
      *
      *     wp siteguardbackup backup
      *     wp siteguardbackup backup --exclude-db --include-files=plugins,themes
      *     wp siteguardbackup backup --send-to-cloud --always-keep
      *     wp siteguardbackup backup --url=subsite.example.com --subsite-only
+     *     wp siteguardbackup backup --include-tables=wp_posts,wp_postmeta --anonymise --anonymise-mode=non_staff
      *
      * @subcommand backup
      */
@@ -87,6 +105,21 @@ class SiteGuard_Backup_CLI_Command extends WP_CLI_Command {
                 WP_CLI::error('--subsite-only requires multisite and a subsite context (use --url=subsite.domain).');
             }
             $options['subsite_backup'] = true;
+        }
+
+        if (!empty($assoc_args['include-tables'])) {
+            $options['include_tables'] = array_filter(array_map('trim', explode(',', $assoc_args['include-tables'])), 'strlen');
+        }
+
+        if (isset($assoc_args['include-nonwp-tables'])) {
+            $options['include_nonwp_tables'] = true;
+        }
+
+        if (isset($assoc_args['anonymise'])) {
+            $options['db_anonymise'] = true;
+            $valid_modes = array('all', 'non_staff', 'wc_orders');
+            $mode = isset($assoc_args['anonymise-mode']) ? $assoc_args['anonymise-mode'] : 'all';
+            $options['db_anonymise_mode'] = in_array($mode, $valid_modes, true) ? $mode : 'all';
         }
 
         WP_CLI::log('Starting backup...');
@@ -229,6 +262,30 @@ class SiteGuard_Backup_CLI_Command extends WP_CLI_Command {
      * [--target-subsite-id=<id>]
      * : Target subsite blog ID for import-as mode. Can be used instead of
      *   --target-subsite-domain; the domain will be derived from the blog ID.
+     *
+     * [--keep-protocol]
+     * : Keep the original protocol during migration (don't force HTTPS).
+     *
+     * [--remap-independent-domains]
+     * : Remap independent domains to subdomains during multisite migration.
+     *
+     * [--pre-restore-backup]
+     * : Create a backup of the current site before restoring.
+     *
+     * [--include-unspecified-tables]
+     * : Include database tables not in the restore selection.
+     *
+     * [--include-unspecified-plugins]
+     * : Keep plugins not in the backup.
+     *
+     * [--include-unspecified-themes]
+     * : Keep themes not in the backup.
+     *
+     * [--restore-plugins=<items>]
+     * : Comma-separated plugin directories to restore (selective).
+     *
+     * [--restore-themes=<items>]
+     * : Comma-separated theme directories to restore (selective).
      *
      * ## EXAMPLES
      *
@@ -381,6 +438,34 @@ class SiteGuard_Backup_CLI_Command extends WP_CLI_Command {
         // Keep original protocol
         if (isset($assoc_args['keep-protocol'])) {
             $restore_options['keep_protocol'] = true;
+        }
+
+        if (isset($assoc_args['remap-independent-domains'])) {
+            $restore_options['remap_independent_domains'] = true;
+        }
+
+        if (isset($assoc_args['pre-restore-backup'])) {
+            $restore_options['pre_restore_backup'] = true;
+        }
+
+        if (isset($assoc_args['include-unspecified-tables'])) {
+            $restore_options['include_unspecified_tables'] = true;
+        }
+
+        if (isset($assoc_args['include-unspecified-plugins'])) {
+            $restore_options['include_unspecified_plugins'] = true;
+        }
+
+        if (isset($assoc_args['include-unspecified-themes'])) {
+            $restore_options['include_unspecified_themes'] = true;
+        }
+
+        if (!empty($assoc_args['restore-plugins'])) {
+            $restore_options['restore_plugins'] = array_filter(array_map('trim', explode(',', $assoc_args['restore-plugins'])), 'strlen');
+        }
+
+        if (!empty($assoc_args['restore-themes'])) {
+            $restore_options['restore_themes'] = array_filter(array_map('trim', explode(',', $assoc_args['restore-themes'])), 'strlen');
         }
 
         WP_CLI::confirm('This will restore the backup. Continue?');
@@ -2133,6 +2218,1396 @@ class SiteGuard_Backup_CLI_Command extends WP_CLI_Command {
                 WP_CLI::log($content);
             } else {
                 WP_CLI::warning('Could not read log file.');
+            }
+        }
+    }
+
+    // ===========================================
+    // GROUP 1: BACKUP MANAGEMENT
+    // ===========================================
+
+    /**
+     * Delete a backup set.
+     *
+     * ## OPTIONS
+     *
+     * <timestamp>
+     * : Unix timestamp of the backup to delete.
+     *
+     * [--delete-remote]
+     * : Also delete from remote storage.
+     *
+     * [--yes]
+     * : Skip confirmation prompt.
+     *
+     * ## EXAMPLES
+     *
+     *     wp siteguardbackup delete 1709283600
+     *     wp siteguardbackup delete 1709283600 --delete-remote --yes
+     *
+     * @subcommand delete
+     */
+    public function delete($args, $assoc_args) {
+        if (empty($args[0])) {
+            WP_CLI::error('Timestamp required.');
+        }
+
+        $timestamp = intval($args[0]);
+        $delete_remote = isset($assoc_args['delete-remote']);
+
+        WP_CLI::confirm("Delete backup from " . gmdate('Y-m-d H:i', $timestamp) . "?", $assoc_args);
+
+        require_once SGBACKUP_DIR . 'includes/class-commands.php';
+        $commands = new SiteGuard_Backup_Commands();
+        $result = $commands->delete_backup(array(
+            'timestamp'     => $timestamp,
+            'delete_remote' => $delete_remote,
+        ));
+
+        if (is_wp_error($result)) {
+            WP_CLI::error($result->get_error_message());
+        }
+
+        WP_CLI::success("Deleted {$result['count']} file(s).");
+    }
+
+    /**
+     * Toggle the always-keep flag on a backup.
+     *
+     * ## OPTIONS
+     *
+     * <timestamp>
+     * : Unix timestamp of the backup.
+     *
+     * [--unset]
+     * : Remove the always-keep flag instead of setting it.
+     *
+     * ## EXAMPLES
+     *
+     *     wp siteguardbackup keep 1709283600
+     *     wp siteguardbackup keep 1709283600 --unset
+     *
+     * @subcommand keep
+     */
+    public function keep($args, $assoc_args) {
+        if (empty($args[0])) {
+            WP_CLI::error('Timestamp required.');
+        }
+
+        $timestamp = intval($args[0]);
+        $always_keep = !isset($assoc_args['unset']);
+
+        require_once SGBACKUP_DIR . 'includes/class-commands.php';
+        $commands = new SiteGuard_Backup_Commands();
+        $result = $commands->always_keep_this_backup(array(
+            'timestamp'   => $timestamp,
+            'always_keep' => $always_keep,
+        ));
+
+        if (is_wp_error($result)) {
+            WP_CLI::error($result->get_error_message());
+        }
+
+        WP_CLI::success($always_keep ? 'Backup marked as always-keep.' : 'Always-keep flag removed.');
+    }
+
+    /**
+     * Show a backup job log.
+     *
+     * ## OPTIONS
+     *
+     * <nonce>
+     * : The job nonce.
+     *
+     * [--tail=<N>]
+     * : Show only the last N lines.
+     *
+     * ## EXAMPLES
+     *
+     *     wp siteguardbackup get_log abc123def456
+     *     wp siteguardbackup get_log abc123def456 --tail=50
+     *
+     * @subcommand get_log
+     */
+    public function get_log($args, $assoc_args) {
+        if (empty($args[0])) {
+            WP_CLI::error('Job nonce required.');
+        }
+
+        require_once SGBACKUP_DIR . 'includes/class-commands.php';
+        $commands = new SiteGuard_Backup_Commands();
+        $result = $commands->get_log(array('nonce' => sanitize_text_field($args[0])));
+
+        if (is_wp_error($result)) {
+            WP_CLI::error($result->get_error_message());
+        }
+
+        $log = isset($result['log']) ? $result['log'] : '';
+        if (empty($log)) {
+            WP_CLI::log('No log data found.');
+            return;
+        }
+
+        if (!empty($assoc_args['tail'])) {
+            $lines = explode("\n", rtrim($log));
+            $n = max(1, intval($assoc_args['tail']));
+            $lines = array_slice($lines, -$n);
+            $log = implode("\n", $lines);
+        }
+
+        WP_CLI::log($log);
+    }
+
+    /**
+     * Abort an active backup job.
+     *
+     * ## OPTIONS
+     *
+     * <nonce>
+     * : The job nonce to abort.
+     *
+     * ## EXAMPLES
+     *
+     *     wp siteguardbackup abort abc123def456
+     *
+     * @subcommand abort
+     */
+    public function abort($args, $assoc_args) {
+        if (empty($args[0])) {
+            WP_CLI::error('Job nonce required.');
+        }
+
+        require_once SGBACKUP_DIR . 'includes/class-commands.php';
+        $commands = new SiteGuard_Backup_Commands();
+        $result = $commands->activejobs_delete(array('job_id' => sanitize_text_field($args[0])));
+
+        if (is_wp_error($result)) {
+            WP_CLI::error($result->get_error_message());
+        }
+
+        WP_CLI::success('Abort requested for job: ' . $args[0]);
+    }
+
+    // ===========================================
+    // GROUP 2: SETTINGS
+    // ===========================================
+
+    /**
+     * Get, set, wipe, export, or import plugin settings.
+     *
+     * ## OPTIONS
+     *
+     * <action>
+     * : Action: get, set, wipe, export, import.
+     *
+     * [--key=<key>]
+     * : Show only a specific setting key (for 'get').
+     *
+     * [--format=<format>]
+     * : Output format: table, json. Default: table.
+     *
+     * [--file=<path>]
+     * : File path for export (output) or import (input).
+     *
+     * [--yes]
+     * : Skip confirmation for destructive actions.
+     *
+     * [--<field>=<value>]
+     * : Any setting key=value pair (for 'set'). Use -- prefix.
+     *
+     * ## EXAMPLES
+     *
+     *     wp siteguardbackup settings get
+     *     wp siteguardbackup settings get --key=interval --format=json
+     *     wp siteguardbackup settings set --retain=5 --retain_db=10 --debug_mode=1
+     *     wp siteguardbackup settings wipe --yes
+     *     wp siteguardbackup settings export --file=/tmp/settings.json
+     *     wp siteguardbackup settings import /tmp/settings.json --yes
+     *
+     * @subcommand settings
+     */
+    public function settings($args, $assoc_args) {
+        if (empty($args[0])) {
+            WP_CLI::error('Action required: get, set, wipe, export, import.');
+        }
+
+        $action = $args[0];
+        require_once SGBACKUP_DIR . 'includes/class-commands.php';
+        $commands = new SiteGuard_Backup_Commands();
+
+        switch ($action) {
+            case 'get':
+                $result = $commands->get_settings();
+                if (is_wp_error($result)) {
+                    WP_CLI::error($result->get_error_message());
+                }
+
+                $format = isset($assoc_args['format']) ? $assoc_args['format'] : 'table';
+
+                if (!empty($assoc_args['key'])) {
+                    $key = $assoc_args['key'];
+                    if (isset($result[$key])) {
+                        if ($format === 'json') {
+                            WP_CLI::log(json_encode(array($key => $result[$key]), JSON_PRETTY_PRINT));
+                        } else {
+                            $val = is_array($result[$key]) ? json_encode($result[$key]) : $result[$key];
+                            WP_CLI::log("{$key}: {$val}");
+                        }
+                    } else {
+                        WP_CLI::error("Setting not found: {$key}");
+                    }
+                    return;
+                }
+
+                if ($format === 'json') {
+                    WP_CLI::log(json_encode($result, JSON_PRETTY_PRINT));
+                } else {
+                    $items = array();
+                    foreach ($result as $k => $v) {
+                        $items[] = array(
+                            'key'   => $k,
+                            'value' => is_array($v) ? json_encode($v) : (string) $v,
+                        );
+                    }
+                    WP_CLI\Utils\format_items('table', $items, array('key', 'value'));
+                }
+                break;
+
+            case 'set':
+                // Collect all --key=value pairs (excluding reserved flags)
+                $reserved = array('format', 'key', 'file', 'yes', 'url', 'path', 'ssh', 'http', 'user', 'skip-plugins', 'skip-themes', 'require');
+                $params = array();
+                foreach ($assoc_args as $k => $v) {
+                    if (in_array($k, $reserved, true)) continue;
+                    // Convert underscore-separated keys
+                    $params[$k] = $v;
+                }
+
+                if (empty($params)) {
+                    WP_CLI::error('No settings specified. Use --key=value format.');
+                }
+
+                $result = $commands->savesettings($params);
+                if (is_wp_error($result)) {
+                    WP_CLI::error($result->get_error_message());
+                }
+
+                WP_CLI::success('Settings saved.');
+                break;
+
+            case 'wipe':
+                WP_CLI::confirm('This will reset ALL plugin settings to defaults.', $assoc_args);
+
+                $result = $commands->wipe_settings();
+                if (is_wp_error($result)) {
+                    WP_CLI::error($result->get_error_message());
+                }
+
+                WP_CLI::success('All settings reset to defaults.');
+                break;
+
+            case 'export':
+                $result = $commands->export_settings(array());
+                if (is_wp_error($result)) {
+                    WP_CLI::error($result->get_error_message());
+                }
+
+                $json = json_encode($result, JSON_PRETTY_PRINT);
+                if (!empty($assoc_args['file'])) {
+                    $written = file_put_contents($assoc_args['file'], $json);
+                    if (false === $written) {
+                        WP_CLI::error('Failed to write to: ' . $assoc_args['file']);
+                    }
+                    WP_CLI::success('Settings exported to: ' . $assoc_args['file']);
+                } else {
+                    WP_CLI::log($json);
+                }
+                break;
+
+            case 'import':
+                $file = isset($args[1]) ? $args[1] : (isset($assoc_args['file']) ? $assoc_args['file'] : '');
+                if (empty($file)) {
+                    WP_CLI::error('File path required for import.');
+                }
+                if (!file_exists($file)) {
+                    WP_CLI::error("File not found: {$file}");
+                }
+
+                $data = json_decode(file_get_contents($file), true);
+                if (!is_array($data) || empty($data['settings'])) {
+                    WP_CLI::error('Invalid settings file format.');
+                }
+
+                WP_CLI::confirm('This will overwrite current settings with imported values.', $assoc_args);
+
+                $result = $commands->import_settings(array('settings' => $data['settings']));
+                if (is_wp_error($result)) {
+                    WP_CLI::error($result->get_error_message());
+                }
+
+                WP_CLI::success("Imported {$result['imported']} settings.");
+                break;
+
+            default:
+                WP_CLI::error("Unknown action: {$action}. Use: get, set, wipe, export, import.");
+        }
+    }
+
+    // ===========================================
+    // GROUP 3: REMOTE STORAGE
+    // ===========================================
+
+    /**
+     * Test remote storage credentials.
+     *
+     * ## OPTIONS
+     *
+     * <method>
+     * : Storage method name (e.g., s3, sftp, googledrive, dropbox).
+     *
+     * ## EXAMPLES
+     *
+     *     wp siteguardbackup remote_test s3
+     *     wp siteguardbackup remote_test sftp
+     *
+     * @subcommand remote_test
+     */
+    public function remote_test($args, $assoc_args) {
+        if (empty($args[0])) {
+            WP_CLI::error('Storage method required.');
+        }
+
+        require_once SGBACKUP_DIR . 'includes/class-commands.php';
+        $commands = new SiteGuard_Backup_Commands();
+        $result = $commands->credentials_test(array('method' => $args[0]));
+
+        if (is_wp_error($result)) {
+            WP_CLI::error($result->get_error_message());
+        }
+
+        WP_CLI::success($result['message']);
+    }
+
+    /**
+     * Upload an existing local backup to remote storage.
+     *
+     * ## OPTIONS
+     *
+     * <timestamp>
+     * : Unix timestamp of the backup to upload.
+     *
+     * [--services=<services>]
+     * : Comma-separated storage methods. Uses configured service if omitted.
+     *
+     * ## EXAMPLES
+     *
+     *     wp siteguardbackup remote_upload 1709283600
+     *     wp siteguardbackup remote_upload 1709283600 --services=s3,dropbox
+     *
+     * @subcommand remote_upload
+     */
+    public function remote_upload($args, $assoc_args) {
+        if (empty($args[0])) {
+            WP_CLI::error('Timestamp required.');
+        }
+
+        $timestamp = intval($args[0]);
+
+        if (!empty($assoc_args['services'])) {
+            $services = array_filter(array_map('trim', explode(',', $assoc_args['services'])), 'strlen');
+        } else {
+            $opts = SiteGuard_Backup_Options::instance();
+            $services = $opts->get_option('sgbackup_service', array('none'));
+            if (!is_array($services)) $services = array($services);
+            $services = array_filter($services, function($s) { return $s !== 'none'; });
+        }
+
+        if (empty($services)) {
+            WP_CLI::error('No storage services specified or configured.');
+        }
+
+        WP_CLI::log('Uploading to: ' . implode(', ', $services) . '...');
+
+        require_once SGBACKUP_DIR . 'includes/class-commands.php';
+        $commands = new SiteGuard_Backup_Commands();
+        $result = $commands->upload_to_remote(array(
+            'timestamp' => $timestamp,
+            'services'  => $services,
+        ));
+
+        if (is_wp_error($result)) {
+            WP_CLI::error($result->get_error_message());
+        }
+
+        foreach ($result['results'] as $svc => $info) {
+            if ($info['success']) {
+                WP_CLI::log("  {$svc}: {$info['uploaded']} file(s) uploaded.");
+            } else {
+                WP_CLI::warning("  {$svc}: " . implode('; ', $info['errors']));
+            }
+        }
+
+        WP_CLI::success('Upload complete.');
+    }
+
+    // ===========================================
+    // GROUP 4: MIGRATION
+    // ===========================================
+
+    /**
+     * Register a migration destination from a key bundle.
+     *
+     * ## OPTIONS
+     *
+     * <key_bundle>
+     * : Base64-encoded key bundle from the destination site.
+     *
+     * ## EXAMPLES
+     *
+     *     wp siteguardbackup migrate_add_destination "eyJwdWJsaWN..."
+     *
+     * @subcommand migrate_add_destination
+     */
+    public function migrate_add_destination($args, $assoc_args) {
+        if (empty($args[0])) {
+            WP_CLI::error('Key bundle required.');
+        }
+
+        require_once SGBACKUP_DIR . 'includes/class-commands.php';
+        $commands = new SiteGuard_Backup_Commands();
+        $result = $commands->migrate_newdestination(array('key_bundle' => $args[0]));
+
+        if (is_wp_error($result)) {
+            WP_CLI::error($result->get_error_message());
+        }
+
+        WP_CLI::success("Destination added: {$result['name']} (ID: {$result['site_id']})");
+    }
+
+    /**
+     * Ping-test a migration destination.
+     *
+     * ## OPTIONS
+     *
+     * <site_id>
+     * : The destination site ID.
+     *
+     * ## EXAMPLES
+     *
+     *     wp siteguardbackup migrate_ping 0
+     *
+     * @subcommand migrate_ping
+     */
+    public function migrate_ping($args, $assoc_args) {
+        if (!isset($args[0])) {
+            WP_CLI::error('Site ID required.');
+        }
+
+        require_once SGBACKUP_DIR . 'includes/class-commands.php';
+        $commands = new SiteGuard_Backup_Commands();
+        $result = $commands->ping_test(array('site_id' => intval($args[0])));
+
+        if (is_wp_error($result)) {
+            WP_CLI::error($result->get_error_message());
+        }
+
+        WP_CLI::success('Ping successful.');
+    }
+
+    /**
+     * Send an existing backup to a remote site.
+     *
+     * ## OPTIONS
+     *
+     * <timestamp>
+     * : Unix timestamp of the backup to send.
+     *
+     * <site_id>
+     * : Destination site ID.
+     *
+     * [--label=<label>]
+     * : Custom label for the send job.
+     *
+     * ## EXAMPLES
+     *
+     *     wp siteguardbackup migrate_send 1709283600 0
+     *     wp siteguardbackup migrate_send 1709283600 0 --label="production-sync"
+     *
+     * @subcommand migrate_send
+     */
+    public function migrate_send($args, $assoc_args) {
+        if (empty($args[0]) || !isset($args[1])) {
+            WP_CLI::error('Usage: wp siteguardbackup migrate_send <timestamp> <site_id>');
+        }
+
+        $timestamp = intval($args[0]);
+        $site_id = intval($args[1]);
+
+        // Verify destination exists
+        $opts = SiteGuard_Backup_Options::instance();
+        $sites = $opts->get_option('sgbackup_remotesites', array());
+        if (!isset($sites[$site_id])) {
+            WP_CLI::error("Destination site ID {$site_id} not found.");
+        }
+
+        $backup_set = SiteGuard_Backup_History::get_history($timestamp);
+        if (empty($backup_set)) {
+            WP_CLI::error("Backup not found for timestamp: {$timestamp}");
+        }
+
+        WP_CLI::log("Sending backup to: " . (isset($sites[$site_id]['name']) ? $sites[$site_id]['name'] : "Site #{$site_id}") . '...');
+
+        // Build options directly (cannot use Commands::migrate_send as it calls die)
+        $sgbackup = SiteGuard_Backup::instance();
+        $backup_files = SiteGuard_Backup_History::get_all_files($backup_set);
+
+        $options = array(
+            'service'                => array("remotesend/{$site_id}"),
+            'nofiles'                => true,
+            'nodb'                   => true,
+            'initial_jobdata_extra'  => array(
+                'backup_files_array'        => $backup_files,
+                'db_backup_files'           => array(),
+                'files_phase_complete'      => true,
+                'db_phase_complete'         => true,
+                'encryption_phase_complete' => true,
+                'manifest_phase_complete'   => true,
+                'original_backup_timestamp' => $timestamp,
+            ),
+        );
+
+        if (!empty($assoc_args['label'])) {
+            $options['label'] = sanitize_text_field(substr($assoc_args['label'], 0, 40));
+        }
+
+        $sgbackup->backup_all($options);
+
+        if (!empty($sgbackup->boot_error)) {
+            WP_CLI::error($sgbackup->boot_error);
+        }
+
+        // Run synchronously via resume loop
+        $nonce = $sgbackup->nonce;
+        for ($i = 0; $i < 50; $i++) {
+            $jobdata = $sgbackup->jobdata_getarray($nonce);
+            $status = isset($jobdata['jobstatus']) ? $jobdata['jobstatus'] : '';
+            if (in_array($status, array('complete', 'finished', 'error', 'aborted', 'failed'), true)) break;
+            $sgbackup->backup_resume($i, $nonce);
+            $jobdata = $sgbackup->jobdata_getarray($nonce);
+            $status = isset($jobdata['jobstatus']) ? $jobdata['jobstatus'] : '';
+            if (in_array($status, array('complete', 'finished', 'error', 'aborted', 'failed'), true)) break;
+        }
+
+        $jobdata = $sgbackup->jobdata_getarray($nonce);
+        $status = isset($jobdata['jobstatus']) ? $jobdata['jobstatus'] : '';
+        if ($status === 'complete' || $status === 'finished') {
+            WP_CLI::success('Migration send complete.');
+        } else {
+            WP_CLI::error('Migration send did not complete (status: ' . $status . '). Check logs.');
+        }
+    }
+
+    /**
+     * Clone current site to a remote destination (full backup + send).
+     *
+     * ## OPTIONS
+     *
+     * <site_id>
+     * : Destination site ID.
+     *
+     * [--label=<label>]
+     * : Custom label for the clone job.
+     *
+     * ## EXAMPLES
+     *
+     *     wp siteguardbackup migrate_clone 0
+     *     wp siteguardbackup migrate_clone 0 --label="staging-clone"
+     *
+     * @subcommand migrate_clone
+     */
+    public function migrate_clone($args, $assoc_args) {
+        if (!isset($args[0])) {
+            WP_CLI::error('Site ID required.');
+        }
+
+        $site_id = intval($args[0]);
+        $opts = SiteGuard_Backup_Options::instance();
+        $sites = $opts->get_option('sgbackup_remotesites', array());
+        if (!isset($sites[$site_id])) {
+            WP_CLI::error("Destination site ID {$site_id} not found.");
+        }
+
+        WP_CLI::log("Cloning site to: " . (isset($sites[$site_id]['name']) ? $sites[$site_id]['name'] : "Site #{$site_id}") . '...');
+
+        $sgbackup = SiteGuard_Backup::instance();
+        $label = !empty($assoc_args['label'])
+            ? sanitize_text_field(substr($assoc_args['label'], 0, 40))
+            : 'Migration clone ' . gmdate('Y-m-d H:i');
+
+        $options = array(
+            'service' => array("remotesend/{$site_id}"),
+            'label'   => $label,
+        );
+
+        $sgbackup->backup_all($options);
+
+        if (!empty($sgbackup->boot_error)) {
+            WP_CLI::error($sgbackup->boot_error);
+        }
+
+        $nonce = $sgbackup->nonce;
+        for ($i = 0; $i < 50; $i++) {
+            $jobdata = $sgbackup->jobdata_getarray($nonce);
+            $status = isset($jobdata['jobstatus']) ? $jobdata['jobstatus'] : '';
+            if (in_array($status, array('complete', 'finished', 'error', 'aborted', 'failed'), true)) break;
+            $sgbackup->backup_resume($i, $nonce);
+            $jobdata = $sgbackup->jobdata_getarray($nonce);
+            $status = isset($jobdata['jobstatus']) ? $jobdata['jobstatus'] : '';
+            if (in_array($status, array('complete', 'finished', 'error', 'aborted', 'failed'), true)) break;
+        }
+
+        $jobdata = $sgbackup->jobdata_getarray($nonce);
+        $status = isset($jobdata['jobstatus']) ? $jobdata['jobstatus'] : '';
+        if ($status === 'complete' || $status === 'finished') {
+            WP_CLI::success('Clone complete.');
+        } else {
+            WP_CLI::error('Clone did not complete (status: ' . $status . '). Check logs.');
+        }
+    }
+
+    /**
+     * List or delete migration destinations.
+     *
+     * ## OPTIONS
+     *
+     * <action>
+     * : Action: list or delete.
+     *
+     * [--site-id=<id>]
+     * : Site ID to delete (required for delete action).
+     *
+     * [--format=<format>]
+     * : Output format: table, json. Default: table.
+     *
+     * ## EXAMPLES
+     *
+     *     wp siteguardbackup migrate_destinations list
+     *     wp siteguardbackup migrate_destinations delete --site-id=0
+     *     wp siteguardbackup migrate_destinations list --format=json
+     *
+     * @subcommand migrate_destinations
+     */
+    public function migrate_destinations($args, $assoc_args) {
+        if (empty($args[0])) {
+            WP_CLI::error('Action required: list or delete.');
+        }
+
+        require_once SGBACKUP_DIR . 'includes/class-commands.php';
+        $commands = new SiteGuard_Backup_Commands();
+
+        if ($args[0] === 'list') {
+            $result = $commands->get_remotesites();
+            if (is_wp_error($result)) {
+                WP_CLI::error($result->get_error_message());
+            }
+
+            if (empty($result)) {
+                WP_CLI::log('No migration destinations configured.');
+                return;
+            }
+
+            $format = isset($assoc_args['format']) ? $assoc_args['format'] : 'table';
+            $items = array();
+            foreach ($result as $id => $site) {
+                $items[] = array(
+                    'id'   => $id,
+                    'name' => $site['name'],
+                    'url'  => $site['url'],
+                );
+            }
+
+            if ($format === 'json') {
+                WP_CLI::log(json_encode($items, JSON_PRETTY_PRINT));
+            } else {
+                WP_CLI\Utils\format_items('table', $items, array('id', 'name', 'url'));
+            }
+
+        } elseif ($args[0] === 'delete') {
+            if (!isset($assoc_args['site-id'])) {
+                WP_CLI::error('--site-id required for delete.');
+            }
+
+            $result = $commands->delete_remotesite(array('site_id' => intval($assoc_args['site-id'])));
+            if (is_wp_error($result)) {
+                WP_CLI::error($result->get_error_message());
+            }
+
+            WP_CLI::success('Destination deleted.');
+        } else {
+            WP_CLI::error("Unknown action: {$args[0]}. Use: list, delete.");
+        }
+    }
+
+    /**
+     * List or delete migration keys.
+     *
+     * ## OPTIONS
+     *
+     * <action>
+     * : Action: list or delete.
+     *
+     * [--key-id=<id>]
+     * : Key hash to delete (required for delete action).
+     *
+     * [--format=<format>]
+     * : Output format: table, json. Default: table.
+     *
+     * ## EXAMPLES
+     *
+     *     wp siteguardbackup migrate_keys list
+     *     wp siteguardbackup migrate_keys delete --key-id=abc123
+     *
+     * @subcommand migrate_keys
+     */
+    public function migrate_keys($args, $assoc_args) {
+        if (empty($args[0])) {
+            WP_CLI::error('Action required: list or delete.');
+        }
+
+        require_once SGBACKUP_DIR . 'includes/class-commands.php';
+        $commands = new SiteGuard_Backup_Commands();
+
+        if ($args[0] === 'list') {
+            $result = $commands->get_migrator_keys();
+            if (is_wp_error($result)) {
+                WP_CLI::error($result->get_error_message());
+            }
+
+            if (empty($result)) {
+                WP_CLI::log('No migration keys found.');
+                return;
+            }
+
+            $format = isset($assoc_args['format']) ? $assoc_args['format'] : 'table';
+            $items = array();
+            foreach ($result as $hash => $key) {
+                $items[] = array(
+                    'id'      => $hash,
+                    'name'    => $key['name'],
+                    'created' => $key['created'] ? gmdate('Y-m-d H:i', $key['created']) : 'unknown',
+                );
+            }
+
+            if ($format === 'json') {
+                WP_CLI::log(json_encode($items, JSON_PRETTY_PRINT));
+            } else {
+                WP_CLI\Utils\format_items('table', $items, array('id', 'name', 'created'));
+            }
+
+        } elseif ($args[0] === 'delete') {
+            if (empty($assoc_args['key-id'])) {
+                WP_CLI::error('--key-id required for delete.');
+            }
+
+            $result = $commands->delete_migrator_key(array('key_id' => $assoc_args['key-id']));
+            if (is_wp_error($result)) {
+                WP_CLI::error($result->get_error_message());
+            }
+
+            WP_CLI::success('Migration key deleted.');
+        } else {
+            WP_CLI::error("Unknown action: {$args[0]}. Use: list, delete.");
+        }
+    }
+
+    // ===========================================
+    // GROUP 5: INSPECTION
+    // ===========================================
+
+    /**
+     * Inspect a backup set's contents (tables, plugins, themes, blogs).
+     *
+     * ## OPTIONS
+     *
+     * <timestamp>
+     * : Unix timestamp of the backup to inspect.
+     *
+     * [--format=<format>]
+     * : Output format: text, json. Default: text.
+     *
+     * ## EXAMPLES
+     *
+     *     wp siteguardbackup inspect 1709283600
+     *     wp siteguardbackup inspect 1709283600 --format=json
+     *
+     * @subcommand inspect
+     */
+    public function inspect($args, $assoc_args) {
+        if (empty($args[0])) {
+            WP_CLI::error('Timestamp required.');
+        }
+
+        require_once SGBACKUP_DIR . 'includes/class-commands.php';
+        $commands = new SiteGuard_Backup_Commands();
+        $result = $commands->get_backup_contents(array('timestamp' => intval($args[0])));
+
+        if (is_wp_error($result)) {
+            WP_CLI::error($result->get_error_message());
+        }
+
+        $format = isset($assoc_args['format']) ? $assoc_args['format'] : 'text';
+
+        if ($format === 'json') {
+            WP_CLI::log(json_encode($result, JSON_PRETTY_PRINT));
+            return;
+        }
+
+        WP_CLI::log("Backup: " . gmdate('Y-m-d H:i', $result['timestamp']));
+        if (!empty($result['size'])) {
+            WP_CLI::log("Size: {$result['size']}");
+        }
+        if (!empty($result['old_siteurl'])) {
+            WP_CLI::log("Source URL: {$result['old_siteurl']}");
+        }
+        WP_CLI::log("Current URL: {$result['current_siteurl']}");
+
+        if (!empty($result['is_subsite_backup'])) {
+            WP_CLI::log("Type: Subsite backup (blog #{$result['subsite_blog_id']})");
+        }
+
+        if (!empty($result['tables'])) {
+            WP_CLI::log('');
+            WP_CLI::log('Tables (' . count($result['tables']) . '):');
+            foreach ($result['tables'] as $t) {
+                WP_CLI::log("  {$t}");
+            }
+        }
+
+        if (!empty($result['plugins'])) {
+            WP_CLI::log('');
+            WP_CLI::log('Plugins (' . count($result['plugins']) . '):');
+            foreach ($result['plugins'] as $p) {
+                WP_CLI::log("  {$p}");
+            }
+        }
+
+        if (!empty($result['themes'])) {
+            WP_CLI::log('');
+            WP_CLI::log('Themes (' . count($result['themes']) . '):');
+            foreach ($result['themes'] as $t) {
+                WP_CLI::log("  {$t}");
+            }
+        }
+
+        if (!empty($result['multisite_blogs'])) {
+            WP_CLI::log('');
+            WP_CLI::log('Multisite blogs (' . count($result['multisite_blogs']) . '):');
+            foreach ($result['multisite_blogs'] as $blog) {
+                if (is_array($blog)) {
+                    WP_CLI::log("  #{$blog['blog_id']} {$blog['domain']}{$blog['path']}");
+                } else {
+                    WP_CLI::log("  {$blog}");
+                }
+            }
+        }
+    }
+
+    /**
+     * List database tables.
+     *
+     * ## OPTIONS
+     *
+     * [--wp-only]
+     * : Show only WordPress-prefixed tables.
+     *
+     * [--non-wp-only]
+     * : Show only non-WordPress tables.
+     *
+     * [--format=<format>]
+     * : Output format: table, json. Default: table.
+     *
+     * ## EXAMPLES
+     *
+     *     wp siteguardbackup db_tables
+     *     wp siteguardbackup db_tables --wp-only
+     *     wp siteguardbackup db_tables --format=json
+     *
+     * @subcommand db_tables
+     */
+    public function db_tables($args, $assoc_args) {
+        require_once SGBACKUP_DIR . 'includes/class-commands.php';
+        $commands = new SiteGuard_Backup_Commands();
+        $result = $commands->get_database_tables(array());
+
+        if (is_wp_error($result)) {
+            WP_CLI::error($result->get_error_message());
+        }
+
+        $tables = $result['tables'];
+        $format = isset($assoc_args['format']) ? $assoc_args['format'] : 'table';
+
+        if (isset($assoc_args['wp-only'])) {
+            $tables = array_filter($tables, function($t) { return $t['is_wp']; });
+        } elseif (isset($assoc_args['non-wp-only'])) {
+            $tables = array_filter($tables, function($t) { return !$t['is_wp']; });
+        }
+
+        $tables = array_values($tables);
+
+        if ($format === 'json') {
+            WP_CLI::log(json_encode($tables, JSON_PRETTY_PRINT));
+        } else {
+            $items = array();
+            foreach ($tables as $t) {
+                $items[] = array(
+                    'table' => $t['name'],
+                    'type'  => $t['is_wp'] ? 'WordPress' : 'Other',
+                );
+            }
+            WP_CLI\Utils\format_items('table', $items, array('table', 'type'));
+            WP_CLI::log(count($items) . ' tables total.');
+        }
+    }
+
+    /**
+     * Show site size per entity.
+     *
+     * ## OPTIONS
+     *
+     * [--format=<format>]
+     * : Output format: table, json. Default: table.
+     *
+     * ## EXAMPLES
+     *
+     *     wp siteguardbackup site_size
+     *     wp siteguardbackup site_size --format=json
+     *
+     * @subcommand site_size
+     */
+    public function site_size($args, $assoc_args) {
+        require_once SGBACKUP_DIR . 'includes/class-commands.php';
+        $commands = new SiteGuard_Backup_Commands();
+        $result = $commands->get_site_size(array());
+
+        if (is_wp_error($result)) {
+            WP_CLI::error($result->get_error_message());
+        }
+
+        $format = isset($assoc_args['format']) ? $assoc_args['format'] : 'table';
+
+        if ($format === 'json') {
+            WP_CLI::log(json_encode($result, JSON_PRETTY_PRINT));
+        } else {
+            $items = array();
+            foreach ($result as $entity => $size) {
+                if ($size < 0) {
+                    $items[] = array('entity' => $entity, 'size' => 'timeout');
+                } else {
+                    $items[] = array('entity' => $entity, 'size' => SiteGuard_Backup_Filesystem::format_bytes($size));
+                }
+            }
+            WP_CLI\Utils\format_items('table', $items, array('entity', 'size'));
+        }
+    }
+
+    /**
+     * Show per-table database sizes.
+     *
+     * ## OPTIONS
+     *
+     * [--format=<format>]
+     * : Output format: table, json. Default: table.
+     *
+     * ## EXAMPLES
+     *
+     *     wp siteguardbackup db_size
+     *     wp siteguardbackup db_size --format=json
+     *
+     * @subcommand db_size
+     */
+    public function db_size($args, $assoc_args) {
+        require_once SGBACKUP_DIR . 'includes/class-commands.php';
+        $commands = new SiteGuard_Backup_Commands();
+        $result = $commands->get_db_size(array());
+
+        if (is_wp_error($result)) {
+            WP_CLI::error($result->get_error_message());
+        }
+
+        $format = isset($assoc_args['format']) ? $assoc_args['format'] : 'table';
+
+        if ($format === 'json') {
+            WP_CLI::log(json_encode($result, JSON_PRETTY_PRINT));
+            return;
+        }
+
+        $items = array();
+        $all_tables = array_merge($result['wp_tables'], $result['non_wp_tables']);
+        foreach ($all_tables as $t) {
+            $items[] = array(
+                'table' => $t['name'],
+                'rows'  => number_format($t['rows']),
+                'data'  => SiteGuard_Backup_Filesystem::format_bytes($t['data']),
+                'index' => SiteGuard_Backup_Filesystem::format_bytes($t['index']),
+                'total' => SiteGuard_Backup_Filesystem::format_bytes($t['size']),
+            );
+        }
+
+        WP_CLI\Utils\format_items('table', $items, array('table', 'rows', 'data', 'index', 'total'));
+        WP_CLI::log('');
+        WP_CLI::log('WP tables: ' . SiteGuard_Backup_Filesystem::format_bytes($result['wp_total']));
+        WP_CLI::log('Non-WP:    ' . SiteGuard_Backup_Filesystem::format_bytes($result['non_wp_total']));
+        WP_CLI::log('Total:     ' . SiteGuard_Backup_Filesystem::format_bytes($result['total']));
+    }
+
+    /**
+     * Show system information.
+     *
+     * ## OPTIONS
+     *
+     * [--format=<format>]
+     * : Output format: text, json. Default: text.
+     *
+     * ## EXAMPLES
+     *
+     *     wp siteguardbackup sysinfo
+     *     wp siteguardbackup sysinfo --format=json
+     *
+     * @subcommand sysinfo
+     */
+    public function sysinfo($args, $assoc_args) {
+        require_once SGBACKUP_DIR . 'includes/class-commands.php';
+        $commands = new SiteGuard_Backup_Commands();
+        $result = $commands->get_sysinfo();
+
+        if (is_wp_error($result)) {
+            WP_CLI::error($result->get_error_message());
+        }
+
+        $format = isset($assoc_args['format']) ? $assoc_args['format'] : 'text';
+
+        if ($format === 'json') {
+            WP_CLI::log(json_encode($result, JSON_PRETTY_PRINT));
+            return;
+        }
+
+        foreach ($result as $key => $value) {
+            if (is_bool($value)) {
+                $value = $value ? 'yes' : 'no';
+            } elseif (is_array($value)) {
+                $value = json_encode($value);
+            }
+            WP_CLI::log(sprintf("  %-20s %s", $key . ':', $value));
+        }
+    }
+
+    /**
+     * List WordPress cron events.
+     *
+     * ## OPTIONS
+     *
+     * [--sgbackup-only]
+     * : Show only SiteGuard Backup cron events.
+     *
+     * [--format=<format>]
+     * : Output format: table, json. Default: table.
+     *
+     * ## EXAMPLES
+     *
+     *     wp siteguardbackup cron_events
+     *     wp siteguardbackup cron_events --sgbackup-only
+     *     wp siteguardbackup cron_events --format=json
+     *
+     * @subcommand cron_events
+     */
+    public function cron_events($args, $assoc_args) {
+        require_once SGBACKUP_DIR . 'includes/class-commands.php';
+        $commands = new SiteGuard_Backup_Commands();
+
+        $params = array();
+        if (isset($assoc_args['sgbackup-only'])) {
+            $params['filter'] = 'sgbackup';
+        }
+
+        $result = $commands->get_cron_events($params);
+
+        if (is_wp_error($result)) {
+            WP_CLI::error($result->get_error_message());
+        }
+
+        $events = $result['events'];
+        $format = isset($assoc_args['format']) ? $assoc_args['format'] : 'table';
+
+        if (empty($events)) {
+            WP_CLI::log('No cron events found.');
+            return;
+        }
+
+        if ($format === 'json') {
+            WP_CLI::log(json_encode($events, JSON_PRETTY_PRINT));
+        } else {
+            $items = array();
+            foreach ($events as $e) {
+                $items[] = array(
+                    'hook'     => $e['hook'],
+                    'next_run' => $e['next_run_date'] . ' UTC',
+                    'schedule' => $e['schedule'],
+                    'interval' => $e['interval'],
+                );
+            }
+            WP_CLI\Utils\format_items('table', $items, array('hook', 'next_run', 'schedule', 'interval'));
+        }
+    }
+
+    // ===========================================
+    // GROUP 6: RESTORE ENHANCEMENTS
+    // ===========================================
+
+    /**
+     * Resume a failed or interrupted restore.
+     *
+     * ## EXAMPLES
+     *
+     *     wp siteguardbackup resume_restore
+     *
+     * @subcommand resume_restore
+     */
+    public function resume_restore($args, $assoc_args) {
+        require_once SGBACKUP_DIR . 'includes/class-commands.php';
+        $commands = new SiteGuard_Backup_Commands();
+        $result = $commands->resume_restore(array());
+
+        if (is_wp_error($result)) {
+            WP_CLI::error($result->get_error_message());
+        }
+
+        if ($result['success']) {
+            WP_CLI::success('Restore resumed and completed.');
+        } else {
+            WP_CLI::warning('Restore resumed with errors.');
+        }
+
+        if (!empty($result['messages'])) {
+            foreach ($result['messages'] as $msg) {
+                WP_CLI::log("  {$msg}");
+            }
+        }
+        if (!empty($result['errors'])) {
+            foreach ($result['errors'] as $err) {
+                WP_CLI::warning("  Error: {$err}");
+            }
+        }
+    }
+
+    // ===========================================
+    // GROUP 7: PRESETS & OTHER
+    // ===========================================
+
+    /**
+     * Manage restore presets.
+     *
+     * ## OPTIONS
+     *
+     * <action>
+     * : Action: list, save, or delete.
+     *
+     * [--name=<name>]
+     * : Preset name (required for save).
+     *
+     * [--preset-id=<id>]
+     * : Preset ID (required for delete).
+     *
+     * [--format=<format>]
+     * : Output format: table, json. Default: table.
+     *
+     * [--<field>=<value>]
+     * : Restore options for save (db, plugins, themes, etc.).
+     *
+     * ## EXAMPLES
+     *
+     *     wp siteguardbackup presets list
+     *     wp siteguardbackup presets save --name="migration-standard" --db=1 --plugins=1 --themes=1 --db_restore_mode=0
+     *     wp siteguardbackup presets delete --preset-id=0
+     *
+     * @subcommand presets
+     */
+    public function presets($args, $assoc_args) {
+        if (empty($args[0])) {
+            WP_CLI::error('Action required: list, save, delete.');
+        }
+
+        require_once SGBACKUP_DIR . 'includes/class-commands.php';
+        $commands = new SiteGuard_Backup_Commands();
+
+        switch ($args[0]) {
+            case 'list':
+                $presets = $commands->get_restore_presets();
+                if (is_wp_error($presets)) {
+                    WP_CLI::error($presets->get_error_message());
+                }
+
+                if (empty($presets)) {
+                    WP_CLI::log('No restore presets found.');
+                    return;
+                }
+
+                $format = isset($assoc_args['format']) ? $assoc_args['format'] : 'table';
+
+                if ($format === 'json') {
+                    WP_CLI::log(json_encode($presets, JSON_PRETTY_PRINT));
+                } else {
+                    $items = array();
+                    foreach ($presets as $id => $preset) {
+                        $opts = $preset['restore_options'];
+                        $entities = array();
+                        foreach (array('db', 'plugins', 'themes', 'uploads', 'others', 'wpcore') as $e) {
+                            if (!empty($opts[$e])) $entities[] = $e;
+                        }
+                        $items[] = array(
+                            'id'       => $id,
+                            'name'     => $preset['name'],
+                            'entities' => implode(',', $entities),
+                            'created'  => gmdate('Y-m-d H:i', $preset['created']),
+                        );
+                    }
+                    WP_CLI\Utils\format_items('table', $items, array('id', 'name', 'entities', 'created'));
+                }
+                break;
+
+            case 'save':
+                if (empty($assoc_args['name'])) {
+                    WP_CLI::error('--name required for save.');
+                }
+
+                $params = $assoc_args;
+                $result = $commands->save_restore_preset($params);
+                if (is_wp_error($result)) {
+                    WP_CLI::error($result->get_error_message());
+                }
+
+                WP_CLI::success("Preset saved with ID: {$result['preset_id']}");
+                break;
+
+            case 'delete':
+                if (!isset($assoc_args['preset-id'])) {
+                    WP_CLI::error('--preset-id required for delete.');
+                }
+
+                $result = $commands->delete_restore_preset(array('preset_id' => intval($assoc_args['preset-id'])));
+                if (is_wp_error($result)) {
+                    WP_CLI::error($result->get_error_message());
+                }
+
+                WP_CLI::success('Preset deleted.');
+                break;
+
+            default:
+                WP_CLI::error("Unknown action: {$args[0]}. Use: list, save, delete.");
+        }
+    }
+
+    /**
+     * Send a test webhook notification.
+     *
+     * ## OPTIONS
+     *
+     * [--url=<url>]
+     * : Override webhook URL. Uses configured URL if omitted.
+     *
+     * ## EXAMPLES
+     *
+     *     wp siteguardbackup test_webhook
+     *     wp siteguardbackup test_webhook --url=https://hooks.example.com/test
+     *
+     * @subcommand test_webhook
+     */
+    public function test_webhook($args, $assoc_args) {
+        require_once SGBACKUP_DIR . 'includes/class-commands.php';
+        $commands = new SiteGuard_Backup_Commands();
+
+        $params = array();
+        if (!empty($assoc_args['url'])) {
+            $params['url'] = $assoc_args['url'];
+        }
+
+        $result = $commands->test_webhook($params);
+
+        if (is_wp_error($result)) {
+            WP_CLI::error($result->get_error_message());
+        }
+
+        WP_CLI::success(isset($result['message']) ? $result['message'] : 'Test webhook sent.');
+    }
+
+    /**
+     * Show failover environment status.
+     *
+     * ## OPTIONS
+     *
+     * [--format=<format>]
+     * : Output format: text, json. Default: text.
+     *
+     * ## EXAMPLES
+     *
+     *     wp siteguardbackup failover_status
+     *     wp siteguardbackup failover_status --format=json
+     *
+     * @subcommand failover_status
+     */
+    public function failover_status($args, $assoc_args) {
+        require_once SGBACKUP_DIR . 'includes/class-commands.php';
+        $commands = new SiteGuard_Backup_Commands();
+        $result = $commands->failover_status();
+
+        if (is_wp_error($result)) {
+            WP_CLI::error($result->get_error_message());
+        }
+
+        $format = isset($assoc_args['format']) ? $assoc_args['format'] : 'text';
+
+        if ($format === 'json') {
+            WP_CLI::log(json_encode($result, JSON_PRETTY_PRINT));
+            return;
+        }
+
+        WP_CLI::log("Role: {$result['role']}");
+        if (!empty($result['production_url'])) {
+            WP_CLI::log("Production URL: {$result['production_url']}");
+        }
+
+        WP_CLI::log('');
+        WP_CLI::log('Environment:');
+        foreach ($result['environment'] as $k => $v) {
+            if (is_bool($v)) $v = $v ? 'yes' : 'no';
+            WP_CLI::log("  {$k}: {$v}");
+        }
+
+        WP_CLI::log('');
+        WP_CLI::log('Backup:');
+        foreach ($result['backup'] as $k => $v) {
+            if (is_bool($v)) $v = $v ? 'yes' : 'no';
+            if (is_null($v)) $v = 'n/a';
+            WP_CLI::log("  {$k}: {$v}");
+        }
+
+        WP_CLI::log('');
+        WP_CLI::log('DB: ' . ($result['db_ok'] ? 'connected' : 'FAILED'));
+        if (!empty($result['disk'])) {
+            $disk = $result['disk'];
+            if (is_array($disk)) {
+                $free = isset($disk['free']) ? SiteGuard_Backup_Filesystem::format_bytes($disk['free']) : 'unknown';
+                WP_CLI::log("Disk free: {$free}");
+            }
+        }
+
+        if (!empty($result['dns'])) {
+            WP_CLI::log('');
+            WP_CLI::log('DNS (' . $result['dns']['host'] . '):');
+            if (!empty($result['dns']['a_records'])) {
+                WP_CLI::log('  A: ' . implode(', ', $result['dns']['a_records']));
+            }
+            if (!empty($result['dns']['cname_records'])) {
+                WP_CLI::log('  CNAME: ' . implode(', ', $result['dns']['cname_records']));
             }
         }
     }
