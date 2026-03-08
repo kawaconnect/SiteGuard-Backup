@@ -17,6 +17,21 @@
 		},
 
 		/**
+		 * Compute mirror domain for a source domain.
+		 * For subdomains of oldHost, replaces oldHost with newHost.
+		 * For independent domains, strips TLD and uses as subdomain of newHost.
+		 */
+		mirrorDomain: function(srcDomain, oldHost, newHost) {
+			if (!oldHost) return srcDomain;
+			if (srcDomain.indexOf(oldHost) !== -1) {
+				return srcDomain.replace(new RegExp(oldHost.replace(/\./g, '\\\\.'), 'g'), newHost);
+			}
+			var parts = srcDomain.split('.');
+			parts.pop();
+			return parts.join('.') + '.' + newHost;
+		},
+
+		/**
 		 * Show a WordPress-style admin notice.
 		 * @param {string} message - The notice text.
 		 * @param {string} type    - 'success', 'error', or 'warning'.
@@ -253,6 +268,10 @@
 
 			$('#sgbackup-backup-status').text(sgbackup_settings.strings.backup_started).removeClass('success error');
 
+			// Mark backup start time so polling knows not to declare "complete"
+			// prematurely during the grace period while the job registers.
+			this._backupStartedAt = Date.now();
+
 			this.ajax('backupnow', params, function(data) {
 				$('#sgbackup-backup-status').html(
 					sgbackup_settings.strings.backup_started +
@@ -305,12 +324,20 @@
 			this.pollTimer = setInterval(function() {
 				self.ajax('activejobs_list', {}, function(data) {
 					if ($.isEmptyObject(data)) {
+						// Grace period: if we just started a backup, don't declare
+						// "complete" for 20s - the job may not be visible yet due to
+						// cron event timing during the direct-chain execution.
+						if (self._backupStartedAt && (Date.now() - self._backupStartedAt) < 20000) {
+							return; // keep polling
+						}
+
 						$('#sgbackup-active-jobs').hide();
 						$('#sgbackup-active-jobs-list').empty();
 						$('#sgbackup-backup-status').text('').removeClass('success error');
 						clearInterval(self.pollTimer);
 						self.pollTimer = null;
 						self._activeJobNonce = null;
+						self._backupStartedAt = null;
 
 						// Check last known jobs for errors or warnings
 						var hadErrors = false;
@@ -341,6 +368,8 @@
 						self.lastKnownJobs = {};
 						return;
 					}
+					// Job found - clear grace period since we've confirmed visibility
+					self._backupStartedAt = null;
 					self.lastKnownJobs = data;
 					self._activeJobNonce = Object.keys(data)[0];
 					self.renderActiveJobs(data);
@@ -766,7 +795,7 @@
 					for (var i = 0; i < sourceBlogs.length; i++) {
 						var src = sourceBlogs[i];
 						var isMainSite = (src.blog_id === 1);
-						var mirrorDomain = oldHost ? src.domain.replace(new RegExp(oldHost.replace(/\./g, '\\\\.'), 'g'), newHost) : src.domain;
+						var mirrorDomain = SGB.mirrorDomain(src.domain, oldHost, newHost);
 						var srcLabel = SGB.esc(src.domain);
 						if (src.blog_id > 0) srcLabel += ' <small style="color:#888;">#' + src.blog_id + '</small>';
 
@@ -833,7 +862,7 @@
 					for (var i = 0; i < sourceBlogs.length; i++) {
 						var src = sourceBlogs[i];
 						var isMainSite = (src.blog_id === 1);
-						var mirrorDomain = oldHost ? src.domain.replace(new RegExp(oldHost.replace(/\./g, '\\\\.'), 'g'), newHost) : src.domain;
+						var mirrorDomain = SGB.mirrorDomain(src.domain, oldHost, newHost);
 						var srcLabel = SGB.esc(src.domain);
 						if (src.blog_id > 0) srcLabel += ' <small style="color:#888;">#' + src.blog_id + '</small>';
 
@@ -975,7 +1004,7 @@
 				for (var i = 0; i < sourceBlogs.length; i++) {
 					var src = sourceBlogs[i];
 					var isMainSite = (src.blog_id === 1);
-					var mirrorDomain = oldHost ? src.domain.replace(new RegExp(oldHost.replace(/\./g, '\\\\.'), 'g'), newHost) : src.domain;
+					var mirrorDomain = SGB.mirrorDomain(src.domain, oldHost, newHost);
 
 					// Determine default action and destination
 					var defaultAction, defaultDest;
@@ -1293,7 +1322,7 @@
 									} else {
 										actionLabel = 'CREATE';
 										actionClass = 'sgbackup-action-create';
-										newBlog = oldBlog.replace(new RegExp(oldHost.replace(/\./g, '\\\\.'), 'g'), newHost);
+										newBlog = SGB.mirrorDomain(oldBlog, oldHost, newHost);
 									}
 								} else {
 									// Mirror mode - check checkbox state for skips
@@ -1306,7 +1335,7 @@
 									} else {
 										actionLabel = 'MIRROR';
 										actionClass = 'sgbackup-action-create';
-										newBlog = oldBlog.replace(new RegExp(oldHost.replace(/\./g, '\\\\.'), 'g'), newHost);
+										newBlog = SGB.mirrorDomain(oldBlog, oldHost, newHost);
 									}
 								}
 								var badge = '<span class="sgbackup-action-badge ' + actionClass + '">' + actionLabel + '</span>';
@@ -1333,6 +1362,19 @@
 							warnings.push('Subsites require wildcard DNS (*.' + newHost + ') and web server config to accept subdomains.');
 						}
 						warnings.push('This is a multisite migration. All ' + data.multisite_blogs.length + ' blog domains will be updated automatically.');
+
+						// Check if any blogs have independent domains (not subdomains of old main site)
+						if (subsiteModeVal === '0' || subsiteModeVal === '3') {
+							var independentCount = 0;
+							for (var ib = 0; ib < data.multisite_blogs.length; ib++) {
+								var ibDomain = (typeof data.multisite_blogs[ib] === 'object') ? data.multisite_blogs[ib].domain : data.multisite_blogs[ib];
+								if (ibDomain.indexOf(oldHost) === -1) independentCount++;
+							}
+							if (independentCount > 0) {
+								var remapChecked = ' checked';
+								warnings.push('<label><input type="checkbox" id="sgbackup-remap-independent" value="1"' + remapChecked + ' /> Remap ' + independentCount + ' independent domain(s) to subdomains of ' + SGB.esc(newHost) + ' (e.g. example.com &rarr; example.' + SGB.esc(newHost) + ')</label>');
+							}
+						}
 					}
 				}
 
@@ -1351,7 +1393,9 @@
 				if (warnings.length) {
 					var warnHtml = '<strong>Warnings:</strong><ul style="margin:5px 0 0 20px;">';
 					for (var i = 0; i < warnings.length; i++) {
-						warnHtml += '<li>' + SGB.esc(warnings[i]) + '</li>';
+						// Allow HTML in warnings that start with '<' (checkboxes, labels)
+						var w = warnings[i];
+						warnHtml += '<li>' + (w.charAt(0) === '<' ? w : SGB.esc(w)) + '</li>';
 					}
 					warnHtml += '</ul>';
 					$('#sgbackup-verify-warnings').html(warnHtml).show();
@@ -1420,6 +1464,12 @@
 			// Keep original protocol (skip HTTP/HTTPS conversion)
 			if ($('#sgbackup-keep-protocol').is(':checked')) {
 				formData.append('keep_protocol', '1');
+			}
+
+			// Remap independent domains to subdomains
+			var $remapCb = $('#sgbackup-remap-independent');
+			if ($remapCb.length) {
+				formData.append('remap_independent_domains', $remapCb.is(':checked') ? '1' : '0');
 			}
 
 			// Collect subsite mapping for custom mode or mirror-mode skips
@@ -2079,6 +2129,19 @@
 					if (cancelled) return;
 					// Re-sync offset from server before retry
 					self.ajax('upload_chunk_status', { filename: file.name }, function(statusData) {
+						if (statusData.status === 1) {
+							// Already complete on server (upload finished despite timeout)
+							self.uploadComplete(file.name, { status: 1 });
+							return;
+						}
+						if (statusData.status === -1) {
+							// File gone - bundle was already extracted and deleted,
+							// or upload was processed. Don't restart from scratch.
+							$('#sgbackup-upload-status').text('Upload complete!').addClass('success');
+							$('#sgbackup-upload-input').val('');
+							setTimeout(function() { location.reload(); }, 1500);
+							return;
+						}
 						if (statusData.status === 0 && statusData.size > 0) {
 							offset = statusData.size;
 						}

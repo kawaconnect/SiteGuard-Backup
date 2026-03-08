@@ -77,6 +77,9 @@ class SiteGuard_Backup_Restorer {
 	/** @var bool Keep original protocol (skip HTTP/HTTPS conversion) */
 	private $keep_protocol = false;
 
+	/** @var bool Remap independent domains to subdomains of the new domain */
+	private $remap_independent_domains = true;
+
 	/** @var bool Whether to include unspecified tables in restore */
 	private $include_unspecified_tables = true;
 
@@ -166,6 +169,13 @@ class SiteGuard_Backup_Restorer {
 			$this->keep_protocol = !empty($restore_options['keep_protocol']);
 		} else {
 			$this->keep_protocol = !empty(SiteGuard_Backup_Options::instance()->get_option('sgbackup_default_keep_protocol', 0));
+		}
+
+		// Remap independent domains - per-restore or saved default
+		if (isset($restore_options['remap_independent_domains'])) {
+			$this->remap_independent_domains = !empty($restore_options['remap_independent_domains']);
+		} else {
+			$this->remap_independent_domains = !empty(SiteGuard_Backup_Options::instance()->get_option('sgbackup_default_remap_independent_domains', 1));
 		}
 
 		// Detect subsite backup from metadata
@@ -553,6 +563,11 @@ class SiteGuard_Backup_Restorer {
 			// Parse old URLs from the SQL before import
 			$this->scan_db_for_old_urls($file_path);
 
+			// Skip user tables during migrations to preserve destination login
+			// credentials. The source backup's wp_users/wp_usermeta have different
+			// password hashes, and importing them would lock out the admin.
+			$skip_user_tables = ($this->is_migration && in_array($this->db_restore_mode, array(self::DB_RESTORE_MIGRATE, self::DB_RESTORE_OVERWRITE), true));
+
 			$this->sgbackup->log("Importing database: {$db_file}");
 
 			// Mode 2 (tables-only): use filtered import with only tables NOT in DB
@@ -614,6 +629,22 @@ class SiteGuard_Backup_Restorer {
 						}
 					);
 				}
+			} elseif ($skip_user_tables) {
+				// Migration: import all tables EXCEPT wp_users and wp_usermeta
+				// to preserve destination login credentials.
+				global $wpdb;
+				$user_tables = array($wpdb->base_prefix . 'users', $wpdb->base_prefix . 'usermeta');
+				$all_tables = SiteGuard_Backup_Database_Utility::get_tables_in_sql_file($file_path);
+				$tables_to_import = array_diff($all_tables, $user_tables);
+				$this->sgbackup->log("Migration: skipping user tables (" . implode(', ', $user_tables) . ") to preserve destination credentials");
+				$this->progress("Importing " . count($tables_to_import) . " tables (preserving user credentials)");
+				$import_result = SiteGuard_Backup_Database_Utility::execute_sql_file_filtered(
+					$file_path,
+					$tables_to_import,
+					function($lines_done) {
+						$this->progress("Database import: {$lines_done} lines processed");
+					}
+				);
 			} else {
 				// Use atomic restore (temp table → RENAME) for crash safety
 				$import_result = SiteGuard_Backup_Database_Utility::execute_sql_file_atomic(
@@ -2009,6 +2040,23 @@ class SiteGuard_Backup_Restorer {
 	}
 
 	/**
+	 * Map an independent domain to a subdomain of the target host.
+	 *
+	 * E.g. example.com → example.old-host.example
+	 *      client-b.example → client-b.old-host.example
+	 *
+	 * @param string $domain The independent domain to remap
+	 * @param string $target_host The target host (e.g. old-host.example)
+	 * @return string The new subdomain
+	 */
+	private function map_independent_domain($domain, $target_host) {
+		$parts = explode('.', $domain);
+		array_pop($parts); // Remove TLD (.com, .net, etc.)
+		$subdomain = implode('.', $parts);
+		return $subdomain . '.' . $target_host;
+	}
+
+	/**
 	 * Build search-replace pairs for all multisite blogs.
 	 *
 	 * For each blog in wp_blogs whose domain contains the old site's domain,
@@ -2078,10 +2126,7 @@ class SiteGuard_Backup_Restorer {
 		$added = array();
 
 		foreach ($blogs as $blog_domain) {
-			// Skip if this blog domain doesn't contain the old domain
-			if (strpos($blog_domain, $old_domain) === false) continue;
-
-			// Compute new blog domain: custom map lookup, skip check, or mirror (str_replace)
+			// Compute new blog domain: custom map lookup, skip check, mirror, or independent remap
 			if ($has_skip_map && isset($this->subsite_map[$blog_domain])) {
 				if ($this->subsite_map[$blog_domain] === self::SUBSITE_SKIP) {
 					$this->sgbackup->log("  {$mode_label}: skipping blog domain {$blog_domain}");
@@ -2093,8 +2138,15 @@ class SiteGuard_Backup_Restorer {
 				} else {
 					$new_blog_domain = str_replace($old_domain, $new_domain, $blog_domain);
 				}
-			} else {
+			} elseif (strpos($blog_domain, $old_domain) !== false) {
+				// Domain contains old domain - standard str_replace
 				$new_blog_domain = str_replace($old_domain, $new_domain, $blog_domain);
+			} elseif ($this->remap_independent_domains) {
+				// Independent domain (e.g. kawaconnect.com) - map to subdomain of new domain
+				$new_blog_domain = $this->map_independent_domain($blog_domain, $new_domain);
+				$this->sgbackup->log("  Independent domain remap: {$blog_domain} -> {$new_blog_domain}");
+			} else {
+				continue; // Independent domain remapping disabled
 			}
 
 			// Skip if already covered by existing pairs or is the bare domain
@@ -2275,8 +2327,12 @@ class SiteGuard_Backup_Restorer {
 				}
 			} elseif (strpos($blog->domain, $old_domain) !== false) {
 				$new_blog_domain = str_replace($old_domain, $new_domain, $blog->domain);
+			} elseif ($this->remap_independent_domains) {
+				// Independent domain - map to subdomain of new domain
+				$new_blog_domain = $this->map_independent_domain($blog->domain, $new_domain);
+				$this->sgbackup->log("  Independent domain remap: {$blog->domain} -> {$new_blog_domain}");
 			} else {
-				continue; // Domain doesn't match old domain and no custom mapping
+				continue; // Independent domain remapping disabled
 			}
 
 			if ($new_blog_domain === $blog->domain) continue; // No change needed
@@ -2305,6 +2361,9 @@ class SiteGuard_Backup_Restorer {
 						$new_val = str_replace($blog->domain, $new_blog_domain, $old_val);
 					} elseif (strpos($old_val, $old_domain) !== false) {
 						$new_val = str_replace($old_domain, $new_domain, $old_val);
+					} elseif ($this->remap_independent_domains) {
+						// Independent domain in option value - replace with new subdomain
+						$new_val = str_replace($blog->domain, $new_blog_domain, $old_val);
 					} else {
 						continue;
 					}
@@ -2998,14 +3057,13 @@ class SiteGuard_Backup_Restorer {
 				}
 			}
 
-			// Auth warning: after a full DB import from a different site, the
-			// user table has been replaced. The current session cookie will be
-			// invalid after this response completes.
+			// User tables are now preserved during migrations (wp_users/wp_usermeta
+			// skipped in import), so destination credentials remain valid.
 			$old_host = parse_url($this->old_siteurl, PHP_URL_HOST);
-			$auth_msg = "The database was replaced with data from {$old_host}. You will need to log in using the admin credentials from {$old_host}. Your current session will expire after this page reloads.";
-			$this->sgbackup->log("[Restore] AUTH WARNING: {$auth_msg}");
+			$auth_msg = "Database restored from {$old_host}. Your login credentials have been preserved.";
+			$this->sgbackup->log("[Restore] {$auth_msg}");
 			if (defined('DOING_AJAX') && DOING_AJAX) {
-				echo 'RINFO:' . json_encode(array('type' => 'warning', 'message' => $auth_msg)) . "\n";
+				echo 'RINFO:' . json_encode(array('type' => 'info', 'message' => $auth_msg)) . "\n";
 				if (ob_get_level()) @ob_flush();
 				@flush();
 			}

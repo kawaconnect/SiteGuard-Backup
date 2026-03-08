@@ -234,24 +234,54 @@ class SiteGuard_Backup_Job_Scheduler {
 		$crons = _get_cron_array();
 		$jobs = array();
 
-		if (empty($crons)) return $jobs;
-
-		foreach ($crons as $time => $hooks) {
-			if (isset($hooks['sgbackup_backup_resume'])) {
-				foreach ($hooks['sgbackup_backup_resume'] as $hash => $event) {
-					$args = $event['args'];
-					if (count($args) >= 2) {
-						$resumption_no = $args[0];
-						$nonce = $args[1];
-						// Keep the earliest (soonest) scheduled resumption per nonce
-						if (!isset($jobs[$nonce]) || $time < $jobs[$nonce]['next_scheduled']) {
-							$jobs[$nonce] = array(
-								'resumption' => $resumption_no,
-								'next_scheduled' => $time,
-								'nonce' => $nonce,
-							);
+		if (!empty($crons)) {
+			foreach ($crons as $time => $hooks) {
+				if (isset($hooks['sgbackup_backup_resume'])) {
+					foreach ($hooks['sgbackup_backup_resume'] as $hash => $event) {
+						$args = $event['args'];
+						if (count($args) >= 2) {
+							$resumption_no = $args[0];
+							$nonce = $args[1];
+							// Keep the earliest (soonest) scheduled resumption per nonce
+							if (!isset($jobs[$nonce]) || $time < $jobs[$nonce]['next_scheduled']) {
+								$jobs[$nonce] = array(
+									'resumption' => $resumption_no,
+									'next_scheduled' => $time,
+									'nonce' => $nonce,
+								);
+							}
 						}
 					}
+				}
+			}
+		}
+
+		// Fallback: during the direct-chain execution, cron events are briefly
+		// cleared and rescheduled between resumptions. If the poll reads the cron
+		// during that window, it finds nothing. Check the active job marker set
+		// by boot_backup() and verify the job hasn't finished.
+		if (empty($jobs)) {
+			$active_nonce = get_option('sgbackup_active_job_nonce');
+			if (!empty($active_nonce)) {
+				$sgbackup = SiteGuard_Backup::instance();
+				$jobdata = $sgbackup->jobdata_getarray($active_nonce);
+				if (!empty($jobdata)) {
+					$status = isset($jobdata['jobstatus']) ? $jobdata['jobstatus'] : '';
+					$terminal = array('complete', 'finished', 'error', 'aborted', 'failed', 'warning');
+					if (!in_array($status, $terminal, true)) {
+						$resumption = isset($jobdata['current_resumption']) ? (int) $jobdata['current_resumption'] : 0;
+						$jobs[$active_nonce] = array(
+							'resumption' => $resumption,
+							'next_scheduled' => time() + 10,
+							'nonce' => $active_nonce,
+						);
+					} else {
+						// Job finished but option wasn't cleaned up - clean it now
+						delete_option('sgbackup_active_job_nonce');
+					}
+				} else {
+					// Stale option with no jobdata - clean up
+					delete_option('sgbackup_active_job_nonce');
 				}
 			}
 		}

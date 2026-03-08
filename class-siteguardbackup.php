@@ -699,6 +699,11 @@ class SiteGuard_Backup {
 		$this->jobdata = $initial_jobdata;
 		$this->save_jobdata();
 
+		// Mark this nonce as the active job so status polling can find it
+		// even during the direct-chain window where cron events are being
+		// cleared and rescheduled (race condition with activejobs_list).
+		update_option('sgbackup_active_job_nonce', $this->nonce, false);
+
 		} finally {
 			$sem->unlock();
 		}
@@ -1249,6 +1254,13 @@ class SiteGuard_Backup {
 
 		// Clear scheduled resumptions
 		SiteGuard_Backup_Job_Scheduler::clear_scheduled_events($this->nonce);
+
+		// Clear active job marker (set in boot_backup) so status polling
+		// correctly reports no active jobs after the backup finishes.
+		$active_nonce = get_option('sgbackup_active_job_nonce');
+		if ($active_nonce === $this->nonce) {
+			delete_option('sgbackup_active_job_nonce');
+		}
 
 		// Clean up abort flag
 		$abort_file = $this->get_backup_dir() . 'deleteflag-' . $this->nonce . '.txt';

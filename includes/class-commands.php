@@ -3045,23 +3045,27 @@ class SiteGuard_Backup_Commands {
 			clearstatcache(true, $final_file);
 			$result['size'] = filesize($final_file);
 
-			// Handle bundle zips
+			// Handle bundle zips - send response BEFORE extraction so the
+			// client doesn't time out waiting (large bundles take minutes).
 			if (strpos($filename, 'sgbackup_bundle_') === 0 && $ext === 'zip') {
+				$result['bundle'] = true;
+				$result['message'] = 'Bundle uploaded - extracting backup files...';
+
+				// Send success response immediately, then extract in background
+				$sgbackup = SiteGuard_Backup::instance();
+				$sgbackup->close_browser_connection(json_encode(array('success' => true, 'data' => $result)));
+
 				$admin = SiteGuard_Backup_Admin::instance();
 				$extracted = $admin->extract_bundle($final_file, $backup_dir);
 				@unlink($final_file);
-				if (is_wp_error($extracted)) {
-					return $extracted;
+				if (!is_wp_error($extracted)) {
+					$audit = SiteGuard_Backup_Audit_Log::instance();
+					$audit->log('upload_bundle', 'Chunked upload and extracted bundle: ' . $filename, array(
+						'files' => count($extracted),
+						'size' => $total_size,
+					));
 				}
-				$result['bundle'] = true;
-				$result['files'] = count($extracted);
-				$result['message'] = sprintf('Bundle extracted: %d backup files imported.', count($extracted));
-
-				$audit = SiteGuard_Backup_Audit_Log::instance();
-				$audit->log('upload_bundle', 'Chunked upload and extracted bundle: ' . $filename, array(
-					'files' => count($extracted),
-					'size' => $total_size,
-				));
+				die; // Response already sent
 			} else {
 				// Register individual backup files in history
 				if (preg_match('/^backup_(\d{4}-\d{2}-\d{2}-\d{4})_[^_]+_([a-zA-Z0-9]+)/', $filename, $m)) {

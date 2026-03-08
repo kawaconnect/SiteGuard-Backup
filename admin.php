@@ -776,6 +776,11 @@ class SiteGuard_Backup_Admin {
 			$restore_options['keep_protocol'] = true;
 		}
 
+		// Remap independent domains to subdomains of the new domain
+		if (isset($_POST['remap_independent_domains'])) {
+			$restore_options['remap_independent_domains'] = !empty($_POST['remap_independent_domains']);
+		}
+
 		// Target domain/blog_id for subsite import
 		if (!empty($_POST['target_subsite_domain'])) {
 			$restore_options['target_subsite_domain'] = sanitize_text_field(wp_unslash($_POST['target_subsite_domain']));
