@@ -2001,6 +2001,14 @@ class SiteGuard_Backup_Restorer {
 		global $wpdb;
 		$tables = SiteGuard_Backup_Database_Utility::get_tables($wpdb->prefix);
 
+		// Exclude user tables from search-replace during migrations to preserve
+		// destination user logins, emails, and credentials
+		if ($this->is_migration) {
+			$user_tables = array($wpdb->users, $wpdb->usermeta);
+			$tables = array_values(array_diff($tables, $user_tables));
+			$this->sgbackup->log("Search-replace: excluding user tables (" . implode(', ', $user_tables) . ") to preserve destination accounts");
+		}
+
 		$sr = new SiteGuard_Backup_Search_Replace();
 		$report = $sr->run($search, $replace, $tables);
 
