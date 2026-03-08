@@ -1306,18 +1306,6 @@ $period_labels = array(
 		</tr>
 	</table>
 
-	<h2><?php esc_html_e('Auto-Backup', 'siteguardbackup'); ?></h2>
-	<table class="form-table">
-		<tr>
-			<th><?php esc_html_e('Before updates', 'siteguardbackup'); ?></th>
-			<td>
-				<label>
-					<input type="checkbox" name="autobackup_default" value="1" <?php checked($settings['autobackup_default']); ?> />
-					<?php esc_html_e('Automatically backup before plugin, theme, or core updates', 'siteguardbackup'); ?>
-				</label>
-			</td>
-		</tr>
-	</table>
 
 	<h2><?php esc_html_e('Settings Lock', 'siteguardbackup'); ?></h2>
 	<table class="form-table">
