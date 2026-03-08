@@ -2328,6 +2328,10 @@ class SiteGuard_Backup_Restorer {
 			} elseif (strpos($blog->domain, $old_domain) !== false) {
 				$new_blog_domain = str_replace($old_domain, $new_domain, $blog->domain);
 			} elseif ($this->remap_independent_domains) {
+				// Skip if search-replace already remapped this domain (it's already a subdomain of new_domain)
+				if ($blog->domain === $new_domain || substr($blog->domain, -(strlen($new_domain) + 1)) === '.' . $new_domain) {
+					continue;
+				}
 				// Independent domain - map to subdomain of new domain
 				$new_blog_domain = $this->map_independent_domain($blog->domain, $new_domain);
 				$this->sgbackup->log("  Independent domain remap: {$blog->domain} -> {$new_blog_domain}");
