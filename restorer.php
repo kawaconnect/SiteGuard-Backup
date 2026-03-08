@@ -2009,8 +2009,30 @@ class SiteGuard_Backup_Restorer {
 			$this->sgbackup->log("Search-replace: excluding user tables (" . implode(', ', $user_tables) . ") to preserve destination accounts");
 		}
 
+		// Save site_admins before search-replace - it contains user_login values
+		// that must stay in sync with wp_users (which we preserve during migration)
+		$saved_site_admins = null;
+		if ($this->is_migration && is_multisite()) {
+			$sitemeta_table = $wpdb->base_prefix . 'sitemeta';
+			$saved_site_admins = $wpdb->get_var($wpdb->prepare(
+				"SELECT meta_value FROM {$sitemeta_table} WHERE meta_key = %s", 'site_admins'
+			));
+		}
+
 		$sr = new SiteGuard_Backup_Search_Replace();
 		$report = $sr->run($search, $replace, $tables);
+
+		// Restore site_admins after search-replace to preserve super-admin grants
+		if ($saved_site_admins !== null) {
+			$wpdb->update(
+				$wpdb->base_prefix . 'sitemeta',
+				array('meta_value' => $saved_site_admins),
+				array('meta_key' => 'site_admins'),
+				array('%s'),
+				array('%s')
+			);
+			$this->sgbackup->log("Restored site_admins after search-replace to preserve super-admin logins");
+		}
 
 		$this->sgbackup->log("Search-replace complete: {$report['changes']} changes across {$report['tables']} tables, {$report['updates']} rows updated");
 		if (!empty($report['errors'])) {
@@ -2704,6 +2726,12 @@ class SiteGuard_Backup_Restorer {
 			$this->remove_temp_dir($temp_dir);
 		}
 
+		// After plugins restore: detect and remove duplicate plugins (same Plugin Name,
+		// different directories) to prevent fatal "Cannot redeclare" errors
+		if ($entity === 'plugins') {
+			$this->remove_duplicate_plugins($dest_dir);
+		}
+
 		// Save progress for resume support
 		$this->save_restore_progress($entity, 'completed');
 
@@ -2751,6 +2779,95 @@ class SiteGuard_Backup_Restorer {
 				$this->sgbackup->log("Selective restore: skipped {$entity} item '{$item}'");
 			}
 		}
+	}
+
+	/**
+	 * Detect and remove duplicate plugins (same Plugin Name, different directories).
+	 *
+	 * After restoring the plugins entity, the backup may contain a plugin in a
+	 * directory named differently than the destination's copy (e.g. "elementorpro"
+	 * vs "elementor-pro"). Both get loaded by WordPress, causing fatal
+	 * "Cannot redeclare" errors. This method scans for duplicates and removes
+	 * the older version.
+	 *
+	 * @param string $plugins_dir Path to the wp-content/plugins/ directory.
+	 */
+	private function remove_duplicate_plugins($plugins_dir) {
+		$plugins_dir = trailingslashit($plugins_dir);
+		$seen = array(); // Plugin Name => array('dir' => dirname, 'version' => version)
+		$removed = 0;
+
+		$dirs = @scandir($plugins_dir);
+		if (!is_array($dirs)) return;
+
+		foreach ($dirs as $dir) {
+			if ($dir === '.' || $dir === '..' || !is_dir($plugins_dir . $dir)) continue;
+
+			// Find the main plugin file (contains "Plugin Name:" header)
+			$plugin_files = glob($plugins_dir . $dir . '/*.php');
+			if (!$plugin_files) continue;
+
+			foreach ($plugin_files as $file) {
+				$header = $this->read_plugin_header($file);
+				if (empty($header['name'])) continue;
+
+				$name = $header['name'];
+				$version = $header['version'] ?: '0.0.0';
+
+				if (isset($seen[$name])) {
+					// Duplicate found - remove the older one
+					$existing = $seen[$name];
+					if (version_compare($version, $existing['version'], '>')) {
+						// New one is newer - remove existing
+						$remove_dir = $plugins_dir . $existing['dir'];
+						$keep_dir = $dir;
+						$seen[$name] = array('dir' => $dir, 'version' => $version);
+					} else {
+						// Existing is newer or same - remove new one
+						$remove_dir = $plugins_dir . $dir;
+						$keep_dir = $existing['dir'];
+					}
+
+					$this->remove_temp_dir($remove_dir);
+					$removed++;
+					$this->sgbackup->log("Removed duplicate plugin '{$name}': deleted " . basename($remove_dir) . "/ (kept {$keep_dir}/ v" . $seen[$name]['version'] . ")");
+					$this->progress("Removed duplicate plugin: " . basename($remove_dir) . "/ (kept {$keep_dir}/)");
+				} else {
+					$seen[$name] = array('dir' => $dir, 'version' => $version);
+				}
+
+				break; // Only check one main file per directory
+			}
+		}
+
+		if ($removed > 0) {
+			$this->sgbackup->log("Duplicate plugin cleanup: removed {$removed} duplicate(s)");
+		}
+	}
+
+	/**
+	 * Read Plugin Name and Version from a PHP plugin file header.
+	 *
+	 * @param string $file Path to the PHP file.
+	 * @return array('name' => string|null, 'version' => string|null)
+	 */
+	private function read_plugin_header($file) {
+		$result = array('name' => null, 'version' => null);
+		$fp = @fopen($file, 'r');
+		if (!$fp) return $result;
+
+		// Read first 8KB (WordPress standard for plugin headers)
+		$data = fread($fp, 8192);
+		fclose($fp);
+
+		if (preg_match('/Plugin\s*Name:\s*(.+)/i', $data, $m)) {
+			$result['name'] = trim($m[1]);
+		}
+		if (preg_match('/Version:\s*([0-9][^\s]*)/i', $data, $m)) {
+			$result['version'] = trim($m[1]);
+		}
+
+		return $result;
 	}
 
 	/**
