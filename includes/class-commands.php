@@ -319,6 +319,14 @@ class SiteGuard_Backup_Commands {
 		SiteGuard_Backup_Job_Scheduler::request_abort($nonce);
 		SiteGuard_Backup_Job_Scheduler::clear_scheduled_events($nonce);
 
+		// Mark jobdata as aborted so the UI stops showing it as running
+		$sgbackup = SiteGuard_Backup::instance();
+		$jobdata = $sgbackup->jobdata_getarray($nonce);
+		if (!empty($jobdata)) {
+			$jobdata['jobstatus'] = 'aborted';
+			$sgbackup->jobdata_set($nonce, $jobdata);
+		}
+
 		return array('success' => true, 'nonce' => $nonce);
 	}
 
