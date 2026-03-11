@@ -304,6 +304,20 @@ class SiteGuard_Backup_Restorer {
 			}
 			$result['messages'] = array_merge($result['messages'], $subsite_result['messages']);
 
+			// Warn about shared entities that can't be per-subsite restored
+			$shared_entities = array('plugins', 'themes', 'others', 'wpcore');
+			foreach ($shared_entities as $entity) {
+				if (!empty($this->restore_options[$entity]) && !empty($this->backup_set[$entity])) {
+					$skip_msg = ucfirst($entity) . " restore skipped: shared network entities cannot be restored in per-subsite import mode";
+					$this->sgbackup->log("[Restore] {$skip_msg}", 'warning');
+					if (defined('DOING_AJAX') && DOING_AJAX) {
+						echo 'RINFO:' . json_encode(array('type' => 'warning', 'message' => $skip_msg)) . "\n";
+						if (ob_get_level()) @ob_flush();
+						@flush();
+					}
+				}
+			}
+
 			// Phase 3: Post-restore
 			$this->post_restore_cleanup();
 			$result['messages'] = array_merge($this->progress, $result['messages']);
@@ -1516,12 +1530,17 @@ class SiteGuard_Backup_Restorer {
 				continue;
 			}
 
-			// Find the actual files - might be in sites/{source_id}/ or root
+			// Two-phase copy: multisite backups store uploads in sites/{id}/,
+			// single-site backups store them at root level
 			$source_subdir = $temp_extract . 'sites/' . $source_id . '/';
-			$copy_from = is_dir($source_subdir) ? $source_subdir : $temp_extract;
-
-			// Copy files to target directory
-			$this->copy_dir_recursive($copy_from, $target_dir);
+			if (is_dir($source_subdir)) {
+				// Multisite subsite backup: copy from sites/{source_id}/
+				$this->copy_dir_recursive($source_subdir, $target_dir);
+			} else {
+				// Single-site backup: copy root-level files, excluding sites/ dir
+				// (which would contain OTHER subsites' uploads)
+				$this->copy_dir_recursive_exclude($temp_extract, $target_dir, array('sites'));
+			}
 
 			$this->remove_dir_recursive($temp_extract);
 			$this->sgbackup->log("Restored uploads from {$zip_file} to /sites/{$target_id}/");
@@ -1544,6 +1563,41 @@ class SiteGuard_Backup_Restorer {
 
 		foreach ($iterator as $item) {
 			$target = $dest . DIRECTORY_SEPARATOR . $iterator->getSubPathname();
+			if ($item->isDir() || is_dir($item->getPathname())) {
+				if (!is_dir($target)) wp_mkdir_p($target);
+			} else {
+				@copy($item->getPathname(), $target);
+			}
+		}
+	}
+
+	/**
+	 * Recursively copy a directory, excluding specified top-level subdirectories.
+	 *
+	 * @param string $source Source directory path.
+	 * @param string $dest   Destination directory path.
+	 * @param array  $exclude Top-level directory names to skip (e.g., array('sites')).
+	 */
+	private function copy_dir_recursive_exclude($source, $dest, $exclude = array()) {
+		if (!is_dir($source)) return;
+		if (!is_dir($dest)) wp_mkdir_p($dest);
+
+		$iterator = new RecursiveIteratorIterator(
+			new RecursiveDirectoryIterator($source, FilesystemIterator::SKIP_DOTS),
+			RecursiveIteratorIterator::SELF_FIRST
+		);
+
+		$source_len = strlen(rtrim($source, '/\\')) + 1;
+
+		foreach ($iterator as $item) {
+			$relative = substr($item->getPathname(), $source_len);
+			// Skip excluded top-level directories
+			foreach ($exclude as $ex) {
+				if (strpos($relative, $ex . DIRECTORY_SEPARATOR) === 0 || $relative === $ex) {
+					continue 2;
+				}
+			}
+			$target = $dest . DIRECTORY_SEPARATOR . $relative;
 			if ($item->isDir() || is_dir($item->getPathname())) {
 				if (!is_dir($target)) wp_mkdir_p($target);
 			} else {
@@ -3223,6 +3277,12 @@ class SiteGuard_Backup_Restorer {
 			}
 		}
 
+		// Clear Elementor's cached CSS files and postmeta flags so it
+		// regenerates CSS with correct (migrated) URLs on next page load
+		if ($this->is_migration) {
+			$this->clear_elementor_css_cache();
+		}
+
 		// Gap 26: Check .htaccess for migration issues
 		$this->check_htaccess_migration();
 
@@ -3680,6 +3740,95 @@ class SiteGuard_Backup_Restorer {
 			if (!empty($old_path) && $old_path !== $current_path && strpos($htaccess_content, $old_path) !== false) {
 				$this->progress("WARNING: .htaccess contains path references to '{$old_path}' which may need updating to '{$current_path}'");
 				$this->sgbackup->log(".htaccess path mismatch: contains '{$old_path}', current site path is '" . ($current_path ?: '/') . "'", 'warning');
+			}
+		}
+	}
+
+	/**
+	 * Clear Elementor's cached CSS files and database flags.
+	 *
+	 * Elementor caches per-post CSS files containing hardcoded URLs. After a
+	 * migration these files reference the old domain, causing broken layouts.
+	 * Clearing the cache forces Elementor to regenerate CSS on next page load.
+	 */
+	private function clear_elementor_css_cache() {
+		global $wpdb;
+		$cleared = 0;
+
+		// 1. Clear postmeta cache flags across all sites
+		$meta_keys = array('_elementor_css', '_elementor_document_cache', '_elementor_page_assets');
+		$tables = array($wpdb->postmeta);
+
+		if (is_multisite()) {
+			$blog_ids = $wpdb->get_col("SELECT blog_id FROM {$wpdb->base_prefix}blogs");
+			foreach ($blog_ids as $bid) {
+				$prefix = ($bid == 1) ? $wpdb->base_prefix : $wpdb->base_prefix . $bid . '_';
+				$table = $prefix . 'postmeta';
+				if ($wpdb->get_var("SHOW TABLES LIKE '{$table}'") === $table) {
+					$tables[] = $table;
+				}
+			}
+			$tables = array_unique($tables);
+		}
+
+		foreach ($tables as $table) {
+			foreach ($meta_keys as $key) {
+				$deleted = $wpdb->query($wpdb->prepare(
+					"DELETE FROM `{$table}` WHERE meta_key = %s", $key
+				));
+				$cleared += (int) $deleted;
+			}
+		}
+
+		// 2. Clear global Elementor options
+		$option_keys = array('_elementor_global_css', 'elementor_frontend_css_updated_time');
+		if (is_multisite()) {
+			foreach ($blog_ids as $bid) {
+				$prefix = ($bid == 1) ? $wpdb->base_prefix : $wpdb->base_prefix . $bid . '_';
+				$options_table = $prefix . 'options';
+				if ($wpdb->get_var("SHOW TABLES LIKE '{$options_table}'") === $options_table) {
+					foreach ($option_keys as $key) {
+						$wpdb->query($wpdb->prepare(
+							"DELETE FROM `{$options_table}` WHERE option_name = %s", $key
+						));
+					}
+				}
+			}
+		} else {
+			foreach ($option_keys as $key) {
+				delete_option($key);
+			}
+		}
+
+		// 3. Delete cached CSS files from uploads/elementor/css/
+		$upload_dir = wp_upload_dir();
+		$base_upload = dirname($upload_dir['basedir']); // wp-content/uploads
+		$css_dirs = array($base_upload . '/elementor/css');
+
+		if (is_multisite()) {
+			foreach ($blog_ids as $bid) {
+				if ($bid == 1) continue;
+				$css_dirs[] = $base_upload . '/sites/' . $bid . '/elementor/css';
+			}
+		}
+
+		$files_deleted = 0;
+		foreach ($css_dirs as $css_dir) {
+			if (!is_dir($css_dir)) continue;
+			$files = glob($css_dir . '/*.css');
+			if (!is_array($files)) continue;
+			foreach ($files as $file) {
+				if (@unlink($file)) $files_deleted++;
+			}
+		}
+
+		if ($cleared > 0 || $files_deleted > 0) {
+			$msg = "Elementor CSS cache cleared: {$cleared} postmeta rows, {$files_deleted} CSS files deleted";
+			$this->sgbackup->log("[Restore] {$msg}");
+			if (defined('DOING_AJAX') && DOING_AJAX) {
+				echo 'RINFO:' . json_encode(array('type' => 'info', 'message' => $msg)) . "\n";
+				if (ob_get_level()) @ob_flush();
+				@flush();
 			}
 		}
 	}
