@@ -183,7 +183,11 @@ class SiteGuard_Backup_Search_Replace {
 				$escaped_pk = str_replace('`', '``', $primary_key);
 				$sql = "UPDATE `{$escaped_table}` SET " . implode(', ', $set_clauses) . " WHERE `{$escaped_pk}` = %s LIMIT 1";
 
-				$result = $wpdb->query($wpdb->prepare($sql, $values));
+				// Escape literal % in values so wpdb::prepare() doesn't mangle them
+				$escaped_values = array_map(function($v) {
+					return is_string($v) ? str_replace('%', '%%', $v) : $v;
+				}, $values);
+				$result = $wpdb->query($wpdb->prepare($sql, $escaped_values));
 
 				if (false === $result) {
 					$this->report['errors'][] = "Error updating {$table}.{$primary_key}={$row[$primary_key]}: " . $wpdb->last_error;
