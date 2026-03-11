@@ -1,0 +1,86 @@
+# SiteGuard Backup
+
+A WordPress backup, restore, and migration plugin built for multisite networks. It handles multisite-aware backup and restore, site-to-site migration, and full WP-CLI support.
+
+## What It Does
+
+- **Full and incremental backups** of files and database, scheduled or on-demand
+- **Per-subsite backup and restore** from Network Admin - back up or restore individual subsites without touching the rest of the network
+- **Site-to-site migration** - pull backups directly from a remote WordPress site over an authenticated, encrypted connection (RSA+AES). No manual file downloads or uploads required
+- **Domain remapping** - migrate between independent domains and subdomains automatically. Handles multisite blog tables, sitemeta, and serialization-aware search-replace across all subsites
+- **12+ remote storage backends** - S3, Google Drive, Dropbox, OneDrive, Azure Blob, GCS, pCloud, FTP, SFTP, WebDAV, OpenStack, Email
+- **WP-CLI integration** - 45+ subcommands covering backups, restores, settings, migrations, and diagnostics
+- **Resumable jobs** - long-running backups resume automatically via WP-Cron if interrupted
+- **Atomic database restores** - imports into temporary tables, then swaps all tables in a single `RENAME TABLE` operation
+- **Split archives** - large backups split at configurable thresholds (default 400 MB)
+- **Encryption** - AES-256-GCM backup encryption with PBKDF2 key derivation
+- **DB anonymisation** - strip PII from database exports (all users, non-staff only, or WooCommerce orders)
+
+## Multisite Focus
+
+This plugin was built to manage a WordPress multisite network where subsites use independent production domains (e.g. `example.com`, `shop.otherdomain.com`) that get backed up and restored onto a standby network using mapped subdomains.
+
+Key multisite capabilities:
+
+- Enumerate all blog domains from `wp_blogs` during restore and build per-blog URL replacement pairs
+- Handle cross-protocol replacements (HTTP/HTTPS) per subsite
+- Directly fix `wp_sitemeta`, `wp_site`, and `wp_blogs` via SQL to avoid search-replace artifacts
+- Preserve `site_admins` and user accounts during migration
+- Detect and remove duplicate plugins when restoring across sites with different installed versions
+- Dispatch scheduled backup cron events for subsites that don't receive regular traffic
+
+## Site-to-Site Migration
+
+Pull backups directly from another WordPress site without manually downloading or uploading files:
+
+1. Generate a key bundle on the **destination** site (Settings > Migration tab)
+2. Paste the key bundle on the **source** site to register it as a destination
+3. Send backups from source to destination - or trigger a backup-and-send in one step
+4. Restore on the destination with automatic domain remapping
+
+The connection is authenticated with RSA key pairs and encrypted with AES. Rate-limited to 60 requests/minute per IP.
+
+## WP-CLI
+
+```bash
+# Backups
+wp siteguardbackup backup [--db-only] [--files-only] [--incremental] [--label=<label>]
+wp siteguardbackup list [--format=table|json]
+wp siteguardbackup status
+wp siteguardbackup delete <timestamp> [--delete-remote] [--yes]
+wp siteguardbackup inspect <timestamp> [--format=table|json]
+
+# Restore
+wp siteguardbackup restore <timestamp> [--entities=<list>] [--db-restore-mode=<mode>]
+wp siteguardbackup resume_restore
+
+# Settings
+wp siteguardbackup settings get [--key=<key>] [--format=table|json]
+wp siteguardbackup settings set --<key>=<value>
+wp siteguardbackup settings export [--file=<path>]
+wp siteguardbackup settings import <file>
+
+# Migration
+wp siteguardbackup migrate_send <timestamp> <site_id>
+wp siteguardbackup migrate_clone <site_id>
+wp siteguardbackup migrate_destinations list [--format=table|json]
+
+# Diagnostics
+wp siteguardbackup sysinfo
+wp siteguardbackup db_tables [--format=table|json]
+wp siteguardbackup site_size [--format=table|json]
+wp siteguardbackup cron_events [--sgbackup-only]
+```
+
+Run `wp help siteguardbackup` for the full command list.
+
+## Requirements
+
+- WordPress 5.6+
+- PHP 7.4+
+
+## License
+
+GPLv2 or later. See [https://www.gnu.org/licenses/gpl-2.0.html](https://www.gnu.org/licenses/gpl-2.0.html).
+
+Portions copyright UpdraftPlus.Com and David Anderson, GPLv2.
