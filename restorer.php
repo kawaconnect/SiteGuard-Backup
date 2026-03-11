@@ -1485,7 +1485,16 @@ class SiteGuard_Backup_Restorer {
 		if (is_string($upload_files)) $upload_files = array($upload_files);
 
 		$opts = SiteGuard_Backup_Options::instance();
-		$uploads_base = SiteGuard_Backup_Filesystem::wp_uploads_dir();
+		// Use the NETWORK uploads base, not the current site's upload dir.
+		// wp_upload_dir() returns a site-specific path (e.g. uploads/sites/19/)
+		// when running in a subsite context, which would double the sites/{id}/ prefix.
+		if (is_multisite()) {
+			switch_to_blog(get_main_site_id());
+			$uploads_base = SiteGuard_Backup_Filesystem::wp_uploads_dir();
+			restore_current_blog();
+		} else {
+			$uploads_base = SiteGuard_Backup_Filesystem::wp_uploads_dir();
+		}
 		$target_dir = trailingslashit($uploads_base) . 'sites/' . $target_id . '/';
 
 		if (!file_exists($target_dir)) {
