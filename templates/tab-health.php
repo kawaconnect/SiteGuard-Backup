@@ -88,3 +88,11 @@ $rest_url = rest_url('sgbackup/v1/health');
 		<p><?php esc_html_e('Loading health status...', 'siteguardbackup'); ?></p>
 	</div>
 </div>
+
+<div class="sgbackup-section">
+	<h2>
+		<?php esc_html_e('Health Monitor Log', 'siteguardbackup'); ?>
+		<button type="button" class="button button-small" id="sgbackup-health-log-clear" style="margin-left:8px;"><?php esc_html_e('Clear', 'siteguardbackup'); ?></button>
+	</h2>
+	<pre id="sgbackup-health-log-content" style="max-height:400px;overflow-y:auto;background:#1d2327;color:#c3c4c7;padding:12px;font-family:monospace;font-size:11px;border-radius:3px;word-break:break-all;line-height:1.6;white-space:pre-wrap;margin:0;"></pre>
+</div>
