@@ -63,6 +63,7 @@ $rest_url = rest_url('sgbackup/v1/health');
 			<th scope="row"><?php esc_html_e('API Endpoint', 'siteguardbackup'); ?></th>
 			<td>
 				<code id="sgbackup-health-endpoint"><?php echo esc_html($rest_url); ?></code>
+				<p class="description"><?php esc_html_e('If this site is behind Cloudflare with Bot Fight Mode enabled, add a WAF rule to skip managed challenges for this URL path. Otherwise the Discord bot will receive a JS challenge page instead of JSON.', 'siteguardbackup'); ?></p>
 			</td>
 		</tr>
 		<tr>
