@@ -3,6 +3,8 @@
  * SiteGuard Backup - Multisite Health Monitor
  *
  * Checks HTTP health and SSL certificate expiry for all subsites.
+ * HTTP checks go through localhost to avoid Cloudflare Bot Fight Mode.
+ * SSL checks go to the public domain to see what users see.
  * Stores results in wp_options and exposes them via REST API.
  */
 
@@ -36,34 +38,39 @@ class SiteGuard_Backup_Health_Monitor {
 		$ssl_warn = intval($opts->get_option('sgbackup_health_ssl_warn_days', 14));
 		$targets = $this->get_check_targets();
 		$results = array();
+		$previous = $opts->get_option('sgbackup_health_results', array());
+		$prev_map = array();
+		foreach ($previous as $p) {
+			$prev_map[$p['site_id']] = $p;
+		}
 
 		// Time budget: stop checking after 55s to stay under Azure's 60s safe limit
-		// and well under PHP max_execution_time (120s default on Azure).
 		$deadline = microtime(true) + 55;
 
 		foreach ($targets as $target) {
 			if (microtime(true) > $deadline) {
-				// Mark remaining sites as unchecked with previous results if available
 				$result = array(
-					'site_id'         => $target['site_id'],
-					'url'             => $target['url'],
-					'domain'          => wp_parse_url($target['url'], PHP_URL_HOST),
-					'status'          => 'unknown',
-					'http_code'       => 0,
-					'response_time'   => 0,
-					'ssl_expiry_days' => -1,
-					'ssl_issuer'      => '',
-					'last_check'      => 0,
-					'error'           => 'Skipped: time budget exceeded',
+					'site_id'            => $target['site_id'],
+					'url'                => $target['url'],
+					'domain'             => wp_parse_url($target['url'], PHP_URL_HOST),
+					'status'             => 'unknown',
+					'http_code'          => 0,
+					'response_time'      => 0,
+					'ssl_expiry_days'    => -1,
+					'ssl_issuer'         => '',
+					'last_check'         => 0,
+					'error'              => 'Skipped: time budget exceeded',
+					'consecutive_failures' => isset($prev_map[$target['site_id']]) ? intval($prev_map[$target['site_id']]['consecutive_failures'] ?? 0) : 0,
+					'check_method'       => 'skipped',
 				);
 				$results[] = $result;
 				continue;
 			}
 
-			$result = $this->check_site($target['url'], $timeout, $ssl_warn);
-			$result['site_id'] = $target['site_id'];
-			$result['url'] = $target['url'];
-			$result['domain'] = wp_parse_url($target['url'], PHP_URL_HOST);
+			$result = $this->check_site($target, $timeout, $ssl_warn);
+			// Track consecutive failures
+			$prev_failures = isset($prev_map[$target['site_id']]) ? intval($prev_map[$target['site_id']]['consecutive_failures'] ?? 0) : 0;
+			$result['consecutive_failures'] = ($result['status'] === 'down') ? $prev_failures + 1 : 0;
 			$results[] = $result;
 		}
 
@@ -74,10 +81,24 @@ class SiteGuard_Backup_Health_Monitor {
 	}
 
 	/**
-	 * Check a single site: HTTP HEAD + SSL certificate inspection.
+	 * Check a single site via internal localhost request + external SSL check.
+	 *
+	 * HTTP: requests localhost with the site's Host header so the check
+	 * never leaves the server and never hits Cloudflare Bot Fight Mode.
+	 *
+	 * SSL: connects to the public domain on port 443 to capture the
+	 * certificate users actually see (including Cloudflare edge certs).
 	 */
-	private function check_site($url, $timeout, $ssl_warn_days) {
+	private function check_site($target, $timeout, $ssl_warn_days) {
+		$url = $target['url'];
+		$site_id = $target['site_id'];
+		$domain = wp_parse_url($url, PHP_URL_HOST);
+		$scheme = wp_parse_url($url, PHP_URL_SCHEME);
+
 		$result = array(
+			'site_id'         => $site_id,
+			'url'             => $url,
+			'domain'          => $domain,
 			'status'          => 'down',
 			'http_code'       => 0,
 			'response_time'   => 0,
@@ -85,18 +106,52 @@ class SiteGuard_Backup_Health_Monitor {
 			'ssl_issuer'      => '',
 			'last_check'      => time(),
 			'error'           => '',
+			'check_method'    => 'unknown',
 		);
 
-		// HTTP health check
-		$start = microtime(true);
-		$response = wp_remote_head($url, array(
-			'timeout'     => $timeout,
-			'sslverify'   => false,
-			'redirection' => 3,
-			'user-agent'  => 'SiteGuard-Health-Monitor/' . SGBACKUP_VERSION,
-		));
-		$elapsed = microtime(true) - $start;
-		$result['response_time'] = round($elapsed, 3);
+		// ---- Internal HTTP check (via localhost, bypasses Cloudflare) ----
+		// Multisite on the same server: request localhost with Host header
+		// so the web server routes it to the correct vhost without going external.
+		$local_url = $this->get_local_url($target);
+		if ($local_url) {
+			$result['check_method'] = 'localhost';
+			$start = microtime(true);
+			$response = wp_remote_head($local_url, array(
+				'timeout'     => $timeout,
+				'sslverify'   => false,
+				'redirection' => 0, // Don't follow redirects - a 301/302 means the site is alive
+				'headers'     => array('Host' => $domain),
+				'user-agent'  => 'SiteGuard-Health-Monitor/' . SGBACKUP_VERSION,
+			));
+			$elapsed = microtime(true) - $start;
+			$result['response_time'] = round($elapsed, 3);
+
+			if (is_wp_error($response)) {
+				// Localhost failed - fall back to external check
+				$result['check_method'] = 'external_fallback';
+				$start2 = microtime(true);
+				$response = wp_remote_head($url, array(
+					'timeout'     => $timeout,
+					'sslverify'   => false,
+					'redirection' => 3,
+					'user-agent'  => 'SiteGuard-Health-Monitor/' . SGBACKUP_VERSION,
+				));
+				$elapsed2 = microtime(true) - $start2;
+				$result['response_time'] = round($elapsed2, 3);
+			}
+		} else {
+			// Not multisite or can't determine local URL - use external
+			$result['check_method'] = 'external';
+			$start = microtime(true);
+			$response = wp_remote_head($url, array(
+				'timeout'     => $timeout,
+				'sslverify'   => false,
+				'redirection' => 3,
+				'user-agent'  => 'SiteGuard-Health-Monitor/' . SGBACKUP_VERSION,
+			));
+			$elapsed = microtime(true) - $start;
+			$result['response_time'] = round($elapsed, 3);
+		}
 
 		if (is_wp_error($response)) {
 			$result['error'] = $response->get_error_message();
@@ -105,25 +160,26 @@ class SiteGuard_Backup_Health_Monitor {
 			$code = wp_remote_retrieve_response_code($response);
 			$result['http_code'] = intval($code);
 
+			// 2xx = operational, 3xx = operational (redirect means site is alive),
+			// 403 from localhost is NOT Cloudflare, it's WordPress/nginx denying - still alive
 			if ($code >= 200 && $code < 400) {
 				$result['status'] = 'operational';
+			} elseif ($code == 403 && $result['check_method'] === 'localhost') {
+				// 403 from localhost is the web server responding - site is alive
+				$result['status'] = 'operational';
+				$result['error'] = '';
 			} else {
 				$result['status'] = 'down';
 				$result['error'] = 'HTTP ' . $code;
 			}
 		}
 
-		// SSL certificate check
-		$host = wp_parse_url($url, PHP_URL_HOST);
-		$scheme = wp_parse_url($url, PHP_URL_SCHEME);
-		if ($host && $scheme === 'https') {
-			$ssl = $this->get_ssl_expiry($host);
+		// ---- SSL certificate check (external, to public domain) ----
+		if ($domain && $scheme === 'https') {
+			$ssl = $this->get_ssl_expiry($domain);
 			$result['ssl_expiry_days'] = $ssl['days'];
 			$result['ssl_issuer'] = $ssl['issuer'];
 
-			// -1 = couldn't check SSL (connection failed), skip SSL status logic
-			// 0 or negative (but not -1) = cert expired or expires today
-			// positive = cert valid, check against warning threshold
 			if ($ssl['days'] !== -1 && $ssl['days'] <= 0) {
 				$result['status'] = 'down';
 				$result['error'] = $result['error'] ? $result['error'] . '; SSL expired' : 'SSL certificate expired';
@@ -141,7 +197,24 @@ class SiteGuard_Backup_Health_Monitor {
 	}
 
 	/**
+	 * Build a localhost URL for internal health checking.
+	 * Returns http://127.0.0.1/ (or http://localhost:PORT/) so the request
+	 * stays on the same server and never goes through Cloudflare.
+	 */
+	private function get_local_url($target) {
+		// Determine the local port the web server is listening on
+		$port = '';
+		if (!empty($_SERVER['SERVER_PORT']) && $_SERVER['SERVER_PORT'] != 80 && $_SERVER['SERVER_PORT'] != 443) {
+			$port = ':' . intval($_SERVER['SERVER_PORT']);
+		}
+
+		// Use 127.0.0.1 to avoid DNS - guaranteed to be the local machine
+		return 'http://127.0.0.1' . $port . '/';
+	}
+
+	/**
 	 * Get SSL certificate expiry info for a host.
+	 * Connects to the public domain to see the cert users see (including Cloudflare edge certs).
 	 */
 	private function get_ssl_expiry($host, $port = 443) {
 		$result = array('days' => -1, 'issuer' => '');
@@ -223,6 +296,19 @@ class SiteGuard_Backup_Health_Monitor {
 	}
 
 	/**
+	 * Get the configured check interval in seconds.
+	 */
+	public function get_interval_seconds() {
+		$opts = SiteGuard_Backup_Options::instance();
+		$key = $opts->get_option('sgbackup_health_interval', 'every10min');
+		$schedules = wp_get_schedules();
+		if (isset($schedules[$key])) {
+			return intval($schedules[$key]['interval']);
+		}
+		return 600; // default 10 min
+	}
+
+	/**
 	 * Enumerate all site URLs to check.
 	 */
 	private function get_check_targets() {
@@ -250,7 +336,6 @@ class SiteGuard_Backup_Health_Monitor {
 
 	/**
 	 * Get or auto-generate the API key for external polling.
-	 * Key is stored hashed - plaintext is only shown once at generation.
 	 */
 	public function get_api_key() {
 		$opts = SiteGuard_Backup_Options::instance();
@@ -260,15 +345,13 @@ class SiteGuard_Backup_Health_Monitor {
 		if (!empty($legacy)) {
 			$opts->update_option('sgbackup_health_api_key_hash', wp_hash_password($legacy));
 			$opts->delete_option('sgbackup_health_api_key');
-			return $legacy; // Return plaintext one last time during migration
+			return $legacy;
 		}
 
 		$hash = $opts->get_option('sgbackup_health_api_key_hash', '');
 		if (empty($hash)) {
-			// No key exists yet - generate one
 			return $this->regenerate_api_key();
 		}
-		// Return empty - hash exists but we never store the plaintext
 		return '';
 	}
 
@@ -278,9 +361,7 @@ class SiteGuard_Backup_Health_Monitor {
 	public function regenerate_api_key() {
 		$key = wp_generate_password(48, false, false);
 		$opts = SiteGuard_Backup_Options::instance();
-		// Store only the hash - plaintext is never persisted
 		$opts->update_option('sgbackup_health_api_key_hash', wp_hash_password($key));
-		// Clean up any legacy plaintext key from pre-security-hardening versions
 		$opts->delete_option('sgbackup_health_api_key');
 		return $key;
 	}
@@ -293,7 +374,6 @@ class SiteGuard_Backup_Health_Monitor {
 
 		$opts = SiteGuard_Backup_Options::instance();
 
-		// Handle legacy plaintext key - migrate to hashed on first validation
 		$legacy = $opts->get_option('sgbackup_health_api_key', '');
 		if (!empty($legacy)) {
 			$opts->update_option('sgbackup_health_api_key_hash', wp_hash_password($legacy));
@@ -310,37 +390,23 @@ class SiteGuard_Backup_Health_Monitor {
 		return wp_check_password($key, $hash);
 	}
 
-	/**
-	 * Check if the API key has been generated (hash exists).
-	 */
 	public function has_api_key() {
 		$opts = SiteGuard_Backup_Options::instance();
-		$hash = $opts->get_option('sgbackup_health_api_key_hash', '');
-		return !empty($hash);
+		return !empty($opts->get_option('sgbackup_health_api_key_hash', '')) || !empty($opts->get_option('sgbackup_health_api_key', ''));
 	}
 
-	/**
-	 * Rate-limit failed auth attempts by IP.
-	 * Returns true if the IP is currently rate-limited.
-	 */
 	public function is_rate_limited($ip) {
 		$key = 'sgbackup_health_rl_' . md5($ip);
 		$attempts = (int) get_transient($key);
 		return $attempts >= self::$AUTH_RATE_LIMIT;
 	}
 
-	/**
-	 * Record a failed auth attempt for an IP.
-	 */
 	public function record_failed_auth($ip) {
 		$key = 'sgbackup_health_rl_' . md5($ip);
 		$attempts = (int) get_transient($key);
 		set_transient($key, $attempts + 1, self::$AUTH_RATE_WINDOW);
 	}
 
-	/**
-	 * Get client IP, respecting Cloudflare/proxy headers.
-	 */
 	public static function get_client_ip() {
 		if (!empty($_SERVER['HTTP_CF_CONNECTING_IP'])) {
 			return sanitize_text_field($_SERVER['HTTP_CF_CONNECTING_IP']);

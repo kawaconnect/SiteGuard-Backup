@@ -31,12 +31,11 @@ $next_check = wp_next_scheduled('sgbackup_health_check');
 			<th scope="row"><?php esc_html_e('Check Interval', 'siteguardbackup'); ?></th>
 			<td>
 				<select id="sgbackup-health-interval">
+					<option value="every5min" <?php selected($health_interval, 'every5min'); ?>><?php esc_html_e('Every 5 minutes', 'siteguardbackup'); ?></option>
+					<option value="every10min" <?php selected($health_interval, 'every10min'); ?>><?php esc_html_e('Every 10 minutes', 'siteguardbackup'); ?></option>
+					<option value="every15min" <?php selected($health_interval, 'every15min'); ?>><?php esc_html_e('Every 15 minutes', 'siteguardbackup'); ?></option>
+					<option value="every30min" <?php selected($health_interval, 'every30min'); ?>><?php esc_html_e('Every 30 minutes', 'siteguardbackup'); ?></option>
 					<option value="everyhour" <?php selected($health_interval, 'everyhour'); ?>><?php esc_html_e('Every hour', 'siteguardbackup'); ?></option>
-					<option value="every2hours" <?php selected($health_interval, 'every2hours'); ?>><?php esc_html_e('Every 2 hours', 'siteguardbackup'); ?></option>
-					<option value="every4hours" <?php selected($health_interval, 'every4hours'); ?>><?php esc_html_e('Every 4 hours', 'siteguardbackup'); ?></option>
-					<option value="every8hours" <?php selected($health_interval, 'every8hours'); ?>><?php esc_html_e('Every 8 hours', 'siteguardbackup'); ?></option>
-					<option value="twicedaily" <?php selected($health_interval, 'twicedaily'); ?>><?php esc_html_e('Twice daily', 'siteguardbackup'); ?></option>
-					<option value="daily" <?php selected($health_interval, 'daily'); ?>><?php esc_html_e('Daily', 'siteguardbackup'); ?></option>
 				</select>
 			</td>
 		</tr>

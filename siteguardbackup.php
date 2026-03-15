@@ -39,6 +39,22 @@ define('SGBACKUP_DEFAULT_UPLOADS_EXCLUDE', 'backup*,*backups,backwpup*,wp-clone,
  */
 function sgbackup_cron_schedules($schedules) {
 	$new = array(
+		'every5min' => array(
+			'interval' => 300,
+			'display'  => __('Every 5 minutes', 'siteguardbackup'),
+		),
+		'every10min' => array(
+			'interval' => 600,
+			'display'  => __('Every 10 minutes', 'siteguardbackup'),
+		),
+		'every15min' => array(
+			'interval' => 900,
+			'display'  => __('Every 15 minutes', 'siteguardbackup'),
+		),
+		'every30min' => array(
+			'interval' => 1800,
+			'display'  => __('Every 30 minutes', 'siteguardbackup'),
+		),
 		'everyhour' => array(
 			'interval' => 3600,
 			'display'  => __('Every hour', 'siteguardbackup'),
@@ -421,12 +437,15 @@ function sgbackup_health_api_callback(WP_REST_Request $request) {
 	$monitor = SiteGuard_Backup_Health_Monitor::instance();
 	$results = $monitor->get_results();
 
+	$opts = SiteGuard_Backup_Options::instance();
 	return rest_ensure_response(array(
-		'status'     => $monitor->get_overall_status(),
-		'site_url'   => get_site_url(),
-		'checked_at' => !empty($results) ? max(array_column($results, 'last_check')) : 0,
-		'sites'      => $results,
-		'version'    => SGBACKUP_VERSION,
+		'status'           => $monitor->get_overall_status(),
+		'site_url'         => get_site_url(),
+		'checked_at'       => !empty($results) ? max(array_column($results, 'last_check')) : 0,
+		'check_interval'   => $monitor->get_interval_seconds(),
+		'check_interval_label' => $opts->get_option('sgbackup_health_interval', 'every10min'),
+		'sites'            => $results,
+		'version'          => SGBACKUP_VERSION,
 	));
 }
 

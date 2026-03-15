@@ -3865,7 +3865,7 @@
 
 			var html = '<table class="widefat fixed striped sgbackup-health-table">';
 			html += '<thead><tr>';
-			html += '<th>Status</th><th>Domain</th><th>HTTP</th><th>Response Time</th><th>SSL Expiry</th><th>Last Checked</th>';
+			html += '<th>Status</th><th>Domain</th><th>HTTP</th><th>Response Time</th><th>SSL Expiry</th><th>Method</th><th>Last Checked</th>';
 			html += '</tr></thead><tbody>';
 
 			var counts = { operational: 0, degraded: 0, down: 0, unknown: 0 };
@@ -3889,11 +3889,14 @@
 				html += '<td>' + (s.http_code || '-') + '</td>';
 				html += '<td>' + responseMs + ' ms</td>';
 				html += '<td' + sslClass + '>' + sslText + (s.ssl_issuer ? ' (' + this.esc(s.ssl_issuer) + ')' : '') + '</td>';
+				html += '<td>' + (s.check_method || '-') + '</td>';
 				html += '<td>' + lastCheck + '</td>';
 				html += '</tr>';
 
 				if (s.error) {
-					html += '<tr><td colspan="6" style="color:#dc3232;padding-left:30px;">Error: ' + this.esc(s.error) + '</td></tr>';
+					html += '<tr><td colspan="7" style="color:#dc3232;padding-left:30px;">Error: ' + this.esc(s.error);
+					if (s.consecutive_failures > 1) html += ' (' + s.consecutive_failures + ' consecutive failures)';
+					html += '</td></tr>';
 				}
 			}
 
