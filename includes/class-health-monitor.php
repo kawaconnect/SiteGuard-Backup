@@ -12,6 +12,12 @@ class SiteGuard_Backup_Health_Monitor {
 
 	private static $instance = null;
 
+	/** @var int Max failed auth attempts before lockout */
+	private static $AUTH_RATE_LIMIT = 20;
+
+	/** @var int Rate limit window in seconds */
+	private static $AUTH_RATE_WINDOW = 300;
+
 	public static function instance() {
 		if (null === self::$instance) {
 			self::$instance = new self();
@@ -244,32 +250,105 @@ class SiteGuard_Backup_Health_Monitor {
 
 	/**
 	 * Get or auto-generate the API key for external polling.
+	 * Key is stored hashed - plaintext is only shown once at generation.
 	 */
 	public function get_api_key() {
 		$opts = SiteGuard_Backup_Options::instance();
-		$key = $opts->get_option('sgbackup_health_api_key', '');
-		if (empty($key)) {
-			$key = $this->regenerate_api_key();
+
+		// Migrate legacy plaintext key to hashed storage
+		$legacy = $opts->get_option('sgbackup_health_api_key', '');
+		if (!empty($legacy)) {
+			$opts->update_option('sgbackup_health_api_key_hash', wp_hash_password($legacy));
+			$opts->delete_option('sgbackup_health_api_key');
+			return $legacy; // Return plaintext one last time during migration
 		}
-		return $key;
+
+		$hash = $opts->get_option('sgbackup_health_api_key_hash', '');
+		if (empty($hash)) {
+			// No key exists yet - generate one
+			return $this->regenerate_api_key();
+		}
+		// Return empty - hash exists but we never store the plaintext
+		return '';
 	}
 
 	/**
-	 * Regenerate the API key.
+	 * Regenerate the API key. Returns the plaintext key (only time it's visible).
 	 */
 	public function regenerate_api_key() {
 		$key = wp_generate_password(48, false, false);
 		$opts = SiteGuard_Backup_Options::instance();
-		$opts->update_option('sgbackup_health_api_key', $key);
+		// Store only the hash - plaintext is never persisted
+		$opts->update_option('sgbackup_health_api_key_hash', wp_hash_password($key));
+		// Clean up any legacy plaintext key from pre-security-hardening versions
+		$opts->delete_option('sgbackup_health_api_key');
 		return $key;
 	}
 
 	/**
-	 * Validate a provided API key.
+	 * Validate a provided API key against the stored hash.
 	 */
 	public function validate_api_key($key) {
-		if (empty($key)) return false;
-		$stored = $this->get_api_key();
-		return hash_equals($stored, $key);
+		if (empty($key) || strlen($key) < 16) return false;
+
+		$opts = SiteGuard_Backup_Options::instance();
+
+		// Handle legacy plaintext key - migrate to hashed on first validation
+		$legacy = $opts->get_option('sgbackup_health_api_key', '');
+		if (!empty($legacy)) {
+			$opts->update_option('sgbackup_health_api_key_hash', wp_hash_password($legacy));
+			$opts->delete_option('sgbackup_health_api_key');
+			return hash_equals($legacy, $key);
+		}
+
+		$hash = $opts->get_option('sgbackup_health_api_key_hash', '');
+		if (empty($hash)) return false;
+
+		if (!function_exists('wp_check_password')) {
+			require_once ABSPATH . WPINC . '/pluggable.php';
+		}
+		return wp_check_password($key, $hash);
+	}
+
+	/**
+	 * Check if the API key has been generated (hash exists).
+	 */
+	public function has_api_key() {
+		$opts = SiteGuard_Backup_Options::instance();
+		$hash = $opts->get_option('sgbackup_health_api_key_hash', '');
+		return !empty($hash);
+	}
+
+	/**
+	 * Rate-limit failed auth attempts by IP.
+	 * Returns true if the IP is currently rate-limited.
+	 */
+	public function is_rate_limited($ip) {
+		$key = 'sgbackup_health_rl_' . md5($ip);
+		$attempts = (int) get_transient($key);
+		return $attempts >= self::$AUTH_RATE_LIMIT;
+	}
+
+	/**
+	 * Record a failed auth attempt for an IP.
+	 */
+	public function record_failed_auth($ip) {
+		$key = 'sgbackup_health_rl_' . md5($ip);
+		$attempts = (int) get_transient($key);
+		set_transient($key, $attempts + 1, self::$AUTH_RATE_WINDOW);
+	}
+
+	/**
+	 * Get client IP, respecting Cloudflare/proxy headers.
+	 */
+	public static function get_client_ip() {
+		if (!empty($_SERVER['HTTP_CF_CONNECTING_IP'])) {
+			return sanitize_text_field($_SERVER['HTTP_CF_CONNECTING_IP']);
+		}
+		if (!empty($_SERVER['HTTP_X_FORWARDED_FOR'])) {
+			$ips = explode(',', $_SERVER['HTTP_X_FORWARDED_FOR']);
+			return sanitize_text_field(trim($ips[0]));
+		}
+		return sanitize_text_field($_SERVER['REMOTE_ADDR'] ?? '0.0.0.0');
 	}
 }

@@ -68,10 +68,11 @@ $rest_url = rest_url('sgbackup/v1/health');
 		<tr>
 			<th scope="row"><?php esc_html_e('API Key', 'siteguardbackup'); ?></th>
 			<td>
-				<input type="text" id="sgbackup-health-api-key" value="" readonly class="regular-text" style="font-family:monospace;" />
-				<button type="button" class="button" id="sgbackup-health-copy-key"><?php esc_html_e('Copy', 'siteguardbackup'); ?></button>
-				<button type="button" class="button" id="sgbackup-health-regen-key"><?php esc_html_e('Regenerate', 'siteguardbackup'); ?></button>
-				<p class="description"><?php esc_html_e('Use this key in the Discord bot as SG_HEALTH_API_KEY. Send as: Authorization: Bearer {key}', 'siteguardbackup'); ?></p>
+				<div id="sgbackup-health-key-status"></div>
+				<input type="text" id="sgbackup-health-api-key" value="" readonly class="regular-text" style="font-family:monospace;display:none;" />
+				<button type="button" class="button" id="sgbackup-health-copy-key" style="display:none;"><?php esc_html_e('Copy', 'siteguardbackup'); ?></button>
+				<button type="button" class="button button-secondary" id="sgbackup-health-regen-key"><?php esc_html_e('Generate New Key', 'siteguardbackup'); ?></button>
+				<p class="description"><?php esc_html_e('The API key is shown only once when generated. Copy it immediately for your Discord bot config. It is stored hashed and cannot be retrieved later.', 'siteguardbackup'); ?></p>
 			</td>
 		</tr>
 	</table>

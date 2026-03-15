@@ -4028,15 +4028,21 @@ class SiteGuard_Backup_CLI_Command extends WP_CLI_Command {
 
         if (isset($assoc_args['regenerate'])) {
             $key = $monitor->regenerate_api_key();
-            WP_CLI::success('API key regenerated.');
+            WP_CLI::success('New API key generated. Copy it now - it cannot be retrieved later (stored as hash).');
+            WP_CLI::log('');
+            WP_CLI::log('API Key: ' . $key);
+            WP_CLI::log('Endpoint: ' . rest_url('sgbackup/v1/health'));
+            WP_CLI::log('');
+            WP_CLI::log('Usage: curl -H "Authorization: Bearer ' . $key . '" ' . rest_url('sgbackup/v1/health'));
         } else {
-            $key = $monitor->get_api_key();
+            if ($monitor->has_api_key()) {
+                WP_CLI::log('API key is configured (stored as hash, not retrievable).');
+                WP_CLI::log('Use --regenerate to create a new key.');
+            } else {
+                WP_CLI::log('No API key generated yet. Use --regenerate to create one.');
+            }
+            WP_CLI::log('Endpoint: ' . rest_url('sgbackup/v1/health'));
         }
-
-        WP_CLI::log('API Key: ' . $key);
-        WP_CLI::log('Endpoint: ' . rest_url('sgbackup/v1/health'));
-        WP_CLI::log('');
-        WP_CLI::log('Usage: curl -H "Authorization: Bearer ' . $key . '" ' . rest_url('sgbackup/v1/health'));
     }
 
     /**

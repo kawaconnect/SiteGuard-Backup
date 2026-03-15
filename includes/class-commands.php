@@ -3211,20 +3211,21 @@ class SiteGuard_Backup_Commands {
 	}
 
 	/**
-	 * Get cached health status and API key.
+	 * Get cached health status. API key is never returned here (hashed at rest).
 	 */
 	public function get_health_status($params) {
 		require_once SGBACKUP_DIR . 'includes/class-health-monitor.php';
 		$monitor = SiteGuard_Backup_Health_Monitor::instance();
 		return array(
-			'overall' => $monitor->get_overall_status(),
-			'sites'   => $monitor->get_results(),
-			'api_key' => $monitor->get_api_key(),
+			'overall'     => $monitor->get_overall_status(),
+			'sites'       => $monitor->get_results(),
+			'has_api_key' => $monitor->has_api_key(),
 		);
 	}
 
 	/**
-	 * Regenerate the health API key.
+	 * Regenerate the health API key. Returns the new plaintext key ONCE.
+	 * After this response, the key is only stored as a hash and cannot be retrieved.
 	 */
 	public function regenerate_health_api_key($params) {
 		require_once SGBACKUP_DIR . 'includes/class-health-monitor.php';

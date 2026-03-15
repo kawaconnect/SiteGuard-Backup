@@ -3805,12 +3805,17 @@
 				});
 			});
 
-			// Regenerate API key
+			// Generate/Regenerate API key - shown once, then hashed
 			$(document).on('click', '#sgbackup-health-regen-key', function() {
-				if (!confirm('Regenerate API key? The Discord bot will need the new key.')) return;
+				if (!confirm('Generate a new API key? Any existing key will stop working. The Discord bot will need the new key.')) return;
 				self.ajax('regenerate_health_api_key', {}, function(data) {
-					$('#sgbackup-health-api-key').val(data.api_key);
-					self.showNotice('API key regenerated.', 'success');
+					$('#sgbackup-health-api-key').val(data.api_key).show();
+					$('#sgbackup-health-copy-key').show();
+					$('#sgbackup-health-key-status').html(
+						'<span style="color:#d63638;font-weight:600;">New key generated - copy it now!</span> ' +
+						'This is the only time it will be shown. It is stored hashed and cannot be retrieved.'
+					);
+					self.showNotice('New API key generated. Copy it now - it will not be shown again.', 'success');
 				});
 			});
 
@@ -3839,8 +3844,12 @@
 			var $container = $('#sgbackup-health-results');
 			$container.html('<p>Loading health status...</p>');
 			this.ajax('get_health_status', {}, function(data) {
-				if (data.api_key) {
-					$('#sgbackup-health-api-key').val(data.api_key);
+				// Show key status (hashed, not retrievable)
+				var $keyStatus = $('#sgbackup-health-key-status');
+				if (data.has_api_key) {
+					$keyStatus.html('<span style="color:#46b450;font-weight:600;">Key configured</span> \u2014 stored as hash, not retrievable. Generate a new one if needed.');
+				} else {
+					$keyStatus.html('<span style="color:#dc3232;font-weight:600;">No key generated</span> \u2014 click "Generate New Key" to create one.');
 				}
 				if (data.sites && data.sites.length > 0) {
 					self.renderHealthResults(data.sites);

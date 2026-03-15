@@ -386,14 +386,30 @@ function sgbackup_register_health_api() {
 add_action('rest_api_init', 'sgbackup_register_health_api');
 
 function sgbackup_health_api_auth(WP_REST_Request $request) {
+	sgbackup_load_classes();
+	require_once SGBACKUP_DIR . 'includes/class-health-monitor.php';
+	$monitor = SiteGuard_Backup_Health_Monitor::instance();
+
+	// Block if health monitor is disabled
+	$opts = SiteGuard_Backup_Options::instance();
+	if (!$opts->get_option('sgbackup_health_enabled', false)) {
+		return new WP_Error('disabled', 'Health monitor is not enabled', array('status' => 404));
+	}
+
+	// Rate limit by IP - block brute force key guessing
+	$ip = SiteGuard_Backup_Health_Monitor::get_client_ip();
+	if ($monitor->is_rate_limited($ip)) {
+		return new WP_Error('rate_limited', 'Too many failed attempts. Try again later.', array('status' => 429));
+	}
+
 	$auth = $request->get_header('Authorization');
 	if (!$auth || strpos($auth, 'Bearer ') !== 0) {
+		$monitor->record_failed_auth($ip);
 		return new WP_Error('unauthorized', 'Missing or invalid Authorization header', array('status' => 401));
 	}
 	$token = substr($auth, 7);
-	sgbackup_load_classes();
-	require_once SGBACKUP_DIR . 'includes/class-health-monitor.php';
-	if (!SiteGuard_Backup_Health_Monitor::instance()->validate_api_key($token)) {
+	if (!$monitor->validate_api_key($token)) {
+		$monitor->record_failed_auth($ip);
 		return new WP_Error('forbidden', 'Invalid API key', array('status' => 403));
 	}
 	return true;
