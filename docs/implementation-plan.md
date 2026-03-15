@@ -12,7 +12,7 @@ The user also has no visibility into migration job errors (they fire and forget)
 
 ## Working Directory
 
-All work happens in: `/opt/docker/wordpressmultisite/plugindev/fork/updraftplus/`
+All work happens in: `/opt/docker/wordpressmultisite/plugindev/siteguard/`
 
 ## Implementation Status
 
@@ -427,5 +427,5 @@ if (data.multisite_blogs && data.multisite_blogs.length > 0) {
 5. Deploy to container and test end-to-end:
    ```bash
    cd /opt/docker/wordpressmultisite
-   docker compose cp plugindev/fork/updraftplus/. wordpress:/var/www/html/wp-content/plugins/siteguardbackup/
+   docker compose cp plugindev/siteguard/. wordpress:/var/www/html/wp-content/plugins/siteguardbackup/
    ```

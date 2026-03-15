@@ -134,6 +134,9 @@ class SiteGuard_Backup_Admin {
 				'upload_chunk'             => wp_create_nonce('sgbackup-upload_chunk'),
 				'upload_chunk_status'      => wp_create_nonce('sgbackup-upload_chunk_status'),
 				'upload_chunk_cancel'      => wp_create_nonce('sgbackup-upload_chunk_cancel'),
+				'health_check_now'         => wp_create_nonce('sgbackup-health_check_now'),
+				'get_health_status'        => wp_create_nonce('sgbackup-get_health_status'),
+				'regenerate_health_api_key' => wp_create_nonce('sgbackup-regenerate_health_api_key'),
 			),
 			'max_upload_size' => wp_max_upload_size(),
 			'chunk_size' => min(2 * 1024 * 1024, intval(0.9 * wp_max_upload_size())),
@@ -328,6 +331,7 @@ class SiteGuard_Backup_Admin {
 			'failover_postfailover'  => array('limit' => 3,  'window' => 60),   // 3 per minute
 			'delete_restore_preset'  => array('limit' => 10, 'window' => 60),   // 10 per minute
 			'save_remotesend_schedule' => array('limit' => 5, 'window' => 60),  // 5 per minute
+			'health_check_now'         => array('limit' => 3, 'window' => 60),  // 3 per minute
 		);
 		if (isset($rate_limits[$subaction])) {
 			$rl = $rate_limits[$subaction];
@@ -344,7 +348,7 @@ class SiteGuard_Backup_Admin {
 		}
 
 		// Enforce settings lock on all mutating commands except activejobs_list (read-only status check)
-		$read_only_commands = array('activejobs_list', 'get_existing_backups', 'get_log', 'get_settings', 'get_sysinfo', 'get_remotesites', 'get_migrator_keys', 'get_backup_contents', 'get_database_tables', 'get_audit_log', 'failover_status', 'get_restore_presets', 'get_remotesend_schedule', 'upload_chunk_status');
+		$read_only_commands = array('activejobs_list', 'get_existing_backups', 'get_log', 'get_settings', 'get_sysinfo', 'get_remotesites', 'get_migrator_keys', 'get_backup_contents', 'get_database_tables', 'get_audit_log', 'failover_status', 'get_restore_presets', 'get_remotesend_schedule', 'upload_chunk_status', 'get_health_status');
 		if (!in_array($subaction, $read_only_commands, true) && $this->is_settings_locked()) {
 			wp_send_json_error(array('message' => 'Settings are locked. Please unlock first.'));
 		}
@@ -409,6 +413,9 @@ class SiteGuard_Backup_Admin {
 			'upload_chunk',
 			'upload_chunk_status',
 			'upload_chunk_cancel',
+			'health_check_now',
+			'get_health_status',
+			'regenerate_health_api_key',
 		);
 
 		if (!in_array($subaction, $allowed_commands, true)) {

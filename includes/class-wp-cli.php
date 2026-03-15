@@ -3887,4 +3887,235 @@ class SiteGuard_Backup_CLI_Command extends WP_CLI_Command {
             ));
         }
     }
+
+    /**
+     * Run health checks on all sites.
+     *
+     * ## OPTIONS
+     *
+     * [--format=<format>]
+     * : Output format: table or json. Default: table.
+     *
+     * ## EXAMPLES
+     *
+     *     wp siteguardbackup health_check
+     *     wp siteguardbackup health_check --format=json
+     *
+     * @subcommand health_check
+     */
+    public function health_check($args, $assoc_args) {
+        require_once SGBACKUP_DIR . 'includes/class-health-monitor.php';
+        $monitor = SiteGuard_Backup_Health_Monitor::instance();
+        $format = isset($assoc_args['format']) ? $assoc_args['format'] : 'table';
+
+        WP_CLI::log('Running health checks...');
+        $results = $monitor->run_checks();
+
+        if (empty($results)) {
+            WP_CLI::warning('No sites to check.');
+            return;
+        }
+
+        if ($format === 'json') {
+            WP_CLI::line(json_encode($results, JSON_PRETTY_PRINT));
+            return;
+        }
+
+        $table = new \WP_CLI\Formatter($assoc_args, array('site_id', 'domain', 'status', 'http_code', 'response_time', 'ssl_expiry_days', 'ssl_issuer', 'error'));
+        $rows = array();
+        foreach ($results as $r) {
+            $rows[] = array(
+                'site_id'        => $r['site_id'],
+                'domain'         => $r['domain'],
+                'status'         => strtoupper($r['status']),
+                'http_code'      => $r['http_code'] ?: '-',
+                'response_time'  => round($r['response_time'] * 1000) . 'ms',
+                'ssl_expiry_days' => $r['ssl_expiry_days'] >= 0 ? $r['ssl_expiry_days'] . 'd' : 'N/A',
+                'ssl_issuer'     => $r['ssl_issuer'] ?: '-',
+                'error'          => $r['error'] ?: '-',
+            );
+        }
+        $table->display_items($rows);
+
+        $overall = $monitor->get_overall_status();
+        WP_CLI::log('');
+        if ($overall === 'operational') {
+            WP_CLI::success('Overall status: OPERATIONAL');
+        } elseif ($overall === 'degraded') {
+            WP_CLI::warning('Overall status: DEGRADED');
+        } else {
+            WP_CLI::error('Overall status: DOWN', false);
+        }
+    }
+
+    /**
+     * Show cached health check results (does not re-run checks).
+     *
+     * ## OPTIONS
+     *
+     * [--format=<format>]
+     * : Output format: table or json. Default: table.
+     *
+     * ## EXAMPLES
+     *
+     *     wp siteguardbackup health_status
+     *     wp siteguardbackup health_status --format=json
+     *
+     * @subcommand health_status
+     */
+    public function health_status($args, $assoc_args) {
+        require_once SGBACKUP_DIR . 'includes/class-health-monitor.php';
+        $monitor = SiteGuard_Backup_Health_Monitor::instance();
+        $format = isset($assoc_args['format']) ? $assoc_args['format'] : 'table';
+        $results = $monitor->get_results();
+
+        if (empty($results)) {
+            WP_CLI::warning('No health data yet. Run: wp siteguardbackup health_check');
+            return;
+        }
+
+        if ($format === 'json') {
+            WP_CLI::line(json_encode(array(
+                'overall' => $monitor->get_overall_status(),
+                'sites'   => $results,
+            ), JSON_PRETTY_PRINT));
+            return;
+        }
+
+        $table = new \WP_CLI\Formatter($assoc_args, array('site_id', 'domain', 'status', 'http_code', 'response_time', 'ssl_expiry_days', 'ssl_issuer', 'error'));
+        $rows = array();
+        foreach ($results as $r) {
+            $rows[] = array(
+                'site_id'        => $r['site_id'],
+                'domain'         => $r['domain'],
+                'status'         => strtoupper($r['status']),
+                'http_code'      => $r['http_code'] ?: '-',
+                'response_time'  => round($r['response_time'] * 1000) . 'ms',
+                'ssl_expiry_days' => $r['ssl_expiry_days'] >= 0 ? $r['ssl_expiry_days'] . 'd' : 'N/A',
+                'ssl_issuer'     => $r['ssl_issuer'] ?: '-',
+                'error'          => $r['error'] ?: '-',
+            );
+        }
+        $table->display_items($rows);
+
+        $overall = $monitor->get_overall_status();
+        WP_CLI::log('');
+        WP_CLI::log('Overall: ' . strtoupper($overall));
+        $last_run = SiteGuard_Backup_Options::instance()->get_option('sgbackup_health_last_run', 0);
+        if ($last_run) {
+            WP_CLI::log('Last checked: ' . date('Y-m-d H:i:s', $last_run) . ' (' . human_time_diff($last_run) . ' ago)');
+        }
+    }
+
+    /**
+     * Show or regenerate the health monitor API key.
+     *
+     * ## OPTIONS
+     *
+     * [--regenerate]
+     * : Generate a new API key.
+     *
+     * ## EXAMPLES
+     *
+     *     wp siteguardbackup health_api_key
+     *     wp siteguardbackup health_api_key --regenerate
+     *
+     * @subcommand health_api_key
+     */
+    public function health_api_key($args, $assoc_args) {
+        require_once SGBACKUP_DIR . 'includes/class-health-monitor.php';
+        $monitor = SiteGuard_Backup_Health_Monitor::instance();
+
+        if (isset($assoc_args['regenerate'])) {
+            $key = $monitor->regenerate_api_key();
+            WP_CLI::success('API key regenerated.');
+        } else {
+            $key = $monitor->get_api_key();
+        }
+
+        WP_CLI::log('API Key: ' . $key);
+        WP_CLI::log('Endpoint: ' . rest_url('sgbackup/v1/health'));
+        WP_CLI::log('');
+        WP_CLI::log('Usage: curl -H "Authorization: Bearer ' . $key . '" ' . rest_url('sgbackup/v1/health'));
+    }
+
+    /**
+     * Enable or disable the health monitor.
+     *
+     * ## OPTIONS
+     *
+     * <action>
+     * : enable or disable
+     *
+     * [--interval=<interval>]
+     * : Check interval: everyhour, every2hours, every4hours, every8hours, twicedaily, daily. Default: every4hours.
+     *
+     * [--timeout=<seconds>]
+     * : HTTP timeout in seconds. Default: 10.
+     *
+     * [--ssl-warn=<days>]
+     * : SSL expiry warning threshold in days. Default: 14.
+     *
+     * ## EXAMPLES
+     *
+     *     wp siteguardbackup health_config enable --interval=every2hours
+     *     wp siteguardbackup health_config disable
+     *
+     * @subcommand health_config
+     */
+    public function health_config($args, $assoc_args) {
+        $opts = SiteGuard_Backup_Options::instance();
+        $action = $args[0];
+
+        if ($action === 'enable') {
+            $opts->update_option('sgbackup_health_enabled', 1);
+
+            if (isset($assoc_args['interval'])) {
+                $valid = array('everyhour', 'every2hours', 'every4hours', 'every8hours', 'twicedaily', 'daily');
+                $interval = $assoc_args['interval'];
+                if (!in_array($interval, $valid, true)) {
+                    WP_CLI::error('Invalid interval. Choose: ' . implode(', ', $valid));
+                }
+                $opts->update_option('sgbackup_health_interval', $interval);
+            } else {
+                $interval = $opts->get_option('sgbackup_health_interval', 'every4hours');
+            }
+
+            if (isset($assoc_args['timeout'])) {
+                $timeout = max(2, min(30, intval($assoc_args['timeout'])));
+                $opts->update_option('sgbackup_health_timeout', $timeout);
+            }
+
+            if (isset($assoc_args['ssl-warn'])) {
+                $warn = max(1, min(90, intval($assoc_args['ssl-warn'])));
+                $opts->update_option('sgbackup_health_ssl_warn_days', $warn);
+            }
+
+            wp_clear_scheduled_hook('sgbackup_health_check');
+            wp_schedule_event(time() + 60, $interval, 'sgbackup_health_check');
+            WP_CLI::success('Health monitor enabled. Interval: ' . $interval);
+
+        } elseif ($action === 'disable') {
+            $opts->update_option('sgbackup_health_enabled', 0);
+            wp_clear_scheduled_hook('sgbackup_health_check');
+            WP_CLI::success('Health monitor disabled.');
+
+        } else {
+            // Show current config
+            $enabled = $opts->get_option('sgbackup_health_enabled', false);
+            $interval = $opts->get_option('sgbackup_health_interval', 'every4hours');
+            $timeout = $opts->get_option('sgbackup_health_timeout', 10);
+            $ssl_warn = $opts->get_option('sgbackup_health_ssl_warn_days', 14);
+            $next = wp_next_scheduled('sgbackup_health_check');
+
+            WP_CLI::log('Health Monitor Configuration:');
+            WP_CLI::log('  Enabled:       ' . ($enabled ? 'Yes' : 'No'));
+            WP_CLI::log('  Interval:      ' . $interval);
+            WP_CLI::log('  HTTP Timeout:  ' . $timeout . 's');
+            WP_CLI::log('  SSL Warning:   ' . $ssl_warn . ' days');
+            if ($next) {
+                WP_CLI::log('  Next check:    ' . date('Y-m-d H:i:s', $next) . ' (' . human_time_diff(time(), $next) . ')');
+            }
+        }
+    }
 }

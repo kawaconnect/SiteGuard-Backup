@@ -421,6 +421,10 @@ class SiteGuard_Backup_Commands {
 			'failover_enabled',
 			'failover_role',
 			'failover_production_url',
+			'health_enabled',
+			'health_interval',
+			'health_timeout',
+			'health_ssl_warn_days',
 		);
 
 		// H5: Handle password protection settings specially before the main loop
@@ -598,7 +602,7 @@ class SiteGuard_Backup_Commands {
 			if (isset($params[$key])) {
 				$value = $params[$key];
 				// Sanitize
-				if (in_array($key, array('retain', 'retain_db', 'split_every', 'max_split', 'delete_local', 'debug_mode', 'encryption_enabled', 'syslog_enabled', 'lock_admin', 'lock_admin_session_length', 'backupdb_nonwp', 'db_anonymise', 'max_incrementals_before_full', 'ssl_disableverify', 'ssl_useservercerts', 'auto_update', 'encrypt_credentials', 'failover_enabled', 'default_db_restore_mode', 'default_subsite_mode', 'default_keep_protocol'))) {
+				if (in_array($key, array('retain', 'retain_db', 'split_every', 'max_split', 'delete_local', 'debug_mode', 'encryption_enabled', 'syslog_enabled', 'lock_admin', 'lock_admin_session_length', 'backupdb_nonwp', 'db_anonymise', 'max_incrementals_before_full', 'ssl_disableverify', 'ssl_useservercerts', 'auto_update', 'encrypt_credentials', 'failover_enabled', 'default_db_restore_mode', 'default_subsite_mode', 'default_keep_protocol', 'health_enabled', 'health_timeout', 'health_ssl_warn_days'))) {
 					$value = intval($value);
 				} elseif ($key === 'email') {
 					$value = sanitize_email($value);
@@ -667,6 +671,18 @@ class SiteGuard_Backup_Commands {
 		}
 		if (isset($params['interval_incremental'])) {
 			$sgbackup->schedule_backup_increments($params['interval_incremental']);
+		}
+
+		// Health monitor schedule management
+		if (isset($params['health_enabled'])) {
+			$health_enabled = intval($params['health_enabled']);
+			$health_interval = isset($params['health_interval']) ? sanitize_text_field($params['health_interval']) : $opts->get_option('sgbackup_health_interval', 'every4hours');
+			if ($health_enabled) {
+				wp_clear_scheduled_hook('sgbackup_health_check');
+				wp_schedule_event(time() + 60, $health_interval, 'sgbackup_health_check');
+			} else {
+				wp_clear_scheduled_hook('sgbackup_health_check');
+			}
 		}
 
 		// Save storage method settings (whitelist method names)
@@ -3183,5 +3199,35 @@ class SiteGuard_Backup_Commands {
 			array('option_name' => $lock_key)
 		);
 		wp_cache_delete($lock_key, 'options');
+	}
+
+	/**
+	 * Run health checks now and return results.
+	 */
+	public function health_check_now($params) {
+		require_once SGBACKUP_DIR . 'includes/class-health-monitor.php';
+		$monitor = SiteGuard_Backup_Health_Monitor::instance();
+		return $monitor->run_checks();
+	}
+
+	/**
+	 * Get cached health status and API key.
+	 */
+	public function get_health_status($params) {
+		require_once SGBACKUP_DIR . 'includes/class-health-monitor.php';
+		$monitor = SiteGuard_Backup_Health_Monitor::instance();
+		return array(
+			'overall' => $monitor->get_overall_status(),
+			'sites'   => $monitor->get_results(),
+			'api_key' => $monitor->get_api_key(),
+		);
+	}
+
+	/**
+	 * Regenerate the health API key.
+	 */
+	public function regenerate_health_api_key($params) {
+		require_once SGBACKUP_DIR . 'includes/class-health-monitor.php';
+		return array('api_key' => SiteGuard_Backup_Health_Monitor::instance()->regenerate_api_key());
 	}
 }

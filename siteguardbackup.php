@@ -193,6 +193,7 @@ function sgbackup_register_cron_hooks() {
 	add_action('sgbackup_backup_resume', 'sgbackup_cron_backup_resume', 10, 2);
 	add_action('sgbackup_backup_incremental', 'sgbackup_cron_backup_incremental');
 	add_action('sgbackup_backup_remotesend', 'sgbackup_cron_backup_remotesend');
+	add_action('sgbackup_health_check', 'sgbackup_cron_health_check');
 }
 
 function sgbackup_cron_backup_files() {
@@ -223,6 +224,12 @@ function sgbackup_cron_backup_incremental() {
 	sgbackup_load_classes();
 	require_once SGBACKUP_DIR . 'class-siteguardbackup.php';
 	SiteGuard_Backup::instance()->backup_incremental();
+}
+
+function sgbackup_cron_health_check() {
+	sgbackup_load_classes();
+	require_once SGBACKUP_DIR . 'includes/class-health-monitor.php';
+	SiteGuard_Backup_Health_Monitor::instance()->run_checks();
 }
 
 function sgbackup_cron_backup_remotesend() {
@@ -276,6 +283,7 @@ function sgbackup_multisite_cron_dispatch() {
 	$sgb_hooks = array(
 		'sgbackup_backup', 'sgbackup_backup_database', 'sgbackup_backup_all',
 		'sgbackup_backup_incremental', 'sgbackup_backup_remotesend', 'sgbackup_backup_resume',
+		'sgbackup_health_check',
 	);
 
 	$sites = get_sites(array('fields' => 'ids', 'number' => 0));
@@ -328,6 +336,7 @@ function sgbackup_deactivate() {
 	wp_clear_scheduled_hook('sgbackup_backup_all');
 	wp_clear_scheduled_hook('sgbackup_backup_incremental');
 	wp_clear_scheduled_hook('sgbackup_backup_remotesend');
+	wp_clear_scheduled_hook('sgbackup_health_check');
 	// Don't clear sgbackup_backup_resume - let running jobs finish
 }
 register_deactivation_hook(__FILE__, 'sgbackup_deactivate');
@@ -363,4 +372,45 @@ function sgbackup_load_migration_listeners() {
 	}
 }
 add_action('plugins_loaded', 'sgbackup_load_migration_listeners', 2);
+
+/**
+ * Register REST API endpoint for external health monitoring (Discord bot).
+ */
+function sgbackup_register_health_api() {
+	register_rest_route('sgbackup/v1', '/health', array(
+		'methods'             => 'GET',
+		'callback'            => 'sgbackup_health_api_callback',
+		'permission_callback' => 'sgbackup_health_api_auth',
+	));
+}
+add_action('rest_api_init', 'sgbackup_register_health_api');
+
+function sgbackup_health_api_auth(WP_REST_Request $request) {
+	$auth = $request->get_header('Authorization');
+	if (!$auth || strpos($auth, 'Bearer ') !== 0) {
+		return new WP_Error('unauthorized', 'Missing or invalid Authorization header', array('status' => 401));
+	}
+	$token = substr($auth, 7);
+	sgbackup_load_classes();
+	require_once SGBACKUP_DIR . 'includes/class-health-monitor.php';
+	if (!SiteGuard_Backup_Health_Monitor::instance()->validate_api_key($token)) {
+		return new WP_Error('forbidden', 'Invalid API key', array('status' => 403));
+	}
+	return true;
+}
+
+function sgbackup_health_api_callback(WP_REST_Request $request) {
+	sgbackup_load_classes();
+	require_once SGBACKUP_DIR . 'includes/class-health-monitor.php';
+	$monitor = SiteGuard_Backup_Health_Monitor::instance();
+	$results = $monitor->get_results();
+
+	return rest_ensure_response(array(
+		'status'     => $monitor->get_overall_status(),
+		'site_url'   => get_site_url(),
+		'checked_at' => !empty($results) ? max(array_column($results, 'last_check')) : 0,
+		'sites'      => $results,
+		'version'    => SGBACKUP_VERSION,
+	));
+}
 

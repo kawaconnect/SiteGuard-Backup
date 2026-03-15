@@ -10,6 +10,7 @@
 		<?php if (SiteGuard_Backup_Options::instance()->get_option('sgbackup_failover_enabled', false)): ?>
 			<a href="#failover" class="nav-tab" data-tab="failover"><?php esc_html_e('Failover', 'siteguardbackup'); ?></a>
 		<?php endif; ?>
+		<a href="#health" class="nav-tab" data-tab="health"><?php esc_html_e('Health Monitor', 'siteguardbackup'); ?></a>
 	</nav>
 
 	<div class="sgbackup-tab-content" id="tab-backup-restore">
@@ -33,6 +34,10 @@
 		<?php include SGBACKUP_DIR . 'templates/tab-failover.php'; ?>
 	</div>
 	<?php endif; ?>
+
+	<div class="sgbackup-tab-content" id="tab-health" style="display:none;">
+		<?php include SGBACKUP_DIR . 'templates/tab-health.php'; ?>
+	</div>
 </div>
 
 <?php include SGBACKUP_DIR . 'templates/backup-now-modal.php'; ?>
