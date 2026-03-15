@@ -36,7 +36,7 @@ $entities_list = array(
 
 $sgbackup = SiteGuard_Backup::instance();
 // Only show methods that have a configuration panel in this template
-$configurable_methods = array('s3', 's3generic', 'googledrive', 'dropbox', 'ftp', 'sftp', 'azure', 'gcs', 'pcloud', 'openstack', 'email');
+$configurable_methods = array('s3', 's3generic', 'b2', 'googledrive', 'dropbox', 'ftp', 'sftp', 'azure', 'gcs', 'pcloud', 'openstack', 'email');
 $methods = array_intersect_key($sgbackup->get_backup_methods(), array_flip($configurable_methods));
 $current_services = $settings['service'];
 if (!is_array($current_services)) $current_services = array($current_services);
@@ -608,6 +608,82 @@ $period_labels = array(
 			<?php endforeach; ?>
 		</div>
 		<a href="#" class="sgbackup-add-instance" data-method="s3generic"><?php esc_html_e('+ Add another S3-Compatible account', 'siteguardbackup'); ?></a>
+	</div>
+
+	<!-- Backblaze B2 Configuration -->
+	<div class="sgbackup-method-config" id="sgbackup-config-b2" style="<?php echo in_array('b2', $current_services) ? '' : 'display:none;'; ?>">
+		<h3><?php esc_html_e('Backblaze B2 Settings', 'siteguardbackup'); ?></h3>
+		<?php
+		$b2_defaults = array('access_key' => '', 'secret_key' => '', 'bucket' => '', 'region' => 'us-west-004', 'path' => '', 'storage_class' => 'STANDARD', 'object_lock_days' => '0', 'instance_label' => '', 'instance_enabled' => '1');
+		$b2_instances = sgbackup_get_method_instances($opts, 'b2', $b2_defaults);
+		?>
+		<div class="sgbackup-instance-container" data-method="b2">
+			<div class="sgbackup-instance-tabs">
+				<?php foreach ($b2_instances as $iid => $iopts): ?>
+					<span class="sgbackup-instance-tab" data-instance="<?php echo esc_attr($iid); ?>">
+						<span class="sgbackup-instance-label" contenteditable="true"><?php echo esc_html(!empty($iopts['instance_label']) ? $iopts['instance_label'] : __('B2', 'siteguardbackup')); ?></span>
+						<?php if ($iid !== 's-0'): ?>
+							<button type="button" class="sgbackup-delete-instance" data-method="b2" data-instance="<?php echo esc_attr($iid); ?>" title="<?php esc_attr_e('Delete instance', 'siteguardbackup'); ?>">&times;</button>
+						<?php endif; ?>
+					</span>
+				<?php endforeach; ?>
+			</div>
+			<?php foreach ($b2_instances as $iid => $iopts): ?>
+			<div class="sgbackup-instance-panel" data-method="b2" data-instance="<?php echo esc_attr($iid); ?>">
+				<table class="form-table">
+					<tr>
+						<th><?php esc_html_e('Enabled', 'siteguardbackup'); ?></th>
+						<td><label><input type="checkbox" class="sgbackup-instance-enabled" data-method="b2" data-instance="<?php echo esc_attr($iid); ?>" value="1" <?php checked($iopts['instance_enabled'] ?? '1', '1'); ?> /> <?php esc_html_e('Enable this instance', 'siteguardbackup'); ?></label></td>
+					</tr>
+					<tr>
+						<th><?php esc_html_e('Application Key ID', 'siteguardbackup'); ?></th>
+						<td>
+							<input type="text" class="sgbackup-instance-field regular-text" data-key="access_key" data-method="b2" data-instance="<?php echo esc_attr($iid); ?>" value="<?php echo esc_attr($iopts['access_key'] ?? ''); ?>" />
+							<p class="description"><?php esc_html_e('The keyID from your B2 Application Key. Create one at B2 Cloud Storage > App Keys.', 'siteguardbackup'); ?></p>
+						</td>
+					</tr>
+					<tr>
+						<th><?php esc_html_e('Application Key', 'siteguardbackup'); ?></th>
+						<td><input type="password" class="sgbackup-instance-field regular-text" data-key="secret_key" data-method="b2" data-instance="<?php echo esc_attr($iid); ?>" value="<?php echo esc_attr($iopts['secret_key'] ?? ''); ?>" autocomplete="off" /></td>
+					</tr>
+					<tr>
+						<th><?php esc_html_e('Bucket', 'siteguardbackup'); ?></th>
+						<td><input type="text" class="sgbackup-instance-field regular-text" data-key="bucket" data-method="b2" data-instance="<?php echo esc_attr($iid); ?>" value="<?php echo esc_attr($iopts['bucket'] ?? ''); ?>" /></td>
+					</tr>
+					<tr>
+						<th><?php esc_html_e('Region', 'siteguardbackup'); ?></th>
+						<td>
+							<select class="sgbackup-instance-field" data-key="region" data-method="b2" data-instance="<?php echo esc_attr($iid); ?>">
+								<option value="us-west-004" <?php selected($iopts['region'] ?? 'us-west-004', 'us-west-004'); ?>>US West (us-west-004)</option>
+								<option value="us-west-002" <?php selected($iopts['region'] ?? 'us-west-004', 'us-west-002'); ?>>US West (us-west-002)</option>
+								<option value="us-east-005" <?php selected($iopts['region'] ?? 'us-west-004', 'us-east-005'); ?>>US East (us-east-005)</option>
+								<option value="eu-central-003" <?php selected($iopts['region'] ?? 'us-west-004', 'eu-central-003'); ?>>EU Central (eu-central-003)</option>
+							</select>
+							<p class="description"><?php esc_html_e('Your B2 bucket region. Check your bucket settings in the B2 console.', 'siteguardbackup'); ?></p>
+						</td>
+					</tr>
+					<tr>
+						<th><?php esc_html_e('Path (optional)', 'siteguardbackup'); ?></th>
+						<td><input type="text" class="sgbackup-instance-field regular-text" data-key="path" data-method="b2" data-instance="<?php echo esc_attr($iid); ?>" value="<?php echo esc_attr($iopts['path'] ?? ''); ?>" placeholder="backups/" /></td>
+					</tr>
+					<tr>
+						<th><?php esc_html_e('Object Lock (days)', 'siteguardbackup'); ?></th>
+						<td>
+							<input type="number" class="sgbackup-instance-field small-text" data-key="object_lock_days" data-method="b2" data-instance="<?php echo esc_attr($iid); ?>" value="<?php echo esc_attr($iopts['object_lock_days'] ?? '0'); ?>" min="0" max="365" />
+							<p class="description"><?php esc_html_e('Immutable backup retention in days. 0 = disabled. Requires Object Lock enabled on the bucket.', 'siteguardbackup'); ?></p>
+						</td>
+					</tr>
+					<tr>
+						<td colspan="2">
+							<button type="button" class="button sgbackup-test-credentials" data-method="b2"><?php esc_html_e('Test Connection', 'siteguardbackup'); ?></button>
+							<span class="sgbackup-test-result"></span>
+						</td>
+					</tr>
+				</table>
+			</div>
+			<?php endforeach; ?>
+		</div>
+		<a href="#" class="sgbackup-add-instance" data-method="b2"><?php esc_html_e('+ Add another Backblaze B2 account', 'siteguardbackup'); ?></a>
 	</div>
 
 	<!-- Google Drive Configuration -->
