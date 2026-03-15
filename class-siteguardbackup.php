@@ -35,6 +35,7 @@ class SiteGuard_Backup {
 		'dropbox'     => 'Dropbox',
 		's3'          => 'Amazon S3 (or compatible)',
 		's3generic'   => 'S3-Compatible (Generic)',
+		'b2'          => 'Backblaze B2',
 		'googledrive' => 'Google Drive',
 		'onedrive'    => 'Microsoft OneDrive',
 		'azure'       => 'Microsoft Azure',
