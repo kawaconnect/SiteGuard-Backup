@@ -5,6 +5,7 @@ $health_interval = $opts->get_option('sgbackup_health_interval', 'every4hours');
 $health_timeout = intval($opts->get_option('sgbackup_health_timeout', 10));
 $health_ssl_warn = intval($opts->get_option('sgbackup_health_ssl_warn_days', 14));
 $rest_url = rest_url('sgbackup/v1/health');
+$next_check = wp_next_scheduled('sgbackup_health_check');
 ?>
 
 <?php if (defined('DISABLE_WP_CRON') && DISABLE_WP_CRON): ?>
@@ -21,7 +22,7 @@ $rest_url = rest_url('sgbackup/v1/health');
 			<th scope="row"><?php esc_html_e('Enable Health Monitor', 'siteguardbackup'); ?></th>
 			<td>
 				<label>
-					<input type="checkbox" name="health_enabled" id="sgbackup-health-enabled" value="1" <?php checked($health_enabled); ?> />
+					<input type="checkbox" id="sgbackup-health-enabled" value="1" <?php checked($health_enabled); ?> />
 					<?php esc_html_e('Periodically check HTTP health and SSL certificate expiry for all sites', 'siteguardbackup'); ?>
 				</label>
 			</td>
@@ -29,7 +30,7 @@ $rest_url = rest_url('sgbackup/v1/health');
 		<tr>
 			<th scope="row"><?php esc_html_e('Check Interval', 'siteguardbackup'); ?></th>
 			<td>
-				<select name="health_interval" id="sgbackup-health-interval">
+				<select id="sgbackup-health-interval">
 					<option value="everyhour" <?php selected($health_interval, 'everyhour'); ?>><?php esc_html_e('Every hour', 'siteguardbackup'); ?></option>
 					<option value="every2hours" <?php selected($health_interval, 'every2hours'); ?>><?php esc_html_e('Every 2 hours', 'siteguardbackup'); ?></option>
 					<option value="every4hours" <?php selected($health_interval, 'every4hours'); ?>><?php esc_html_e('Every 4 hours', 'siteguardbackup'); ?></option>
@@ -42,18 +43,25 @@ $rest_url = rest_url('sgbackup/v1/health');
 		<tr>
 			<th scope="row"><?php esc_html_e('HTTP Timeout', 'siteguardbackup'); ?></th>
 			<td>
-				<input type="number" name="health_timeout" id="sgbackup-health-timeout" value="<?php echo esc_attr($health_timeout); ?>" min="2" max="30" class="small-text" />
+				<input type="number" id="sgbackup-health-timeout" value="<?php echo esc_attr($health_timeout); ?>" min="2" max="30" class="small-text" />
 				<?php esc_html_e('seconds', 'siteguardbackup'); ?>
 			</td>
 		</tr>
 		<tr>
 			<th scope="row"><?php esc_html_e('SSL Warning Threshold', 'siteguardbackup'); ?></th>
 			<td>
-				<input type="number" name="health_ssl_warn_days" id="sgbackup-health-ssl-warn" value="<?php echo esc_attr($health_ssl_warn); ?>" min="1" max="90" class="small-text" />
+				<input type="number" id="sgbackup-health-ssl-warn" value="<?php echo esc_attr($health_ssl_warn); ?>" min="1" max="90" class="small-text" />
 				<?php esc_html_e('days before expiry', 'siteguardbackup'); ?>
 			</td>
 		</tr>
 	</table>
+	<p>
+		<button type="button" class="button button-primary" id="sgbackup-health-save"><?php esc_html_e('Save Health Settings', 'siteguardbackup'); ?></button>
+		<span id="sgbackup-health-save-status" style="margin-left:10px;"></span>
+	</p>
+	<?php if ($health_enabled && $next_check): ?>
+	<p class="description"><?php printf(esc_html__('Next scheduled check: %s', 'siteguardbackup'), date_i18n(get_option('date_format') . ' ' . get_option('time_format'), $next_check)); ?></p>
+	<?php endif; ?>
 </div>
 
 <div class="sgbackup-section">
@@ -63,7 +71,6 @@ $rest_url = rest_url('sgbackup/v1/health');
 			<th scope="row"><?php esc_html_e('API Endpoint', 'siteguardbackup'); ?></th>
 			<td>
 				<code id="sgbackup-health-endpoint"><?php echo esc_html($rest_url); ?></code>
-				<p class="description"><?php esc_html_e('If this site is behind Cloudflare with Bot Fight Mode enabled, add a WAF rule to skip managed challenges for this URL path. Otherwise the Discord bot will receive a JS challenge page instead of JSON.', 'siteguardbackup'); ?></p>
 			</td>
 		</tr>
 		<tr>
@@ -73,7 +80,7 @@ $rest_url = rest_url('sgbackup/v1/health');
 				<input type="text" id="sgbackup-health-api-key" value="" readonly class="regular-text" style="font-family:monospace;display:none;" />
 				<button type="button" class="button" id="sgbackup-health-copy-key" style="display:none;"><?php esc_html_e('Copy', 'siteguardbackup'); ?></button>
 				<button type="button" class="button button-secondary" id="sgbackup-health-regen-key"><?php esc_html_e('Generate New Key', 'siteguardbackup'); ?></button>
-				<p class="description"><?php esc_html_e('The API key is shown only once when generated. Copy it immediately for your Discord bot config. It is stored hashed and cannot be retrieved later.', 'siteguardbackup'); ?></p>
+				<p class="description"><?php esc_html_e('The API key is shown only once when generated. Copy it immediately. It is stored hashed and cannot be retrieved later.', 'siteguardbackup'); ?></p>
 			</td>
 		</tr>
 	</table>
@@ -85,7 +92,7 @@ $rest_url = rest_url('sgbackup/v1/health');
 		<button type="button" class="button" id="sgbackup-health-check-now" style="margin-left:10px;"><?php esc_html_e('Check Now', 'siteguardbackup'); ?></button>
 	</h2>
 	<div id="sgbackup-health-results">
-		<p><?php esc_html_e('Loading health status...', 'siteguardbackup'); ?></p>
+		<p><?php esc_html_e('Click a button or switch to this tab to see activity in the log below.', 'siteguardbackup'); ?></p>
 	</div>
 </div>
 

@@ -8,6 +8,7 @@
 		pollTimer: null,
 		lastKnownJobs: {},
 		uploadAbortController: null,
+		_healthLog: [],
 
 		// HTML escape utility to prevent XSS
 		esc: function(str) {
@@ -3658,20 +3659,18 @@
 
 		// ===== Health Monitor =====
 
-		_healthLog: [],
-
 		_hlog: function(level, msg, data) {
 			var ts = new Date().toISOString();
 			var entry = '[' + ts + '] [' + level.toUpperCase() + '] ' + msg;
 			if (data !== undefined) {
-				try { entry += ' ' + JSON.stringify(data); } catch(e) { entry += ' [unserializable]'; }
+				try { entry += ' | ' + JSON.stringify(data); } catch(e) { entry += ' | [unserializable]'; }
 			}
 			this._healthLog.push(entry);
 			var $log = $('#sgbackup-health-log-content');
 			if ($log.length) {
-				$log.append(this.esc(entry) + '\n');
-				var el = $log[0];
-				el.scrollTop = el.scrollHeight;
+				var color = level === 'error' ? '#e74c3c' : level === 'ok' ? '#2ecc71' : level === 'warn' ? '#f39c12' : '#c3c4c7';
+				$log.append('<span style="color:' + color + '">' + this.esc(entry) + '</span>\n');
+				$log[0].scrollTop = $log[0].scrollHeight;
 			}
 			if (level === 'error') { console.error('[SGB Health]', msg, data); }
 			else { console.log('[SGB Health]', msg, data); }
@@ -3679,29 +3678,79 @@
 
 		bindHealthMonitor: function() {
 			var self = this;
-			this._hlog('info', 'bindHealthMonitor called');
-			this._hlog('info', 'AJAX URL: ' + sgbackup_settings.ajax_url);
-			this._hlog('info', 'Nonces available', {
-				health_check_now: !!sgbackup_settings.nonces.health_check_now,
-				get_health_status: !!sgbackup_settings.nonces.get_health_status,
-				regenerate_health_api_key: !!sgbackup_settings.nonces.regenerate_health_api_key
+			this._hlog('info', '=== bindHealthMonitor starting ===');
+			this._hlog('info', 'Page URL: ' + window.location.href);
+			this._hlog('info', 'Hash: ' + window.location.hash);
+			this._hlog('info', 'AJAX URL: ' + (typeof sgbackup_settings !== 'undefined' ? sgbackup_settings.ajax_url : 'sgbackup_settings NOT DEFINED'));
+
+			if (typeof sgbackup_settings === 'undefined') {
+				this._hlog('error', 'sgbackup_settings is undefined - wp_localize_script failed. AJAX will not work.');
+				return;
+			}
+
+			this._hlog('info', 'Nonces present', {
+				generic: sgbackup_settings.nonce ? 'yes' : 'NO',
+				health_check_now: sgbackup_settings.nonces && sgbackup_settings.nonces.health_check_now ? 'yes' : 'NO',
+				get_health_status: sgbackup_settings.nonces && sgbackup_settings.nonces.get_health_status ? 'yes' : 'NO',
+				regenerate_health_api_key: sgbackup_settings.nonces && sgbackup_settings.nonces.regenerate_health_api_key ? 'yes' : 'NO',
+				savesettings: sgbackup_settings.nonces && sgbackup_settings.nonces.savesettings ? 'yes' : 'NO'
+			});
+			this._hlog('info', 'Is multisite: ' + sgbackup_settings.is_multisite);
+
+			// Check DOM elements exist
+			this._hlog('info', 'DOM check', {
+				'#sgbackup-health-check-now': $('#sgbackup-health-check-now').length,
+				'#sgbackup-health-regen-key': $('#sgbackup-health-regen-key').length,
+				'#sgbackup-health-save': $('#sgbackup-health-save').length,
+				'#sgbackup-health-enabled': $('#sgbackup-health-enabled').length,
+				'#sgbackup-health-results': $('#sgbackup-health-results').length,
+				'#sgbackup-health-log-content': $('#sgbackup-health-log-content').length,
+				'#sgbackup-health-api-key': $('#sgbackup-health-api-key').length,
+				'#sgbackup-health-key-status': $('#sgbackup-health-key-status').length
 			});
 
-			// Load health status when Health tab is shown
+			// ---- Save Health Settings button ----
+			$(document).on('click', '#sgbackup-health-save', function() {
+				var $btn = $(this);
+				var $status = $('#sgbackup-health-save-status');
+				var settings = {
+					health_enabled: $('#sgbackup-health-enabled').is(':checked') ? 1 : 0,
+					health_interval: $('#sgbackup-health-interval').val(),
+					health_timeout: parseInt($('#sgbackup-health-timeout').val(), 10) || 10,
+					health_ssl_warn_days: parseInt($('#sgbackup-health-ssl-warn').val(), 10) || 14
+				};
+				self._hlog('info', 'Save Health Settings clicked', settings);
+				$btn.prop('disabled', true);
+				$status.text('Saving...').css('color', '');
+				self.ajax('savesettings', settings, function(resp) {
+					self._hlog('ok', 'Settings saved successfully', resp);
+					$btn.prop('disabled', false);
+					$status.text('Saved!').css('color', '#46b450');
+					self.showNotice('Health settings saved.', 'success');
+					setTimeout(function() { $status.text(''); }, 3000);
+				}, function(err) {
+					self._hlog('error', 'savesettings FAILED', { error: err });
+					$btn.prop('disabled', false);
+					$status.text('Error: ' + (err || 'Save failed')).css('color', '#dc3232');
+					self.showNotice(err || 'Failed to save settings.', 'error');
+				});
+			});
+
+			// ---- Load health status when Health tab is shown ----
 			$(document).on('click', '.sgbackup-tabs .nav-tab[data-tab="health"]', function() {
-				self._hlog('info', 'Health tab clicked - loading status');
+				self._hlog('info', 'Health tab clicked');
 				self.loadHealthStatus();
 			});
 
-			// Check Now button
+			// ---- Check Now button ----
 			$(document).on('click', '#sgbackup-health-check-now', function() {
 				var $btn = $(this);
-				self._hlog('info', 'Check Now clicked');
+				self._hlog('info', '>>> Check Now button clicked');
 				$btn.prop('disabled', true).text('Checking...');
-				self._hlog('info', 'Sending AJAX: health_check_now');
 				self.ajax('health_check_now', {}, function(data) {
-					self._hlog('ok', 'health_check_now succeeded', { sites: (data && data.length) || 'N/A' });
-					self.renderHealthResults(data);
+					var count = Array.isArray(data) ? data.length : (data && data.sites ? data.sites.length : '?');
+					self._hlog('ok', 'health_check_now response received - ' + count + ' sites');
+					self.renderHealthResults(Array.isArray(data) ? data : data.sites || data);
 					$btn.prop('disabled', false).text('Check Now');
 					self.showNotice('Health check complete.', 'success');
 				}, function(err) {
@@ -3711,99 +3760,108 @@
 				});
 			});
 
-			// Generate/Regenerate API key
+			// ---- Generate New Key button ----
 			$(document).on('click', '#sgbackup-health-regen-key', function() {
-				if (!confirm('Generate a new API key? Any existing key will stop working. The Discord bot will need the new key.')) {
+				if (!confirm('Generate a new API key? Any existing key will stop working.')) {
 					self._hlog('info', 'Key generation cancelled by user');
 					return;
 				}
-				self._hlog('info', 'Sending AJAX: regenerate_health_api_key');
+				self._hlog('info', '>>> Generate New Key clicked');
 				self.ajax('regenerate_health_api_key', {}, function(data) {
-					self._hlog('ok', 'API key generated', { key_length: data.api_key ? data.api_key.length : 0 });
-					$('#sgbackup-health-api-key').val(data.api_key).show();
-					$('#sgbackup-health-copy-key').show();
-					$('#sgbackup-health-key-status').html(
-						'<span style="color:#d63638;font-weight:600;">New key generated - copy it now!</span> ' +
-						'This is the only time it will be shown. It is stored hashed and cannot be retrieved.'
-					);
-					self.showNotice('New API key generated. Copy it now - it will not be shown again.', 'success');
+					self._hlog('ok', 'API key generated', { key_length: data && data.api_key ? data.api_key.length : 0 });
+					if (data && data.api_key) {
+						$('#sgbackup-health-api-key').val(data.api_key).show();
+						$('#sgbackup-health-copy-key').show();
+						$('#sgbackup-health-key-status').html(
+							'<span style="color:#d63638;font-weight:600;">New key generated - copy it now!</span> ' +
+							'This is the only time it will be shown.'
+						);
+						self.showNotice('New API key generated. Copy it now!', 'success');
+					} else {
+						self._hlog('error', 'Response missing api_key field', data);
+					}
 				}, function(err) {
 					self._hlog('error', 'regenerate_health_api_key FAILED', { error: err });
 					self.showNotice(err || 'Failed to generate key.', 'error');
 				});
 			});
 
-			// Copy API key
+			// ---- Copy API key button ----
 			$(document).on('click', '#sgbackup-health-copy-key', function() {
 				var key = $('#sgbackup-health-api-key').val();
+				self._hlog('info', 'Copy key clicked, key length: ' + (key ? key.length : 0));
 				if (!key) { self.showNotice('No API key to copy.', 'warning'); return; }
 				if (navigator.clipboard) {
 					navigator.clipboard.writeText(key).then(function() {
 						self._hlog('ok', 'API key copied to clipboard');
 						self.showNotice('API key copied to clipboard.', 'success');
+					}, function(err) {
+						self._hlog('error', 'Clipboard API failed', { error: String(err) });
+						self.fallbackCopy(key);
+						self.showNotice('API key copied.', 'success');
 					});
 				} else {
 					self.fallbackCopy(key);
-					self._hlog('ok', 'API key copied (fallback)');
+					self._hlog('ok', 'API key copied (fallback method)');
 					self.showNotice('API key copied to clipboard.', 'success');
 				}
 			});
 
-			// Clear log button
+			// ---- Clear log button ----
 			$(document).on('click', '#sgbackup-health-log-clear', function() {
 				self._healthLog = [];
 				$('#sgbackup-health-log-content').html('');
 				self._hlog('info', 'Log cleared');
 			});
 
-			// Auto-load if landing on health tab via URL hash
+			// ---- Auto-load if landing on health tab via URL hash ----
 			if (window.location.hash === '#health') {
-				this._hlog('info', 'Landing on health tab - auto-loading status');
+				this._hlog('info', 'URL hash is #health - auto-loading status');
 				this.loadHealthStatus();
 			}
 
-			this._hlog('ok', 'bindHealthMonitor complete - all event handlers bound');
+			this._hlog('ok', '=== bindHealthMonitor complete - all handlers bound ===');
 		},
 
 		loadHealthStatus: function() {
 			var self = this;
 			var $container = $('#sgbackup-health-results');
 			$container.html('<p>Loading health status...</p>');
-			this._hlog('info', 'Sending AJAX: get_health_status');
+			this._hlog('info', '>>> Sending AJAX: get_health_status');
 			this.ajax('get_health_status', {}, function(data) {
-				self._hlog('ok', 'get_health_status response received', {
+				self._hlog('ok', 'get_health_status response', {
 					overall: data.overall,
 					has_api_key: data.has_api_key,
-					site_count: data.sites ? data.sites.length : 0
+					site_count: data.sites ? data.sites.length : 0,
+					raw_keys: Object.keys(data)
 				});
-				// Show key status
 				var $keyStatus = $('#sgbackup-health-key-status');
 				if (data.has_api_key) {
-					$keyStatus.html('<span style="color:#46b450;font-weight:600;">Key configured</span> \u2014 stored as hash, not retrievable. Generate a new one if needed.');
+					$keyStatus.html('<span style="color:#46b450;font-weight:600;">Key configured</span> - stored as hash. Generate a new one if needed.');
 				} else {
-					$keyStatus.html('<span style="color:#dc3232;font-weight:600;">No key generated</span> \u2014 click "Generate New Key" to create one.');
+					$keyStatus.html('<span style="color:#dc3232;font-weight:600;">No key generated</span> - click "Generate New Key" to create one.');
 				}
 				if (data.sites && data.sites.length > 0) {
-					self._hlog('info', 'Rendering ' + data.sites.length + ' sites');
+					self._hlog('info', 'Rendering ' + data.sites.length + ' site results');
 					self.renderHealthResults(data.sites);
 				} else {
-					self._hlog('warn', 'No health data available');
-					$container.html('<p>No health data yet. Click <strong>Check Now</strong> to run the first check, or enable the health monitor and wait for the scheduled check.</p>');
+					self._hlog('warn', 'No site data returned - health checks may not have run yet');
+					$container.html('<p>No health data yet. Click <strong>Check Now</strong> to run the first check.</p>');
 				}
 			}, function(err) {
-				self._hlog('error', 'get_health_status FAILED', { error: err });
-				$container.html('<p class="notice notice-error" style="padding:10px;">' + (err || 'Failed to load health status.') + '</p>');
+				self._hlog('error', 'get_health_status AJAX FAILED', { error: err });
+				$container.html('<p class="notice notice-error" style="padding:10px;">Failed: ' + self.esc(err || 'Unknown error') + '</p>');
 			});
 		},
 
 		renderHealthResults: function(sites) {
 			if (!sites || !sites.length) {
-				this._hlog('warn', 'renderHealthResults called with empty data');
+				this._hlog('warn', 'renderHealthResults: no data');
 				$('#sgbackup-health-results').html('<p>No sites checked yet.</p>');
 				return;
 			}
 
-			this._hlog('info', 'Rendering health table for ' + sites.length + ' sites');
+			this._hlog('info', 'Building table for ' + sites.length + ' sites');
 
 			var html = '<table class="widefat fixed striped sgbackup-health-table">';
 			html += '<thead><tr>';
@@ -3842,7 +3900,7 @@
 			html += '</tbody></table>';
 			$('#sgbackup-health-results').html(html);
 
-			this._hlog('ok', 'Health table rendered', counts);
+			this._hlog('ok', 'Table rendered', counts);
 		}
 	};
 
