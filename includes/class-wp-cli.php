@@ -4077,14 +4077,14 @@ class SiteGuard_Backup_CLI_Command extends WP_CLI_Command {
             $opts->update_option('sgbackup_health_enabled', 1);
 
             if (isset($assoc_args['interval'])) {
-                $valid = array('everyhour', 'every2hours', 'every4hours', 'every8hours', 'twicedaily', 'daily');
+                $valid = array('every5min', 'every10min', 'every15min', 'every30min', 'everyhour', 'every2hours', 'every4hours', 'every8hours', 'twicedaily', 'daily');
                 $interval = $assoc_args['interval'];
                 if (!in_array($interval, $valid, true)) {
                     WP_CLI::error('Invalid interval. Choose: ' . implode(', ', $valid));
                 }
                 $opts->update_option('sgbackup_health_interval', $interval);
             } else {
-                $interval = $opts->get_option('sgbackup_health_interval', 'every4hours');
+                $interval = $opts->get_option('sgbackup_health_interval', 'every10min');
             }
 
             if (isset($assoc_args['timeout'])) {
@@ -4109,7 +4109,7 @@ class SiteGuard_Backup_CLI_Command extends WP_CLI_Command {
         } else {
             // Show current config
             $enabled = $opts->get_option('sgbackup_health_enabled', false);
-            $interval = $opts->get_option('sgbackup_health_interval', 'every4hours');
+            $interval = $opts->get_option('sgbackup_health_interval', 'every10min');
             $timeout = $opts->get_option('sgbackup_health_timeout', 10);
             $ssl_warn = $opts->get_option('sgbackup_health_ssl_warn_days', 14);
             $next = wp_next_scheduled('sgbackup_health_check');

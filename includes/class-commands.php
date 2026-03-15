@@ -602,7 +602,10 @@ class SiteGuard_Backup_Commands {
 			if (isset($params[$key])) {
 				$value = $params[$key];
 				// Sanitize
-				if (in_array($key, array('retain', 'retain_db', 'split_every', 'max_split', 'delete_local', 'debug_mode', 'encryption_enabled', 'syslog_enabled', 'lock_admin', 'lock_admin_session_length', 'backupdb_nonwp', 'db_anonymise', 'max_incrementals_before_full', 'ssl_disableverify', 'ssl_useservercerts', 'auto_update', 'encrypt_credentials', 'failover_enabled', 'default_db_restore_mode', 'default_subsite_mode', 'default_keep_protocol', 'health_enabled', 'health_timeout', 'health_ssl_warn_days'))) {
+				if ($key === 'health_interval') {
+					$valid_intervals = array('every5min', 'every10min', 'every15min', 'every30min', 'everyhour', 'every2hours', 'every4hours', 'every8hours', 'twicedaily', 'daily');
+					$value = in_array($value, $valid_intervals, true) ? $value : 'every10min';
+				} elseif (in_array($key, array('retain', 'retain_db', 'split_every', 'max_split', 'delete_local', 'debug_mode', 'encryption_enabled', 'syslog_enabled', 'lock_admin', 'lock_admin_session_length', 'backupdb_nonwp', 'db_anonymise', 'max_incrementals_before_full', 'ssl_disableverify', 'ssl_useservercerts', 'auto_update', 'encrypt_credentials', 'failover_enabled', 'default_db_restore_mode', 'default_subsite_mode', 'default_keep_protocol', 'health_enabled', 'health_timeout', 'health_ssl_warn_days'))) {
 					$value = intval($value);
 				} elseif ($key === 'email') {
 					$value = sanitize_email($value);
@@ -676,7 +679,7 @@ class SiteGuard_Backup_Commands {
 		// Health monitor schedule management
 		if (isset($params['health_enabled'])) {
 			$health_enabled = intval($params['health_enabled']);
-			$health_interval = isset($params['health_interval']) ? sanitize_text_field($params['health_interval']) : $opts->get_option('sgbackup_health_interval', 'every4hours');
+			$health_interval = isset($params['health_interval']) ? sanitize_text_field($params['health_interval']) : $opts->get_option('sgbackup_health_interval', 'every10min');
 			if ($health_enabled) {
 				wp_clear_scheduled_hook('sgbackup_health_check');
 				wp_schedule_event(time() + 60, $health_interval, 'sgbackup_health_check');

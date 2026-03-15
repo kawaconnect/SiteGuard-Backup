@@ -1,7 +1,7 @@
 <?php if (!defined('ABSPATH')) die('No direct access.');
 $opts = SiteGuard_Backup_Options::instance();
 $health_enabled = $opts->get_option('sgbackup_health_enabled', false);
-$health_interval = $opts->get_option('sgbackup_health_interval', 'every4hours');
+$health_interval = $opts->get_option('sgbackup_health_interval', 'every10min');
 $health_timeout = intval($opts->get_option('sgbackup_health_timeout', 10));
 $health_ssl_warn = intval($opts->get_option('sgbackup_health_ssl_warn_days', 14));
 $rest_url = rest_url('sgbackup/v1/health');
