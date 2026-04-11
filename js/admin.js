@@ -3754,11 +3754,30 @@
 				self._hlog('info', '>>> Check Now button clicked');
 				$btn.prop('disabled', true).text('Checking...');
 				self.ajax('health_check_now', {}, function(data) {
-					var count = Array.isArray(data) ? data.length : (data && data.sites ? data.sites.length : '?');
-					self._hlog('ok', 'health_check_now response received - ' + count + ' sites');
-					self.renderHealthResults(Array.isArray(data) ? data : data.sites || data);
+					var sites = Array.isArray(data) ? data : (data && data.sites ? data.sites : []);
+					self._hlog('ok', 'health_check_now response received - ' + sites.length + ' sites');
+					self.renderHealthResults(sites);
 					$btn.prop('disabled', false).text('Check Now');
-					self.showNotice('Health check complete.', 'success');
+
+					// Surface any SSL probe failures as a toast so the user doesn't
+					// have to scan the table for amber rows.
+					var sslFailed = [];
+					for (var i = 0; i < sites.length; i++) {
+						var s = sites[i];
+						if (s && s.ssl_error && s.ssl_ok === false) {
+							sslFailed.push((s.domain || s.url || '?') + ' - ' + s.ssl_error);
+						}
+					}
+					if (sslFailed.length === 0) {
+						self.showNotice('Health check complete.', 'success');
+					} else {
+						var msg = 'Health check complete, but SSL cert could not be read for ' +
+							sslFailed.length + ' site' + (sslFailed.length === 1 ? '' : 's') + ': ' +
+							sslFailed.slice(0, 3).join('; ') +
+							(sslFailed.length > 3 ? ' (+' + (sslFailed.length - 3) + ' more)' : '');
+						self.showNotice(msg, 'error');
+						self._hlog('error', 'SSL probe failures', sslFailed);
+					}
 				}, function(err) {
 					self._hlog('error', 'health_check_now FAILED', { error: err });
 					$btn.prop('disabled', false).text('Check Now');

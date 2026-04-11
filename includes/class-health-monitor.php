@@ -191,6 +191,16 @@ class SiteGuard_Backup_Health_Monitor {
 			$ssl = $this->get_ssl_expiry($domain, $timeout);
 			$result['ssl_checked_at'] = time();
 
+			// Hostname mismatch: probe succeeded but the cert isn't valid for our
+			// domain. Treat as a probe failure with an explicit error so the user
+			// can see why the site is serving the "wrong" cert.
+			if (!empty($ssl['ok']) && !empty($ssl['san']) && is_array($ssl['san'])) {
+				if (!$this->cert_matches_host($domain, $ssl['san'])) {
+					$ssl['ok'] = false;
+					$ssl['error'] = 'cert hostname mismatch: cert valid for ' . implode(', ', array_slice($ssl['san'], 0, 3)) . ' (expected ' . $domain . ')';
+				}
+			}
+
 			if (!empty($ssl['ok'])) {
 				// Fresh successful probe: write new values
 				$result['ssl_expiry_days']  = intval($ssl['days']);
@@ -216,13 +226,37 @@ class SiteGuard_Backup_Health_Monitor {
 				}
 				$result['ssl_ok']    = false;
 				$result['ssl_stale'] = true;
-				$result['ssl_error'] = (string) $ssl['error'];
+				// Prefix the error with the domain so operators can see at a glance
+				// which site failed (especially in error_log / Azure diagnostics).
+				$result['ssl_error'] = 'SSL probe failed for ' . $domain . ': ' . (string) $ssl['error'];
+
+				// Log to PHP error_log so the failure is visible in server diagnostic
+				// logs (Azure App Service /home/LogFiles, docker logs, etc) without
+				// needing to open the Health tab. Only log on state change (new
+				// failure or error message changed) to avoid spamming the log every
+				// cron tick when a site's probe is persistently broken.
+				$prev_error = $prev && isset($prev['ssl_error']) ? (string) $prev['ssl_error'] : '';
+				if ($prev_error !== $result['ssl_error']) {
+					error_log('SiteGuard Backup: ' . $result['ssl_error']);
+				}
 
 				// Probe failure degrades (amber) but never marks site down - HTTP drives down.
 				// Don't downgrade an already-down site either.
 				if ($result['status'] === 'operational') {
 					$result['status'] = 'degraded';
 				}
+			}
+		} elseif ($domain && $scheme !== 'https') {
+			// Explicit marker: http-only site, no cert to check. UI renders "-".
+			$result['ssl_error'] = '';
+		} elseif (!$domain) {
+			// home_url() returned something unparseable - surface it rather than
+			// silently skipping.
+			$result['ssl_error'] = 'SSL probe skipped: could not parse domain from ' . $url;
+			$result['ssl_stale'] = true;
+			$prev_error = $prev && isset($prev['ssl_error']) ? (string) $prev['ssl_error'] : '';
+			if ($prev_error !== $result['ssl_error']) {
+				error_log('SiteGuard Backup: ' . $result['ssl_error']);
 			}
 		}
 
@@ -377,11 +411,54 @@ class SiteGuard_Backup_Health_Monitor {
 	}
 
 	/**
+	 * Extract SAN DNS names (+CN fallback) from a parsed x509 into a flat array
+	 * of lowercase hostnames for hostname-match checks.
+	 */
+	private function extract_cert_names($parsed) {
+		$names = array();
+		if (!is_array($parsed)) return $names;
+
+		if (!empty($parsed['extensions']['subjectAltName'])) {
+			$san = (string) $parsed['extensions']['subjectAltName'];
+			foreach (explode(',', $san) as $entry) {
+				$entry = trim($entry);
+				if (stripos($entry, 'DNS:') === 0) {
+					$names[] = strtolower(substr($entry, 4));
+				}
+			}
+		}
+		if (!empty($parsed['subject']['CN'])) {
+			$names[] = strtolower((string) $parsed['subject']['CN']);
+		}
+
+		return array_values(array_unique(array_filter($names)));
+	}
+
+	/**
+	 * Check whether a host matches any of the cert's DNS names (supports
+	 * one leading "*." wildcard label, per RFC 6125).
+	 */
+	private function cert_matches_host($host, $names) {
+		$host = strtolower($host);
+		foreach ($names as $name) {
+			if ($name === $host) return true;
+			if (strpos($name, '*.') === 0) {
+				$suffix = substr($name, 1); // ".example.com"
+				$host_label_end = strpos($host, '.');
+				if ($host_label_end !== false && substr($host, $host_label_end) === $suffix) {
+					return true;
+				}
+			}
+		}
+		return false;
+	}
+
+	/**
 	 * Parse a CURLINFO_CERTINFO array (leaf cert at index 0) into the
 	 * standard return shape.
 	 */
 	private function parse_curl_certinfo($certinfo) {
-		$result = array('ok' => false, 'days' => -1, 'issuer' => '', 'error' => '', 'method' => 'curl');
+		$result = array('ok' => false, 'days' => -1, 'issuer' => '', 'error' => '', 'method' => 'curl', 'san' => array());
 
 		$leaf = isset($certinfo[0]) && is_array($certinfo[0]) ? $certinfo[0] : null;
 		if (!$leaf) {
@@ -414,6 +491,33 @@ class SiteGuard_Backup_Health_Monitor {
 				} elseif (isset($parsed['issuer']['CN'])) {
 					$result['issuer'] = (string) $parsed['issuer']['CN'];
 				}
+				$result['san'] = $this->extract_cert_names($parsed);
+			}
+		}
+
+		// CURLINFO_CERTINFO also exposes SAN as a "Subject Alternative Name" string.
+		if (empty($result['san'])) {
+			foreach (array('Subject Alternative Name', 'subjectAltName', 'X509v3 Subject Alternative Name') as $k) {
+				if (!empty($leaf[$k])) {
+					$names = array();
+					foreach (explode(',', (string) $leaf[$k]) as $entry) {
+						$entry = trim($entry);
+						if (stripos($entry, 'DNS:') === 0) {
+							$names[] = strtolower(substr($entry, 4));
+						}
+					}
+					if ($names) $result['san'] = array_values(array_unique($names));
+					break;
+				}
+			}
+		}
+		// Last-resort CN fallback from the raw "Subject" string.
+		if (empty($result['san'])) {
+			foreach (array('Subject', 'subject') as $k) {
+				if (!empty($leaf[$k]) && preg_match('~CN\s*=\s*([^,/]+)~', (string) $leaf[$k], $m)) {
+					$result['san'] = array(strtolower(trim($m[1])));
+					break;
+				}
 			}
 		}
 
@@ -445,7 +549,7 @@ class SiteGuard_Backup_Health_Monitor {
 	 * Fallback SSL probe via raw stream_socket_client.
 	 */
 	private function get_ssl_expiry_via_stream($host, $timeout, $port = 443) {
-		$result = array('ok' => false, 'days' => -1, 'issuer' => '', 'error' => '', 'method' => 'stream');
+		$result = array('ok' => false, 'days' => -1, 'issuer' => '', 'error' => '', 'method' => 'stream', 'san' => array());
 
 		if (!function_exists('stream_socket_client')) {
 			$result['error'] = 'stream_socket_client unavailable';
@@ -512,6 +616,7 @@ class SiteGuard_Backup_Health_Monitor {
 			$result['issuer'] = $cert['issuer']['CN'];
 		}
 
+		$result['san'] = $this->extract_cert_names($cert);
 		$result['ok'] = true;
 		return $result;
 	}
