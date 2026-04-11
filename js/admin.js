@@ -198,15 +198,14 @@
 				$('#sgbackup-entity-checkboxes').toggle(this.checked);
 			});
 
-			// Show subsite backup option when on a multisite subsite
+			// Show subsite backup option when on a multisite subsite, and
+			// auto-check it. Running backup from a subsite admin ALWAYS
+			// produces a subsite-scoped backup on the server (the engine
+			// forces it), so the checkbox is confirmatory rather than
+			// optional - ticked by default so the UI reflects reality.
 			if (sgbackup_settings.is_multisite && sgbackup_settings.current_blog_id > 1) {
 				$('#sgbackup-subsite-backup-option').show();
-				// When the plugin is per-site activated (not network-activated),
-				// default to subsite-only backup - a full network dump from here
-				// would leak data from other subsites.
-				if (sgbackup_settings.is_single_site_mode) {
-					$('#sgbackup-subsite-backup-option input[name="sgbackup_subsite_backup"]').prop('checked', true);
-				}
+				$('#sgbackup-subsite-backup-option input[name="sgbackup_subsite_backup"]').prop('checked', true);
 			}
 		},
 

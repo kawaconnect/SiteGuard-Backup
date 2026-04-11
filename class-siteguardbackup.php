@@ -679,15 +679,21 @@ class SiteGuard_Backup {
 			$initial_jobdata['is_autobackup'] = true;
 		}
 
-		// Per-subsite backup: detect if running from a subsite admin context.
-		// Two triggers:
-		//   1. Caller explicitly set subsite_backup (e.g. "Backup this subsite only" checkbox
-		//      or --subsite-only CLI flag).
-		//   2. Plugin is per-site activated on a subsite (not network-activated). In that case
-		//      a full network dump would leak data from other subsites this admin can't see -
-		//      force subsite-only as a safety default.
+		// Per-subsite backup: always flag a backup as subsite-scoped when running
+		// from a subsite admin context (blog_id > 1), regardless of whether the
+		// plugin is network-activated or per-site activated.
+		//
+		// Reasoning: in a subsite context, $wpdb->prefix is already wp_{blog_id}_
+		// and wp_upload_dir() is already per-subsite. The generic backup_database()
+		// path therefore dumps subsite-scoped tables no matter what - but without
+		// the flag set it ALSO skips the filtered wp_users/wp_usermeta inclusion
+		// that backup_subsite_database() does, producing an incomplete dump.
+		// So in a subsite context the backup is effectively per-subsite either
+		// way; we just need to mark it correctly.
+		//
+		// Full network backups are expected to run from blog_id=1 / network admin.
 		$subsite_backup = !empty($options['subsite_backup'])
-			|| (function_exists('sgbackup_is_single_site_mode') && sgbackup_is_single_site_mode());
+			|| (is_multisite() && get_current_blog_id() > 1);
 
 		if (is_multisite() && get_current_blog_id() > 1 && $subsite_backup) {
 			$blog_id = get_current_blog_id();

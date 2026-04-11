@@ -42,8 +42,8 @@
 	<div id="sgbackup-subsite-backup-option" style="display:none;">
 		<hr />
 		<p>
-			<label><input type="checkbox" name="sgbackup_subsite_backup" value="1" /> <?php esc_html_e('Backup this subsite only', 'siteguardbackup'); ?></label>
-			<br /><span class="description"><?php esc_html_e('Only include this subsite\'s database tables and uploads. Plugins, themes, and core files are still backed up in full if selected above.', 'siteguardbackup'); ?></span>
+			<label><input type="checkbox" name="sgbackup_subsite_backup" value="1" checked /> <?php esc_html_e('Backup this subsite only', 'siteguardbackup'); ?></label>
+			<br /><span class="description"><?php esc_html_e('Backups run from a subsite admin are always scoped to that subsite - the database includes only this subsite\'s tables plus the users assigned to it, and uploads include only this subsite\'s media. Plugins, themes, and core files are network-shared and still backed up in full if selected above. For a full network backup, run from the Network Admin.', 'siteguardbackup'); ?></span>
 		</p>
 	</div>
 
