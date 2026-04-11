@@ -2,7 +2,7 @@
 /**
  * Plugin Name: SiteGuard Backup
  * Description: Complete WordPress backup, restore, and migration solution with scheduled, incremental, and site-to-site migration support.
- * Version: 1.4.8
+ * Version: 1.4.9
  * Author: KawaConnect LLC
  * License: GPL-2.0-or-later
  * Requires at least: 5.6
@@ -13,7 +13,7 @@
 if (!defined('ABSPATH')) die('No direct access.');
 
 // Core constants
-define('SGBACKUP_VERSION', '1.4.8');
+define('SGBACKUP_VERSION', '1.4.9');
 define('SGBACKUP_DIR', plugin_dir_path(__FILE__));
 define('SGBACKUP_URL', plugin_dir_url(__FILE__));
 define('SGBACKUP_PLUGIN_SLUG', plugin_basename(__FILE__));
@@ -406,7 +406,12 @@ function sgbackup_load_migration_listeners() {
 add_action('plugins_loaded', 'sgbackup_load_migration_listeners', 2);
 
 /**
- * Register REST API endpoint for external health monitoring (Discord bot).
+ * Register REST API endpoints for external health monitoring (Discord bot).
+ *
+ * Endpoints (all require `Authorization: Bearer <api_key>`):
+ *   GET  /wp-json/sgbackup/v1/health        - full health payload (cached)
+ *   GET  /wp-json/sgbackup/v1/health/ping   - auth smoke test, minimal body
+ *   POST /wp-json/sgbackup/v1/health/check  - trigger an on-demand run, returns fresh payload
  */
 function sgbackup_register_health_api() {
 	register_rest_route('sgbackup/v1', '/health', array(
@@ -414,8 +419,60 @@ function sgbackup_register_health_api() {
 		'callback'            => 'sgbackup_health_api_callback',
 		'permission_callback' => 'sgbackup_health_api_auth',
 	));
+	register_rest_route('sgbackup/v1', '/health/ping', array(
+		'methods'             => 'GET',
+		'callback'            => 'sgbackup_health_api_ping_callback',
+		'permission_callback' => 'sgbackup_health_api_auth',
+	));
+	register_rest_route('sgbackup/v1', '/health/check', array(
+		'methods'             => 'POST',
+		'callback'            => 'sgbackup_health_api_check_callback',
+		'permission_callback' => 'sgbackup_health_api_auth',
+	));
 }
 add_action('rest_api_init', 'sgbackup_register_health_api');
+
+/**
+ * Bot-facing auth smoke test. Returns 200 + small body so clients can verify
+ * the API key without pulling the full site list (and without triggering a
+ * health run).
+ */
+function sgbackup_health_api_ping_callback(WP_REST_Request $request) {
+	return rest_ensure_response(array(
+		'ok'          => true,
+		'site_url'    => get_site_url(),
+		'version'     => SGBACKUP_VERSION,
+		'api_version' => 2,
+		'time'        => time(),
+	));
+}
+
+/**
+ * Trigger an on-demand health run (same path as the admin "Check Now" button),
+ * then return the fresh payload. Rate-limited by the existing auth rate limiter
+ * plus a short per-token cooldown so a misbehaving bot can't hammer the cron.
+ */
+function sgbackup_health_api_check_callback(WP_REST_Request $request) {
+	sgbackup_load_classes();
+	require_once SGBACKUP_DIR . 'includes/class-health-monitor.php';
+
+	// Cooldown: at most one bot-triggered run every 30 seconds, regardless of
+	// which key called. The cron tick is still free to run on its own schedule.
+	$cooldown_key = 'sgbackup_health_bot_check_cooldown';
+	if (get_transient($cooldown_key)) {
+		return new WP_Error(
+			'cooldown',
+			'On-demand health check is on cooldown. Poll GET /health for cached data or retry in a few seconds.',
+			array('status' => 429)
+		);
+	}
+	set_transient($cooldown_key, 1, 30);
+
+	$monitor = SiteGuard_Backup_Health_Monitor::instance();
+	$monitor->run_checks();
+
+	return sgbackup_health_api_callback($request);
+}
 
 function sgbackup_health_api_auth(WP_REST_Request $request) {
 	sgbackup_load_classes();
@@ -454,14 +511,116 @@ function sgbackup_health_api_callback(WP_REST_Request $request) {
 	$results = $monitor->get_results();
 
 	$opts = SiteGuard_Backup_Options::instance();
+	$ssl_warn_days = intval($opts->get_option('sgbackup_health_ssl_warn_days', 14));
+
+	// Build a pre-computed summary + actionable alerts list so external
+	// consumers (Discord bot, Slack, email) don't each re-implement the
+	// same reduction over the per-site array. Every site row is still
+	// returned in full via the 'sites' key for bots that want raw data.
+	$summary = array(
+		'total'            => count($results),
+		'operational'      => 0,
+		'degraded'         => 0,
+		'down'             => 0,
+		'unknown'          => 0,
+		'ssl_ok'           => 0,
+		'ssl_failing'      => 0,
+		'ssl_stale'        => 0,
+		'ssl_expiring_soon' => 0,  // days <= ssl_warn_days (includes expired)
+		'ssl_expired'      => 0,   // days <= 0 from a fresh probe
+	);
+	$alerts = array();
+	$ssl_last_check = 0;
+
+	foreach ($results as $site) {
+		$status = isset($site['status']) ? $site['status'] : 'unknown';
+		if (isset($summary[$status])) $summary[$status]++;
+
+		$domain = isset($site['domain']) ? (string) $site['domain'] : (isset($site['url']) ? (string) $site['url'] : '?');
+
+		// HTTP-level alerts
+		if ($status === 'down') {
+			$err = !empty($site['error']) ? $site['error'] : 'site unreachable';
+			$consec = isset($site['consecutive_failures']) ? intval($site['consecutive_failures']) : 0;
+			$alerts[] = array(
+				'severity' => 'critical',
+				'type'     => 'site_down',
+				'domain'   => $domain,
+				'message'  => $domain . ' is DOWN: ' . $err . ($consec > 1 ? ' (' . $consec . ' consecutive failures)' : ''),
+				'site_id'  => isset($site['site_id']) ? intval($site['site_id']) : 0,
+			);
+		}
+
+		// SSL-level counts and alerts
+		$ssl_ok         = !empty($site['ssl_ok']);
+		$ssl_stale      = !empty($site['ssl_stale']);
+		$ssl_error      = isset($site['ssl_error']) ? (string) $site['ssl_error'] : '';
+		$ssl_days       = isset($site['ssl_expiry_days']) ? intval($site['ssl_expiry_days']) : -1;
+		$ssl_at         = isset($site['ssl_checked_at']) ? intval($site['ssl_checked_at']) : 0;
+		$ssl_last_ok    = isset($site['ssl_last_success']) ? intval($site['ssl_last_success']) : 0;
+		$scheme         = isset($site['url']) ? parse_url($site['url'], PHP_URL_SCHEME) : '';
+
+		if ($ssl_at > $ssl_last_check) $ssl_last_check = $ssl_at;
+
+		if ($scheme === 'https') {
+			if ($ssl_ok) {
+				$summary['ssl_ok']++;
+			}
+			if ($ssl_stale) {
+				$summary['ssl_stale']++;
+			}
+			if ($ssl_error && !$ssl_ok) {
+				$summary['ssl_failing']++;
+				$alerts[] = array(
+					'severity' => 'warning',
+					'type'     => 'ssl_probe_failed',
+					'domain'   => $domain,
+					'message'  => $ssl_error . ($ssl_last_ok ? ' (last successful probe ' . gmdate('Y-m-d H:i \U\T\C', $ssl_last_ok) . ')' : ''),
+					'site_id'  => isset($site['site_id']) ? intval($site['site_id']) : 0,
+					'ssl_last_success' => $ssl_last_ok,
+				);
+			}
+			// Fresh data: flag expiry conditions (don't double-alert on stale).
+			if (!$ssl_stale && $ssl_days >= 0) {
+				if ($ssl_days <= 0) {
+					$summary['ssl_expired']++;
+					$summary['ssl_expiring_soon']++;
+					$alerts[] = array(
+						'severity' => 'critical',
+						'type'     => 'ssl_expired',
+						'domain'   => $domain,
+						'message'  => $domain . ' SSL certificate is EXPIRED (days=' . $ssl_days . ')',
+						'site_id'  => isset($site['site_id']) ? intval($site['site_id']) : 0,
+						'ssl_expiry_days' => $ssl_days,
+					);
+				} elseif ($ssl_days <= $ssl_warn_days) {
+					$summary['ssl_expiring_soon']++;
+					$alerts[] = array(
+						'severity' => ($ssl_days <= 3 ? 'critical' : 'warning'),
+						'type'     => 'ssl_expiring',
+						'domain'   => $domain,
+						'message'  => $domain . ' SSL certificate expires in ' . $ssl_days . ' day' . ($ssl_days === 1 ? '' : 's') . ' (issuer: ' . (isset($site['ssl_issuer']) ? $site['ssl_issuer'] : '?') . ')',
+						'site_id'  => isset($site['site_id']) ? intval($site['site_id']) : 0,
+						'ssl_expiry_days' => $ssl_days,
+					);
+				}
+			}
+		}
+	}
+
 	return rest_ensure_response(array(
-		'status'           => $monitor->get_overall_status(),
-		'site_url'         => get_site_url(),
-		'checked_at'       => !empty($results) ? max(array_column($results, 'last_check')) : 0,
-		'check_interval'   => $monitor->get_interval_seconds(),
+		'status'               => $monitor->get_overall_status(),
+		'site_url'             => get_site_url(),
+		'checked_at'           => !empty($results) ? max(array_column($results, 'last_check')) : 0,
+		'ssl_checked_at'       => $ssl_last_check,
+		'check_interval'       => $monitor->get_interval_seconds(),
 		'check_interval_label' => $opts->get_option('sgbackup_health_interval', 'every10min'),
-		'sites'            => $results,
-		'version'          => SGBACKUP_VERSION,
+		'ssl_warn_days'        => $ssl_warn_days,
+		'summary'              => $summary,
+		'alerts'               => $alerts,
+		'sites'                => $results,
+		'version'              => SGBACKUP_VERSION,
+		'api_version'          => 2,
 	));
 }
 
