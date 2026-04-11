@@ -2,7 +2,7 @@
 /**
  * Plugin Name: SiteGuard Backup
  * Description: Complete WordPress backup, restore, and migration solution with scheduled, incremental, and site-to-site migration support.
- * Version: 1.4.2
+ * Version: 1.4.3
  * Author: KawaConnect LLC
  * License: GPL-2.0-or-later
  * Requires at least: 5.6
@@ -13,7 +13,7 @@
 if (!defined('ABSPATH')) die('No direct access.');
 
 // Core constants
-define('SGBACKUP_VERSION', '1.4.2');
+define('SGBACKUP_VERSION', '1.4.3');
 define('SGBACKUP_DIR', plugin_dir_path(__FILE__));
 define('SGBACKUP_URL', plugin_dir_url(__FILE__));
 define('SGBACKUP_PLUGIN_SLUG', plugin_basename(__FILE__));
@@ -106,6 +106,22 @@ function sgbackup_should_load() {
 	if (defined('XMLRPC_REQUEST') && XMLRPC_REQUEST) return true;
 
 	return false;
+}
+
+/**
+ * Returns true when the plugin is running on a multisite subsite and is NOT
+ * network-activated - i.e. the site admin activated SiteGuard on their own
+ * subsite via the per-site plugins screen. In that mode backups must default
+ * to the current subsite only (never dump the whole network).
+ */
+function sgbackup_is_single_site_mode() {
+	if (!is_multisite()) return false;
+	if (get_current_blog_id() <= 1) return false;
+
+	if (!function_exists('is_plugin_active_for_network')) {
+		require_once ABSPATH . 'wp-admin/includes/plugin.php';
+	}
+	return !is_plugin_active_for_network(plugin_basename(__FILE__));
 }
 
 /**

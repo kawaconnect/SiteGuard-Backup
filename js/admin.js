@@ -201,6 +201,12 @@
 			// Show subsite backup option when on a multisite subsite
 			if (sgbackup_settings.is_multisite && sgbackup_settings.current_blog_id > 1) {
 				$('#sgbackup-subsite-backup-option').show();
+				// When the plugin is per-site activated (not network-activated),
+				// default to subsite-only backup - a full network dump from here
+				// would leak data from other subsites.
+				if (sgbackup_settings.is_single_site_mode) {
+					$('#sgbackup-subsite-backup-option input[name="sgbackup_subsite_backup"]').prop('checked', true);
+				}
 			}
 		},
 

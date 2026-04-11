@@ -142,6 +142,7 @@ class SiteGuard_Backup_Admin {
 			'chunk_size' => min(2 * 1024 * 1024, intval(0.9 * wp_max_upload_size())),
 			'is_multisite' => is_multisite(),
 			'current_blog_id' => get_current_blog_id(),
+			'is_single_site_mode' => function_exists('sgbackup_is_single_site_mode') ? sgbackup_is_single_site_mode() : false,
 			'default_db_restore_mode' => intval(SiteGuard_Backup_Options::instance()->get_option('sgbackup_default_db_restore_mode', 0)),
 			'default_subsite_mode' => intval(SiteGuard_Backup_Options::instance()->get_option('sgbackup_default_subsite_mode', 0)),
 			'default_keep_protocol' => intval(SiteGuard_Backup_Options::instance()->get_option('sgbackup_default_keep_protocol', 0)),

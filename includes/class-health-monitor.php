@@ -254,22 +254,205 @@ class SiteGuard_Backup_Health_Monitor {
 	 * Get SSL certificate expiry info for a host.
 	 * Connects to the public domain to see the cert users see (including Cloudflare edge certs).
 	 *
-	 * Returns ['ok' => bool, 'days' => int, 'issuer' => string, 'error' => string].
+	 * Returns ['ok' => bool, 'days' => int, 'issuer' => string, 'error' => string, 'method' => string].
 	 * On failure, 'ok' is false and 'error' contains a human-readable reason.
+	 *
+	 * Tries two transports so the check survives hostile network environments
+	 * (Azure App Service outbound restrictions, Cloudflare Bot Fight Mode, etc):
+	 *   1. cURL via wp_remote_head + CURLINFO_CERTINFO - uses the same HTTP stack
+	 *      the rest of the plugin uses, handles proxies/keep-alive/SNAT better.
+	 *   2. Raw stream_socket_client('ssl://…') - pure-PHP fallback when cURL
+	 *      isn't available or its request errors out before TLS completes.
 	 */
 	private function get_ssl_expiry($host, $timeout, $port = 443) {
-		$result = array('ok' => false, 'days' => -1, 'issuer' => '', 'error' => '');
+		if (!function_exists('openssl_x509_parse')) {
+			return array('ok' => false, 'days' => -1, 'issuer' => '', 'error' => 'openssl extension missing', 'method' => 'none');
+		}
 
-		if (!function_exists('stream_socket_client') || !function_exists('openssl_x509_parse')) {
-			$result['error'] = 'openssl/stream extension missing';
+		// Clamp timeout to sane bounds.
+		$timeout = max(2, min(120, intval($timeout)));
+
+		// Attempt 1: cURL via WordPress HTTP API, capturing the full cert chain.
+		$curl_result = $this->get_ssl_expiry_via_curl($host, $timeout, $port);
+		if (!empty($curl_result['ok'])) {
+			return $curl_result;
+		}
+
+		// Attempt 2: raw stream_socket_client fallback.
+		$stream_result = $this->get_ssl_expiry_via_stream($host, $timeout, $port);
+		if (!empty($stream_result['ok'])) {
+			return $stream_result;
+		}
+
+		// Both failed - return the more informative error (prefer cURL's message
+		// unless it's empty/"cURL unavailable", in which case use the stream error).
+		$curl_err = isset($curl_result['error']) ? (string) $curl_result['error'] : '';
+		$stream_err = isset($stream_result['error']) ? (string) $stream_result['error'] : '';
+		if ($curl_err === '' || strpos($curl_err, 'cURL unavailable') !== false) {
+			return $stream_result;
+		}
+		// Combine both for maximum diagnostic value.
+		$combined = $curl_err;
+		if ($stream_err !== '' && $stream_err !== $curl_err) {
+			$combined .= '; fallback: ' . $stream_err;
+		}
+		return array('ok' => false, 'days' => -1, 'issuer' => '', 'error' => $combined, 'method' => 'both-failed');
+	}
+
+	/**
+	 * SSL probe via cURL + CURLINFO_CERTINFO using wp_remote_head.
+	 * Uses http_api_curl filter to enable cert capture, then reads the chain
+	 * from curl_getinfo() in a second filter invocation.
+	 */
+	private function get_ssl_expiry_via_curl($host, $timeout, $port = 443) {
+		$result = array('ok' => false, 'days' => -1, 'issuer' => '', 'error' => '', 'method' => 'curl');
+
+		if (!function_exists('curl_init') || !function_exists('curl_getinfo')) {
+			$result['error'] = 'cURL unavailable';
 			return $result;
 		}
 
-		// Bracket IPv6 literals for the ssl:// URL syntax.
 		$host_for_url = (strpos($host, ':') !== false && strpos($host, '[') === false) ? '[' . $host . ']' : $host;
+		$url = 'https://' . $host_for_url . ($port !== 443 ? ':' . intval($port) : '') . '/';
 
-		// Clamp timeout to sane bounds and keep it an integer for stream_socket_client.
-		$timeout = max(2, min(120, intval($timeout)));
+		// Capture the cURL handle so we can pull CURLINFO_CERTINFO after the request.
+		// WordPress's http_api_curl filter fires once before execution (when we can
+		// set options) and we retain a reference to the handle for post-execution.
+		$captured = array('handle' => null, 'certinfo' => null);
+
+		$filter = function($handle, $r, $filter_url) use (&$captured, $url) {
+			if ($filter_url !== $url) {
+				return $handle;
+			}
+			$captured['handle'] = $handle;
+			if (defined('CURLOPT_CERTINFO')) {
+				@curl_setopt($handle, CURLOPT_CERTINFO, true);
+			}
+			// Don't follow redirects - we only need the TLS handshake to complete.
+			@curl_setopt($handle, CURLOPT_FOLLOWLOCATION, false);
+			// CURLOPT_NOBODY is already set by wp_remote_head; belt-and-braces.
+			@curl_setopt($handle, CURLOPT_NOBODY, true);
+			return $handle;
+		};
+		add_action('http_api_curl', $filter, 10, 3);
+
+		$args = array(
+			'timeout'     => $timeout,
+			'redirection' => 0,
+			'sslverify'   => false,
+			'user-agent'  => 'SiteGuard-Health-Monitor/' . SGBACKUP_VERSION,
+		);
+		$response = wp_remote_head($url, $args);
+
+		remove_action('http_api_curl', $filter, 10);
+
+		// Pull CURLINFO_CERTINFO from the captured handle if possible. The handle
+		// may still be alive - WP's Requests library closes it after the request,
+		// but on many PHP builds curl_getinfo still returns data on a closed handle
+		// within the same request cycle.
+		if ($captured['handle']) {
+			$info = @curl_getinfo($captured['handle']);
+			if (is_array($info) && isset($info['certinfo']) && is_array($info['certinfo']) && !empty($info['certinfo'])) {
+				$captured['certinfo'] = $info['certinfo'];
+			}
+		}
+
+		if (is_wp_error($response)) {
+			$msg = $response->get_error_message();
+			// If the body errored but we still captured the cert chain during TLS
+			// handshake, that's a win - cert check is what we care about.
+			if (!empty($captured['certinfo'])) {
+				return $this->parse_curl_certinfo($captured['certinfo']);
+			}
+			$result['error'] = 'curl: ' . ($msg !== '' ? $msg : 'request failed');
+			return $result;
+		}
+
+		if (empty($captured['certinfo'])) {
+			$result['error'] = 'curl: CURLINFO_CERTINFO empty (cURL compiled without cert capture?)';
+			return $result;
+		}
+
+		return $this->parse_curl_certinfo($captured['certinfo']);
+	}
+
+	/**
+	 * Parse a CURLINFO_CERTINFO array (leaf cert at index 0) into the
+	 * standard return shape.
+	 */
+	private function parse_curl_certinfo($certinfo) {
+		$result = array('ok' => false, 'days' => -1, 'issuer' => '', 'error' => '', 'method' => 'curl');
+
+		$leaf = isset($certinfo[0]) && is_array($certinfo[0]) ? $certinfo[0] : null;
+		if (!$leaf) {
+			$result['error'] = 'curl: certinfo empty';
+			return $result;
+		}
+
+		// CURLINFO_CERTINFO returns string values keyed by field name.
+		// "Expire date" format: "Jan  1 00:00:00 2027 GMT"
+		$expire = null;
+		foreach (array('Expire date', 'Expire Date', 'notAfter', 'NotAfter') as $k) {
+			if (!empty($leaf[$k])) { $expire = $leaf[$k]; break; }
+		}
+		if ($expire) {
+			$ts = strtotime($expire);
+			if ($ts !== false) {
+				$result['days'] = intval(floor(($ts - time()) / 86400));
+			}
+		}
+
+		// If the leaf has a PEM blob we can parse the full x509 for a better issuer.
+		if (!empty($leaf['Cert'])) {
+			$parsed = @openssl_x509_parse($leaf['Cert']);
+			if (is_array($parsed)) {
+				if (isset($parsed['validTo_time_t'])) {
+					$result['days'] = intval(floor(($parsed['validTo_time_t'] - time()) / 86400));
+				}
+				if (isset($parsed['issuer']['O'])) {
+					$result['issuer'] = (string) $parsed['issuer']['O'];
+				} elseif (isset($parsed['issuer']['CN'])) {
+					$result['issuer'] = (string) $parsed['issuer']['CN'];
+				}
+			}
+		}
+
+		// Fall back to the "Issuer" field CURLINFO_CERTINFO sometimes exposes directly.
+		if ($result['issuer'] === '') {
+			foreach (array('Issuer', 'issuer') as $k) {
+				if (!empty($leaf[$k])) {
+					$raw = (string) $leaf[$k];
+					if (preg_match('~O\s*=\s*([^,/]+)~', $raw, $m)) {
+						$result['issuer'] = trim($m[1]);
+					} elseif (preg_match('~CN\s*=\s*([^,/]+)~', $raw, $m)) {
+						$result['issuer'] = trim($m[1]);
+					}
+					break;
+				}
+			}
+		}
+
+		if ($result['days'] === -1) {
+			$result['error'] = 'curl: unable to parse expiry';
+			return $result;
+		}
+
+		$result['ok'] = true;
+		return $result;
+	}
+
+	/**
+	 * Fallback SSL probe via raw stream_socket_client.
+	 */
+	private function get_ssl_expiry_via_stream($host, $timeout, $port = 443) {
+		$result = array('ok' => false, 'days' => -1, 'issuer' => '', 'error' => '', 'method' => 'stream');
+
+		if (!function_exists('stream_socket_client')) {
+			$result['error'] = 'stream_socket_client unavailable';
+			return $result;
+		}
+
+		$host_for_url = (strpos($host, ':') !== false && strpos($host, '[') === false) ? '[' . $host . ']' : $host;
 
 		$context = stream_context_create(array(
 			'ssl' => array(
@@ -297,29 +480,27 @@ class SiteGuard_Backup_Health_Monitor {
 			if ($msg === '') {
 				$msg = 'connection failed';
 			}
-			$result['error'] = 'connect failed: ' . $msg . ' (errno ' . intval($errno) . ')';
+			$result['error'] = 'stream: ' . $msg . ' (errno ' . intval($errno) . ')';
 			return $result;
 		}
 
-		// The 4th arg to stream_socket_client governs connect; apply a read timeout
-		// to cover the TLS handshake completion as well.
 		@stream_set_timeout($stream, $timeout);
 
 		$params = stream_context_get_params($stream);
 		fclose($stream);
 
 		if (!isset($params['options']['ssl']['peer_certificate'])) {
-			$result['error'] = 'no peer certificate returned';
+			$result['error'] = 'stream: no peer certificate returned';
 			return $result;
 		}
 
 		$cert = @openssl_x509_parse($params['options']['ssl']['peer_certificate']);
 		if (!$cert) {
-			$result['error'] = 'cert parse failed';
+			$result['error'] = 'stream: cert parse failed';
 			return $result;
 		}
 		if (!isset($cert['validTo_time_t'])) {
-			$result['error'] = 'cert missing expiry field';
+			$result['error'] = 'stream: cert missing expiry field';
 			return $result;
 		}
 
