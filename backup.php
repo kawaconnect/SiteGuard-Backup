@@ -270,6 +270,13 @@ class SiteGuard_Backup_Engine {
 		if ($entity === 'others') {
 			$excludes = array_merge($excludes, SiteGuard_Backup_Filesystem::wp_others_excludes());
 		}
+		// Apply entity-level excludes (e.g. wpcore excludes wp-content and wp-config.php).
+		// These are defined in get_backup_entities() and are a hard safety requirement,
+		// not user-configurable - wp-config.php contains DB credentials and salts and
+		// MUST never land in a backup archive.
+		if (!empty($entities_info[$entity]['excludes']) && is_array($entities_info[$entity]['excludes'])) {
+			$excludes = array_merge($excludes, $entities_info[$entity]['excludes']);
+		}
 
 		// Enumerate files - cache the list in a temp file to avoid re-scanning
 		// the entire directory tree on every resumption (saves ~2s per cycle on CIFS)
@@ -483,6 +490,22 @@ class SiteGuard_Backup_Engine {
 	private function add_to_zip($zip_path, $file_path, $archive_name, $file_size) {
 		// Guard against directories misreported as files (CIFS/SMB mounts)
 		if (is_dir($file_path)) return false;
+
+		// Hard security guard: NEVER allow wp-config.php into a backup archive.
+		// wp-config.php contains DB credentials and the 8 WP salts. Even if an
+		// entity-level exclude or a user setting is missing, this file must
+		// never end up in an sgbackup archive. Compared by basename against
+		// both the relative archive name and the absolute source path to
+		// catch custom ABSPATH layouts where wp-config.php lives one level up.
+		$base = basename($archive_name);
+		if ($base === 'wp-config.php' || basename($file_path) === 'wp-config.php') {
+			if (!isset($this->_zip_wpconfig_blocked)) $this->_zip_wpconfig_blocked = 0;
+			if ($this->_zip_wpconfig_blocked < 3) {
+				$this->sgbackup->log("Zip skip: wp-config.php blocked by security guard ({$file_path})", 'warning');
+				$this->_zip_wpconfig_blocked++;
+			}
+			return false;
+		}
 
 		$is_symlink = is_link($file_path);
 		$resolved = $is_symlink ? realpath($file_path) : $file_path;
