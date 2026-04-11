@@ -270,12 +270,43 @@ class SiteGuard_Backup_Engine {
 		if ($entity === 'others') {
 			$excludes = array_merge($excludes, SiteGuard_Backup_Filesystem::wp_others_excludes());
 		}
-		// Apply entity-level excludes (e.g. wpcore excludes wp-content and wp-config.php).
-		// These are defined in get_backup_entities() and are a hard safety requirement,
-		// not user-configurable - wp-config.php contains DB credentials and salts and
-		// MUST never land in a backup archive.
+		// Apply entity-level excludes declared in get_backup_entities()
+		// (e.g. wpcore excludes wp-content - plugins/themes/uploads/others
+		// have their own dedicated entities, so don't duplicate them here).
 		if (!empty($entities_info[$entity]['excludes']) && is_array($entities_info[$entity]['excludes'])) {
 			$excludes = array_merge($excludes, $entities_info[$entity]['excludes']);
+		}
+
+		// Context-aware wp-config.php handling for wpcore.
+		//
+		//   - Local-only backup (service == ['none']) → INCLUDE wp-config.php.
+		//     Operator is downloading the archive themselves and needs the DB
+		//     credentials, salts, and custom constants for disaster recovery.
+		//
+		//   - Remote upload (any configured service) → EXCLUDE wp-config.php.
+		//     The archive is leaving this server to land on S3, Dropbox,
+		//     Google Drive, FTP, etc. Third-party storage shouldn't hold
+		//     DB credentials or auth salts in cleartext.
+		//
+		// Operators who want the opposite behavior can filter the excludes
+		// list via sgbackup_exclude_files or use the sgbackup_backup_excludes
+		// filter below.
+		if ($entity === 'wpcore') {
+			$services = $this->sgbackup->jobdata_get('service', array('none'));
+			if (!is_array($services)) $services = array($services);
+			$has_remote = false;
+			foreach ($services as $svc) {
+				if ($svc !== 'none' && $svc !== '' && $svc !== null) {
+					$has_remote = true;
+					break;
+				}
+			}
+			if ($has_remote) {
+				$excludes[] = 'wp-config.php';
+				$this->sgbackup->log('wpcore: excluding wp-config.php - backup is destined for remote upload (' . implode(', ', $services) . '), will not ship credentials off-server');
+			} else {
+				$this->sgbackup->log('wpcore: including wp-config.php - local-only backup (disaster-recovery ready). Store the archive in a private location.');
+			}
 		}
 
 		// Enumerate files - cache the list in a temp file to avoid re-scanning
@@ -490,22 +521,6 @@ class SiteGuard_Backup_Engine {
 	private function add_to_zip($zip_path, $file_path, $archive_name, $file_size) {
 		// Guard against directories misreported as files (CIFS/SMB mounts)
 		if (is_dir($file_path)) return false;
-
-		// Hard security guard: NEVER allow wp-config.php into a backup archive.
-		// wp-config.php contains DB credentials and the 8 WP salts. Even if an
-		// entity-level exclude or a user setting is missing, this file must
-		// never end up in an sgbackup archive. Compared by basename against
-		// both the relative archive name and the absolute source path to
-		// catch custom ABSPATH layouts where wp-config.php lives one level up.
-		$base = basename($archive_name);
-		if ($base === 'wp-config.php' || basename($file_path) === 'wp-config.php') {
-			if (!isset($this->_zip_wpconfig_blocked)) $this->_zip_wpconfig_blocked = 0;
-			if ($this->_zip_wpconfig_blocked < 3) {
-				$this->sgbackup->log("Zip skip: wp-config.php blocked by security guard ({$file_path})", 'warning');
-				$this->_zip_wpconfig_blocked++;
-			}
-			return false;
-		}
 
 		$is_symlink = is_link($file_path);
 		$resolved = $is_symlink ? realpath($file_path) : $file_path;

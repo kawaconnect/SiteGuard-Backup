@@ -67,7 +67,11 @@ class SiteGuard_Backup_Filesystem {
 			'wpcore' => array(
 				'path'  => ABSPATH,
 				'label' => __('WordPress Core', 'siteguardbackup'),
-				'excludes' => array('wp-content', 'wp-config.php'),
+				// wp-content is handled by the plugins/themes/uploads/others entities - don't duplicate.
+				// wp-config.php IS included by design: for full disaster recovery you need the DB
+				// credentials, salts, and any custom constants it defines. Operators must treat
+				// the backup archive as sensitive and secure its storage location accordingly.
+				'excludes' => array('wp-content'),
 			),
 		);
 	}
