@@ -214,6 +214,7 @@ function sgbackup_check_schedule_missed() {
 	}
 }
 add_action('wp_loaded', 'sgbackup_check_schedule_missed');
+add_action('wp_loaded', 'sgbackup_ensure_health_cron');
 
 /**
  * Register cron action hooks (lightweight, always loaded).
@@ -260,8 +261,32 @@ function sgbackup_cron_backup_incremental() {
 
 function sgbackup_cron_health_check() {
 	sgbackup_load_classes();
+	$opts = SiteGuard_Backup_Options::instance();
+	if ( ! $opts->get_option( 'sgbackup_health_enabled', false ) ) {
+		return;
+	}
 	require_once SGBACKUP_DIR . 'includes/class-health-monitor.php';
 	SiteGuard_Backup_Health_Monitor::instance()->run_checks();
+}
+
+/**
+ * Self-healing: re-register the health check cron if it's enabled but missing.
+ * WordPress cron events can silently disappear (plugin updates, DB issues, etc).
+ */
+function sgbackup_ensure_health_cron() {
+	sgbackup_load_classes();
+	$opts = SiteGuard_Backup_Options::instance();
+	if ( ! $opts->get_option( 'sgbackup_health_enabled', false ) ) {
+		return;
+	}
+	if ( wp_next_scheduled( 'sgbackup_health_check' ) ) {
+		return; // Already scheduled, nothing to do
+	}
+	$interval = $opts->get_option( 'sgbackup_health_interval', 'every10min' );
+	wp_schedule_event( time() + 60, $interval, 'sgbackup_health_check' );
+	if ( function_exists( 'sgbackup_health_log' ) ) {
+		sgbackup_health_log( 'Re-registered missing health check cron (interval: ' . $interval . ')' );
+	}
 }
 
 function sgbackup_cron_backup_remotesend() {
