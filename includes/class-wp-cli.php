@@ -4088,7 +4088,7 @@ class SiteGuard_Backup_CLI_Command extends WP_CLI_Command {
             }
 
             if (isset($assoc_args['timeout'])) {
-                $timeout = max(2, min(30, intval($assoc_args['timeout'])));
+                $timeout = max(2, min(60, intval($assoc_args['timeout'])));
                 $opts->update_option('sgbackup_health_timeout', $timeout);
             }
 

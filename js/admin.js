@@ -3875,10 +3875,34 @@
 				counts[s.status] = (counts[s.status] || 0) + 1;
 				var statusClass = 'sgbackup-health-' + s.status;
 				var statusLabel = s.status.charAt(0).toUpperCase() + s.status.slice(1);
-				var sslText = s.ssl_expiry_days >= 0 ? s.ssl_expiry_days + ' days' : 'N/A';
+				var sslHttps = (s.url && s.url.indexOf('https://') === 0);
+				var sslError = s.ssl_error || '';
+				var sslStale = !!s.ssl_stale;
+				var sslText;
 				var sslClass = '';
-				if (s.ssl_expiry_days >= 0 && s.ssl_expiry_days <= 14) sslClass = ' style="color:#dc3232;font-weight:600;"';
-				else if (s.ssl_expiry_days >= 0 && s.ssl_expiry_days <= 30) sslClass = ' style="color:#dba617;font-weight:600;"';
+
+				if (s.ssl_expiry_days >= 0) {
+					sslText = s.ssl_expiry_days + ' days';
+					if (sslStale && s.ssl_last_success) {
+						sslText += ' (stale, last OK ' + new Date(s.ssl_last_success * 1000).toLocaleDateString() + ')';
+					} else if (sslStale) {
+						sslText += ' (stale)';
+					}
+					if (sslStale) {
+						sslClass = ' style="color:#dba617;font-weight:600;"';
+					} else if (s.ssl_expiry_days <= 14) {
+						sslClass = ' style="color:#dc3232;font-weight:600;"';
+					} else if (s.ssl_expiry_days <= 30) {
+						sslClass = ' style="color:#dba617;font-weight:600;"';
+					}
+				} else if (sslError) {
+					sslText = 'N/A - ' + this.esc(sslError);
+					sslClass = ' style="color:#dba617;font-weight:600;"';
+				} else if (!sslHttps) {
+					sslText = '-';
+				} else {
+					sslText = 'N/A';
+				}
 
 				var lastCheck = s.last_check ? new Date(s.last_check * 1000).toLocaleString() : 'Never';
 				var responseMs = Math.round(s.response_time * 1000);
@@ -3897,6 +3921,14 @@
 					html += '<tr><td colspan="7" style="color:#dc3232;padding-left:30px;">Error: ' + this.esc(s.error);
 					if (s.consecutive_failures > 1) html += ' (' + s.consecutive_failures + ' consecutive failures)';
 					html += '</td></tr>';
+				}
+
+				if (sslError && sslError !== s.error) {
+					var sslRow = 'SSL probe: ' + this.esc(sslError);
+					if (s.ssl_checked_at) {
+						sslRow += ' (' + new Date(s.ssl_checked_at * 1000).toLocaleString() + ')';
+					}
+					html += '<tr><td colspan="7" style="color:#dba617;padding-left:30px;font-size:11px;">' + sslRow + '</td></tr>';
 				}
 			}
 

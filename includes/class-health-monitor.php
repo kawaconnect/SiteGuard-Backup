@@ -48,6 +48,8 @@ class SiteGuard_Backup_Health_Monitor {
 		$deadline = microtime(true) + 55;
 
 		foreach ($targets as $target) {
+			$prev = isset($prev_map[$target['site_id']]) ? $prev_map[$target['site_id']] : null;
+
 			if (microtime(true) > $deadline) {
 				$result = array(
 					'site_id'            => $target['site_id'],
@@ -56,20 +58,25 @@ class SiteGuard_Backup_Health_Monitor {
 					'status'             => 'unknown',
 					'http_code'          => 0,
 					'response_time'      => 0,
-					'ssl_expiry_days'    => -1,
-					'ssl_issuer'         => '',
+					'ssl_expiry_days'    => isset($prev['ssl_expiry_days']) ? intval($prev['ssl_expiry_days']) : -1,
+					'ssl_issuer'         => isset($prev['ssl_issuer']) ? (string) $prev['ssl_issuer'] : '',
+					'ssl_ok'             => false,
+					'ssl_error'          => 'skipped: time budget exceeded',
+					'ssl_stale'          => true,
+					'ssl_last_success'   => isset($prev['ssl_last_success']) ? intval($prev['ssl_last_success']) : 0,
+					'ssl_checked_at'     => isset($prev['ssl_checked_at']) ? intval($prev['ssl_checked_at']) : 0,
 					'last_check'         => 0,
 					'error'              => 'Skipped: time budget exceeded',
-					'consecutive_failures' => isset($prev_map[$target['site_id']]) ? intval($prev_map[$target['site_id']]['consecutive_failures'] ?? 0) : 0,
+					'consecutive_failures' => $prev ? intval($prev['consecutive_failures'] ?? 0) : 0,
 					'check_method'       => 'skipped',
 				);
 				$results[] = $result;
 				continue;
 			}
 
-			$result = $this->check_site($target, $timeout, $ssl_warn);
+			$result = $this->check_site($target, $timeout, $ssl_warn, $prev);
 			// Track consecutive failures
-			$prev_failures = isset($prev_map[$target['site_id']]) ? intval($prev_map[$target['site_id']]['consecutive_failures'] ?? 0) : 0;
+			$prev_failures = $prev ? intval($prev['consecutive_failures'] ?? 0) : 0;
 			$result['consecutive_failures'] = ($result['status'] === 'down') ? $prev_failures + 1 : 0;
 			$results[] = $result;
 		}
@@ -89,7 +96,7 @@ class SiteGuard_Backup_Health_Monitor {
 	 * SSL: connects to the public domain on port 443 to capture the
 	 * certificate users actually see (including Cloudflare edge certs).
 	 */
-	private function check_site($target, $timeout, $ssl_warn_days) {
+	private function check_site($target, $timeout, $ssl_warn_days, $prev = null) {
 		$url = $target['url'];
 		$site_id = $target['site_id'];
 		$domain = wp_parse_url($url, PHP_URL_HOST);
@@ -104,6 +111,11 @@ class SiteGuard_Backup_Health_Monitor {
 			'response_time'   => 0,
 			'ssl_expiry_days' => -1,
 			'ssl_issuer'      => '',
+			'ssl_ok'          => false,
+			'ssl_error'       => '',
+			'ssl_stale'       => false,
+			'ssl_last_success' => 0,
+			'ssl_checked_at'  => 0,
 			'last_check'      => time(),
 			'error'           => '',
 			'check_method'    => 'unknown',
@@ -176,15 +188,41 @@ class SiteGuard_Backup_Health_Monitor {
 
 		// ---- SSL certificate check (external, to public domain) ----
 		if ($domain && $scheme === 'https') {
-			$ssl = $this->get_ssl_expiry($domain);
-			$result['ssl_expiry_days'] = $ssl['days'];
-			$result['ssl_issuer'] = $ssl['issuer'];
+			$ssl = $this->get_ssl_expiry($domain, $timeout);
+			$result['ssl_checked_at'] = time();
 
-			if ($ssl['days'] !== -1 && $ssl['days'] <= 0) {
-				$result['status'] = 'down';
-				$result['error'] = $result['error'] ? $result['error'] . '; SSL expired' : 'SSL certificate expired';
-			} elseif ($ssl['days'] > 0 && $ssl['days'] <= $ssl_warn_days && $result['status'] === 'operational') {
-				$result['status'] = 'degraded';
+			if (!empty($ssl['ok'])) {
+				// Fresh successful probe: write new values
+				$result['ssl_expiry_days']  = intval($ssl['days']);
+				$result['ssl_issuer']       = (string) $ssl['issuer'];
+				$result['ssl_ok']           = true;
+				$result['ssl_stale']        = false;
+				$result['ssl_error']        = '';
+				$result['ssl_last_success'] = time();
+
+				// Only escalate status based on fresh cert data
+				if ($ssl['days'] !== -1 && $ssl['days'] <= 0) {
+					$result['status'] = 'down';
+					$result['error'] = $result['error'] ? $result['error'] . '; SSL expired' : 'SSL certificate expired';
+				} elseif ($ssl['days'] > 0 && $ssl['days'] <= $ssl_warn_days && $result['status'] === 'operational') {
+					$result['status'] = 'degraded';
+				}
+			} else {
+				// Probe failed: carry forward last-known-good data if we have any
+				if ($prev && isset($prev['ssl_expiry_days']) && intval($prev['ssl_expiry_days']) >= 0) {
+					$result['ssl_expiry_days']  = intval($prev['ssl_expiry_days']);
+					$result['ssl_issuer']       = isset($prev['ssl_issuer']) ? (string) $prev['ssl_issuer'] : '';
+					$result['ssl_last_success'] = isset($prev['ssl_last_success']) ? intval($prev['ssl_last_success']) : 0;
+				}
+				$result['ssl_ok']    = false;
+				$result['ssl_stale'] = true;
+				$result['ssl_error'] = (string) $ssl['error'];
+
+				// Probe failure degrades (amber) but never marks site down - HTTP drives down.
+				// Don't downgrade an already-down site either.
+				if ($result['status'] === 'operational') {
+					$result['status'] = 'degraded';
+				}
 			}
 		}
 
@@ -215,9 +253,23 @@ class SiteGuard_Backup_Health_Monitor {
 	/**
 	 * Get SSL certificate expiry info for a host.
 	 * Connects to the public domain to see the cert users see (including Cloudflare edge certs).
+	 *
+	 * Returns ['ok' => bool, 'days' => int, 'issuer' => string, 'error' => string].
+	 * On failure, 'ok' is false and 'error' contains a human-readable reason.
 	 */
-	private function get_ssl_expiry($host, $port = 443) {
-		$result = array('days' => -1, 'issuer' => '');
+	private function get_ssl_expiry($host, $timeout, $port = 443) {
+		$result = array('ok' => false, 'days' => -1, 'issuer' => '', 'error' => '');
+
+		if (!function_exists('stream_socket_client') || !function_exists('openssl_x509_parse')) {
+			$result['error'] = 'openssl/stream extension missing';
+			return $result;
+		}
+
+		// Bracket IPv6 literals for the ssl:// URL syntax.
+		$host_for_url = (strpos($host, ':') !== false && strpos($host, '[') === false) ? '[' . $host . ']' : $host;
+
+		// Clamp timeout to sane bounds and keep it an integer for stream_socket_client.
+		$timeout = max(2, min(120, intval($timeout)));
 
 		$context = stream_context_create(array(
 			'ssl' => array(
@@ -232,27 +284,42 @@ class SiteGuard_Backup_Health_Monitor {
 		$errno = 0;
 		$errstr = '';
 		$stream = @stream_socket_client(
-			'ssl://' . $host . ':' . $port,
+			'ssl://' . $host_for_url . ':' . $port,
 			$errno,
 			$errstr,
-			5,
+			$timeout,
 			STREAM_CLIENT_CONNECT,
 			$context
 		);
 
 		if (!$stream) {
+			$msg = trim((string) $errstr);
+			if ($msg === '') {
+				$msg = 'connection failed';
+			}
+			$result['error'] = 'connect failed: ' . $msg . ' (errno ' . intval($errno) . ')';
 			return $result;
 		}
+
+		// The 4th arg to stream_socket_client governs connect; apply a read timeout
+		// to cover the TLS handshake completion as well.
+		@stream_set_timeout($stream, $timeout);
 
 		$params = stream_context_get_params($stream);
 		fclose($stream);
 
 		if (!isset($params['options']['ssl']['peer_certificate'])) {
+			$result['error'] = 'no peer certificate returned';
 			return $result;
 		}
 
-		$cert = openssl_x509_parse($params['options']['ssl']['peer_certificate']);
-		if (!$cert || !isset($cert['validTo_time_t'])) {
+		$cert = @openssl_x509_parse($params['options']['ssl']['peer_certificate']);
+		if (!$cert) {
+			$result['error'] = 'cert parse failed';
+			return $result;
+		}
+		if (!isset($cert['validTo_time_t'])) {
+			$result['error'] = 'cert missing expiry field';
 			return $result;
 		}
 
@@ -264,6 +331,7 @@ class SiteGuard_Backup_Health_Monitor {
 			$result['issuer'] = $cert['issuer']['CN'];
 		}
 
+		$result['ok'] = true;
 		return $result;
 	}
 

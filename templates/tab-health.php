@@ -40,10 +40,10 @@ $next_check = wp_next_scheduled('sgbackup_health_check');
 			</td>
 		</tr>
 		<tr>
-			<th scope="row"><?php esc_html_e('HTTP Timeout', 'siteguardbackup'); ?></th>
+			<th scope="row"><?php esc_html_e('Health Check Timeout', 'siteguardbackup'); ?></th>
 			<td>
-				<input type="number" id="sgbackup-health-timeout" value="<?php echo esc_attr($health_timeout); ?>" min="2" max="30" class="small-text" />
-				<?php esc_html_e('seconds', 'siteguardbackup'); ?>
+				<input type="number" id="sgbackup-health-timeout" value="<?php echo esc_attr($health_timeout); ?>" min="2" max="60" class="small-text" />
+				<?php esc_html_e('seconds (applies to both HTTP and SSL probes)', 'siteguardbackup'); ?>
 			</td>
 		</tr>
 		<tr>
