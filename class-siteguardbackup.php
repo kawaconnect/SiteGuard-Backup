@@ -1375,7 +1375,10 @@ class SiteGuard_Backup {
 				}
 			}
 			if (!empty($entity_files)) {
-				$backup_data[$entity] = $entity_files;
+				// Defense in depth: dedupe here too, so historical jobdata with
+				// duplicates (from before the create_zips fix) still lands as a
+				// clean history entry.
+				$backup_data[$entity] = array_values(array_unique($entity_files));
 			}
 		}
 

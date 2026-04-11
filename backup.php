@@ -197,7 +197,11 @@ class SiteGuard_Backup_Engine {
 			}
 
 			if (is_array($result) && !empty($result)) {
-				$backup_files_array = array_merge($backup_files_array, $result);
+				// Deduplicate: if the entity went through mid-entity resumption,
+				// the same zip filename was already persisted to jobdata during
+				// the partial pass, and backup_entity() returns it again on the
+				// completing pass. Merging naively would list the file twice.
+				$backup_files_array = array_values(array_unique(array_merge($backup_files_array, $result)));
 				$entities[$entity]['status'] = 'complete';
 				$this->sgbackup->log("Entity {$entity} complete: " . count($result) . " zip file(s)");
 			} elseif ($result === true) {
