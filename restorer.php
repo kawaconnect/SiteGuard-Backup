@@ -1261,6 +1261,29 @@ class SiteGuard_Backup_Restorer {
 			$result['messages'][] = "Remediation: " . count($remediation['unmet_plugins']) . " plugin(s) / " . (empty($remediation['unmet_theme']) ? 0 : 1) . " theme(s) on the source are not installed on this network.";
 		}
 
+		// Step 8.5: Serialized-length repair safety net. Any upstream corruption
+		// that changed string byte lengths without updating the s:N:"…" prefix
+		// (e.g. old v1.4.9 percent-doubling bug, or future bugs we haven't
+		// discovered yet) breaks PHP's unserialize() and WordPress silently
+		// substitutes defaults. Walk text columns on the target subsite tables,
+		// repair where possible, report where not.
+		$repair_report = $this->repair_serialized_lengths(array(
+			$target_prefix . 'options',
+			$target_prefix . 'postmeta',
+			$target_prefix . 'posts',
+		));
+		if ($repair_report['broken'] > 0) {
+			$this->sgbackup->log(sprintf(
+				'Serialized-length repair: scanned %d rows, %d broken blobs found, %d fixed, %d still broken',
+				$repair_report['scanned'], $repair_report['broken'], $repair_report['fixed'], $repair_report['broken'] - $repair_report['fixed']
+			));
+			if (!empty($repair_report['still_broken'])) {
+				foreach ($repair_report['still_broken'] as $ref) {
+					$this->sgbackup->log("Serialized-length repair: still broken after repair: {$ref}", 'warning');
+				}
+			}
+		}
+
 		// Step 9: Invalidate caches that are now stale. rewrite_rules holds
 		// baked-in paths; Elementor caches CSS keyed by post/URL; object cache
 		// may be serving pre-restore option_values. WordPress rebuilds all of
@@ -1275,6 +1298,21 @@ class SiteGuard_Backup_Restorer {
 		}
 		if (function_exists('clean_blog_cache')) {
 			clean_blog_cache($target_id);
+		}
+
+		// Step 9.5: HTTP smoke test. Fetch the restored subsite's URL over
+		// HTTP and assert: 200, no WordPress "critical error" string, no
+		// residual host-escape token, no source domain leakage. Any failure
+		// here is surfaced as a remediation warning (not a hard error - the
+		// admin's server config might prevent a self-referential loopback).
+		$smoke_errors = $this->http_smoke_test_subsite($target_url_base, $old_domain);
+		foreach ($smoke_errors as $msg) {
+			$this->sgbackup->log("[Smoke test] {$msg}", 'warning');
+			if (defined('DOING_AJAX') && DOING_AJAX) {
+				echo 'RINFO:' . json_encode(array('type' => 'warning', 'message' => $msg)) . "\n";
+				if (ob_get_level()) @ob_flush();
+				@flush();
+			}
 		}
 
 		// Step 10: Validation sweep. Check for lingering tokens, lingering
@@ -1366,45 +1404,87 @@ class SiteGuard_Backup_Restorer {
 
 		// Also consider the source's active_sitewide_plugins reported in backup
 		// metadata (if sender was updated to transmit it). These are
-		// network-activated plugins the source relied on.
+		// network-activated plugins the source relied on. On a per-subsite
+		// import these WILL NOT be in the imported wp_N_options.active_plugins
+		// (they live in wp_sitemeta on the source) - meaning the restored
+		// subsite comes up with zero plugins enabled unless we explicitly
+		// reconstruct the active set here.
 		$source_network_plugins = array();
 		if (!empty($this->backup_set['subsite_active_sitewide_plugins']) && is_array($this->backup_set['subsite_active_sitewide_plugins'])) {
 			$source_network_plugins = array_values(array_map('strval', $this->backup_set['subsite_active_sitewide_plugins']));
 		}
 
+		// Build the set of plugins that the source subsite effectively had
+		// running: its own active_plugins PLUS every network-active plugin.
 		$all_source = array_values(array_unique(array_merge($source_plugins, $source_network_plugins)));
 
-		// Check each plugin file exists on the destination
-		$kept = array();
-		foreach ($source_plugins as $p) {
-			$path = WP_PLUGIN_DIR . '/' . $p;
-			if (file_exists($path)) {
-				$kept[] = $p;
-			}
-		}
-		// Plugins that are neither on disk nor network-activated on destination
+		// Destination's network-active set - we do NOT per-subsite-activate
+		// plugins that are already network-active on the destination; they're
+		// already running for every subsite.
 		$destination_network = array();
 		if (is_multisite() && function_exists('get_site_option')) {
 			$dn = get_site_option('active_sitewide_plugins', array());
 			if (is_array($dn)) $destination_network = array_keys($dn);
 		}
+
+		// Activation policy: for each source plugin, if it exists on disk and
+		// is not network-active on destination, activate it per-subsite. Track
+		// the unmet ones (not on disk and not network-active) for remediation.
+		$to_activate_on_subsite = array();
 		foreach ($all_source as $p) {
 			$path = WP_PLUGIN_DIR . '/' . $p;
-			if (!file_exists($path) && !in_array($p, $destination_network, true)) {
+			$on_disk = file_exists($path);
+			$already_netwide = in_array($p, $destination_network, true);
+			if ($on_disk && !$already_netwide) {
+				$to_activate_on_subsite[] = $p;
+			} elseif (!$on_disk && !$already_netwide) {
 				$out['unmet_plugins'][] = $p;
 			}
 		}
-		$out['kept_plugins'] = $kept;
+		$out['kept_plugins'] = $to_activate_on_subsite;
 
-		// Write back the pruned intersection so the subsite doesn't try to boot
-		// plugins that don't exist on disk (those would fatal in a stock install).
-		if ($source_plugins !== $kept) {
+		// Write the reconstructed active_plugins list to the target subsite.
+		// Do this unconditionally when we have a non-empty set - even if the
+		// imported option already has values, those values came from the
+		// source's subsite-level list which misses network-activated plugins.
+		if (!empty($to_activate_on_subsite) || $source_plugins !== $to_activate_on_subsite) {
 			$wpdb->update(
 				$target_prefix . 'options',
-				array('option_value' => serialize($kept)),
+				array('option_value' => serialize(array_values(array_unique($to_activate_on_subsite)))),
 				array('option_name' => 'active_plugins')
 			);
-			$this->sgbackup->log("active_plugins reconciled for blog #{$target_id}: kept " . count($kept) . "/" . count($source_plugins) . " (dropped " . implode(', ', array_diff($source_plugins, $kept)) . ')');
+			$diff = array_values(array_diff($all_source, $to_activate_on_subsite, $destination_network));
+			$this->sgbackup->log(sprintf(
+				"active_plugins reconciled for blog #%d: activating %d per-subsite (%s); %d already network-active on destination; %d unmet (%s)",
+				$target_id,
+				count($to_activate_on_subsite),
+				implode(', ', $to_activate_on_subsite) ?: '-',
+				count(array_intersect($all_source, $destination_network)),
+				count($out['unmet_plugins']),
+				implode(', ', $out['unmet_plugins']) ?: '-'
+			));
+		}
+
+		// Elementor 3.35+ has an upstream bug: the dashboard-widget module's
+		// init calls the unnamespaced is_plugin_active() on frontend page
+		// loads, but that function lives in wp-admin/includes/plugin.php which
+		// isn't loaded on frontend by default. Sites that happen to have
+		// *another* plugin require()ing that file at bootstrap paper over the
+		// bug; a clean subsite with only Elementor active does not - it emits
+		// a WSOD on every frontend request.
+		//
+		// Drop a 3-line mu-plugin that preloads the admin plugin API whenever
+		// Elementor is being activated per-subsite or is network-active. The
+		// shim is a no-op on admin requests (already loaded) and adds
+		// microseconds to frontend boot. Idempotent: skipped if already
+		// present.
+		$has_elementor =
+			in_array('elementor/elementor.php', $to_activate_on_subsite, true) ||
+			in_array('elementor-pro/elementor-pro.php', $to_activate_on_subsite, true) ||
+			in_array('elementor/elementor.php', $destination_network, true) ||
+			in_array('elementor-pro/elementor-pro.php', $destination_network, true);
+		if ($has_elementor) {
+			$this->ensure_elementor_plugin_api_shim();
 		}
 
 		// Verify active theme exists; if not, record as unmet
@@ -1417,6 +1497,101 @@ class SiteGuard_Backup_Restorer {
 		}
 
 		return $out;
+	}
+
+	/**
+	 * Fetch the restored subsite URL and surface obvious trouble markers.
+	 * Uses WP's HTTP API with sslverify=false so self-signed / staging certs
+	 * don't derail the test. Short timeout so a hung request doesn't stall
+	 * the restore. Returns an array of warning messages (empty = clean).
+	 */
+	private function http_smoke_test_subsite($target_url_base, $old_domain) {
+		$msgs = array();
+		$url = $target_url_base ? (rtrim($target_url_base, '/') . '/') : '';
+		if (empty($url) || !function_exists('wp_remote_get')) return $msgs;
+
+		$resp = wp_remote_get($url, array(
+			'timeout'     => 12,
+			'redirection' => 3,
+			'sslverify'   => false,
+			'headers'     => array('Cache-Control' => 'no-cache'),
+			'user-agent'  => 'SiteGuardBackup/RestoreSmokeTest',
+		));
+		if (is_wp_error($resp)) {
+			$msgs[] = sprintf('Smoke test could not fetch %s (%s). Verify locally after the restore completes.', $url, $resp->get_error_message());
+			return $msgs;
+		}
+		$code = wp_remote_retrieve_response_code($resp);
+		$body = (string) wp_remote_retrieve_body($resp);
+
+		if ($code < 200 || $code >= 400) {
+			$msgs[] = sprintf('Smoke test: %s returned HTTP %d - restored subsite may not be reachable yet (DNS, SSL, or server config).', $url, $code);
+		}
+		if (stripos($body, 'There has been a critical error on this website') !== false) {
+			$msgs[] = sprintf('Smoke test: %s rendered WordPress fatal error page. Check PHP error log for the restored subsite.', $url);
+		}
+		if (preg_match('/\{[0-9a-f]{64}\}/', $body)) {
+			$msgs[] = sprintf('Smoke test: %s response still contains a host-escape token ({64-hex}). Token sweep likely missed a table.', $url);
+		}
+		// %% in HTML is suspicious - Yoast %%sep%% only appears inside <title>
+		// before template rendering; after rendering there should be zero. We
+		// allow a small threshold before flagging to avoid false positives on
+		// plugins that legitimately emit inline <style> with escaped percents.
+		$pct_pct_count = substr_count($body, '%%');
+		if ($pct_pct_count > 3) {
+			$msgs[] = sprintf('Smoke test: %s body contains %d instances of "%%%%" - likely the percent-doubling regression in text output.', $url, $pct_pct_count);
+		}
+		if (!empty($old_domain) && stripos($body, $old_domain) !== false) {
+			$msgs[] = sprintf('Smoke test: %s body still references source domain %s - search-replace missed something.', $url, $old_domain);
+		}
+		if (empty($msgs)) {
+			$this->sgbackup->log("Smoke test passed for {$url} (HTTP {$code}, no trouble markers)");
+		}
+		return $msgs;
+	}
+
+	/**
+	 * Drop an mu-plugin that preloads wp-admin/includes/plugin.php so the
+	 * unnamespaced is_plugin_active() / get_plugins() / is_plugin_active_for_network()
+	 * helpers are available on frontend page loads. This works around an
+	 * upstream Elementor 3.35+ bug that fatals on frontend when no other
+	 * plugin happens to have require()'d the admin plugin API already.
+	 *
+	 * Idempotent: no-op if an mu-plugin with our marker is already present.
+	 */
+	private function ensure_elementor_plugin_api_shim() {
+		if (!defined('WPMU_PLUGIN_DIR')) {
+			$mu_dir = (defined('WP_CONTENT_DIR') ? WP_CONTENT_DIR : ABSPATH . 'wp-content') . '/mu-plugins';
+		} else {
+			$mu_dir = WPMU_PLUGIN_DIR;
+		}
+		$target = $mu_dir . '/sgbackup-plugin-api-preload.php';
+		if (file_exists($target)) {
+			return; // already installed
+		}
+		if (!is_dir($mu_dir)) {
+			if (!wp_mkdir_p($mu_dir)) {
+				$this->sgbackup->log("Could not create mu-plugins dir at {$mu_dir}; Elementor is_plugin_active shim skipped.", 'warning');
+				return;
+			}
+		}
+		$body = "<?php\n"
+			. "/*\n"
+			. " * Plugin Name: SiteGuard Backup - plugin.php preload\n"
+			. " * Description: Loads wp-admin/includes/plugin.php on every request so plugins that call is_plugin_active() / get_plugins() on the frontend (e.g. Elementor 3.35+) don't fatal. Dropped by SiteGuard Backup during subsite restore.\n"
+			. " * Author: SiteGuard Backup\n"
+			. " * Version: 1.0.0\n"
+			. " */\n"
+			. "if (!defined('ABSPATH')) { return; }\n"
+			. "if (!function_exists('is_plugin_active')) {\n"
+			. "    require_once ABSPATH . 'wp-admin/includes/plugin.php';\n"
+			. "}\n";
+		$bytes = @file_put_contents($target, $body);
+		if ($bytes === false) {
+			$this->sgbackup->log("Could not write Elementor plugin-api shim at {$target}", 'warning');
+		} else {
+			$this->sgbackup->log("Installed Elementor plugin-api shim at {$target} ({$bytes} bytes) - preloads wp-admin/includes/plugin.php on every request to work around Elementor 3.35+ frontend fatal.");
+		}
 	}
 
 	private function emit_remediation_notice($remediation, $target_domain) {
@@ -1535,7 +1710,152 @@ class SiteGuard_Backup_Restorer {
 			}
 		}
 
+		// 5. Percent-doubling check: if any row has `%%` in a place where it
+		// almost certainly shouldn't (permalink_structure, known CSS options),
+		// flag it. Yoast and a few plugins legitimately store `%%sep%%` style
+		// placeholders, so we allowlist those - they're always `%%TOKEN%%`
+		// with an alpha/underscore token between the pairs.
+		$percent_fields_to_check = array(
+			array('option_name' => 'permalink_structure', 'expect_no' => true),
+		);
+		foreach ($percent_fields_to_check as $check) {
+			$v = $wpdb->get_var($wpdb->prepare(
+				"SELECT option_value FROM {$target_prefix}options WHERE option_name = %s",
+				$check['option_name']
+			));
+			if ($v !== null && $v !== '' && strpos($v, '%%') !== false && !empty($check['expect_no'])) {
+				$errors[] = sprintf(
+					'%soptions.%s contains "%%%%" (value: %s). This is the %%%%-doubling regression - run repair_serialized_lengths and a %%%%->%% sweep.',
+					$target_prefix, $check['option_name'], $v
+				);
+			}
+		}
+
+		// 6. Sweep a sample of posts/postmeta/options for stray %% that is NOT
+		// a Yoast-style %%token%% pair. The count is capped to avoid scanning
+		// the entire DB; we just want a signal.
+		$scan_tables = array(
+			$target_prefix . 'options',
+			$target_prefix . 'postmeta',
+			$target_prefix . 'posts',
+		);
+		$stray_count = 0;
+		foreach ($scan_tables as $tbl) {
+			$safe = SiteGuard_Backup_Database_Utility::sanitize_table_name($tbl);
+			if (!$safe) continue;
+			if (!$wpdb->get_var($wpdb->prepare("SHOW TABLES LIKE %s", $safe))) continue;
+			$cols = $wpdb->get_results("DESCRIBE `{$safe}`", ARRAY_A);
+			foreach ($cols as $col) {
+				$type = strtolower($col['Type']);
+				if (!preg_match('/text|longtext|mediumtext|varchar/i', $type)) continue;
+				$colname = str_replace('`', '``', $col['Field']);
+				$rows = $wpdb->get_col("SELECT `{$colname}` FROM `{$safe}` WHERE `{$colname}` LIKE '%\\%\\%%' LIMIT 20");
+				foreach ($rows as $v) {
+					if (!is_string($v)) continue;
+					// Strip Yoast-style %%alpha_underscore%% tokens and see if %% remains.
+					$stripped = preg_replace('/%%[a-z_]+(?:\([^)]*\))?%%/i', '', $v);
+					if (strpos($stripped, '%%') !== false) {
+						$stray_count++;
+						if ($stray_count <= 3) {
+							$errors[] = sprintf(
+								'Stray "%%%%" found in %s.%s: %s (first 80 chars). Likely the percent-doubling regression.',
+								$tbl, $col['Field'], substr($v, 0, 80)
+							);
+						}
+					}
+				}
+				if ($stray_count > 20) break 2;
+			}
+		}
+		if ($stray_count > 3) {
+			$errors[] = sprintf('...and %d more stray %%%% occurrences across %s.', $stray_count - 3, implode(', ', $scan_tables));
+		}
+
 		return $errors;
+	}
+
+	/**
+	 * Walk text columns on the provided tables, find serialized blobs whose
+	 * `s:N:"..."` length prefix no longer matches the payload (a common fallout
+	 * of upstream bugs that change byte lengths without re-serializing), and
+	 * repair them. Returns a scanned/broken/fixed counts summary.
+	 *
+	 * Repair strategy is the "naive regex" approach: recompute N based on what
+	 * the non-greedy regex matches as the string content. This correctly fixes
+	 * the vast majority of cases (Elementor kits, plugin options, widget blobs,
+	 * theme mods). It fails only when the string content itself contains the
+	 * literal byte sequence `";` - those rows are reported as still-broken so
+	 * the admin can inspect.
+	 */
+	private function repair_serialized_lengths($tables) {
+		global $wpdb;
+		$report = array('scanned' => 0, 'broken' => 0, 'fixed' => 0, 'still_broken' => array());
+
+		foreach ($tables as $table) {
+			$safe = SiteGuard_Backup_Database_Utility::sanitize_table_name($table);
+			if (!$safe) continue;
+			if (!$wpdb->get_var($wpdb->prepare("SHOW TABLES LIKE %s", $safe))) continue;
+
+			$cols = $wpdb->get_results("DESCRIBE `{$safe}`", ARRAY_A);
+			$pk_col = null;
+			foreach ($cols as $col) {
+				if ($col['Key'] === 'PRI') { $pk_col = $col['Field']; break; }
+			}
+			if (!$pk_col) continue;
+
+			foreach ($cols as $col) {
+				$type = strtolower($col['Type']);
+				if (!preg_match('/text|longtext|mediumtext/i', $type)) continue;
+				$colname = $col['Field'];
+				$esc_pk  = str_replace('`', '``', $pk_col);
+				$esc_col = str_replace('`', '``', $colname);
+
+				// Pull rows that LOOK serialized. LIKE with binary-safe prefixes.
+				$rows = $wpdb->get_results(
+					"SELECT `{$esc_pk}` AS pk, `{$esc_col}` AS val FROM `{$safe}`" .
+					" WHERE `{$esc_col}` LIKE 'a:%' OR `{$esc_col}` LIKE 's:%' OR `{$esc_col}` LIKE 'O:%'",
+					ARRAY_A
+				);
+				foreach ($rows as $row) {
+					$report['scanned']++;
+					$val = (string) $row['val'];
+					if ($val === '') continue;
+					// Must start with a serialization token
+					if (!preg_match('/^[asOibdNrR]:/', $val)) continue;
+					// Native unserialize first; if it passes, nothing to repair.
+					$ok = @unserialize($val);
+					if ($ok !== false || $val === 'b:0;') continue;
+
+					$report['broken']++;
+					$repaired = $this->repair_serialized_blob($val);
+					if ($repaired !== false && $repaired !== $val && @unserialize($repaired) !== false) {
+						$report['fixed']++;
+						$wpdb->update($safe, array($colname => $repaired), array($pk_col => $row['pk']));
+					} else {
+						$report['still_broken'][] = "{$safe}#{$row['pk']}.{$colname}";
+					}
+				}
+			}
+		}
+		return $report;
+	}
+
+	/**
+	 * Recompute s:N:"…" length prefixes based on the regex-matched string
+	 * content. Not rigorous - fails on strings that contain the bytes `";` -
+	 * but idempotent and safe: if the result fails to unserialize, the caller
+	 * discards it and reports still_broken.
+	 */
+	private function repair_serialized_blob($blob) {
+		if (!is_string($blob) || $blob === '') return false;
+		$repaired = preg_replace_callback(
+			'/s:\d+:"(.*?)";/s',
+			function ($m) {
+				return 's:' . strlen($m[1]) . ':"' . $m[1] . '";';
+			},
+			$blob
+		);
+		return $repaired;
 	}
 
 	/**

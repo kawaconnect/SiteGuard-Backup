@@ -170,24 +170,20 @@ class SiteGuard_Backup_Search_Replace {
 				// In dry-run mode, count what would change without writing
 				$this->report['updates']++;
 			} else {
-				$set_clauses = array();
-				$values = array();
-
-				foreach ($updates as $col => $val) {
-					$escaped_col = str_replace('`', '``', $col);
-					$set_clauses[] = "`{$escaped_col}` = %s";
-					$values[] = $val;
-				}
-
-				$values[] = $row[$primary_key];
-				$escaped_pk = str_replace('`', '``', $primary_key);
-				$sql = "UPDATE `{$escaped_table}` SET " . implode(', ', $set_clauses) . " WHERE `{$escaped_pk}` = %s LIMIT 1";
-
-				// Escape literal % in values so wpdb::prepare() doesn't mangle them
-				$escaped_values = array_map(function($v) {
-					return is_string($v) ? str_replace('%', '%%', $v) : $v;
-				}, $values);
-				$result = $wpdb->query($wpdb->prepare($sql, $escaped_values));
+				// Use wpdb::update() with raw values. DO NOT pre-escape %.
+				//
+				// History: earlier versions did str_replace('%', '%%', $v) here
+				// on the theory that wpdb::prepare() would interpret % in value
+				// arguments as format specifiers. It does not - vsprintf leaves
+				// % in the substituted value verbatim, and prepare()'s
+				// placeholder-escape round-trip preserves it. Pre-escaping here
+				// caused every % in every touched cell to double on write
+				// (`100%` → `100%%`, `/%postname%/` → `/%%postname%%/`,
+				// Yoast `%%sep%%` → `%%%%sep%%%%`). Entire tables of CSS
+				// percentages, permalinks, and Yoast title formats were corrupted
+				// at once. See 2026-04-16 postmortem for blast radius.
+				$where = array($primary_key => $row[$primary_key]);
+				$result = $wpdb->update($table, $updates, $where);
 
 				if (false === $result) {
 					$this->report['errors'][] = "Error updating {$table}.{$primary_key}={$row[$primary_key]}: " . $wpdb->last_error;
