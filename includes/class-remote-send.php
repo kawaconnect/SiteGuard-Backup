@@ -484,6 +484,10 @@ class SiteGuard_Backup_Remote_Send {
 			$history[$target_ts]['is_subsite_backup'] = true;
 			$history[$target_ts]['subsite_blog_id'] = isset($data['subsite_blog_id']) ? intval($data['subsite_blog_id']) : 0;
 			$history[$target_ts]['subsite_domain'] = isset($data['subsite_domain']) ? sanitize_text_field($data['subsite_domain']) : '';
+			$history[$target_ts]['subsite_path']   = isset($data['subsite_path']) ? sanitize_text_field($data['subsite_path']) : '/';
+			$history[$target_ts]['subsite_url']    = isset($data['subsite_url']) ? esc_url_raw($data['subsite_url']) : '';
+			$history[$target_ts]['subsite_home_url'] = isset($data['subsite_home_url']) ? esc_url_raw($data['subsite_home_url']) : '';
+			$history[$target_ts]['subsite_scheme']   = isset($data['subsite_scheme']) && in_array($data['subsite_scheme'], array('http', 'https'), true) ? $data['subsite_scheme'] : '';
 			$changed = true;
 		}
 

@@ -1197,9 +1197,9 @@
 
 				// Detect subsite backup and show import UI with subsite picker
 				if (data.is_subsite_backup && sgbackup_settings.is_multisite) {
-					var srcLabel = data.subsite_domain || ('blog #' + data.subsite_blog_id);
-					html += '<tr><td><strong>Subsite backup:</strong></td><td>' + SGB.esc(srcLabel) + '</td></tr>';
-					$('#sgbackup-subsite-import-notice').text('This is a per-subsite backup from ' + srcLabel + '. Select which subsite to restore it into:');
+					var srcLabel = data.subsite_url || data.subsite_domain || ('blog #' + data.subsite_blog_id);
+					html += '<tr><td><strong>Subsite backup source:</strong></td><td>' + SGB.esc(srcLabel) + ' (blog #' + parseInt(data.subsite_blog_id || 0) + ')</td></tr>';
+					$('#sgbackup-subsite-import-notice').text('This is a per-subsite backup from ' + srcLabel + '. Select which subsite to restore it into - all URLs containing the source domain will be rewritten to the destination.');
 
 					// Populate the subsite picker dropdown
 					var $sel = $('#sgbackup-target-subsite-select');

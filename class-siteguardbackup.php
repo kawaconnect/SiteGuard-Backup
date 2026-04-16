@@ -702,6 +702,16 @@ class SiteGuard_Backup {
 			$initial_jobdata['subsite_blog_id'] = $blog_id;
 			$initial_jobdata['subsite_domain'] = $blog_details ? $blog_details->domain : '';
 			$initial_jobdata['subsite_path'] = $blog_details ? $blog_details->path : '/';
+
+			// Capture the subsite's full siteurl/home while we're guaranteed to be
+			// in the subsite's context. Later stages (remote upload, history write)
+			// can run on main-site cron context where site_url() would return the
+			// wrong URL. Use get_blog_option() for an unambiguous per-blog read.
+			$sub_siteurl = get_blog_option($blog_id, 'siteurl');
+			$sub_home = get_blog_option($blog_id, 'home');
+			$initial_jobdata['subsite_url'] = $sub_siteurl ? $sub_siteurl : '';
+			$initial_jobdata['subsite_home_url'] = $sub_home ? $sub_home : '';
+			$initial_jobdata['subsite_scheme'] = $sub_siteurl ? parse_url($sub_siteurl, PHP_URL_SCHEME) : '';
 		}
 
 		// Merge any extra jobdata (e.g., from migrate_send pre-setting phase flags)
@@ -1199,6 +1209,10 @@ class SiteGuard_Backup {
 		$is_subsite_backup = $this->jobdata_get('is_subsite_backup', false);
 		$subsite_blog_id = $this->jobdata_get('subsite_blog_id', 0);
 		$subsite_domain = $this->jobdata_get('subsite_domain', '');
+		$subsite_path = $this->jobdata_get('subsite_path', '/');
+		$subsite_url = $this->jobdata_get('subsite_url', '');
+		$subsite_home_url = $this->jobdata_get('subsite_home_url', '');
+		$subsite_scheme = $this->jobdata_get('subsite_scheme', '');
 
 		// Nothing to send if no meaningful metadata
 		if (empty($label) && !$always_keep && !$is_subsite_backup) return;
@@ -1214,10 +1228,15 @@ class SiteGuard_Backup {
 		require_once SGBACKUP_DIR . 'includes/class-remote-communications.php';
 		$rpc = new SiteGuard_Backup_Remote_Communications();
 
+		// Prefer the captured subsite URL over site_url(): the metadata call can
+		// run on a main-site cron context where site_url() returns the network
+		// home, not the subsite we actually backed up.
+		$source_url = $is_subsite_backup && !empty($subsite_url) ? $subsite_url : site_url();
+
 		$payload = array(
 			'timestamp'  => intval($timestamp),
 			'nonce'      => $nonce,
-			'source_url' => site_url(),
+			'source_url' => $source_url,
 		);
 		if (!empty($label)) $payload['label'] = $label;
 		if ($always_keep) $payload['always_keep'] = true;
@@ -1225,6 +1244,10 @@ class SiteGuard_Backup {
 			$payload['is_subsite_backup'] = true;
 			$payload['subsite_blog_id'] = intval($subsite_blog_id);
 			$payload['subsite_domain'] = $subsite_domain;
+			$payload['subsite_path'] = $subsite_path;
+			$payload['subsite_url'] = $subsite_url;
+			$payload['subsite_home_url'] = $subsite_home_url;
+			$payload['subsite_scheme'] = $subsite_scheme;
 		}
 
 		$result = $rpc->send_message($sites[$site_id], 'set_backup_metadata', $payload);
@@ -1445,6 +1468,9 @@ class SiteGuard_Backup {
 			$backup_data['subsite_blog_id'] = $this->jobdata_get('subsite_blog_id', 0);
 			$backup_data['subsite_domain'] = $this->jobdata_get('subsite_domain', '');
 			$backup_data['subsite_path'] = $this->jobdata_get('subsite_path', '/');
+			$backup_data['subsite_url'] = $this->jobdata_get('subsite_url', '');
+			$backup_data['subsite_home_url'] = $this->jobdata_get('subsite_home_url', '');
+			$backup_data['subsite_scheme'] = $this->jobdata_get('subsite_scheme', '');
 		}
 
 		// Handle incremental merging

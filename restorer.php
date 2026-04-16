@@ -972,28 +972,87 @@ class SiteGuard_Backup_Restorer {
 		}
 
 		// Step 5: Search-replace old domain -> new domain in subsite tables only
-		$old_domain = isset($this->backup_set['subsite_domain']) ? $this->backup_set['subsite_domain'] : '';
-		$old_url_base = ''; // Full old URL base for path-aware comparison
-		// For single-site backups, subsite_domain won't be set - read from the imported options table
-		if (empty($old_domain)) {
-			$target_prefix = $wpdb->base_prefix . $target_id . '_';
-			$imported_siteurl = $wpdb->get_var("SELECT option_value FROM {$target_prefix}options WHERE option_name = 'siteurl'");
+		//
+		// Source URL detection precedence (most specific wins):
+		//   1. backup_set['subsite_url']     - full URL transmitted by sender
+		//   2. backup_set['subsite_domain']  + path  - older senders transmitting only the host
+		//   3. imported wp_N_options.siteurl - last-resort SQL scan after import
+		$target_prefix_for_scan = $wpdb->base_prefix . $target_id . '_';
+		$old_siteurl = '';
+		$old_home_url = '';
+		$old_domain = '';
+		$old_path = '/';
+		$old_scheme = '';
+
+		if (!empty($this->backup_set['subsite_url'])) {
+			$old_siteurl = rtrim($this->backup_set['subsite_url'], '/');
+			$old_scheme = parse_url($old_siteurl, PHP_URL_SCHEME);
+			$old_domain = parse_url($old_siteurl, PHP_URL_HOST);
+			$p = parse_url($old_siteurl, PHP_URL_PATH);
+			$old_path = $p ? (rtrim($p, '/') . '/') : '/';
+			if (!empty($this->backup_set['subsite_home_url'])) {
+				$old_home_url = rtrim($this->backup_set['subsite_home_url'], '/');
+			}
+			$this->sgbackup->log("Source URL from transmitted metadata: {$old_siteurl}");
+		} elseif (!empty($this->backup_set['subsite_domain'])) {
+			$old_domain = $this->backup_set['subsite_domain'];
+			$old_path = !empty($this->backup_set['subsite_path']) ? $this->backup_set['subsite_path'] : '/';
+			$old_scheme = !empty($this->backup_set['subsite_scheme']) ? $this->backup_set['subsite_scheme'] : '';
+			$this->sgbackup->log("Source domain from metadata (no full URL): {$old_domain}{$old_path}");
+		}
+
+		// SQL fallback when nothing useful was transmitted
+		if (empty($old_siteurl)) {
+			$imported_siteurl = $wpdb->get_var("SELECT option_value FROM {$target_prefix_for_scan}options WHERE option_name = 'siteurl'");
+			$imported_home    = $wpdb->get_var("SELECT option_value FROM {$target_prefix_for_scan}options WHERE option_name = 'home'");
 			if ($imported_siteurl) {
-				$old_domain = parse_url($imported_siteurl, PHP_URL_HOST);
-				$old_url_base = rtrim($imported_siteurl, '/');
-				$this->sgbackup->log("Detected source domain from imported siteurl: {$old_domain}");
+				$old_siteurl = rtrim($imported_siteurl, '/');
+				if (empty($old_domain)) $old_domain = parse_url($imported_siteurl, PHP_URL_HOST);
+				if (empty($old_scheme)) $old_scheme = parse_url($imported_siteurl, PHP_URL_SCHEME);
+				$p = parse_url($imported_siteurl, PHP_URL_PATH);
+				if (empty($old_path) || $old_path === '/') {
+					$old_path = $p ? (rtrim($p, '/') . '/') : '/';
+				}
+				$this->sgbackup->log("Source URL recovered from imported siteurl: {$imported_siteurl}");
+			}
+			if ($imported_home && empty($old_home_url)) {
+				$old_home_url = rtrim($imported_home, '/');
 			}
 		}
-		// Build the target URL: domain + path (handles subdirectory installs)
-		$new_scheme = parse_url(get_option('siteurl'), PHP_URL_SCHEME);
-		$target_url_base = $new_scheme . '://' . $target_domain . rtrim($target_path, '/');
 
-		// Compare full URL bases to catch subdirectory-only path changes
-		// (e.g., example.com/shop -> example.com/store where domain is the same)
+		// Target scheme. Prefer a per-restore override if the user supplied one,
+		// otherwise follow the destination network's main-site scheme (the
+		// convention in every WP multisite install - subsites inherit it unless
+		// someone manually forced a different one). Fall back to is_ssl() if
+		// somehow the option isn't readable.
+		$new_scheme = '';
+		if (!empty($this->restore_options['target_scheme']) && in_array($this->restore_options['target_scheme'], array('http', 'https'), true)) {
+			$new_scheme = $this->restore_options['target_scheme'];
+		}
+		if (empty($new_scheme)) {
+			$network_siteurl = '';
+			if (is_multisite()) {
+				$network_siteurl = get_blog_option(get_main_site_id(), 'siteurl');
+			}
+			if (empty($network_siteurl)) $network_siteurl = get_option('siteurl');
+			$new_scheme = $network_siteurl ? parse_url($network_siteurl, PHP_URL_SCHEME) : '';
+		}
+		if (empty($new_scheme)) {
+			$new_scheme = is_ssl() ? 'https' : 'http';
+		}
+
+		$target_url_base = $new_scheme . '://' . $target_domain . rtrim($target_path, '/');
+		$old_url_base = !empty($old_siteurl) ? $old_siteurl : (!empty($old_domain) ? (($old_scheme ?: 'https') . '://' . $old_domain . rtrim($old_path, '/')) : '');
+
+		// Decide whether we need search-replace. Even if domain is identical,
+		// a scheme or path change still requires rewriting.
 		$needs_sr = !empty($old_domain) && $old_domain !== $target_domain;
 		if (!$needs_sr && !empty($old_url_base) && $old_url_base !== $target_url_base) {
 			$needs_sr = true;
 			$this->sgbackup->log("Same domain but different path/scheme detected: {$old_url_base} -> {$target_url_base}");
+		}
+		if (!$needs_sr && empty($old_domain)) {
+			$this->sgbackup->log("WARNING: search-replace skipped - could not determine source URL from metadata, backup_set, or imported options. URLs in the imported tables will retain their original host.", 'warning');
 		}
 
 		if ($needs_sr) {
@@ -1006,27 +1065,41 @@ class SiteGuard_Backup_Restorer {
 
 			$search = array();
 			$replace = array();
+			$seen = array();
+			$add_pair = function($from, $to) use (&$search, &$replace, &$seen) {
+				if ($from === '' || $from === $to) return;
+				$key = $from . "\x1f" . $to;
+				if (isset($seen[$key])) return;
+				$seen[$key] = true;
+				$search[] = $from;
+				$replace[] = $to;
+			};
 
-			// If we have the full old URL base, use it for precise path replacement
+			// Pair 1-2: schemed full URLs. Cover both http:// and https:// because
+			// the source DB may contain either, regardless of what scheme the
+			// source was actually serving at backup time.
 			if (!empty($old_url_base)) {
-				$old_url_https = preg_replace('/^https?/', 'https', $old_url_base);
-				$old_url_http = preg_replace('/^https?/', 'http', $old_url_base);
-				$search[] = $old_url_https;
-				$replace[] = $target_url_base;
-				$search[] = $old_url_http;
-				$replace[] = $target_url_base;
-			} else {
-				// Fallback: domain-only replacement (both protocols)
-				$search[] = 'https://' . $old_domain;
-				$replace[] = $target_url_base;
-				$search[] = 'http://' . $old_domain;
-				$replace[] = $target_url_base;
+				$bare_old = preg_replace('#^https?://#i', '', $old_url_base);
+				$add_pair('https://' . $bare_old, $target_url_base);
+				$add_pair('http://' . $bare_old,  $target_url_base);
+				// Protocol-relative (//host/path) - used by some themes/plugins
+				$add_pair('//' . $bare_old, '//' . $target_domain . rtrim($target_path, '/'));
 			}
-			// Bare domain catch-all (domain-only, no path - safer for non-URL contexts)
+			// Pair 3-4: home_url if it differs from siteurl (rare but legal)
+			if (!empty($old_home_url) && $old_home_url !== $old_url_base) {
+				$bare_home = preg_replace('#^https?://#i', '', $old_home_url);
+				$add_pair('https://' . $bare_home, $target_url_base);
+				$add_pair('http://' . $bare_home,  $target_url_base);
+				$add_pair('//' . $bare_home, '//' . $target_domain . rtrim($target_path, '/'));
+			}
+			// Pair 5-6: domain-only (catches URLs in serialized blobs where the
+			// scheme/path doesn't match what we computed, plus raw references
+			// like "shop.example.com" in text fields)
 			if ($old_domain !== $target_domain) {
-				$search[] = $old_domain;
-				$replace[] = $target_domain;
+				$add_pair($old_domain, $target_domain);
 			}
+
+			$this->sgbackup->log("Subsite search-replace pairs: " . count($search) . " - " . wp_json_encode(array_slice($search, 0, 6)) . " -> " . wp_json_encode(array_slice($replace, 0, 6)));
 
 			$sr = new SiteGuard_Backup_Search_Replace();
 			$report = $sr->run($search, $replace, $tables);
@@ -1037,9 +1110,21 @@ class SiteGuard_Backup_Restorer {
 			$result['messages'][] = "Search-replace: {$report['changes']} changes ({$old_domain} -> {$target_domain}" . ($target_path !== '/' ? $target_path : '') . ")";
 		}
 
-		// Step 6: Fix subsite options (siteurl, home)
+		// Step 6: Fix subsite options (siteurl, home). Preserve any source-side
+		// home-vs-siteurl divergence by reapplying the relative path.
 		$target_prefix = $wpdb->base_prefix . $target_id . '_';
 		$new_siteurl = $target_url_base;
+		$new_home = $target_url_base;
+		if (!empty($old_home_url) && !empty($old_siteurl) && $old_home_url !== $old_siteurl) {
+			$old_home_path = parse_url($old_home_url, PHP_URL_PATH);
+			$old_site_path = parse_url($old_siteurl, PHP_URL_PATH);
+			$old_home_path = $old_home_path ? rtrim($old_home_path, '/') : '';
+			$old_site_path = $old_site_path ? rtrim($old_site_path, '/') : '';
+			if ($old_home_path !== $old_site_path) {
+				$suffix = $old_home_path !== '' ? $old_home_path : '';
+				$new_home = $new_scheme . '://' . $target_domain . rtrim($target_path, '/') . $suffix;
+			}
+		}
 
 		$wpdb->update(
 			$target_prefix . 'options',
@@ -1048,11 +1133,21 @@ class SiteGuard_Backup_Restorer {
 		);
 		$wpdb->update(
 			$target_prefix . 'options',
-			array('option_value' => $new_siteurl),
+			array('option_value' => $new_home),
 			array('option_name' => 'home')
 		);
 
-		$this->sgbackup->log("Fixed subsite siteurl/home -> {$new_siteurl}");
+		// Also sync the multisite registry in case it got out of step (e.g. an
+		// existing subsite whose wp_blogs.domain disagreed with what the admin
+		// picked). This is cheap insurance.
+		$blogs_table = $wpdb->base_prefix . 'blogs';
+		$wpdb->update(
+			$blogs_table,
+			array('domain' => $target_domain, 'path' => $target_path),
+			array('blog_id' => $target_id)
+		);
+
+		$this->sgbackup->log("Fixed subsite siteurl={$new_siteurl} home={$new_home} wp_blogs(domain={$target_domain}, path={$target_path})");
 		$result['messages'][] = "Subsite import complete: blog #{$target_id} at {$target_domain}";
 
 		return $result;

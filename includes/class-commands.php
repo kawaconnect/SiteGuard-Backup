@@ -1418,8 +1418,12 @@ class SiteGuard_Backup_Commands {
 		// Include subsite backup metadata
 		if (!empty($backup_set['is_subsite_backup'])) {
 			$result['is_subsite_backup'] = true;
-			$result['subsite_blog_id'] = isset($backup_set['subsite_blog_id']) ? intval($backup_set['subsite_blog_id']) : 0;
-			$result['subsite_domain'] = isset($backup_set['subsite_domain']) ? $backup_set['subsite_domain'] : '';
+			$result['subsite_blog_id']   = isset($backup_set['subsite_blog_id']) ? intval($backup_set['subsite_blog_id']) : 0;
+			$result['subsite_domain']    = isset($backup_set['subsite_domain']) ? $backup_set['subsite_domain'] : '';
+			$result['subsite_path']      = isset($backup_set['subsite_path']) ? $backup_set['subsite_path'] : '/';
+			$result['subsite_url']       = isset($backup_set['subsite_url']) ? $backup_set['subsite_url'] : '';
+			$result['subsite_home_url']  = isset($backup_set['subsite_home_url']) ? $backup_set['subsite_home_url'] : '';
+			$result['subsite_scheme']    = isset($backup_set['subsite_scheme']) ? $backup_set['subsite_scheme'] : '';
 		}
 
 		// Calculate total backup size
@@ -1616,6 +1620,12 @@ class SiteGuard_Backup_Commands {
 				$result['subsite_blog_id'] = $subsite_id;
 				if (empty($result['subsite_domain']) && !empty($result['old_siteurl'])) {
 					$result['subsite_domain'] = parse_url($result['old_siteurl'], PHP_URL_HOST);
+				}
+				if (empty($result['subsite_url']) && !empty($result['old_siteurl'])) {
+					$result['subsite_url']    = $result['old_siteurl'];
+					$result['subsite_scheme'] = parse_url($result['old_siteurl'], PHP_URL_SCHEME);
+					$p = parse_url($result['old_siteurl'], PHP_URL_PATH);
+					$result['subsite_path']   = $p ? (rtrim($p, '/') . '/') : '/';
 				}
 			}
 		}
