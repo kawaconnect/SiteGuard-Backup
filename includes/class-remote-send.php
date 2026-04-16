@@ -488,6 +488,26 @@ class SiteGuard_Backup_Remote_Send {
 			$history[$target_ts]['subsite_url']    = isset($data['subsite_url']) ? esc_url_raw($data['subsite_url']) : '';
 			$history[$target_ts]['subsite_home_url'] = isset($data['subsite_home_url']) ? esc_url_raw($data['subsite_home_url']) : '';
 			$history[$target_ts]['subsite_scheme']   = isset($data['subsite_scheme']) && in_array($data['subsite_scheme'], array('http', 'https'), true) ? $data['subsite_scheme'] : '';
+			// Plugin/theme state from the source subsite. Stored as plain arrays
+			// of slug strings; cap length defensively to prevent a rogue sender
+			// from bloating history. 500 entries covers the largest realistic
+			// plugin list by an order of magnitude.
+			$cap_list = function($in) {
+				if (!is_array($in)) return array();
+				$out = array();
+				foreach ($in as $v) {
+					if (!is_string($v)) continue;
+					$v = sanitize_text_field($v);
+					if ($v === '') continue;
+					$out[] = $v;
+					if (count($out) >= 500) break;
+				}
+				return $out;
+			};
+			$history[$target_ts]['subsite_active_plugins']           = isset($data['subsite_active_plugins']) ? $cap_list($data['subsite_active_plugins']) : array();
+			$history[$target_ts]['subsite_active_sitewide_plugins']  = isset($data['subsite_active_sitewide_plugins']) ? $cap_list($data['subsite_active_sitewide_plugins']) : array();
+			$history[$target_ts]['subsite_stylesheet']               = isset($data['subsite_stylesheet']) ? sanitize_text_field($data['subsite_stylesheet']) : '';
+			$history[$target_ts]['subsite_template']                 = isset($data['subsite_template']) ? sanitize_text_field($data['subsite_template']) : '';
 			$changed = true;
 		}
 

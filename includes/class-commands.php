@@ -1424,6 +1424,10 @@ class SiteGuard_Backup_Commands {
 			$result['subsite_url']       = isset($backup_set['subsite_url']) ? $backup_set['subsite_url'] : '';
 			$result['subsite_home_url']  = isset($backup_set['subsite_home_url']) ? $backup_set['subsite_home_url'] : '';
 			$result['subsite_scheme']    = isset($backup_set['subsite_scheme']) ? $backup_set['subsite_scheme'] : '';
+			$result['subsite_active_plugins']           = isset($backup_set['subsite_active_plugins']) && is_array($backup_set['subsite_active_plugins']) ? array_values($backup_set['subsite_active_plugins']) : array();
+			$result['subsite_active_sitewide_plugins']  = isset($backup_set['subsite_active_sitewide_plugins']) && is_array($backup_set['subsite_active_sitewide_plugins']) ? array_values($backup_set['subsite_active_sitewide_plugins']) : array();
+			$result['subsite_stylesheet']               = isset($backup_set['subsite_stylesheet']) ? $backup_set['subsite_stylesheet'] : '';
+			$result['subsite_template']                 = isset($backup_set['subsite_template']) ? $backup_set['subsite_template'] : '';
 		}
 
 		// Calculate total backup size

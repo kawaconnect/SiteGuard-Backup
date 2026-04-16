@@ -18,11 +18,17 @@
 
 		<h3><?php esc_html_e('Select what to restore:', 'siteguardbackup'); ?></h3>
 		<p><label><input type="checkbox" name="sgbackup_restore_db" value="1" checked /> <?php esc_html_e('Database', 'siteguardbackup'); ?></label></p>
-		<p><label><input type="checkbox" name="sgbackup_restore_plugins" value="1" checked /> <?php esc_html_e('Plugins', 'siteguardbackup'); ?></label></p>
-		<p><label><input type="checkbox" name="sgbackup_restore_themes" value="1" checked /> <?php esc_html_e('Themes', 'siteguardbackup'); ?></label></p>
+		<p>
+			<label><input type="checkbox" name="sgbackup_restore_plugins" value="1" class="sgbackup-destructive-entity" data-entity-name="plugins" /> <?php esc_html_e('Plugins', 'siteguardbackup'); ?></label>
+			<span class="description" style="color:#b32d2e;">&nbsp;<?php esc_html_e('- destructive on shared network dirs; default off', 'siteguardbackup'); ?></span>
+		</p>
+		<p>
+			<label><input type="checkbox" name="sgbackup_restore_themes" value="1" class="sgbackup-destructive-entity" data-entity-name="themes" /> <?php esc_html_e('Themes', 'siteguardbackup'); ?></label>
+			<span class="description" style="color:#b32d2e;">&nbsp;<?php esc_html_e('- destructive on shared network dirs; default off', 'siteguardbackup'); ?></span>
+		</p>
 		<p><label><input type="checkbox" name="sgbackup_restore_uploads" value="1" checked /> <?php esc_html_e('Uploads', 'siteguardbackup'); ?></label></p>
-		<p><label><input type="checkbox" name="sgbackup_restore_others" value="1" checked /> <?php esc_html_e('Others', 'siteguardbackup'); ?></label></p>
-		<p><label><input type="checkbox" name="sgbackup_restore_wpcore" value="1" checked /> <?php esc_html_e('WordPress Core', 'siteguardbackup'); ?></label></p>
+		<p><label><input type="checkbox" name="sgbackup_restore_others" value="1" /> <?php esc_html_e('Others (wp-content non-plugin/theme/upload)', 'siteguardbackup'); ?></label></p>
+		<p><label><input type="checkbox" name="sgbackup_restore_wpcore" value="1" /> <?php esc_html_e('WordPress Core (wp-admin, wp-includes)', 'siteguardbackup'); ?></label></p>
 		<hr />
 		<p>
 			<a href="#" id="sgbackup-selective-restore-link"><?php esc_html_e('Select individual items to restore...', 'siteguardbackup'); ?></a>

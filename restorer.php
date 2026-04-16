@@ -304,21 +304,67 @@ class SiteGuard_Backup_Restorer {
 			}
 			$result['messages'] = array_merge($result['messages'], $subsite_result['messages']);
 
-			// Warn about shared entities that can't be per-subsite restored
-			$shared_entities = array('plugins', 'themes', 'others', 'wpcore');
+			// Shared network entities (plugins/themes/others/wpcore) live at the
+			// network level, not per-subsite. These are opt-in with a destructive
+			// warning in the UI (default OFF) because a careless extract clobbers
+			// what every other subsite on the network is running.
+			//
+			// Policy when opted in: force "skip existing" (MOVEIN_SKIP_EXISTING)
+			// so we only add items from the backup that don't already exist on
+			// the destination. That matches the common need ("restore subsite
+			// also installs the plugins the subsite relied on") while preserving
+			// destination versions of everything that's already there.
+			//
+			// wpcore is deliberately excluded even when opted in - restoring
+			// WordPress core files over a live network is almost never what an
+			// admin wants from a subsite import.
+			$shared_entities   = array('plugins', 'themes', 'others');
+			$original_mode     = $this->move_in_mode;
+			$original_migration= $this->is_migration;
 			foreach ($shared_entities as $entity) {
-				if (!empty($this->restore_options[$entity]) && !empty($this->backup_set[$entity])) {
-					$skip_msg = ucfirst($entity) . " restore skipped: shared network entities cannot be restored in per-subsite import mode";
-					$this->sgbackup->log("[Restore] {$skip_msg}", 'warning');
-					if (defined('DOING_AJAX') && DOING_AJAX) {
-						echo 'RINFO:' . json_encode(array('type' => 'warning', 'message' => $skip_msg)) . "\n";
-						if (ob_get_level()) @ob_flush();
-						@flush();
-					}
+				if (empty($this->restore_options[$entity]) || empty($this->backup_set[$entity])) continue;
+
+				// Clamp to skip-existing so we don't overwrite what's already
+				// installed; admins can still pick merge/overwrite in non-subsite
+				// restore paths.
+				$this->move_in_mode = self::MOVEIN_SKIP_EXISTING;
+				// Don't let restore_file_entity's migration-special-case logic
+				// (which removes this plugin's own directory) fire here - this is
+				// a subsite import, not a cross-domain migration of the host.
+				$this->is_migration = false;
+
+				$warn_msg = ucfirst($entity) . " restore in subsite-import mode: installing only items NOT already present on this network (mode=skip-existing). Destination versions of existing " . $entity . " are preserved.";
+				$this->sgbackup->log("[Restore] {$warn_msg}");
+				if (defined('DOING_AJAX') && DOING_AJAX) {
+					echo 'RINFO:' . json_encode(array('type' => 'info', 'message' => $warn_msg)) . "\n";
+					if (ob_get_level()) @ob_flush();
+					@flush();
+				}
+
+				$ok = $this->restore_file_entity($entity, $backup_dir);
+				if ($ok) {
+					$result['messages'][] = ucfirst($entity) . " extracted (missing items only - existing preserved)";
+				} else {
+					$result['errors'][] = "Failed to extract {$entity}";
+				}
+			}
+			$this->move_in_mode  = $original_mode;
+			$this->is_migration  = $original_migration;
+
+			// wpcore in subsite mode is always refused.
+			if (!empty($this->restore_options['wpcore']) && !empty($this->backup_set['wpcore'])) {
+				$skip_msg = "WordPress Core restore skipped: refusing to overwrite core files from a per-subsite backup. Run a full-network restore if that's intended.";
+				$this->sgbackup->log("[Restore] {$skip_msg}", 'warning');
+				if (defined('DOING_AJAX') && DOING_AJAX) {
+					echo 'RINFO:' . json_encode(array('type' => 'warning', 'message' => $skip_msg)) . "\n";
+					if (ob_get_level()) @ob_flush();
+					@flush();
 				}
 			}
 
-			// Phase 3: Post-restore
+			// Phase 3: Post-restore (shared across all restore paths - temp-dir
+			// pruning and validation live in post_restore_cleanup so every
+			// restore flow gets them).
 			$this->post_restore_cleanup();
 			$result['messages'] = array_merge($this->progress, $result['messages']);
 			$this->sgbackup->logfile_close();
@@ -1075,6 +1121,21 @@ class SiteGuard_Backup_Restorer {
 				$replace[] = $to;
 			};
 
+			// Pair 0: host-provider %-escape tokens. WP Engine and some managed
+			// hosts rewrite literal "%" characters to a fixed {64-hex} token in
+			// mysqldump output to defeat format-specifier injection via
+			// wpdb::prepare(). Left in place, these tokens corrupt inline CSS
+			// ("width:100{…};") and any string that used % (URL-encoded
+			// characters, percentage values, etc.). Unwrap before the URL SR
+			// pairs so the SR engine's unserialize/reserialize path fixes the
+			// length prefixes on serialized blobs at the same time.
+			$known_tokens = apply_filters('sgbackup_known_escape_tokens', array(
+				'{43ded7db8220f9320535a3aa7ca010fd0da6724531b8493a05e5c6388a06739f}', // WP Engine default
+			));
+			foreach ($known_tokens as $tok) {
+				$add_pair($tok, '%');
+			}
+
 			// Pair 1-2: schemed full URLs. Cover both http:// and https:// because
 			// the source DB may contain either, regardless of what scheme the
 			// source was actually serving at backup time.
@@ -1099,7 +1160,24 @@ class SiteGuard_Backup_Restorer {
 				$add_pair($old_domain, $target_domain);
 			}
 
-			$this->sgbackup->log("Subsite search-replace pairs: " . count($search) . " - " . wp_json_encode(array_slice($search, 0, 6)) . " -> " . wp_json_encode(array_slice($replace, 0, 6)));
+			// Pair 7+: uploads path remap when the target blog_id differs from the
+			// source. WP multisite stores uploads under wp-content/uploads/sites/{id}/
+			// and those paths are baked into post_content + postmeta (Elementor, ACF,
+			// page builders). Without this, every image in the restored subsite 404s.
+			// Cover plain, escaped-slash (JSON), and no-leading-slash variants.
+			if ($source_id > 0 && $target_id > 0 && (int) $source_id !== (int) $target_id) {
+				$add_pair('/wp-content/uploads/sites/' . $source_id . '/', '/wp-content/uploads/sites/' . $target_id . '/');
+				$add_pair('\/wp-content\/uploads\/sites\/' . $source_id . '\/', '\/wp-content\/uploads\/sites\/' . $target_id . '\/');
+				$add_pair('wp-content/uploads/sites/' . $source_id . '/', 'wp-content/uploads/sites/' . $target_id . '/');
+				// Defensive: bare sites/{n}/ segment without the wp-content prefix,
+				// only when the ids are at least 2 digits (blog_id=1 is main site,
+				// and a raw "sites/1/" substring would have countless false matches).
+				if ((int) $source_id >= 10 && (int) $target_id >= 1) {
+					$add_pair('/sites/' . $source_id . '/', '/sites/' . $target_id . '/');
+				}
+			}
+
+			$this->sgbackup->log("Subsite search-replace pairs: " . count($search) . " - " . wp_json_encode(array_slice($search, 0, 10)) . " -> " . wp_json_encode(array_slice($replace, 0, 10)));
 
 			$sr = new SiteGuard_Backup_Search_Replace();
 			$report = $sr->run($search, $replace, $tables);
@@ -1148,9 +1226,381 @@ class SiteGuard_Backup_Restorer {
 		);
 
 		$this->sgbackup->log("Fixed subsite siteurl={$new_siteurl} home={$new_home} wp_blogs(domain={$target_domain}, path={$target_path})");
+
+		// Step 7: Residual escape-token sweep. The known-token SR pair above
+		// catches the well-known WPE value, but other hosts use different hashes.
+		// Scan the target's wp_N_options / postmeta / posts for lingering
+		// {64-hex} tokens, collect unique ones, and run a second SR pass.
+		$sweep_tables = array(
+			$target_prefix . 'options',
+			$target_prefix . 'posts',
+			$target_prefix . 'postmeta',
+		);
+		$residual_tokens = $this->scan_for_escape_tokens($sweep_tables);
+		if (!empty($residual_tokens)) {
+			require_once SGBACKUP_DIR . 'includes/class-search-replace.php';
+			$sr2 = new SiteGuard_Backup_Search_Replace();
+			$pairs = array();
+			foreach ($residual_tokens as $tok) {
+				$pairs['search'][]  = $tok;
+				$pairs['replace'][] = '%';
+			}
+			$all_tables = SiteGuard_Backup_Database_Utility::get_tables($target_prefix);
+			$report2 = $sr2->run($pairs['search'], $pairs['replace'], $all_tables);
+			$this->sgbackup->log("Residual escape-token sweep: " . count($residual_tokens) . " token(s) replaced across {$report2['tables']} tables ({$report2['changes']} changes). Tokens: " . wp_json_encode(array_values($residual_tokens)));
+		}
+
+		// Step 8: Transfer source subsite's active_plugins - intersect with what
+		// is actually installed on the destination, and report the unmet subset
+		// as a remediation item. The import wrote whatever was in the source's
+		// wp_N_options, but on a fresh destination network many of those plugins
+		// may not be installed yet.
+		$remediation = $this->apply_subsite_active_plugins_policy($target_prefix, $target_id);
+		if (!empty($remediation['unmet_plugins']) || !empty($remediation['unmet_theme'])) {
+			$this->emit_remediation_notice($remediation, $target_domain);
+			$result['messages'][] = "Remediation: " . count($remediation['unmet_plugins']) . " plugin(s) / " . (empty($remediation['unmet_theme']) ? 0 : 1) . " theme(s) on the source are not installed on this network.";
+		}
+
+		// Step 9: Invalidate caches that are now stale. rewrite_rules holds
+		// baked-in paths; Elementor caches CSS keyed by post/URL; object cache
+		// may be serving pre-restore option_values. WordPress rebuilds all of
+		// these on next request, so deletion is safe.
+		$wpdb->delete($target_prefix . 'options', array('option_name' => 'rewrite_rules'));
+		$this->sgbackup->log("Deleted {$target_prefix}options.rewrite_rules (will be rebuilt on first pretty-permalink request)");
+		$this->clear_subsite_elementor_cache($target_id);
+		if (function_exists('wp_cache_flush_group')) {
+			wp_cache_flush_group('options');
+		} elseif (function_exists('wp_cache_flush')) {
+			wp_cache_flush();
+		}
+		if (function_exists('clean_blog_cache')) {
+			clean_blog_cache($target_id);
+		}
+
+		// Step 10: Validation sweep. Check for lingering tokens, lingering
+		// /sites/{src}/ paths, and unserializable options. Surface failures as
+		// errors so the caller can report "partial restore needs remediation"
+		// rather than "success".
+		$validation_errors = $this->validate_subsite_restore($target_prefix, $target_id, $source_id);
+		if (!empty($validation_errors)) {
+			$result['errors'] = array_merge($result['errors'], $validation_errors);
+			foreach ($validation_errors as $ve) {
+				$this->sgbackup->log("[Validation] {$ve}", 'warning');
+				if (defined('DOING_AJAX') && DOING_AJAX) {
+					echo 'RINFO:' . json_encode(array('type' => 'warning', 'message' => $ve)) . "\n";
+					if (ob_get_level()) @ob_flush();
+					@flush();
+				}
+			}
+		}
+
 		$result['messages'][] = "Subsite import complete: blog #{$target_id} at {$target_domain}";
 
 		return $result;
+	}
+
+	/**
+	 * Scan a small set of text columns across $tables for {64-hex} escape
+	 * tokens and return the unique set. Keeps the SELECT cheap by only peeking
+	 * at likely-affected columns (options, postmeta, posts).
+	 *
+	 * @param array $tables Tables to scan.
+	 * @return array Map of token => token (dedup-friendly).
+	 */
+	private function scan_for_escape_tokens($tables) {
+		global $wpdb;
+		$found = array();
+
+		foreach ($tables as $table) {
+			$safe = SiteGuard_Backup_Database_Utility::sanitize_table_name($table);
+			if (!$safe) continue;
+			// Only proceed if the table actually exists
+			$exists = $wpdb->get_var($wpdb->prepare("SHOW TABLES LIKE %s", $safe));
+			if (!$exists) continue;
+
+			$cols = $wpdb->get_results("DESCRIBE `{$safe}`", ARRAY_A);
+			foreach ($cols as $col) {
+				$type = strtolower($col['Type']);
+				if (!preg_match('/text|longtext|mediumtext|varchar/i', $type)) continue;
+				$colname = str_replace('`', '``', $col['Field']);
+				// MySQL REGEXP: match literal "{", 64 hex chars, "}"
+				$rows = $wpdb->get_col("SELECT `{$colname}` FROM `{$safe}` WHERE `{$colname}` REGEXP '\\\\{[0-9a-f]{64}\\\\}' LIMIT 50");
+				foreach ($rows as $val) {
+					if (is_null($val)) continue;
+					if (preg_match_all('/\{[0-9a-f]{64}\}/', $val, $matches)) {
+						foreach ($matches[0] as $m) {
+							$found[$m] = $m;
+						}
+					}
+				}
+				// Bail once we've found a few - typical host emits one token
+				if (count($found) >= 5) return $found;
+			}
+		}
+		return $found;
+	}
+
+	/**
+	 * After a per-subsite restore, reconcile active_plugins / active theme with
+	 * what's actually installed on the destination network. Sets the intersection,
+	 * reports the unmet subset as remediation data.
+	 *
+	 * @param string $target_prefix e.g. wp_34_
+	 * @param int    $target_id
+	 * @return array ['unmet_plugins' => [...], 'unmet_theme' => string|'', 'kept_plugins' => [...]]
+	 */
+	private function apply_subsite_active_plugins_policy($target_prefix, $target_id) {
+		global $wpdb;
+		$out = array('unmet_plugins' => array(), 'unmet_theme' => '', 'kept_plugins' => array());
+
+		// Pull the imported list. wp_N_options.active_plugins is a serialized array.
+		$serialized = $wpdb->get_var($wpdb->prepare(
+			"SELECT option_value FROM {$target_prefix}options WHERE option_name = %s",
+			'active_plugins'
+		));
+		$source_plugins = array();
+		if (!empty($serialized)) {
+			$maybe = @unserialize($serialized);
+			if (is_array($maybe)) $source_plugins = array_values(array_filter(array_map('strval', $maybe)));
+		}
+
+		// Also consider the source's active_sitewide_plugins reported in backup
+		// metadata (if sender was updated to transmit it). These are
+		// network-activated plugins the source relied on.
+		$source_network_plugins = array();
+		if (!empty($this->backup_set['subsite_active_sitewide_plugins']) && is_array($this->backup_set['subsite_active_sitewide_plugins'])) {
+			$source_network_plugins = array_values(array_map('strval', $this->backup_set['subsite_active_sitewide_plugins']));
+		}
+
+		$all_source = array_values(array_unique(array_merge($source_plugins, $source_network_plugins)));
+
+		// Check each plugin file exists on the destination
+		$kept = array();
+		foreach ($source_plugins as $p) {
+			$path = WP_PLUGIN_DIR . '/' . $p;
+			if (file_exists($path)) {
+				$kept[] = $p;
+			}
+		}
+		// Plugins that are neither on disk nor network-activated on destination
+		$destination_network = array();
+		if (is_multisite() && function_exists('get_site_option')) {
+			$dn = get_site_option('active_sitewide_plugins', array());
+			if (is_array($dn)) $destination_network = array_keys($dn);
+		}
+		foreach ($all_source as $p) {
+			$path = WP_PLUGIN_DIR . '/' . $p;
+			if (!file_exists($path) && !in_array($p, $destination_network, true)) {
+				$out['unmet_plugins'][] = $p;
+			}
+		}
+		$out['kept_plugins'] = $kept;
+
+		// Write back the pruned intersection so the subsite doesn't try to boot
+		// plugins that don't exist on disk (those would fatal in a stock install).
+		if ($source_plugins !== $kept) {
+			$wpdb->update(
+				$target_prefix . 'options',
+				array('option_value' => serialize($kept)),
+				array('option_name' => 'active_plugins')
+			);
+			$this->sgbackup->log("active_plugins reconciled for blog #{$target_id}: kept " . count($kept) . "/" . count($source_plugins) . " (dropped " . implode(', ', array_diff($source_plugins, $kept)) . ')');
+		}
+
+		// Verify active theme exists; if not, record as unmet
+		$stylesheet = $wpdb->get_var("SELECT option_value FROM {$target_prefix}options WHERE option_name = 'stylesheet'");
+		if (!empty($stylesheet)) {
+			$theme_dir = defined('WP_CONTENT_DIR') ? (WP_CONTENT_DIR . '/themes/' . $stylesheet) : '';
+			if ($theme_dir && !is_dir($theme_dir)) {
+				$out['unmet_theme'] = $stylesheet;
+			}
+		}
+
+		return $out;
+	}
+
+	private function emit_remediation_notice($remediation, $target_domain) {
+		$lines = array();
+		if (!empty($remediation['unmet_plugins'])) {
+			$lines[] = 'Source plugins not installed on this network: ' . implode(', ', $remediation['unmet_plugins']) . '. Install + network-activate them (or copy from the source) before the subsite can use them.';
+		}
+		if (!empty($remediation['unmet_theme'])) {
+			$lines[] = 'Active theme "' . $remediation['unmet_theme'] . '" is not installed on this network. Install it or switch the subsite to another theme.';
+		}
+		foreach ($lines as $msg) {
+			$this->sgbackup->log("[Remediation] {$msg}", 'warning');
+			if (defined('DOING_AJAX') && DOING_AJAX) {
+				echo 'RINFO:' . json_encode(array('type' => 'warning', 'message' => $msg)) . "\n";
+				if (ob_get_level()) @ob_flush();
+				@flush();
+			}
+		}
+	}
+
+	/**
+	 * Delete Elementor's cached CSS for a specific subsite.
+	 *
+	 * Elementor stores generated CSS under uploads/sites/{id}/elementor/css/ and
+	 * caches a flag in postmeta per post. Deleting the files + flags forces
+	 * regeneration with the post-restore URLs.
+	 */
+	private function clear_subsite_elementor_cache($target_id) {
+		global $wpdb;
+		// Files: uploads/sites/{id}/elementor/css/*
+		$uploads_base = '';
+		if (is_multisite()) {
+			switch_to_blog(get_main_site_id());
+			$uploads_base = SiteGuard_Backup_Filesystem::wp_uploads_dir();
+			restore_current_blog();
+		}
+		if (!empty($uploads_base)) {
+			$elementor_dir = rtrim($uploads_base, '/') . '/sites/' . intval($target_id) . '/elementor/css/';
+			if (is_dir($elementor_dir)) {
+				$this->remove_dir_recursive($elementor_dir);
+				$this->sgbackup->log("Cleared Elementor CSS cache at {$elementor_dir}");
+			}
+		}
+
+		// Postmeta flag that tells Elementor "this post's CSS is fresh".
+		$prefix = $wpdb->base_prefix . intval($target_id) . '_';
+		$postmeta = $prefix . 'postmeta';
+		if ($wpdb->get_var($wpdb->prepare("SHOW TABLES LIKE %s", $postmeta))) {
+			$wpdb->delete($postmeta, array('meta_key' => '_elementor_css'));
+		}
+	}
+
+	/**
+	 * Post-restore validation for a subsite import. Returns a list of human-readable
+	 * warnings; empty array means the subsite looks clean.
+	 */
+	private function validate_subsite_restore($target_prefix, $target_id, $source_id) {
+		global $wpdb;
+		$errors = array();
+
+		// 1. Any {64-hex} tokens still present in options/postmeta/posts?
+		$lingering = $this->scan_for_escape_tokens(array(
+			$target_prefix . 'options',
+			$target_prefix . 'posts',
+			$target_prefix . 'postmeta',
+		));
+		if (!empty($lingering)) {
+			$errors[] = 'Host-provider escape tokens still present after restore (' . count($lingering) . ' unique): ' . implode(', ', array_slice(array_keys($lingering), 0, 3)) . (count($lingering) > 3 ? ', ...' : '') . '. Manually search-replace to "%".';
+		}
+
+		// 2. Any /sites/{src}/ references still present when ids differ?
+		if ((int) $source_id > 0 && (int) $target_id > 0 && (int) $source_id !== (int) $target_id) {
+			$src_path = '/sites/' . intval($source_id) . '/';
+			$check_tables = array(
+				$target_prefix . 'options',
+				$target_prefix . 'posts',
+				$target_prefix . 'postmeta',
+			);
+			foreach ($check_tables as $tbl) {
+				$safe = SiteGuard_Backup_Database_Utility::sanitize_table_name($tbl);
+				if (!$safe) continue;
+				if (!$wpdb->get_var($wpdb->prepare("SHOW TABLES LIKE %s", $safe))) continue;
+				// Check each text column
+				$cols = $wpdb->get_results("DESCRIBE `{$safe}`", ARRAY_A);
+				foreach ($cols as $col) {
+					$type = strtolower($col['Type']);
+					if (!preg_match('/text|longtext|mediumtext|varchar/i', $type)) continue;
+					$colname = str_replace('`', '``', $col['Field']);
+					$n = (int) $wpdb->get_var($wpdb->prepare("SELECT COUNT(*) FROM `{$safe}` WHERE `{$colname}` LIKE %s", '%' . $wpdb->esc_like($src_path) . '%'));
+					if ($n > 0) {
+						$errors[] = "{$n} rows in {$tbl}.{$col['Field']} still reference {$src_path} after restore (target is blog_id={$target_id}).";
+						break 2;
+					}
+				}
+			}
+		}
+
+		// 3. siteurl / home sanity
+		$siteurl = $wpdb->get_var("SELECT option_value FROM {$target_prefix}options WHERE option_name = 'siteurl'");
+		$home    = $wpdb->get_var("SELECT option_value FROM {$target_prefix}options WHERE option_name = 'home'");
+		if (empty($siteurl) || empty($home)) {
+			$errors[] = "blog #{$target_id} is missing siteurl or home option after restore.";
+		}
+
+		// 4. Spot-check that the most common serialized options still unserialize.
+		$check_opts = array('active_plugins', 'sidebars_widgets', 'theme_mods_' . ($wpdb->get_var("SELECT option_value FROM {$target_prefix}options WHERE option_name = 'stylesheet'")));
+		foreach ($check_opts as $opt) {
+			if (empty($opt)) continue;
+			$val = $wpdb->get_var($wpdb->prepare("SELECT option_value FROM {$target_prefix}options WHERE option_name = %s", $opt));
+			if (empty($val)) continue;
+			if (in_array(substr($val, 0, 2), array('a:', 's:', 'O:', 'i:', 'b:', 'd:'), true)) {
+				$ok = @unserialize($val);
+				if ($ok === false && $val !== 'b:0;') {
+					$errors[] = "Option {$opt} on blog #{$target_id} failed to unserialize - the row is corrupt. Consider deleting it (WordPress will rebuild if safe).";
+				}
+			}
+		}
+
+		return $errors;
+	}
+
+	/**
+	 * Move processed backup archives + prune stale per-restore temp dirs out of
+	 * the top level of wp-content/sgbackup/ so the directory doesn't fill up
+	 * with orphaned files after successful restores.
+	 *
+	 * Archive policy:
+	 *   - .zip / .sql.gz / .crypt files (the actual backup artefacts) are kept
+	 *     in place - history still references them and the user can re-restore.
+	 *   - temp_uploads_{ts}/ and restore_{md5}/ dirs get aggressively pruned;
+	 *     anything older than 1 hour is removed. The top 3 by mtime are kept as
+	 *     forensic samples in case the user needs to diagnose a bad restore.
+	 *   - deleteflag-*.txt files older than 24h are consumed by the GC (they
+	 *     were never being cleaned up before).
+	 */
+	private function archive_processed_backup_files($backup_dir) {
+		$backup_dir = rtrim($backup_dir, '/\\') . '/';
+		if (!is_dir($backup_dir)) return;
+
+		$now = time();
+		$keep_recent = 3;
+
+		// Sweep temp_uploads_{ts}/ and restore_{md5}/ directories
+		$candidates = array();
+		$dh = @opendir($backup_dir);
+		if ($dh) {
+			while (false !== ($name = readdir($dh))) {
+				if ($name === '.' || $name === '..') continue;
+				$path = $backup_dir . $name;
+				if (!is_dir($path)) continue;
+				if (preg_match('/^(temp_uploads_|restore_)/', $name)) {
+					$candidates[] = array('path' => $path, 'mtime' => @filemtime($path) ?: 0);
+				}
+			}
+			closedir($dh);
+		}
+		// Sort newest first; keep $keep_recent, prune the rest if older than 1h
+		usort($candidates, function($a, $b) { return $b['mtime'] <=> $a['mtime']; });
+		$pruned = 0;
+		foreach ($candidates as $i => $c) {
+			if ($i < $keep_recent) continue;
+			if (($now - $c['mtime']) < 3600) continue;
+			$this->remove_dir_recursive($c['path']);
+			$pruned++;
+		}
+		if ($pruned > 0) {
+			$this->sgbackup->log("Pruned {$pruned} stale temp/restore directories from sgbackup/");
+		}
+
+		// Consume stale deleteflag-*.txt markers
+		$flag_files = glob($backup_dir . 'deleteflag-*.txt');
+		if (is_array($flag_files)) {
+			$flag_pruned = 0;
+			foreach ($flag_files as $flag) {
+				$age = $now - (@filemtime($flag) ?: $now);
+				if ($age > 86400) {
+					@unlink($flag);
+					$flag_pruned++;
+				}
+			}
+			if ($flag_pruned > 0) {
+				$this->sgbackup->log("Consumed {$flag_pruned} stale deleteflag-*.txt markers (>24h old)");
+			}
+		}
 	}
 
 	/**
@@ -3388,6 +3838,12 @@ class SiteGuard_Backup_Restorer {
 			$wpdb->esc_like('_transient_') . '%',
 			$wpdb->esc_like('_site_transient_') . '%'
 		));
+
+		// Prune stale temp/restore dirs and consume deleteflag-*.txt markers so
+		// wp-content/sgbackup/ doesn't accumulate forever. Runs on every
+		// restore path (subsite, batch, full network) at successful completion.
+		$opts = SiteGuard_Backup_Options::instance();
+		$this->archive_processed_backup_files($opts->get_backup_dir());
 
 		$this->progress("Post-restore cleanup complete");
 	}

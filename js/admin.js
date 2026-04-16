@@ -635,6 +635,27 @@
 				$('#sgbackup-restore-done').hide();
 			});
 
+			// Destructive entity warning: plugins/themes default OFF. When the
+			// admin toggles them on, require explicit confirmation. The target is
+			// a shared network directory (wp-content/plugins, wp-content/themes),
+			// so a careless restore clobbers what every other subsite on the
+			// network is running.
+			$(document).on('change', '.sgbackup-destructive-entity', function() {
+				var $cb = $(this);
+				if (!$cb.is(':checked')) return;
+				var entityName = $cb.data('entity-name') || 'files';
+				var msg =
+					'WARNING: Restoring ' + entityName + ' is DESTRUCTIVE on a multisite network.\n\n' +
+					'The ' + entityName + ' directory is SHARED across every subsite. Restoring ' +
+					'from a backup will overwrite or mix in whatever was in the source backup, ' +
+					'which can break other subsites, disable plugins with active licenses, or ' +
+					'downgrade/upgrade code unexpectedly.\n\n' +
+					'Only proceed if you understand the impact. Continue?';
+				if (!window.confirm(msg)) {
+					$cb.prop('checked', false);
+				}
+			});
+
 			// Show/hide subsite mode based on DB restore mode (multisite only)
 			$(document).on('change', 'select[name="sgbackup_db_restore_mode"]', function() {
 				var val = $(this).val();

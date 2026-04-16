@@ -712,6 +712,26 @@ class SiteGuard_Backup {
 			$initial_jobdata['subsite_url'] = $sub_siteurl ? $sub_siteurl : '';
 			$initial_jobdata['subsite_home_url'] = $sub_home ? $sub_home : '';
 			$initial_jobdata['subsite_scheme'] = $sub_siteurl ? parse_url($sub_siteurl, PHP_URL_SCHEME) : '';
+
+			// Capture plugin/theme state so the restorer can rebuild the active
+			// set against whatever the destination network has installed. Without
+			// this, Elementor (etc.) ends up inactive on the restored subsite and
+			// the page renders as a pile of div markup with no CSS/JS.
+			$sub_active_plugins = get_blog_option($blog_id, 'active_plugins', array());
+			$initial_jobdata['subsite_active_plugins'] = is_array($sub_active_plugins) ? array_values(array_filter(array_map('strval', $sub_active_plugins))) : array();
+			$initial_jobdata['subsite_stylesheet']     = (string) get_blog_option($blog_id, 'stylesheet', '');
+			$initial_jobdata['subsite_template']       = (string) get_blog_option($blog_id, 'template', '');
+
+			// Network-activated plugins: these live in wp_sitemeta and are NOT
+			// in wp_N_options.active_plugins, so the per-subsite SQL dump doesn't
+			// include them. Carry them as metadata so the restorer knows which
+			// plugins the source relied on at the network level.
+			if (function_exists('get_site_option')) {
+				$netwide = get_site_option('active_sitewide_plugins', array());
+				$initial_jobdata['subsite_active_sitewide_plugins'] = is_array($netwide) ? array_keys($netwide) : array();
+			} else {
+				$initial_jobdata['subsite_active_sitewide_plugins'] = array();
+			}
 		}
 
 		// Merge any extra jobdata (e.g., from migrate_send pre-setting phase flags)
@@ -1213,6 +1233,10 @@ class SiteGuard_Backup {
 		$subsite_url = $this->jobdata_get('subsite_url', '');
 		$subsite_home_url = $this->jobdata_get('subsite_home_url', '');
 		$subsite_scheme = $this->jobdata_get('subsite_scheme', '');
+		$subsite_active_plugins = $this->jobdata_get('subsite_active_plugins', array());
+		$subsite_active_sitewide_plugins = $this->jobdata_get('subsite_active_sitewide_plugins', array());
+		$subsite_stylesheet = $this->jobdata_get('subsite_stylesheet', '');
+		$subsite_template = $this->jobdata_get('subsite_template', '');
 
 		// Nothing to send if no meaningful metadata
 		if (empty($label) && !$always_keep && !$is_subsite_backup) return;
@@ -1248,6 +1272,10 @@ class SiteGuard_Backup {
 			$payload['subsite_url'] = $subsite_url;
 			$payload['subsite_home_url'] = $subsite_home_url;
 			$payload['subsite_scheme'] = $subsite_scheme;
+			$payload['subsite_active_plugins']          = is_array($subsite_active_plugins) ? array_values($subsite_active_plugins) : array();
+			$payload['subsite_active_sitewide_plugins'] = is_array($subsite_active_sitewide_plugins) ? array_values($subsite_active_sitewide_plugins) : array();
+			$payload['subsite_stylesheet']              = (string) $subsite_stylesheet;
+			$payload['subsite_template']                = (string) $subsite_template;
 		}
 
 		$result = $rpc->send_message($sites[$site_id], 'set_backup_metadata', $payload);
@@ -1471,6 +1499,10 @@ class SiteGuard_Backup {
 			$backup_data['subsite_url'] = $this->jobdata_get('subsite_url', '');
 			$backup_data['subsite_home_url'] = $this->jobdata_get('subsite_home_url', '');
 			$backup_data['subsite_scheme'] = $this->jobdata_get('subsite_scheme', '');
+			$backup_data['subsite_active_plugins']           = $this->jobdata_get('subsite_active_plugins', array());
+			$backup_data['subsite_active_sitewide_plugins']  = $this->jobdata_get('subsite_active_sitewide_plugins', array());
+			$backup_data['subsite_stylesheet']               = $this->jobdata_get('subsite_stylesheet', '');
+			$backup_data['subsite_template']                 = $this->jobdata_get('subsite_template', '');
 		}
 
 		// Handle incremental merging
