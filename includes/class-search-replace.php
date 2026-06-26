@@ -100,25 +100,69 @@ class SiteGuard_Backup_Search_Replace {
 
 		$this->report['tables']++;
 
-		// Process in pages
-		$offset = 0;
-		$has_more = true;
+		// Build the column list to fetch: skip binary/blob columns (they are never
+		// replaced) so their bytes never enter PHP memory. Always keep the primary key.
+		$fetch_cols = array();
+		foreach ($col_names as $c) {
+			if (isset($binary_cols[$c]) && $c !== $primary_key) continue;
+			$fetch_cols[] = '`' . str_replace('`', '``', $c) . '`';
+		}
+		$select_list = implode(', ', $fetch_cols);
 
-		while ($has_more) {
+		// Adaptive paging. A fixed 1000-row page balloons to hundreds of MB / >1GB on
+		// page-builder tables where single Elementor JSON/serialized blobs run 1-2MB each.
+		// Start at the configured size and halve the page whenever process memory crosses
+		// ~70% of the limit, so the resident set stays bounded regardless of row width.
+		$page_size = $this->page_size;
+		$mem_limit = $this->get_memory_limit_bytes();
+		$offset = 0;
+
+		while (true) {
 			$rows = $wpdb->get_results(
-				$wpdb->prepare("SELECT * FROM `{$escaped_table}` LIMIT %d OFFSET %d", $this->page_size, $offset),
+				$wpdb->prepare("SELECT {$select_list} FROM `{$escaped_table}` LIMIT %d OFFSET %d", $page_size, $offset),
 				ARRAY_A
 			);
 
 			if (empty($rows)) break;
-			if (count($rows) < $this->page_size) $has_more = false;
+			$fetched = count($rows);
 
 			foreach ($rows as $row) {
 				$this->process_row($table, $row, $search, $replace, $primary_key, $col_names, $binary_cols);
 			}
 
-			$offset += $this->page_size;
+			$offset += $fetched;
+
+			// Release the page and wpdb's internal result copy before fetching the next.
+			unset($rows);
+			$wpdb->flush();
+			// If SAVEQUERIES is enabled, wpdb appends every statement to an in-memory
+			// log that would otherwise hold the entire restore in RAM. Drop it.
+			if (!empty($wpdb->queries)) $wpdb->queries = array();
+
+			if ($fetched < $page_size) break;
+
+			// Throttle: shrink the page (and collect cycles) when memory runs high.
+			if ($mem_limit > 0 && memory_get_usage(true) > 0.7 * $mem_limit) {
+				$page_size = max(20, (int) floor($page_size / 2));
+				gc_collect_cycles();
+			}
 		}
+	}
+
+	/**
+	 * Resolve the PHP memory_limit to bytes. Returns 0 when unlimited (-1).
+	 */
+	private function get_memory_limit_bytes() {
+		$limit = trim((string) ini_get('memory_limit'));
+		if ('' === $limit || '-1' === $limit) return 0;
+		$unit = strtolower(substr($limit, -1));
+		$value = (int) $limit;
+		switch ($unit) {
+			case 'g': $value *= 1024;
+			case 'm': $value *= 1024;
+			case 'k': $value *= 1024;
+		}
+		return $value;
 	}
 
 	/**
@@ -136,6 +180,10 @@ class SiteGuard_Backup_Search_Replace {
 		$stripped_table = preg_replace('/^' . preg_quote($wpdb->prefix, '/') . '/', '', $table);
 
 		foreach ($col_names as $col) {
+			// Binary/blob columns are not fetched (process_table omits them), so they
+			// won't be present in $row. Skip anything not selected.
+			if (!array_key_exists($col, $row)) continue;
+
 			$old_value = $row[$col];
 
 			// Skip NULL values
@@ -211,6 +259,21 @@ class SiteGuard_Backup_Search_Replace {
 
 		try {
 			if (is_string($data)) {
+				// Fast path: if the search term cannot occur anywhere in this string -
+				// neither verbatim nor JSON slash-escaped ("https:\/\/old") - there is
+				// nothing to replace. Skipping here avoids the expensive
+				// unserialize/json_decode -> recurse -> re-encode round-trip for the
+				// overwhelming majority of (often multi-MB) page-builder blobs that do
+				// not reference the old domain at all. Serialized and plain strings store
+				// values verbatim; JSON only escapes forward slashes for our URL needles,
+				// so checking both forms is sufficient and safe.
+				if ('' !== $from && false === strpos($data, $from)) {
+					$from_json = str_replace('/', '\\/', $from);
+					if ($from_json === $from || false === strpos($data, $from_json)) {
+						return $data;
+					}
+				}
+
 				// Check if it's serialized
 				if ($this->is_serialized($data)) {
 					if (PHP_VERSION_ID >= 70000) {

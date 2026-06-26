@@ -1353,6 +1353,13 @@ class SiteGuard_Backup_Database_Utility {
 		$current_table = '';
 		$skipping_table = false;
 
+		// max_allowed_packet for splitting oversized INSERT statements
+		$max_packet = 16777216;
+		$packet_row = $wpdb->get_row("SHOW VARIABLES LIKE 'max_allowed_packet'");
+		if ($packet_row && isset($packet_row->Value) && (int) $packet_row->Value > 0) {
+			$max_packet = (int) $packet_row->Value;
+		}
+
 		$wpdb->query('SET FOREIGN_KEY_CHECKS = 0');
 		$wpdb->query("SET SQL_MODE = 'NO_AUTO_VALUE_ON_ZERO'");
 
@@ -1420,8 +1427,15 @@ class SiteGuard_Backup_Database_Utility {
 
 				if (empty($query)) continue;
 
-				// Remap table prefixes in the query
-				$query = self::remap_table_prefix_in_query($query, $source_prefix, $target_prefix);
+				// If SAVEQUERIES is on, keep wpdb's statement log from accumulating the
+				// whole dump (each multi-MB INSERT would otherwise be retained in RAM).
+				if (!empty($wpdb->queries)) $wpdb->queries = array();
+
+				// Remap only the leading table-name token. Anchoring avoids running a
+				// PCRE over the entire (possibly multi-MB) VALUES blob - which both
+				// copies the whole string and can hit pcre.backtrack_limit and return
+				// NULL, silently dropping the statement (data loss).
+				$query = self::remap_leading_table_prefix($query, $source_prefix, $target_prefix);
 
 				if (self::is_dangerous_sql($query)) {
 					$result['errors'][] = "Blocked dangerous SQL on line {$line_count}";
@@ -1429,6 +1443,30 @@ class SiteGuard_Backup_Database_Utility {
 				}
 
 				$wpdb->check_connection();
+
+				// Split oversized INSERTs at row boundaries to stay under
+				// max_allowed_packet and keep peak memory bounded.
+				if (strlen($query) > ($max_packet - 1024) && preg_match('/^INSERT\s+INTO/i', $query)) {
+					$insert_prefix = '';
+					if (preg_match('/^(INSERT\s+INTO\s+`[^`]+`\s*(?:\([^)]+\))?\s*VALUES\s*)/is', $query, $pfx_m)) {
+						$insert_prefix = $pfx_m[1];
+					}
+					if ($insert_prefix) {
+						$values_part = substr($query, strlen($insert_prefix));
+						unset($query);
+						$chunks = self::split_insert_values($values_part, $max_packet - strlen($insert_prefix) - 1024);
+						unset($values_part);
+						foreach ($chunks as $chunk) {
+							$res = $wpdb->query($insert_prefix . $chunk);
+							if (false === $res) {
+								$result['errors'][] = "SQL error (split INSERT) on line {$line_count}: " . $wpdb->last_error;
+							}
+						}
+						unset($chunks);
+						continue;
+					}
+				}
+
 				$res = $wpdb->query($query);
 				if (false === $res) {
 					$result['errors'][] = "SQL error on line {$line_count}: " . $wpdb->last_error;
@@ -1443,7 +1481,7 @@ class SiteGuard_Backup_Database_Utility {
 		if (!empty(trim($buffer))) {
 			$query = trim(rtrim($buffer, ';'));
 			if (!empty($query) && !$skipping_table) {
-				$query = self::remap_table_prefix_in_query($query, $source_prefix, $target_prefix);
+				$query = self::remap_leading_table_prefix($query, $source_prefix, $target_prefix);
 				if (!self::is_dangerous_sql($query)) {
 					$wpdb->check_connection();
 					$res = $wpdb->query($query);
@@ -1506,6 +1544,13 @@ class SiteGuard_Backup_Database_Utility {
 		$current_action = ''; // 'remap', 'skip'
 		$current_remap_src = '';
 		$current_remap_dst = '';
+
+		// max_allowed_packet for splitting oversized INSERT statements
+		$max_packet = 16777216;
+		$packet_row = $wpdb->get_row("SHOW VARIABLES LIKE 'max_allowed_packet'");
+		if ($packet_row && isset($packet_row->Value) && (int) $packet_row->Value > 0) {
+			$max_packet = (int) $packet_row->Value;
+		}
 
 		$wpdb->query('SET FOREIGN_KEY_CHECKS = 0');
 		$wpdb->query("SET SQL_MODE = 'NO_AUTO_VALUE_ON_ZERO'");
@@ -1586,9 +1631,14 @@ class SiteGuard_Backup_Database_Utility {
 
 				if (empty($query)) continue;
 
-				// Remap table prefix
+				// Keep wpdb's statement log bounded if SAVEQUERIES is on.
+				if (!empty($wpdb->queries)) $wpdb->queries = array();
+
+				// Remap table prefix (anchored to the leading table name only - see
+				// remap_leading_table_prefix: avoids copying/backtracking the whole
+				// multi-MB VALUES blob, which could silently drop the statement).
 				if (!empty($current_remap_src) && !empty($current_remap_dst)) {
-					$query = self::remap_table_prefix_in_query($query, $current_remap_src, $current_remap_dst);
+					$query = self::remap_leading_table_prefix($query, $current_remap_src, $current_remap_dst);
 				}
 
 				if (self::is_dangerous_sql($query)) {
@@ -1597,6 +1647,30 @@ class SiteGuard_Backup_Database_Utility {
 				}
 
 				$wpdb->check_connection();
+
+				// Split oversized INSERTs at row boundaries to stay under
+				// max_allowed_packet and keep peak memory bounded.
+				if (strlen($query) > ($max_packet - 1024) && preg_match('/^INSERT\s+INTO/i', $query)) {
+					$insert_prefix = '';
+					if (preg_match('/^(INSERT\s+INTO\s+`[^`]+`\s*(?:\([^)]+\))?\s*VALUES\s*)/is', $query, $pfx_m)) {
+						$insert_prefix = $pfx_m[1];
+					}
+					if ($insert_prefix) {
+						$values_part = substr($query, strlen($insert_prefix));
+						unset($query);
+						$chunks = self::split_insert_values($values_part, $max_packet - strlen($insert_prefix) - 1024);
+						unset($values_part);
+						foreach ($chunks as $chunk) {
+							$res = $wpdb->query($insert_prefix . $chunk);
+							if (false === $res) {
+								$result['errors'][] = "SQL error (split INSERT) on line {$line_count}: " . $wpdb->last_error;
+							}
+						}
+						unset($chunks);
+						continue;
+					}
+				}
+
 				$res = $wpdb->query($query);
 				if (false === $res) {
 					$result['errors'][] = "SQL error on line {$line_count}: " . $wpdb->last_error;
@@ -1613,7 +1687,7 @@ class SiteGuard_Backup_Database_Utility {
 			$query = trim(rtrim($buffer, ';'));
 			if (!empty($query)) {
 				if (!empty($current_remap_src) && !empty($current_remap_dst)) {
-					$query = self::remap_table_prefix_in_query($query, $current_remap_src, $current_remap_dst);
+					$query = self::remap_leading_table_prefix($query, $current_remap_src, $current_remap_dst);
 				}
 				if (!self::is_dangerous_sql($query)) {
 					$wpdb->check_connection();
@@ -1639,5 +1713,34 @@ class SiteGuard_Backup_Database_Utility {
 		// Replace backtick-quoted table names
 		$escaped_source = preg_quote($source_prefix, '/');
 		return preg_replace('/`' . $escaped_source . '([^`]+)`/', '`' . $target_prefix . '$1`', $query);
+	}
+
+	/**
+	 * Remap the prefix of ONLY the leading table-name token of a statement
+	 * (DROP/CREATE/INSERT/REPLACE/ALTER/TRUNCATE/LOCK ... `prefix_table`).
+	 *
+	 * Anchored at the start of the statement so it never scans the (potentially
+	 * multi-MB) VALUES blob of a large INSERT. This avoids both the full-string
+	 * copy and the catastrophic PCRE backtracking that the unanchored
+	 * remap_table_prefix_in_query() pattern (`[^`]+`) can hit on big statements -
+	 * which returns NULL and silently drops the statement. WordPress dumps carry
+	 * the prefix only in the leading table name (no inter-table foreign keys), so
+	 * anchoring is sufficient.
+	 *
+	 * @param string $query         A single SQL statement.
+	 * @param string $source_prefix Prefix to replace (e.g. 'wp_39_').
+	 * @param string $target_prefix Replacement prefix (e.g. 'wp_11_').
+	 * @return string
+	 */
+	private static function remap_leading_table_prefix($query, $source_prefix, $target_prefix) {
+		$escaped_source = preg_quote($source_prefix, '/');
+		$out = preg_replace(
+			'/^((?:DROP\s+TABLE(?:\s+IF\s+EXISTS)?|CREATE\s+TABLE(?:\s+IF\s+NOT\s+EXISTS)?|INSERT\s+(?:IGNORE\s+)?INTO|REPLACE\s+INTO|ALTER\s+TABLE|TRUNCATE(?:\s+TABLE)?|LOCK\s+TABLES)\s+`)' . $escaped_source . '/i',
+			'${1}' . $target_prefix,
+			$query,
+			1
+		);
+		// preg_replace returns NULL on PCRE failure; never propagate that as the query.
+		return (null === $out) ? $query : $out;
 	}
 }

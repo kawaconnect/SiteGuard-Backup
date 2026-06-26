@@ -1186,6 +1186,9 @@ class SiteGuard_Backup_Restorer {
 			$this->progress("Search-replace: {$report['changes']} changes in {$report['tables']} tables");
 
 			$result['messages'][] = "Search-replace: {$report['changes']} changes ({$old_domain} -> {$target_domain}" . ($target_path !== '/' ? $target_path : '') . ")";
+
+			// Release the first pass's engine + report before any later passes.
+			unset($sr, $report);
 		}
 
 		// Step 6: Fix subsite options (siteurl, home). Preserve any source-side
@@ -1245,8 +1248,11 @@ class SiteGuard_Backup_Restorer {
 				$pairs['search'][]  = $tok;
 				$pairs['replace'][] = '%';
 			}
-			$all_tables = SiteGuard_Backup_Database_Utility::get_tables($target_prefix);
-			$report2 = $sr2->run($pairs['search'], $pairs['replace'], $all_tables);
+			// Escape tokens only ever occur in the option_value / post_content /
+			// meta_value columns we just scanned, so confine the second pass to those
+			// tables instead of re-walking every table on the network (a full extra
+			// pass over wp_N_* that found nothing but cost the most memory/time).
+			$report2 = $sr2->run($pairs['search'], $pairs['replace'], $sweep_tables);
 			$this->sgbackup->log("Residual escape-token sweep: " . count($residual_tokens) . " token(s) replaced across {$report2['tables']} tables ({$report2['changes']} changes). Tokens: " . wp_json_encode(array_values($residual_tokens)));
 		}
 
