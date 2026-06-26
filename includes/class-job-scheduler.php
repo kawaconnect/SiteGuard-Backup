@@ -21,6 +21,31 @@ class SiteGuard_Backup_Job_Scheduler {
 		$nonce = $sgbackup->nonce;
 		$resume_interval = $sgbackup->jobdata_get('resume_interval', 300);
 
+		// --- Adaptive resume interval (shortens the interval again after quick runs) ---
+		// run_times records how long each completed resumption actually took. Without
+		// this, the interval stays pinned at the 300s default forever, so a host that
+		// finishes a batch in ~5s still idles ~5 min between batches (turning a short
+		// backup into hours). Re-tune the next interval to ~2x the recent average,
+		// bounded to [30, 300]s, and only ever LOWER it here (the activity-backoff path
+		// in increase_resume_and_reschedule() still raises it under contention).
+		//
+		// This is environment self-tuning and safe on constrained hosts (e.g. Azure
+		// App Service): slower runtimes -> larger interval automatically, and the host's
+		// own wp-cron cadence still gates how soon a resumption can actually fire, so
+		// this can never run faster than the host allows. Only batch *timing* changes -
+		// batch size and execution behaviour are untouched.
+		$run_times = array_filter((array) $sgbackup->jobdata_get('run_times', array()), 'is_numeric');
+		if (count($run_times) >= 2) {
+			$recent = array_slice($run_times, -5);
+			$avg = array_sum($recent) / count($recent);
+			$tuned = max(30, min(300, (int) ceil($avg * 2)));
+			if ($tuned < $resume_interval) {
+				$resume_interval = $tuned;
+				$sgbackup->jobdata_set('resume_interval', $resume_interval);
+				$sgbackup->log("Resume interval auto-tuned to {$resume_interval}s (avg runtime " . round($avg, 1) . "s)");
+			}
+		}
+
 		// Track this resumption's check-in
 		$useful_checkins = $sgbackup->jobdata_get('useful_checkins', array());
 		$useful_checkins[$resumption] = time();
