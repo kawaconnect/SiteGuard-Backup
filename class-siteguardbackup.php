@@ -802,6 +802,29 @@ class SiteGuard_Backup {
 		$jobstatus = $this->jobdata_get('jobstatus', '');
 		$terminal = array('complete', 'finished', 'error', 'aborted', 'failed', 'warning');
 		if (in_array($jobstatus, $terminal, true)) {
+			// Self-heal an interrupted finalize. backup_finish() sets jobstatus to a
+			// terminal value BEFORE it writes history and clears the active-job marker.
+			// If the process dies in that window (timeout / fatal mid-finalize on a large
+			// set), the backup is registered nowhere yet the active marker stays set, so
+			// the UI shows it "in progress / uploading" forever and every later resumption
+			// would return here and never recover. If a successful job is not yet flagged
+			// finalized, complete the cleanup idempotently (save_to_history is keyed by
+			// timestamp; clearing events/markers is safe to repeat).
+			if (!$this->jobdata_get('finalized', false)
+				&& in_array($jobstatus, array('complete', 'finished', 'warning'), true)) {
+				$this->backup_time = $this->jobdata_get('backup_time');
+				$this->logfile_open($this->nonce);
+				$this->log("Self-healing interrupted finalize (status={$jobstatus})");
+				$this->save_to_history();
+				SiteGuard_Backup_Job_Scheduler::clear_scheduled_events($bnonce);
+				$active_nonce = get_option('sgbackup_active_job_nonce');
+				if ($active_nonce === $bnonce) {
+					delete_option('sgbackup_active_job_nonce');
+				}
+				$this->jobdata_set('finalized', 1);
+				$this->log("Finalize recovered");
+				$this->logfile_close();
+			}
 			return;
 		}
 
@@ -1328,6 +1351,10 @@ class SiteGuard_Backup {
 		if ($active_nonce === $this->nonce) {
 			delete_option('sgbackup_active_job_nonce');
 		}
+
+		// Mark fully finalized: history written and active marker cleared. A later
+		// resumption uses this to know finalization completed and must NOT self-heal.
+		$this->jobdata_set('finalized', 1);
 
 		// Clean up abort flag
 		$abort_file = $this->get_backup_dir() . 'deleteflag-' . $this->nonce . '.txt';
