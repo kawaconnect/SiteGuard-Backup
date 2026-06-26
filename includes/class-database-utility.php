@@ -350,7 +350,13 @@ class SiteGuard_Backup_Database_Utility {
 					} elseif (isset($binary_cols[$col_name])) {
 						$values[] = strlen($value) > 0 ? '0x' . bin2hex($value) : "''";
 					} else {
-						$values[] = "'" . $wpdb->_real_escape($value) . "'";
+						// wpdb::_real_escape() appends add_placeholder_escape(), turning every
+						// literal % into a per-process {hash} token that is normally stripped
+						// only inside wpdb::query(). We write straight to a dump file (never run
+						// through query), so strip it here - otherwise %-bearing data (Yoast
+						// %%sep%% templates, percent-encoded URLs, …) is frozen as {hash} and
+						// corrupted on restore.
+						$values[] = "'" . $wpdb->remove_placeholder_escape($wpdb->_real_escape($value)) . "'";
 					}
 				}
 				$row_strings[] = '(' . implode(', ', $values) . ')';
@@ -458,7 +464,9 @@ class SiteGuard_Backup_Database_Utility {
 					} elseif (isset($binary_cols[$col_name])) {
 						$values[] = strlen($value) > 0 ? '0x' . bin2hex($value) : "''";
 					} else {
-						$values[] = "'" . $wpdb_instance->_real_escape($value) . "'";
+						// Strip the placeholder-escape token _real_escape() appends (see note in
+						// php_dump_table) so % characters survive the dump intact.
+						$values[] = "'" . $wpdb_instance->remove_placeholder_escape($wpdb_instance->_real_escape($value)) . "'";
 					}
 				}
 				$row_strings[] = '(' . implode(', ', $values) . ')';
