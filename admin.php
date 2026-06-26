@@ -922,8 +922,12 @@ class SiteGuard_Backup_Admin {
 		}
 		clearstatcache(true, $dest);
 
-		// Handle bundle zip files (created by "Download" button)
-		if (strpos($filename, 'sgbackup_bundle_') === 0 && strtolower($ext) === 'zip') {
+		// Handle backup bundle / set zips. Recognise by CONTENTS, not just the filename,
+		// so a bundle that has been renamed (e.g. site-backup.zip) - or a plain zip of the
+		// raw backup_* files - still imports as a proper, restorable backup with its
+		// db/uploads/... entities, instead of a "generic" item with no Restore action.
+		if (strtolower($ext) === 'zip'
+			&& (strpos($filename, 'sgbackup_bundle_') === 0 || $this->zip_contains_backup($dest))) {
 			$extracted_files = $this->extract_bundle($dest, $backup_dir);
 			@unlink($dest); // Remove the bundle zip after extraction
 			if (is_wp_error($extracted_files)) {
@@ -1267,7 +1271,8 @@ class SiteGuard_Backup_Admin {
 		}
 		$zip->close();
 
-		// Register in backup history using manifest metadata
+		// Register in backup history using the bundle control file's metadata.
+		$registered = false;
 		if ($manifest && !empty($manifest['timestamp']) && !empty($manifest['backup'])) {
 			$backup_data = $manifest['backup'];
 			$total_size = 0;
@@ -1279,9 +1284,88 @@ class SiteGuard_Backup_Admin {
 			$backup_data['size'] = $total_size;
 			$backup_data['service'] = array('none');
 			SiteGuard_Backup_History::add_backup(intval($manifest['timestamp']), $backup_data);
+			$registered = true;
+		}
+
+		// Fallback: no (or invalid) _sgbackup_bundle.json - e.g. someone re-zipped the
+		// raw backup_* files under a custom name. Reconstruct the history entry from the
+		// extracted entity filenames so the upload still registers as a restorable backup
+		// (with its db/uploads/... parts) instead of leaving loose, unregistered files.
+		if (!$registered) {
+			$this->register_backup_from_files($extracted, $backup_dir);
 		}
 
 		return $extracted;
+	}
+
+	/**
+	 * Does this zip contain a SiteGuard backup? True if it has the bundle control file
+	 * (_sgbackup_bundle.json) OR any backup_* entity file at the root - regardless of the
+	 * archive's own name. Lets renamed bundles / hand-zipped backup sets import correctly.
+	 */
+	private function zip_contains_backup($zip_path) {
+		if (!class_exists('ZipArchive')) return false;
+		$zip = new ZipArchive();
+		if (true !== $zip->open($zip_path)) return false;
+		$found = false;
+		for ($i = 0; $i < $zip->numFiles; $i++) {
+			$entry = $zip->getNameIndex($i);
+			if ($entry === false) continue;
+			// root-level entries only
+			if (strpos($entry, '/') !== false || strpos($entry, '\\') !== false) continue;
+			if ($entry === '_sgbackup_bundle.json') { $found = true; break; }
+			if (preg_match('/^backup_\d{4}-\d{2}-\d{2}-\d{4}_.+-(db|uploads|plugins|themes|others|wpcore)\b/i', $entry)) {
+				$found = true; break;
+			}
+		}
+		$zip->close();
+		return $found;
+	}
+
+	/**
+	 * Reconstruct and register a backup-history entry purely from extracted entity
+	 * filenames (backup_<Y-m-d-Hi>_<site>_<nonce>-<entity>.<ext>), for bundles that
+	 * lack a _sgbackup_bundle.json control file. Groups split entities (uploads-1, …),
+	 * picks up the per-backup -manifest.json, and writes one history entry.
+	 *
+	 * @return bool True if a backup was registered.
+	 */
+	private function register_backup_from_files($files, $backup_dir) {
+		$entities = array('db', 'plugins', 'themes', 'uploads', 'others', 'wpcore');
+		$nonce = '';
+		$timestamp = 0;
+		$data = array();
+		foreach ((array) $files as $f) {
+			if (!preg_match('/^backup_(\d{4}-\d{2}-\d{2})-(\d{2})(\d{2})_[^_]+_([a-zA-Z0-9]+)-/', $f, $m)) continue;
+			if ($nonce === '') {
+				$nonce = $m[4];
+				$timestamp = strtotime($m[1] . ' ' . $m[2] . ':' . $m[3]);
+			}
+			if (preg_match('/-manifest\.json$/i', $f)) { $data['manifest'] = $f; continue; }
+			foreach ($entities as $e) {
+				// match -db. , -uploads. , and split parts like -uploads-1.
+				if (preg_match('/-' . preg_quote($e, '/') . '(\.|-\d+\.)/i', $f)) {
+					$data[$e][] = $f;
+					break;
+				}
+			}
+		}
+		if ($nonce === '' || !$timestamp) return false;
+
+		$total_size = 0;
+		foreach ((array) $files as $f) {
+			$p = $backup_dir . $f;
+			clearstatcache(true, $p);
+			if (file_exists($p)) $total_size += filesize($p);
+		}
+		foreach ($entities as $e) {
+			if (isset($data[$e])) $data[$e] = array_values(array_unique($data[$e]));
+		}
+		$data['nonce']   = $nonce;
+		$data['service'] = array('none');
+		$data['size']    = $total_size;
+		SiteGuard_Backup_History::add_backup($timestamp, $data);
+		return true;
 	}
 
 	/**
