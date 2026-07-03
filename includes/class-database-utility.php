@@ -1533,6 +1533,17 @@ class SiteGuard_Backup_Database_Utility {
 	 * @return bool True if the statement should be blocked.
 	 */
 	private static function is_dangerous_sql($query) {
+		// Data statements (INSERT/REPLACE) can never be a privilege or file
+		// operation - OUTFILE/LOAD DATA/GRANT are not valid inside them - so the
+		// patterns below must NOT be matched against their row data. Several
+		// patterns are non-anchored (\bLOAD DATA\b, \bINTO OUTFILE\b, \bSET
+		// GLOBAL\b, …) and would otherwise false-positive on ordinary content
+		// that merely contains the phrase (e.g. Elementor JSON with the words
+		// "Load data"), silently dropping a whole batch of legitimate rows.
+		if (preg_match('/^\s*(?:INSERT|REPLACE)\b/i', $query)) {
+			return false;
+		}
+
 		$dangerous_patterns = array(
 			'/^\s*GRANT\s/i',
 			'/^\s*REVOKE\s/i',
