@@ -259,6 +259,14 @@ class SiteGuard_Backup_Commands {
 		$sgbackup = SiteGuard_Backup::instance();
 		$log = $sgbackup->get_log($nonce);
 
+		// Defensive tail cap: never hand back more than 256KB even if the underlying
+		// reader loaded a very large file. NOTE (coordinator): SiteGuard_Backup::get_log()
+		// in class-siteguardbackup.php should also tail-cap at the source to avoid OOM there.
+		$max_log_bytes = 262144;
+		if (is_string($log) && strlen($log) > $max_log_bytes) {
+			$log = "[log truncated]\n" . substr($log, -$max_log_bytes);
+		}
+
 		return array('log' => $log, 'nonce' => $nonce);
 	}
 
@@ -427,6 +435,16 @@ class SiteGuard_Backup_Commands {
 			'health_ssl_warn_days',
 		);
 
+		// Validate up-front, BEFORE any update_option, so a validation failure can't leave
+		// settings half-applied. IP allowlist self-lockout guard must run before we commit
+		// the password hash / recipients / encryption key / etc.
+		if (isset($params['ip_allowlist']) && !empty(trim($params['ip_allowlist']))) {
+			require_once SGBACKUP_DIR . 'includes/class-security.php';
+			if (!SiteGuard_Backup_Security::validate_allowlist_includes_current_ip($params['ip_allowlist'])) {
+				return new WP_Error('lockout_prevention', 'Your current IP (' . SiteGuard_Backup_Security::get_client_ip() . ') is not in the allowlist. Add it to prevent locking yourself out.');
+			}
+		}
+
 		// H5: Handle password protection settings specially before the main loop
 		if (isset($params['lock_admin_password'])) {
 			$password = $params['lock_admin_password'];
@@ -529,14 +547,6 @@ class SiteGuard_Backup_Commands {
 			$events = array_values(array_intersect($events, $valid_events));
 			$opts->update_option('sgbackup_webhook_events', $events);
 			unset($params['webhook_events']);
-		}
-
-		// IP allowlist: validate current IP is included to prevent self-lockout
-		if (isset($params['ip_allowlist']) && !empty(trim($params['ip_allowlist']))) {
-			require_once SGBACKUP_DIR . 'includes/class-security.php';
-			if (!SiteGuard_Backup_Security::validate_allowlist_includes_current_ip($params['ip_allowlist'])) {
-				return new WP_Error('lockout_prevention', 'Your current IP (' . SiteGuard_Backup_Security::get_client_ip() . ') is not in the allowlist. Add it to prevent locking yourself out.');
-			}
 		}
 
 		// Failover role: validate against known roles
@@ -775,7 +785,9 @@ class SiteGuard_Backup_Commands {
 					'host'   => isset($extdb['host']) ? sanitize_text_field($extdb['host']) : '',
 					'port'   => isset($extdb['port']) ? intval($extdb['port']) : 3306,
 					'user'   => isset($extdb['user']) ? sanitize_text_field($extdb['user']) : '',
-					'pass'   => isset($extdb['pass']) ? sanitize_text_field($extdb['pass']) : '',
+					// Don't sanitize_text_field the DB password (strips spaces/newlines/`<`,
+					// corrupting valid credentials); only strip null bytes.
+					'pass'   => isset($extdb['pass']) ? str_replace(chr(0), '', (string) $extdb['pass']) : '',
 					'name'   => isset($extdb['name']) ? sanitize_text_field($extdb['name']) : '',
 					'prefix' => isset($extdb['prefix']) ? sanitize_text_field($extdb['prefix']) : '',
 				);
@@ -828,8 +840,23 @@ class SiteGuard_Backup_Commands {
 
 		$host = sanitize_text_field($params['host']);
 		$user = sanitize_text_field($params['user']);
-		$pass = isset($params['pass']) ? sanitize_text_field($params['pass']) : '';
+		// Do NOT sanitize_text_field the DB password: it strips spaces/newlines/`<` and would
+		// corrupt otherwise-valid credentials. Only strip null bytes.
+		$pass = isset($params['pass']) ? str_replace(chr(0), '', (string) $params['pass']) : '';
 		$name = sanitize_text_field($params['name']);
+
+		// SSRF hardening: refuse cloud-metadata / link-local targets and audit the outbound attempt.
+		$host_only = preg_replace('/:\d+$/', '', trim($host));
+		$check_ip = filter_var($host_only, FILTER_VALIDATE_IP) ? $host_only : @gethostbyname($host_only);
+		if (is_string($check_ip) && filter_var($check_ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) {
+			// 169.254.0.0/16 = link-local, includes the 169.254.169.254 cloud metadata endpoint.
+			if (strpos($check_ip, '169.254.') === 0) {
+				return new WP_Error('db_host_blocked', 'Refusing to connect to a link-local/metadata address (' . $check_ip . ').');
+			}
+		}
+		if (class_exists('SiteGuard_Backup_Audit_Log')) {
+			SiteGuard_Backup_Audit_Log::instance()->log('extdb_test', 'External DB connection test to host: ' . $host_only);
+		}
 
 		$test_wpdb = new wpdb($user, $pass, $name, $host);
 
@@ -1957,7 +1984,10 @@ class SiteGuard_Backup_Commands {
 			}
 
 			$real_path = realpath($path);
-			if ($real_path === false || strpos($real_path, $real_dir) !== 0) {
+			// Compare against the directory WITH a trailing separator so a sibling like
+			// /…/sgbackupEVIL is not accepted as a child of /…/sgbackup.
+			$real_dir_sep = $real_dir ? rtrim($real_dir, DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR : '';
+			if ($real_path === false || $real_dir_sep === '' || strpos($real_path, $real_dir_sep) !== 0) {
 				return new WP_Error('invalid_path', 'Invalid file path');
 			}
 
@@ -2502,6 +2532,9 @@ class SiteGuard_Backup_Commands {
 		$defaults = $opts->get_defaults();
 		$imported = 0;
 
+		require_once SGBACKUP_DIR . 'includes/class-security.php';
+		$encrypt_creds = (bool) $opts->get_option('sgbackup_encrypt_credentials', false);
+
 		foreach ($params['settings'] as $key => $value) {
 			// Sanitize key to alphanumeric and underscore only
 			if (!preg_match('/^[a-zA-Z0-9_]+$/', $key)) continue;
@@ -2510,13 +2543,47 @@ class SiteGuard_Backup_Commands {
 				if ($key === 'lock_admin_password') continue;
 				// Type-check against default value
 				if (gettype($value) !== gettype($defaults[$key])) continue;
+				// Tighten the type check: an array-typed option previously imported unchecked.
+				// Recursively enforce scalar/array leaves (drops objects/resources); leaves
+				// string content intact so multi-line settings aren't mangled.
+				if (is_array($value)) {
+					$value = $this->sanitize_imported_array($value);
+				} elseif (!is_scalar($value) && !is_null($value)) {
+					continue;
+				}
 				$opts->update_option('sgbackup_' . $key, $value);
 				$imported++;
 			} elseif (strpos($key, 'method_') === 0) {
 				$method = substr($key, 7);
-				if (in_array($method, self::$valid_methods, true) && is_array($value)) {
-					$opts->update_option('sgbackup_' . $method, $value);
+				if (!in_array($method, self::$valid_methods, true) || !is_array($value)) continue;
+
+				// Multi-instance format: array('version'=>N, 'settings'=>array(id=>fields)).
+				if (isset($value['settings']) && is_array($value['settings'])) {
+					$clean = array(
+						'version'  => isset($value['version']) ? intval($value['version']) : 1,
+						'settings' => array(),
+					);
+					foreach ($value['settings'] as $instance_id => $instance_settings) {
+						if (!is_array($instance_settings)) continue;
+						$instance_settings = $this->sanitize_imported_method_fields($instance_settings);
+						if ($encrypt_creds) {
+							$instance_settings = SiteGuard_Backup_Security::encrypt_method_options($method, $instance_settings);
+						}
+						$clean['settings'][sanitize_text_field($instance_id)] = $instance_settings;
+					}
+					$opts->update_option('sgbackup_' . $method, $clean);
 					$imported++;
+				} elseif ($this->is_flat_method_settings($value)) {
+					// Legacy flat format: array(field=>scalar).
+					$clean = $this->sanitize_imported_method_fields($value);
+					if ($encrypt_creds) {
+						$clean = SiteGuard_Backup_Security::encrypt_method_options($method, $clean);
+					}
+					$opts->update_option('sgbackup_' . $method, $clean);
+					$imported++;
+				} else {
+					// Unexpected structure: skip rather than persist an attacker-shaped blob.
+					error_log('SiteGuard Backup: skipped import of "' . $key . '" (unexpected method settings structure).');
 				}
 			}
 		}
@@ -2526,6 +2593,72 @@ class SiteGuard_Backup_Commands {
 		$audit->log('settings_imported', 'Imported ' . $imported . ' settings.');
 
 		return array('success' => true, 'imported' => $imported);
+	}
+
+	/**
+	 * Recursively enforce that an imported array contains only scalar/array leaves.
+	 * Drops objects/resources; preserves string content (no mangling of multi-line values).
+	 *
+	 * @param array $arr Imported array.
+	 * @return array Cleaned array.
+	 */
+	private function sanitize_imported_array($arr) {
+		$clean = array();
+		foreach ($arr as $k => $v) {
+			if (is_string($k)) $k = sanitize_text_field($k);
+			if (is_array($v)) {
+				$clean[$k] = $this->sanitize_imported_array($v);
+			} elseif (is_scalar($v) || is_null($v)) {
+				$clean[$k] = $v;
+			}
+			// objects / resources dropped
+		}
+		return $clean;
+	}
+
+	/**
+	 * Sanitize a storage-method options array on import, mirroring savesettings():
+	 * multi-line credential fields keep newlines (tags/null bytes stripped), everything
+	 * else goes through sanitize_text_field. Nested arrays are dropped (fields are scalar).
+	 *
+	 * @param array $fields Method field map.
+	 * @return array Sanitized field map.
+	 */
+	private function sanitize_imported_method_fields($fields) {
+		$multiline_fields = array('key', 'pass', 'secret', 'token', 'private_key', 'client_secret', 'access_token', 'refresh_token');
+		$clean = array();
+		foreach ($fields as $fkey => $val) {
+			$fkey = sanitize_text_field($fkey);
+			if (is_array($val)) continue; // method fields are scalar
+			if (!is_string($val)) {
+				$clean[$fkey] = (is_scalar($val) || is_null($val)) ? $val : '';
+				continue;
+			}
+			if (in_array($fkey, $multiline_fields, true)) {
+				$val = wp_check_invalid_utf8($val);
+				$val = wp_strip_all_tags($val);
+				$val = str_replace(chr(0), '', $val);
+			} else {
+				$val = sanitize_text_field($val);
+			}
+			$clean[$fkey] = $val;
+		}
+		return $clean;
+	}
+
+	/**
+	 * True if the value looks like a flat method-settings map (field=>scalar), i.e. an
+	 * associative array with no nested-array values. Used to reject unexpected structures.
+	 *
+	 * @param array $value Candidate value.
+	 * @return bool
+	 */
+	private function is_flat_method_settings($value) {
+		if (!is_array($value) || empty($value)) return false;
+		foreach ($value as $v) {
+			if (is_array($v)) return false;
+		}
+		return true;
 	}
 
 	/**
@@ -2698,17 +2831,19 @@ class SiteGuard_Backup_Commands {
 		for ($i = 0; $i < $max_resumptions; $i++) {
 			$jobdata = $sgbackup->jobdata_getarray($nonce);
 			$status = isset($jobdata['jobstatus']) ? $jobdata['jobstatus'] : '';
-			if (in_array($status, array('complete', 'finished', 'error', 'aborted', 'failed'), true)) break;
+			if (in_array($status, array('complete', 'finished', 'warning', 'error', 'aborted', 'failed'), true)) break;
 			$sgbackup->backup_resume($i, $nonce);
 			$jobdata = $sgbackup->jobdata_getarray($nonce);
 			$status = isset($jobdata['jobstatus']) ? $jobdata['jobstatus'] : '';
-			if (in_array($status, array('complete', 'finished', 'error', 'aborted', 'failed'), true)) break;
+			if (in_array($status, array('complete', 'finished', 'warning', 'error', 'aborted', 'failed'), true)) break;
 		}
 
 		$jobdata = $sgbackup->jobdata_getarray($nonce);
 		$status = isset($jobdata['jobstatus']) ? $jobdata['jobstatus'] : '';
 
-		if ($status === 'complete' || $status === 'finished') {
+		// The real terminal success states set by backup_finish are complete/warning
+		// ('finished' kept for backward compat); a 'warning' backup still succeeded.
+		if ($status === 'complete' || $status === 'finished' || $status === 'warning') {
 			return array(
 				'success'  => true,
 				'nonce'    => $nonce,
@@ -2791,8 +2926,12 @@ class SiteGuard_Backup_Commands {
 			$sr_parts = explode('|', $params['search_replace'], 2);
 			if (count($sr_parts) === 2 && !empty($sr_parts[0]) && !empty($sr_parts[1])) {
 				require_once SGBACKUP_DIR . 'includes/class-search-replace.php';
+				require_once SGBACKUP_DIR . 'includes/class-database-utility.php';
 				$sr = new SiteGuard_Backup_Search_Replace();
-				$results['search_replace'] = $sr->run($sr_parts[0], $sr_parts[1], false);
+				// run() signature is run($search, $replace, $tables, $dry_run=false). The 3rd
+				// arg is the table list, NOT $dry_run: passing `false` made it a silent no-op.
+				$sr_tables = SiteGuard_Backup_Database_Utility::get_tables($wpdb->prefix);
+				$results['search_replace'] = $sr->run($sr_parts[0], $sr_parts[1], $sr_tables, false);
 			}
 		}
 

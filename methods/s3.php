@@ -60,6 +60,20 @@ class SiteGuard_Backup_Method_S3 extends SiteGuard_Backup_Module {
 	}
 
 	/**
+	 * Encode a URI path per segment (RFC 3986), preserving forward slashes.
+	 *
+	 * SigV4 requires the canonical URI to be the URI-encoded path exactly as
+	 * sent on the wire, so the same encoded string must be used for both the
+	 * canonical request and the request URL.
+	 *
+	 * @param string $path URI path (e.g. /bucket/dir/file name.zip).
+	 * @return string Encoded path.
+	 */
+	protected function encode_uri_path($path) {
+		return implode('/', array_map('rawurlencode', explode('/', $path)));
+	}
+
+	/**
 	 * Generate AWS Signature V4 for S3 requests.
 	 */
 	protected function sign_request($method, $uri, $headers, $payload_hash, $query = '') {
@@ -131,7 +145,8 @@ class SiteGuard_Backup_Method_S3 extends SiteGuard_Backup_Module {
 			$key = substr($key, 0, $qpos);
 		}
 
-		$uri = "/{$bucket}/{$path}{$key}";
+		// Encode once; the same encoded URI is used in the canonical request and the URL
+		$uri = $this->encode_uri_path("/{$bucket}/{$path}{$key}");
 
 		// Hash all request bodies (not just PUT) for Backblaze B2 compatibility
 		$payload_hash = (!empty($body))
@@ -265,8 +280,31 @@ class SiteGuard_Backup_Method_S3 extends SiteGuard_Backup_Module {
 		}
 		$upload_id = $m[1];
 
+		// Any failure after a successful CreateMultipartUpload must abort the
+		// upload, otherwise orphaned parts accrue storage charges indefinitely.
+		$result = $this->upload_parts_and_complete($file, $key, $upload_id);
+		if (is_wp_error($result)) {
+			$this->abort_multipart_upload($key, $upload_id);
+			return $result;
+		}
+
+		return true;
+	}
+
+	/**
+	 * Upload all parts of a multipart upload, then complete it.
+	 *
+	 * @param string $file      Full path to file.
+	 * @param string $key       Object key.
+	 * @param string $upload_id Multipart upload ID.
+	 * @return bool|WP_Error
+	 */
+	protected function upload_parts_and_complete($file, $key, $upload_id) {
 		$chunk_size = 10485760; // 10MB per part
 		$fh = fopen($file, 'rb');
+		if (!$fh) {
+			return new WP_Error('s3_read', 'Failed to open file for reading: ' . $file);
+		}
 		$part_number = 1;
 		$etags = array();
 
@@ -275,12 +313,12 @@ class SiteGuard_Backup_Method_S3 extends SiteGuard_Backup_Module {
 			if (false === $chunk || strlen($chunk) === 0) break;
 
 			$part_key = $key . "?partNumber={$part_number}&uploadId=" . urlencode($upload_id);
-			$result = $this->request('PUT', $part_key, $chunk);
+			$result = $this->request_with_retries(function() use ($part_key, $chunk) {
+				return $this->request('PUT', $part_key, $chunk);
+			}, "S3 part {$part_number} upload");
 
 			if (is_wp_error($result)) {
 				fclose($fh);
-				// Abort multipart
-				$this->request('DELETE', $key . '?uploadId=' . urlencode($upload_id));
 				return $result;
 			}
 
@@ -288,7 +326,6 @@ class SiteGuard_Backup_Method_S3 extends SiteGuard_Backup_Module {
 			$etag = isset($headers['etag']) ? trim($headers['etag'], '"') : '';
 			if (empty($etag)) {
 				fclose($fh);
-				$this->request('DELETE', $key . '?uploadId=' . urlencode($upload_id));
 				return new WP_Error('s3_missing_etag', "Missing ETag for part {$part_number}");
 			}
 			$etags[$part_number] = $etag;
@@ -312,6 +349,22 @@ class SiteGuard_Backup_Method_S3 extends SiteGuard_Backup_Module {
 		return is_wp_error($complete) ? $complete : true;
 	}
 
+	/**
+	 * Best-effort AbortMultipartUpload for a failed multipart upload.
+	 *
+	 * @param string $key       Object key.
+	 * @param string $upload_id Multipart upload ID.
+	 */
+	protected function abort_multipart_upload($key, $upload_id) {
+		$abort = $this->request('DELETE', $key . '?uploadId=' . urlencode($upload_id));
+		if (is_wp_error($abort)) {
+			SiteGuard_Backup::instance()->log(
+				"S3: failed to abort multipart upload {$upload_id} for {$key}: " . $abort->get_error_message(),
+				'warning'
+			);
+		}
+	}
+
 	public function download($file, $dest_dir) {
 		$key = $file;
 		$local_path = trailingslashit($dest_dir) . basename($file);
@@ -321,7 +374,8 @@ class SiteGuard_Backup_Method_S3 extends SiteGuard_Backup_Module {
 		$endpoint = $this->get_endpoint();
 		$bucket = $options['bucket'];
 		$path = !empty($options['path']) ? trim($options['path'], '/') . '/' : '';
-		$uri = "/{$bucket}/{$path}{$key}";
+		// Encode once; the same encoded URI is used in the canonical request and the URL
+		$uri = $this->encode_uri_path("/{$bucket}/{$path}{$key}");
 		$payload_hash = hash('sha256', ''); // Hash of empty body - required by B2
 
 		$headers = array('Host' => $this->get_host());

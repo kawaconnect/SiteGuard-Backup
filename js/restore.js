@@ -1,6 +1,13 @@
 /**
  * SiteGuard Backup - Restore Progress Handler
  *
+ * @deprecated UNUSED. window.SGBRestore is never invoked by the plugin and this
+ * file has drifted from the authoritative implementation. The live restore flow
+ * (streaming XHR, connection-loss handling, resume, progress rendering) lives in
+ * js/admin.js -> SGB.doRestore(). Do NOT add features here. This file is kept
+ * only so the existing wp_enqueue_script handle (owned by admin.php) does not
+ * 404; remove the enqueue and this file together in a future cleanup.
+ *
  * Handles streaming XHR for restore progress display.
  */
 (function($) {

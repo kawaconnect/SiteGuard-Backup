@@ -47,13 +47,24 @@ class SiteGuard_Backup_Remote_Communications {
 		// Create name hash for identification
 		$name_hash = wp_generate_password(12, false);
 
-		// Store locally
+		// Store locally. Encrypt the private key at rest if the credential
+		// encryption helper is available (AUTH_KEY-derived AES-256-GCM). Old
+		// keys stored before this change remain plaintext and are handled by the
+		// graceful passthrough in decrypt_private_key() on read.
 		$opts = SiteGuard_Backup_Options::instance();
 		$local_keys = $opts->get_option('sgbackup_migrator_localkeys', array());
 
+		$stored_private_key = $private_key;
+		if (file_exists(SGBACKUP_DIR . 'includes/class-security.php')) {
+			require_once SGBACKUP_DIR . 'includes/class-security.php';
+			if (class_exists('SiteGuard_Backup_Security')) {
+				$stored_private_key = SiteGuard_Backup_Security::encrypt_option($private_key);
+			}
+		}
+
 		$local_keys[$name_hash] = array(
 			'name'        => $name,
-			'private_key' => $private_key,
+			'private_key' => $stored_private_key,
 			'public_key'  => $public_key,
 			'created'     => time(),
 			'format'      => 1, // Start with format 1 until sender upgrades
@@ -257,6 +268,18 @@ class SiteGuard_Backup_Remote_Communications {
 		// Try OAEP first (new format), fall back to PKCS#1 v1.5 (legacy)
 		$result = openssl_private_decrypt($rsa_encrypted, $aes_key, $priv_key_resource, OPENSSL_PKCS1_OAEP_PADDING);
 		if (!$result) {
+			// Downgrade to PKCS#1 v1.5 is OFF by default: automatically accepting
+			// it exposes the receiver to Bleichenbacher-style padding-oracle
+			// attacks. Only try the legacy path if an operator has explicitly
+			// opted in for a known legacy peer.
+			if (!get_option('sgbackup_allow_legacy_rsa_padding', false)) {
+				return new WP_Error('rsa_decrypt', 'RSA decryption failed (OAEP). Legacy PKCS#1 v1.5 padding is disabled.');
+			}
+
+			if (class_exists('SiteGuard_Backup')) {
+				SiteGuard_Backup::instance()->log('Warning: falling back to deprecated PKCS#1 v1.5 RSA padding (sgbackup_allow_legacy_rsa_padding is enabled). This is vulnerable to padding-oracle attacks; upgrade the remote peer and disable this option.', 'warning');
+			}
+
 			// Fallback for messages from older senders using PKCS#1 v1.5
 			$decrypted_key_iv = '';
 			$result = openssl_private_decrypt($rsa_encrypted, $decrypted_key_iv, $priv_key_resource);

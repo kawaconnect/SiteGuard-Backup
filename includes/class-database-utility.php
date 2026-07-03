@@ -199,10 +199,15 @@ class SiteGuard_Backup_Database_Utility {
 
 			// Capture stderr separately so warnings (e.g. MariaDB deprecation
 			// notices) don't pollute the SQL output file.
+			// --hex-blob so binary/blob data round-trips safely; explicit
+			// --default-character-set so multibyte text is emitted in the DB's
+			// charset rather than the client default (M3).
+			$charset = (defined('DB_CHARSET') && DB_CHARSET) ? DB_CHARSET : 'utf8mb4';
 			$stderr_file = $opts_file . '.err';
 			$cmd = sprintf(
-				'mysqldump --defaults-extra-file=%s --no-tablespaces --single-transaction --quick --skip-lock-tables --skip-add-locks %s %s %s %s > %s 2>%s',
+				'mysqldump --defaults-extra-file=%s --no-tablespaces --single-transaction --quick --skip-lock-tables --skip-add-locks --hex-blob --default-character-set=%s %s %s %s %s > %s 2>%s',
 				escapeshellarg($opts_file),
+				escapeshellarg($charset),
 				$port,
 				$socket,
 				escapeshellarg($db),
@@ -254,95 +259,164 @@ class SiteGuard_Backup_Database_Utility {
 	 * @param string $where_clause   Optional WHERE clause for filtered dumps (e.g. "ID IN (1,2,3)").
 	 * @return bool True on success.
 	 */
-	public static function php_dump_table($table, $outfile, $batch_size = 1000, $structure_only = false, $where_clause = '') {
+	public static function php_dump_table($table, $outfile, $batch_size = 1000, $structure_only = false, $where_clause = '', $anonymiser = null) {
 		global $wpdb;
 
 		$table = self::sanitize_table_name($table);
+		if (!$table) return false;
 
 		$use_gzip = (substr($outfile, -3) === '.gz');
 		$fh = $use_gzip ? @gzopen($outfile, 'wb9') : @fopen($outfile, 'w');
 		if (!$fh) return false;
 
+		// Writer returns bytes written (or false). Every write MUST be verified
+		// against the intended length - an unchecked short write silently
+		// truncates the dump (C2).
 		$write = function($data) use ($fh, $use_gzip) {
 			return $use_gzip ? @gzwrite($fh, $data) : @fwrite($fh, $data);
+		};
+		// Abort: close, delete the partial output, return false so the table is
+		// never treated as fully dumped.
+		$abort = function($msg = '') use ($fh, $use_gzip, $outfile, $table) {
+			$use_gzip ? @gzclose($fh) : @fclose($fh);
+			@unlink($outfile);
+			if ($msg !== '') error_log("SiteGuard Backup: dump of {$table} aborted: {$msg}");
+			return false;
+		};
+		$put = function($data) use ($write) {
+			if ('' === $data) return true;
+			$n = $write($data);
+			return ($n !== false && $n === strlen($data));
+		};
+		$close_ok = function() use ($fh, $use_gzip, $outfile) {
+			$ok = $use_gzip ? @gzclose($fh) : @fclose($fh);
+			if (false === $ok) { @unlink($outfile); return false; }
+			return true;
 		};
 
 		// Table structure
 		$create = $wpdb->get_row("SHOW CREATE TABLE `{$table}`", ARRAY_N);
-		if (!$create) {
-			$use_gzip ? @gzclose($fh) : @fclose($fh);
-			return false;
+		if (!$create || !isset($create[1])) {
+			return $abort('SHOW CREATE TABLE failed');
 		}
 
-		$write("DROP TABLE IF EXISTS `{$table}`;\n");
-		$write($create[1] . ";\n\n");
+		if (!$put("DROP TABLE IF EXISTS `{$table}`;\n") || !$put($create[1] . ";\n\n")) {
+			return $abort('short write on structure');
+		}
 
 		// Gap 21: Structure-only mode - skip data
 		if ($structure_only) {
-			$write("-- Structure only: data excluded by data_optional_tables setting\n\n");
-			$use_gzip ? @gzclose($fh) : @fclose($fh);
-			return true;
+			if (!$put("-- Structure only: data excluded by data_optional_tables setting\n\n")) {
+				return $abort('short write (structure-only)');
+			}
+			return $close_ok();
 		}
 
 		// Table data
 		$where_sql = !empty($where_clause) ? " WHERE {$where_clause}" : '';
-		$count_query = "SELECT COUNT(*) FROM `{$table}`{$where_sql}";
-		$total_rows = (int) $wpdb->get_var($count_query);
+		$total_rows = (int) $wpdb->get_var("SELECT COUNT(*) FROM `{$table}`{$where_sql}");
 		if ($total_rows === 0) {
-			$use_gzip ? @gzclose($fh) : @fclose($fh);
-			return true;
+			if (!$put("-- sgbackup:table-complete {$table} rows=0\n\n")) return $abort('short write (marker)');
+			return $close_ok();
 		}
 
-		// Get columns for INSERT statement with type info
+		// Column metadata. Exclude STORED/VIRTUAL generated columns from BOTH the
+		// SELECT and the INSERT column list - listing a generated column in INSERT
+		// fails with err 3105 and loses the whole table (M1).
 		$columns = $wpdb->get_results("SHOW COLUMNS FROM `{$table}`", ARRAY_A);
-		$col_names = array_map(function($c) { return '`' . $c['Field'] . '`'; }, $columns);
-		$col_list = implode(', ', $col_names);
+		if (empty($columns)) return $abort('SHOW COLUMNS failed');
 
-		// Detect binary/blob columns
+		$data_cols = array();
 		$binary_cols = array();
-		foreach ($columns as $i => $col) {
+		$all_pk_cols = array();
+		foreach ($columns as $col) {
+			if ($col['Key'] === 'PRI') $all_pk_cols[] = $col['Field'];
+			if (isset($col['Extra']) && preg_match('/GENERATED/i', $col['Extra'])) {
+				continue; // never dump generated column values
+			}
+			$data_cols[] = $col['Field'];
 			$type = strtolower($col['Type']);
 			if (preg_match('/binary|blob|bit/i', $type)) {
 				$binary_cols[$col['Field']] = true;
 			}
 		}
+		if (empty($data_cols)) return $abort('no dumpable columns');
 
-		// Use primary-key-based pagination when possible (much faster than
-		// LIMIT/OFFSET on large tables - avoids scanning N rows to skip them)
-		$primary_key = null;
-		foreach ($columns as $col) {
-			if ($col['Key'] === 'PRI') {
-				$primary_key = $col['Field'];
-				break;
-			}
+		$col_list = implode(', ', array_map(function($f) { return '`' . $f . '`'; }, $data_cols));
+
+		// Pagination strategy (C1):
+		//  - exactly one PRI column (and no WHERE) -> single-column keyset (fast).
+		//  - composite PK, no PK, or a WHERE clause -> deterministic full ORDER BY
+		//    with LIMIT/OFFSET so no rows are dropped at tie boundaries.
+		$single_keyset = (count($all_pk_cols) === 1 && empty($where_clause) && in_array($all_pk_cols[0], $data_cols, true));
+		$pk = $single_keyset ? $all_pk_cols[0] : null;
+		$order_cols = !empty($all_pk_cols) ? $all_pk_cols : $data_cols;
+		$order_by = implode(', ', array_map(function($f) { return '`' . $f . '` ASC'; }, $order_cols));
+
+		// Byte-budgeted INSERT emission (H1): accumulate rows until ~8MB (capped by
+		// max_allowed_packet/2) regardless of row count, so wide page-builder rows
+		// can't balloon a single statement / peak memory.
+		$byte_budget = 8 * 1024 * 1024;
+		$packet_row = $wpdb->get_row("SHOW VARIABLES LIKE 'max_allowed_packet'");
+		if ($packet_row && isset($packet_row->Value) && (int) $packet_row->Value > 0) {
+			$byte_budget = (int) min($byte_budget, max(65536, ((int) $packet_row->Value) / 2));
 		}
 
-		$last_pk = 0;
+		$insert_header = "INSERT INTO `{$table}` ({$col_list}) VALUES\n";
+		$pending = array();
+		$pending_bytes = 0;
+		$flush_insert = function() use (&$pending, &$pending_bytes, $insert_header, $put) {
+			if (empty($pending)) return true;
+			$ok = $put($insert_header . implode(",\n", $pending) . ";\n\n");
+			$pending = array();
+			$pending_bytes = 0;
+			return $ok;
+		};
+
+		// Keep the SELECT itself modest - with unknown row width, start small and
+		// let it adapt down under memory pressure.
+		$fetch_limit = max(1, min(200, (int) $batch_size));
+
+		$have_last = false;
+		$last_pk = null;
 		$rows_done = 0;
+		$offset = 0;
+
 		while ($rows_done < $total_rows) {
-			if ($primary_key && empty($where_clause)) {
-				// Primary key pagination: WHERE pk > last_pk ORDER BY pk LIMIT batch
-				$rows = $wpdb->get_results(
-					$wpdb->prepare(
-						"SELECT * FROM `{$table}` WHERE `{$primary_key}` > %s ORDER BY `{$primary_key}` ASC LIMIT %d",
-						$last_pk, $batch_size
-					),
-					ARRAY_A
-				);
+			if ($single_keyset) {
+				if ($have_last) {
+					$rows = $wpdb->get_results($wpdb->prepare(
+						"SELECT {$col_list} FROM `{$table}` WHERE `{$pk}` > %s ORDER BY `{$pk}` ASC LIMIT %d",
+						$last_pk, $fetch_limit
+					), ARRAY_A);
+				} else {
+					$rows = $wpdb->get_results($wpdb->prepare(
+						"SELECT {$col_list} FROM `{$table}` ORDER BY `{$pk}` ASC LIMIT %d",
+						$fetch_limit
+					), ARRAY_A);
+				}
 			} else {
-				// Fallback to OFFSET pagination for tables without PK or with WHERE
-				$rows = $wpdb->get_results(
-					$wpdb->prepare("SELECT * FROM `{$table}`{$where_sql} LIMIT %d OFFSET %d", $batch_size, $rows_done),
-					ARRAY_A
-				);
+				$rows = $wpdb->get_results($wpdb->prepare(
+					"SELECT {$col_list} FROM `{$table}`{$where_sql} ORDER BY {$order_by} LIMIT %d OFFSET %d",
+					$fetch_limit, $offset
+				), ARRAY_A);
 			}
 
-			if (empty($rows)) break;
+			if (empty($rows)) {
+				// Empty can mean genuine EOF OR a query error - get_results()
+				// returns empty on both. Distinguish via last_error (C3).
+				if ($wpdb->last_error) {
+					return $abort('query error: ' . $wpdb->last_error);
+				}
+				break;
+			}
 
-			$write("INSERT INTO `{$table}` ({$col_list}) VALUES\n");
-
-			$row_strings = array();
 			foreach ($rows as $row) {
+				// Apply anonymisation if available (row-aware - see anonymise_row).
+				// Kept null for normal backups so this path is a no-op there.
+				if ($anonymiser !== null && $anonymiser->should_anonymise_row($table, $row)) {
+					$row = $anonymiser->anonymise_row($table, $row);
+				}
 				$values = array();
 				foreach ($row as $col_name => $value) {
 					if (is_null($value)) {
@@ -350,36 +424,53 @@ class SiteGuard_Backup_Database_Utility {
 					} elseif (isset($binary_cols[$col_name])) {
 						$values[] = strlen($value) > 0 ? '0x' . bin2hex($value) : "''";
 					} else {
-						// wpdb::_real_escape() appends add_placeholder_escape(), turning every
-						// literal % into a per-process {hash} token that is normally stripped
-						// only inside wpdb::query(). We write straight to a dump file (never run
-						// through query), so strip it here - otherwise %-bearing data (Yoast
-						// %%sep%% templates, percent-encoded URLs, …) is frozen as {hash} and
-						// corrupted on restore.
+						// Strip the placeholder-escape token _real_escape() appends
+						// so % survives the dump (Yoast %%sep%%, encoded URLs, …).
 						$values[] = "'" . $wpdb->remove_placeholder_escape($wpdb->_real_escape($value)) . "'";
 					}
 				}
-				$row_strings[] = '(' . implode(', ', $values) . ')';
+				$row_str = '(' . implode(', ', $values) . ')';
 
-				// Track last PK for keyset pagination
-				if ($primary_key && isset($row[$primary_key])) {
-					$last_pk = $row[$primary_key];
+				if (!empty($pending) && ($pending_bytes + strlen($row_str) + 2) > $byte_budget) {
+					if (!$flush_insert()) return $abort('short write (insert flush)');
+				}
+				$pending[] = $row_str;
+				$pending_bytes += strlen($row_str) + 2;
+
+				if ($single_keyset && isset($row[$pk])) {
+					$last_pk = $row[$pk];
 				}
 			}
-			$write(implode(",\n", $row_strings) . ";\n\n");
 
-			$rows_done += count($rows);
+			$fetched = count($rows);
+			$rows_done += $fetched;
+			$offset += $fetched;
+			$have_last = true;
 
-			// Adaptive batch sizing based on memory
+			// Adaptive fetch sizing based on memory (secondary guard alongside the
+			// byte-budgeted flush above).
 			$mem_usage = memory_get_usage(true);
 			$mem_limit = self::parse_size(ini_get('memory_limit'));
 			if ($mem_limit > 0 && $mem_usage > ($mem_limit * 0.7)) {
-				$batch_size = max(100, intval($batch_size / 2));
+				$fetch_limit = max(20, intval($fetch_limit / 2));
 			}
 		}
 
-		$use_gzip ? @gzclose($fh) : @fclose($fh);
-		return true;
+		if (!$flush_insert()) return $abort('short write (final insert)');
+
+		// Completeness check (C3): a large shortfall means we lost data. A tiny one
+		// can be legitimate (rows deleted concurrently) - tolerate <1%.
+		if ($rows_done < $total_rows) {
+			$ratio = $total_rows > 0 ? ($rows_done / $total_rows) : 1;
+			if ($ratio < 0.99) {
+				return $abort("truncated: only {$rows_done}/{$total_rows} rows emitted");
+			}
+			error_log("SiteGuard Backup: dump of {$table} short by " . ($total_rows - $rows_done) . " rows (within tolerance)");
+		}
+
+		if (!$put("-- sgbackup:table-complete {$table} rows={$rows_done}\n\n")) return $abort('short write (marker)');
+
+		return $close_ok();
 	}
 
 	/**
@@ -394,67 +485,134 @@ class SiteGuard_Backup_Database_Utility {
 	 */
 	public static function php_dump_table_with_connection($table, $outfile, $wpdb_instance, $batch_size = 1000, $anonymiser = null) {
 		$table = self::sanitize_table_name($table);
+		if (!$table) return false;
 
 		$use_gzip = (substr($outfile, -3) === '.gz');
 		$fh = $use_gzip ? @gzopen($outfile, 'wb9') : @fopen($outfile, 'w');
 		if (!$fh) return false;
 
+		// See php_dump_table for the rationale behind the checked writer / abort.
 		$write = function($data) use ($fh, $use_gzip) {
 			return $use_gzip ? @gzwrite($fh, $data) : @fwrite($fh, $data);
+		};
+		$abort = function($msg = '') use ($fh, $use_gzip, $outfile, $table) {
+			$use_gzip ? @gzclose($fh) : @fclose($fh);
+			@unlink($outfile);
+			if ($msg !== '') error_log("SiteGuard Backup: dump of {$table} aborted: {$msg}");
+			return false;
+		};
+		$put = function($data) use ($write) {
+			if ('' === $data) return true;
+			$n = $write($data);
+			return ($n !== false && $n === strlen($data));
+		};
+		$close_ok = function() use ($fh, $use_gzip, $outfile) {
+			$ok = $use_gzip ? @gzclose($fh) : @fclose($fh);
+			if (false === $ok) { @unlink($outfile); return false; }
+			return true;
 		};
 
 		// Table structure
 		$create = $wpdb_instance->get_row("SHOW CREATE TABLE `{$table}`", ARRAY_N);
-		if (!$create) {
-			$use_gzip ? @gzclose($fh) : @fclose($fh);
-			return false;
+		if (!$create || !isset($create[1])) {
+			return $abort('SHOW CREATE TABLE failed');
 		}
 
-		$write("DROP TABLE IF EXISTS `{$table}`;\n");
-		$write($create[1] . ";\n\n");
+		if (!$put("DROP TABLE IF EXISTS `{$table}`;\n") || !$put($create[1] . ";\n\n")) {
+			return $abort('short write on structure');
+		}
 
 		// Table data
 		$total_rows = (int) $wpdb_instance->get_var("SELECT COUNT(*) FROM `{$table}`");
 		if ($total_rows === 0) {
-			$use_gzip ? @gzclose($fh) : @fclose($fh);
-			return true;
+			if (!$put("-- sgbackup:table-complete {$table} rows=0\n\n")) return $abort('short write (marker)');
+			return $close_ok();
 		}
 
-		// Get columns for INSERT statement with type info
+		// Column metadata - exclude generated columns from SELECT + INSERT (M1).
 		$columns = $wpdb_instance->get_results("SHOW COLUMNS FROM `{$table}`", ARRAY_A);
-		$col_names = array_map(function($c) { return '`' . $c['Field'] . '`'; }, $columns);
-		$col_list = implode(', ', $col_names);
+		if (empty($columns)) return $abort('SHOW COLUMNS failed');
 
-		// Detect binary/blob columns
+		$data_cols = array();
 		$binary_cols = array();
-		foreach ($columns as $i => $col) {
+		$all_pk_cols = array();
+		foreach ($columns as $col) {
+			if ($col['Key'] === 'PRI') $all_pk_cols[] = $col['Field'];
+			if (isset($col['Extra']) && preg_match('/GENERATED/i', $col['Extra'])) {
+				continue;
+			}
+			$data_cols[] = $col['Field'];
 			$type = strtolower($col['Type']);
 			if (preg_match('/binary|blob|bit/i', $type)) {
 				$binary_cols[$col['Field']] = true;
 			}
 		}
+		if (empty($data_cols)) return $abort('no dumpable columns');
 
+		$col_list = implode(', ', array_map(function($f) { return '`' . $f . '`'; }, $data_cols));
+
+		// Pagination strategy (C1): single-column keyset when exactly one PRI col,
+		// otherwise deterministic full ORDER BY + LIMIT/OFFSET.
+		$single_keyset = (count($all_pk_cols) === 1 && in_array($all_pk_cols[0], $data_cols, true));
+		$pk = $single_keyset ? $all_pk_cols[0] : null;
+		$order_cols = !empty($all_pk_cols) ? $all_pk_cols : $data_cols;
+		$order_by = implode(', ', array_map(function($f) { return '`' . $f . '` ASC'; }, $order_cols));
+
+		// Byte-budgeted INSERT emission (H1).
+		$byte_budget = 8 * 1024 * 1024;
+		$packet_row = $wpdb_instance->get_row("SHOW VARIABLES LIKE 'max_allowed_packet'");
+		if ($packet_row && isset($packet_row->Value) && (int) $packet_row->Value > 0) {
+			$byte_budget = (int) min($byte_budget, max(65536, ((int) $packet_row->Value) / 2));
+		}
+
+		$insert_header = "INSERT INTO `{$table}` ({$col_list}) VALUES\n";
+		$pending = array();
+		$pending_bytes = 0;
+		$flush_insert = function() use (&$pending, &$pending_bytes, $insert_header, $put) {
+			if (empty($pending)) return true;
+			$ok = $put($insert_header . implode(",\n", $pending) . ";\n\n");
+			$pending = array();
+			$pending_bytes = 0;
+			return $ok;
+		};
+
+		$fetch_limit = max(1, min(200, (int) $batch_size));
+		$have_last = false;
+		$last_pk = null;
+		$rows_done = 0;
 		$offset = 0;
-		while ($offset < $total_rows) {
-			$rows = $wpdb_instance->get_results(
-				$wpdb_instance->prepare("SELECT * FROM `{$table}` LIMIT %d OFFSET %d", $batch_size, $offset),
-				ARRAY_A
-			);
 
-			if (empty($rows)) break;
+		while ($rows_done < $total_rows) {
+			if ($single_keyset) {
+				if ($have_last) {
+					$rows = $wpdb_instance->get_results($wpdb_instance->prepare(
+						"SELECT {$col_list} FROM `{$table}` WHERE `{$pk}` > %s ORDER BY `{$pk}` ASC LIMIT %d",
+						$last_pk, $fetch_limit
+					), ARRAY_A);
+				} else {
+					$rows = $wpdb_instance->get_results($wpdb_instance->prepare(
+						"SELECT {$col_list} FROM `{$table}` ORDER BY `{$pk}` ASC LIMIT %d",
+						$fetch_limit
+					), ARRAY_A);
+				}
+			} else {
+				$rows = $wpdb_instance->get_results($wpdb_instance->prepare(
+					"SELECT {$col_list} FROM `{$table}` ORDER BY {$order_by} LIMIT %d OFFSET %d",
+					$fetch_limit, $offset
+				), ARRAY_A);
+			}
 
-			$write("INSERT INTO `{$table}` ({$col_list}) VALUES\n");
+			if (empty($rows)) {
+				if ($wpdb_instance->last_error) {
+					return $abort('query error: ' . $wpdb_instance->last_error);
+				}
+				break;
+			}
 
-			$row_strings = array();
 			foreach ($rows as $row) {
-				// Apply anonymisation if available
+				// Apply anonymisation if available (row-aware - see anonymise_row).
 				if ($anonymiser !== null && $anonymiser->should_anonymise_row($table, $row)) {
-					foreach ($row as $col_name => &$value) {
-						if ($value !== null) {
-							$value = $anonymiser->anonymise_value($col_name, $value);
-						}
-					}
-					unset($value);
+					$row = $anonymiser->anonymise_row($table, $row);
 				}
 
 				$values = array();
@@ -464,27 +622,47 @@ class SiteGuard_Backup_Database_Utility {
 					} elseif (isset($binary_cols[$col_name])) {
 						$values[] = strlen($value) > 0 ? '0x' . bin2hex($value) : "''";
 					} else {
-						// Strip the placeholder-escape token _real_escape() appends (see note in
-						// php_dump_table) so % characters survive the dump intact.
 						$values[] = "'" . $wpdb_instance->remove_placeholder_escape($wpdb_instance->_real_escape($value)) . "'";
 					}
 				}
-				$row_strings[] = '(' . implode(', ', $values) . ')';
+				$row_str = '(' . implode(', ', $values) . ')';
+
+				if (!empty($pending) && ($pending_bytes + strlen($row_str) + 2) > $byte_budget) {
+					if (!$flush_insert()) return $abort('short write (insert flush)');
+				}
+				$pending[] = $row_str;
+				$pending_bytes += strlen($row_str) + 2;
+
+				if ($single_keyset && isset($row[$pk])) {
+					$last_pk = $row[$pk];
+				}
 			}
-			$write(implode(",\n", $row_strings) . ";\n\n");
 
-			$offset += $batch_size;
+			$fetched = count($rows);
+			$rows_done += $fetched;
+			$offset += $fetched;
+			$have_last = true;
 
-			// Adaptive batch sizing based on memory
 			$mem_usage = memory_get_usage(true);
 			$mem_limit = self::parse_size(ini_get('memory_limit'));
 			if ($mem_limit > 0 && $mem_usage > ($mem_limit * 0.7)) {
-				$batch_size = max(100, intval($batch_size / 2));
+				$fetch_limit = max(20, intval($fetch_limit / 2));
 			}
 		}
 
-		$use_gzip ? @gzclose($fh) : @fclose($fh);
-		return true;
+		if (!$flush_insert()) return $abort('short write (final insert)');
+
+		if ($rows_done < $total_rows) {
+			$ratio = $total_rows > 0 ? ($rows_done / $total_rows) : 1;
+			if ($ratio < 0.99) {
+				return $abort("truncated: only {$rows_done}/{$total_rows} rows emitted");
+			}
+			error_log("SiteGuard Backup: dump of {$table} short by " . ($total_rows - $rows_done) . " rows (within tolerance)");
+		}
+
+		if (!$put("-- sgbackup:table-complete {$table} rows={$rows_done}\n\n")) return $abort('short write (marker)');
+
+		return $close_ok();
 	}
 
 	/**
@@ -510,7 +688,7 @@ class SiteGuard_Backup_Database_Utility {
 			$create = $wpdb->get_row("SHOW CREATE VIEW `{$name}`", ARRAY_N);
 			if ($create && isset($create[1])) {
 				$sql .= "DROP VIEW IF EXISTS `{$name}`;\n";
-				$sql .= $create[1] . ";\n\n";
+				$sql .= self::strip_definer($create[1]) . ";\n\n";
 			}
 		}
 
@@ -526,6 +704,11 @@ class SiteGuard_Backup_Database_Utility {
 	public static function dump_routines($outfile) {
 		global $wpdb;
 
+		// NOTE (M4 scoping): information_schema.ROUTINES is not prefix-filterable
+		// and is scoped to the whole schema, so this includes ALL routines in the
+		// database - including any belonging to other apps sharing the DB. We strip
+		// DEFINER (the main restore breakage, err 1449) but do NOT attempt to scope
+		// by prefix here. Callers doing prefix-filtered backups should be aware.
 		$routines = $wpdb->get_results($wpdb->prepare(
 			"SELECT ROUTINE_NAME, ROUTINE_TYPE FROM information_schema.ROUTINES WHERE ROUTINE_SCHEMA = %s",
 			DB_NAME
@@ -540,12 +723,27 @@ class SiteGuard_Backup_Database_Utility {
 			$create = $wpdb->get_row("SHOW CREATE {$type} `{$name}`", ARRAY_N);
 			if ($create && isset($create[2])) {
 				$sql .= "DROP {$type} IF EXISTS `{$name}`;;\n";
-				$sql .= $create[2] . ";;\n\n";
+				$sql .= self::strip_definer($create[2]) . ";;\n\n";
 			}
 		}
 		$sql .= "DELIMITER ;\n";
 
 		return (bool) file_put_contents($outfile, $sql, FILE_APPEND);
+	}
+
+	/**
+	 * Remove the `DEFINER=`user`@`host`` clause from a CREATE VIEW/PROCEDURE/
+	 * FUNCTION/TRIGGER statement. Restoring a definer that references a user which
+	 * does not exist on the target server fails with err 1449 (M4). Handles both
+	 * backtick- and single-quote-quoted user/host forms.
+	 */
+	public static function strip_definer($sql) {
+		$out = preg_replace(
+			'/\sDEFINER\s*=\s*(?:`(?:[^`]|``)*`|\'(?:[^\']|\'\')*\')@(?:`(?:[^`]|``)*`|\'(?:[^\']|\'\')*\')/i',
+			'',
+			$sql
+		);
+		return (null === $out) ? $sql : $out;
 	}
 
 	/**
@@ -734,6 +932,19 @@ class SiteGuard_Backup_Database_Utility {
 
 		$temp_prefix = '_sgb_tmp_' . substr(md5(time()), 0, 6) . '_';
 
+		// Compute the temp table name, hash-truncating so it never exceeds MySQL's
+		// 64-char identifier limit (M12) - otherwise CREATE fails with err 1059 and
+		// the atomic swap loses the table's data.
+		$make_temp = function($original) use ($temp_prefix) {
+			$temp = $temp_prefix . $original;
+			if (strlen($temp) > 64) {
+				$keep = 64 - strlen($temp_prefix) - 9; // 8 hash chars + '_'
+				if ($keep < 0) $keep = 0;
+				$temp = $temp_prefix . substr(md5($original), 0, 8) . '_' . substr($original, 0, $keep);
+			}
+			return $temp;
+		};
+
 		// Read the SQL file and replace table names with temp prefix
 		$is_gz = (substr($sql_file, -3) === '.gz');
 		$fh = $is_gz ? @gzopen($sql_file, 'rb') : @fopen($sql_file, 'r');
@@ -824,9 +1035,17 @@ class SiteGuard_Backup_Database_Utility {
 
 				if (empty($query)) continue;
 
-				// Skip SET/conditional statements that are just mysqldump housekeeping
-				if (preg_match('/^\/\*!?\d+\s/i', $query)) {
-					// MySQL conditional comment - execute it as-is (SET CHARACTER_SET etc.)
+				// MySQL conditional comment (/*!ver ... */). Strip the wrapper and vet
+				// the inner statement BEFORE executing - otherwise CREATE TRIGGER/EVENT
+				// etc. smuggled inside a version comment bypasses is_dangerous_sql() (M6).
+				if (preg_match('/^\/\*!?\d*\s/i', $query)) {
+					$inner = preg_replace('#^/\*!?\d*\s*#', '', $query);
+					$inner = preg_replace('#\*/\s*$#', '', $inner);
+					$inner = trim($inner);
+					if (self::is_dangerous_sql($inner)) {
+						$result['errors'][] = "Blocked dangerous SQL in conditional comment on line {$line_count}";
+						continue;
+					}
 					$wpdb->query($query);
 					continue;
 				}
@@ -848,12 +1067,12 @@ class SiteGuard_Backup_Database_Utility {
 				// Rewrite table names to use temp prefix
 				if (preg_match('/^(DROP TABLE\s+IF\s+EXISTS\s+)`([^`]+)`/i', $query, $m)) {
 					$original = $m[2];
-					$temp = $temp_prefix . $original;
+					$temp = $make_temp($original);
 					$tables_created[$original] = $temp;
 					$query = $m[1] . '`' . $temp . '`';
 				} elseif (preg_match('/^(CREATE TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?)`([^`]+)`/i', $query, $m)) {
 					$original = $m[2];
-					$temp = $temp_prefix . $original;
+					$temp = $make_temp($original);
 					$tables_created[$original] = $temp;
 					$query = str_replace('`' . $original . '`', '`' . $temp . '`', $query);
 					// Engine compatibility
@@ -897,9 +1116,13 @@ class SiteGuard_Backup_Database_Utility {
 					}
 				}
 
-				// Reconnect if needed
+				// Reconnect if needed. If the connection object changed (a reconnect
+				// happened), re-apply the session import state (M5).
 				if (method_exists($wpdb, 'check_connection')) {
-					$wpdb->check_connection(false);
+					$dbh_before = $wpdb->dbh;
+					if ($wpdb->check_connection(false) && $wpdb->dbh !== $dbh_before) {
+						self::apply_import_session_state();
+					}
 				}
 
 				$res = $wpdb->query($query);
@@ -930,13 +1153,15 @@ class SiteGuard_Backup_Database_Utility {
 
 		$is_gz ? @gzclose($fh) : @fclose($fh);
 
-		// Atomic rename: swap temp tables with originals
-		if (!empty($tables_created) && $result['success']) {
-			$rename_parts = array();
+		// Atomic rename: swap temp tables with originals - ONLY when the import
+		// produced no errors. Gating on empty(errors) (evaluated BEFORE the rename)
+		// is what stops half-empty temp tables being renamed over live data while
+		// the originals are dropped (C4). The previous gate used $result['success'],
+		// which is not computed until after this block, so it was always true.
+		if (!empty($tables_created) && empty($result['errors'])) {
 			$old_tables = array();
 			foreach ($tables_created as $original => $temp) {
 				$original = self::sanitize_table_name($original);
-				$temp = self::sanitize_table_name($temp);
 				// Use hash to avoid name collisions on long table names
 				$old_backup = '_sgb_old_' . substr(md5($original), 0, 8) . '_' . substr($original, 0, 40);
 				$old_tables[] = $old_backup;
@@ -956,29 +1181,50 @@ class SiteGuard_Backup_Database_Utility {
 				$rename_parts[] = "`{$original}` TO `{$old_backup}`, `{$temp}` TO `{$original}`";
 			}
 
+			// Track which _sgb_old_ backups are safe to drop (i.e. their original was
+			// actually superseded by a confirmed temp->live rename).
+			$swapped_olds = array();
+
 			if (!empty($rename_parts)) {
 				$rename_sql = "RENAME TABLE " . implode(', ', $rename_parts);
 				$rename_result = $wpdb->query($rename_sql);
 				if (false === $rename_result) {
-					// Fallback: two-step rename per table (original→old, temp→original)
+					// Fallback: two-step rename per table. Do NOT drop the _sgb_old_
+					// backup until the temp->live rename is confirmed (C4). If temp->live
+					// fails, roll the original back so live data is never lost.
 					$old_idx = 0;
 					foreach ($tables_created as $original => $temp) {
 						$original = self::sanitize_table_name($original);
 						$temp = self::sanitize_table_name($temp);
 						$old_backup = $old_tables[$old_idx++];
 						$wpdb->query("DROP TABLE IF EXISTS `{$old_backup}`");
-						// Try rename original→old first to preserve data
-						$wpdb->query("RENAME TABLE `{$original}` TO `{$old_backup}`");
-						$wpdb->query("RENAME TABLE `{$temp}` TO `{$original}`");
+						// original may not exist yet (first-ever restore of this table);
+						// a failed move there is expected and fine.
+						$r_orig = $wpdb->query("RENAME TABLE `{$original}` TO `{$old_backup}`");
+						$r_temp = $wpdb->query("RENAME TABLE `{$temp}` TO `{$original}`");
+						if (false === $r_temp) {
+							$result['errors'][] = "Atomic rename fallback failed for `{$original}` - live table left intact";
+							// Roll the original back if we had moved it aside.
+							if (false !== $r_orig) {
+								$wpdb->query("RENAME TABLE `{$old_backup}` TO `{$original}`");
+							}
+							// Leave the temp table for inspection; nothing to clean up here.
+						} elseif (false !== $r_orig) {
+							$swapped_olds[] = $old_backup;
+						}
 					}
+				} else {
+					$swapped_olds = $old_tables;
 				}
-				// Clean up old backup tables after successful rename
-				foreach ($old_tables as $old_tbl) {
+
+				// Clean up only the backups whose originals were confirmed superseded.
+				foreach ($swapped_olds as $old_tbl) {
 					$wpdb->query("DROP TABLE IF EXISTS `{$old_tbl}`");
 				}
 			}
 		} elseif (!empty($tables_created)) {
-			// Clean up temp tables on failure
+			// Import had errors - drop the temp tables and leave the live tables (and
+			// any originals) completely untouched.
 			foreach ($tables_created as $original => $temp) {
 				$temp = self::sanitize_table_name($temp);
 				$wpdb->query("DROP TABLE IF EXISTS `{$temp}`");
@@ -1162,9 +1408,13 @@ class SiteGuard_Backup_Database_Utility {
 						}
 					}
 
-					// Reconnect if MySQL connection was lost
+					// Reconnect if MySQL connection was lost. Re-apply session import
+					// state when a reconnect actually replaced the connection (M5).
 					if (method_exists($wpdb, 'check_connection')) {
-						$wpdb->check_connection(false);
+						$dbh_before = $wpdb->dbh;
+						if ($wpdb->check_connection(false) && $wpdb->dbh !== $dbh_before) {
+							self::apply_import_session_state();
+						}
 					}
 
 					$res = $wpdb->query($query);
@@ -1257,6 +1507,23 @@ class SiteGuard_Backup_Database_Utility {
 		}
 
 		return !empty($chunks) ? $chunks : array($values_str);
+	}
+
+	/**
+	 * Re-apply the per-session import state (FK checks off, NO_AUTO_VALUE_ON_ZERO).
+	 *
+	 * wpdb::check_connection() may transparently reconnect mid-import, which resets
+	 * all SESSION variables - losing the SET statements issued at the top of the
+	 * import loop and corrupting AUTO_INCREMENT-zero rows / tripping FK errors (M5).
+	 * Callers invoke this only when they detect the underlying connection changed.
+	 *
+	 * @param object|null $db Optional wpdb-like connection; defaults to global $wpdb.
+	 */
+	private static function apply_import_session_state($db = null) {
+		global $wpdb;
+		$conn = $db ? $db : $wpdb;
+		$conn->query('SET FOREIGN_KEY_CHECKS = 0');
+		$conn->query("SET SQL_MODE = 'NO_AUTO_VALUE_ON_ZERO'");
 	}
 
 	/**
@@ -1450,7 +1717,9 @@ class SiteGuard_Backup_Database_Utility {
 					continue;
 				}
 
+				$dbh_before = $wpdb->dbh;
 				$wpdb->check_connection();
+				if ($wpdb->dbh !== $dbh_before) self::apply_import_session_state();
 
 				// Split oversized INSERTs at row boundaries to stay under
 				// max_allowed_packet and keep peak memory bounded.
@@ -1491,7 +1760,9 @@ class SiteGuard_Backup_Database_Utility {
 			if (!empty($query) && !$skipping_table) {
 				$query = self::remap_leading_table_prefix($query, $source_prefix, $target_prefix);
 				if (!self::is_dangerous_sql($query)) {
+					$dbh_before = $wpdb->dbh;
 					$wpdb->check_connection();
+					if ($wpdb->dbh !== $dbh_before) self::apply_import_session_state();
 					$res = $wpdb->query($query);
 					if (false === $res) {
 						$result['errors'][] = "SQL error at end: " . $wpdb->last_error;
@@ -1654,7 +1925,9 @@ class SiteGuard_Backup_Database_Utility {
 					continue;
 				}
 
+				$dbh_before = $wpdb->dbh;
 				$wpdb->check_connection();
+				if ($wpdb->dbh !== $dbh_before) self::apply_import_session_state();
 
 				// Split oversized INSERTs at row boundaries to stay under
 				// max_allowed_packet and keep peak memory bounded.
@@ -1698,7 +1971,9 @@ class SiteGuard_Backup_Database_Utility {
 					$query = self::remap_leading_table_prefix($query, $current_remap_src, $current_remap_dst);
 				}
 				if (!self::is_dangerous_sql($query)) {
+					$dbh_before = $wpdb->dbh;
 					$wpdb->check_connection();
+					if ($wpdb->dbh !== $dbh_before) self::apply_import_session_state();
 					$res = $wpdb->query($query);
 					if (false === $res) {
 						$result['errors'][] = "SQL error at end: " . $wpdb->last_error;

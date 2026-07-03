@@ -18,6 +18,52 @@ if (!defined('ABSPATH')) die('No direct access.');
 class SiteGuard_Backup_CLI_Command extends WP_CLI_Command {
 
     /**
+     * The single shared set of terminal backup job statuses. backup_finish() sets
+     * 'complete' or 'warning'; 'finished' is kept for backward compatibility.
+     *
+     * @param string $status Job status.
+     * @return bool True if the job has reached a terminal state.
+     */
+    private static function backup_status_terminal($status) {
+        return in_array($status, array('complete', 'finished', 'warning', 'error', 'aborted', 'failed'), true);
+    }
+
+    /**
+     * True if a terminal status represents a successful backup (a 'warning' backup
+     * still completed and produced files).
+     *
+     * @param string $status Job status.
+     * @return bool
+     */
+    private static function backup_status_succeeded($status) {
+        return in_array($status, array('complete', 'finished', 'warning'), true);
+    }
+
+    /**
+     * Read the last $max_bytes of a file via fseek (tail), prepending a truncation
+     * marker when the file is larger. Avoids loading a multi-MB log fully into memory.
+     *
+     * @param string $path      File path.
+     * @param int    $max_bytes Cap (default 256KB).
+     * @return string|false File tail, or false on error.
+     */
+    private function read_file_tail($path, $max_bytes = 262144) {
+        $size = @filesize($path);
+        if ($size === false) return false;
+        $fh = @fopen($path, 'rb');
+        if (!$fh) return false;
+        $truncated = false;
+        if ($size > $max_bytes) {
+            fseek($fh, -$max_bytes, SEEK_END);
+            $truncated = true;
+        }
+        $data = stream_get_contents($fh);
+        fclose($fh);
+        if ($data === false) return false;
+        return $truncated ? "[log truncated]\n" . $data : $data;
+    }
+
+    /**
      * Run a backup.
      *
      * ## OPTIONS
@@ -135,18 +181,18 @@ class SiteGuard_Backup_CLI_Command extends WP_CLI_Command {
         for ($i = 0; $i < $max_resumptions; $i++) {
             $jobdata = $sgbackup->jobdata_getarray($nonce);
             $status = isset($jobdata['jobstatus']) ? $jobdata['jobstatus'] : '';
-            if (in_array($status, array('complete', 'finished', 'error', 'aborted', 'failed'), true)) break;
+            if (self::backup_status_terminal($status)) break;
 
             $sgbackup->backup_resume($i, $nonce);
 
             $jobdata = $sgbackup->jobdata_getarray($nonce);
             $status = isset($jobdata['jobstatus']) ? $jobdata['jobstatus'] : '';
-            if (in_array($status, array('complete', 'finished', 'error', 'aborted', 'failed'), true)) break;
+            if (self::backup_status_terminal($status)) break;
         }
 
         $jobdata = $sgbackup->jobdata_getarray($nonce);
         $status = isset($jobdata['jobstatus']) ? $jobdata['jobstatus'] : '';
-        if ($status === 'complete' || $status === 'finished') {
+        if (self::backup_status_succeeded($status)) {
             WP_CLI::success('Backup complete. Job nonce: ' . $nonce);
         } else {
             WP_CLI::error('Backup did not complete (status: ' . $status . '). Check logs.');
@@ -626,13 +672,13 @@ class SiteGuard_Backup_CLI_Command extends WP_CLI_Command {
         for ($i = 0; $i < $max_resumptions; $i++) {
             $jobdata = $sgbackup->jobdata_getarray($nonce);
             $status = isset($jobdata['jobstatus']) ? $jobdata['jobstatus'] : '';
-            if ($status === 'finished' || $status === 'error') break;
+            if (self::backup_status_terminal($status)) break;
 
             $sgbackup->backup_resume($i, $nonce);
 
             $jobdata = $sgbackup->jobdata_getarray($nonce);
             $status = isset($jobdata['jobstatus']) ? $jobdata['jobstatus'] : '';
-            if ($status === 'finished' || $status === 'error') break;
+            if (self::backup_status_terminal($status)) break;
         }
 
         // Get the backup files
@@ -900,13 +946,13 @@ class SiteGuard_Backup_CLI_Command extends WP_CLI_Command {
         for ($i = 0; $i < 20; $i++) {
             $jobdata = $sgbackup->jobdata_getarray($nonce);
             $status = isset($jobdata['jobstatus']) ? $jobdata['jobstatus'] : '';
-            if ($status === 'finished' || $status === 'error') break;
+            if (self::backup_status_terminal($status)) break;
 
             $sgbackup->backup_resume($i, $nonce);
 
             $jobdata = $sgbackup->jobdata_getarray($nonce);
             $status = isset($jobdata['jobstatus']) ? $jobdata['jobstatus'] : '';
-            if ($status === 'finished' || $status === 'error') break;
+            if (self::backup_status_terminal($status)) break;
         }
 
         // Find the backup
@@ -967,10 +1013,12 @@ class SiteGuard_Backup_CLI_Command extends WP_CLI_Command {
                 }
             }
 
-            // Show database progress
-            if (isset($jobdata['db_completed_tables']) && is_array($jobdata['db_completed_tables'])) {
-                $completed = count($jobdata['db_completed_tables']);
-                WP_CLI::log("  DB tables completed: {$completed}");
+            // Show database progress. The completed-table set was moved out of the
+            // jobdata blob into its own option ('sgbackup_dbtables_<nonce>') to avoid
+            // O(n^2) rewrites on large multisite dumps, so read it from there.
+            $dbtables = SiteGuard_Backup_Options::instance()->get_option('sgbackup_dbtables_' . $nonce, array());
+            if (is_array($dbtables) && !empty($dbtables)) {
+                WP_CLI::log("  DB tables completed: " . count($dbtables));
             }
 
             // Show percentage if available
@@ -2213,7 +2261,7 @@ class SiteGuard_Backup_CLI_Command extends WP_CLI_Command {
         if (isset($assoc_args['display'])) {
             WP_CLI::log('');
             WP_CLI::log('--- Log Content ---');
-            $content = file_get_contents($full_path);
+            $content = $this->read_file_tail($full_path);
             if ($content !== false) {
                 WP_CLI::log($content);
             } else {
@@ -2791,16 +2839,16 @@ class SiteGuard_Backup_CLI_Command extends WP_CLI_Command {
         for ($i = 0; $i < 50; $i++) {
             $jobdata = $sgbackup->jobdata_getarray($nonce);
             $status = isset($jobdata['jobstatus']) ? $jobdata['jobstatus'] : '';
-            if (in_array($status, array('complete', 'finished', 'error', 'aborted', 'failed'), true)) break;
+            if (self::backup_status_terminal($status)) break;
             $sgbackup->backup_resume($i, $nonce);
             $jobdata = $sgbackup->jobdata_getarray($nonce);
             $status = isset($jobdata['jobstatus']) ? $jobdata['jobstatus'] : '';
-            if (in_array($status, array('complete', 'finished', 'error', 'aborted', 'failed'), true)) break;
+            if (self::backup_status_terminal($status)) break;
         }
 
         $jobdata = $sgbackup->jobdata_getarray($nonce);
         $status = isset($jobdata['jobstatus']) ? $jobdata['jobstatus'] : '';
-        if ($status === 'complete' || $status === 'finished') {
+        if (self::backup_status_succeeded($status)) {
             WP_CLI::success('Migration send complete.');
         } else {
             WP_CLI::error('Migration send did not complete (status: ' . $status . '). Check logs.');
@@ -2859,16 +2907,16 @@ class SiteGuard_Backup_CLI_Command extends WP_CLI_Command {
         for ($i = 0; $i < 50; $i++) {
             $jobdata = $sgbackup->jobdata_getarray($nonce);
             $status = isset($jobdata['jobstatus']) ? $jobdata['jobstatus'] : '';
-            if (in_array($status, array('complete', 'finished', 'error', 'aborted', 'failed'), true)) break;
+            if (self::backup_status_terminal($status)) break;
             $sgbackup->backup_resume($i, $nonce);
             $jobdata = $sgbackup->jobdata_getarray($nonce);
             $status = isset($jobdata['jobstatus']) ? $jobdata['jobstatus'] : '';
-            if (in_array($status, array('complete', 'finished', 'error', 'aborted', 'failed'), true)) break;
+            if (self::backup_status_terminal($status)) break;
         }
 
         $jobdata = $sgbackup->jobdata_getarray($nonce);
         $status = isset($jobdata['jobstatus']) ? $jobdata['jobstatus'] : '';
-        if ($status === 'complete' || $status === 'finished') {
+        if (self::backup_status_succeeded($status)) {
             WP_CLI::success('Clone complete.');
         } else {
             WP_CLI::error('Clone did not complete (status: ' . $status . '). Check logs.');

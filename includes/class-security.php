@@ -50,6 +50,11 @@ class SiteGuard_Backup_Security {
 		}
 
 		if (!function_exists('openssl_encrypt') || !defined('AUTH_KEY')) {
+			// Storing plaintext because we cannot derive an encryption key.
+			// Surface this rather than silently persisting a secret in the clear.
+			if (!defined('AUTH_KEY') && class_exists('SiteGuard_Backup')) {
+				SiteGuard_Backup::instance()->log('Warning: storage credentials cannot be encrypted at rest because AUTH_KEY is not defined in wp-config.php. They will be stored in plaintext.', 'warning');
+			}
 			return $plaintext;
 		}
 
@@ -118,10 +123,36 @@ class SiteGuard_Backup_Security {
 		);
 
 		if (false === $plaintext) {
-			return $encrypted; // Decryption failed, return as-is
+			// The value IS marked encrypted (sgenc: prefix) but cannot be
+			// decrypted. The overwhelmingly likely cause is that AUTH_KEY changed
+			// after a migration/restore, so the derived key no longer matches.
+			// Returning the raw ciphertext blob would let it be used as a literal
+			// credential (guaranteed auth failures, or worse, silent misuse).
+			// Return empty and flag the site so an admin re-enters the credential.
+			self::flag_credentials_unreadable();
+			return '';
 		}
 
 		return $plaintext;
+	}
+
+	/**
+	 * Record that stored storage credentials could not be decrypted and notify.
+	 * Idempotent: safe to call repeatedly (option/log are only written once per state).
+	 */
+	private static function flag_credentials_unreadable() {
+		if (function_exists('get_option') && function_exists('update_option')) {
+			if (!get_option('sgbackup_credentials_unreadable')) {
+				update_option('sgbackup_credentials_unreadable', 1, false);
+				$msg = 'Stored storage credentials are unreadable (likely AUTH_KEY changed after a migration or restore). Re-enter your remote storage credentials in SiteGuard Backup settings.';
+				if (class_exists('SiteGuard_Backup')) {
+					SiteGuard_Backup::instance()->log($msg, 'error');
+				}
+				if (class_exists('SiteGuard_Backup_Audit_Log')) {
+					SiteGuard_Backup_Audit_Log::instance()->log('credentials_unreadable', $msg);
+				}
+			}
+		}
 	}
 
 	/**

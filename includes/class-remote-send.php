@@ -110,7 +110,7 @@ class SiteGuard_Backup_Remote_Send {
 		$payload = $rpc->decrypt_message(
 			$encrypted,
 			$enc_key,
-			$key_data['private_key']
+			$this->decrypt_private_key($key_data['private_key'])
 		);
 
 		if (is_wp_error($payload)) {
@@ -199,7 +199,7 @@ class SiteGuard_Backup_Remote_Send {
 			return;
 		}
 
-		$payload = $rpc->decrypt_message($encrypted, $enc_key, $key_data['private_key']);
+		$payload = $rpc->decrypt_message($encrypted, $enc_key, $this->decrypt_private_key($key_data['private_key']));
 
 		if (is_wp_error($payload)) {
 			wp_send_json_error(array('message' => 'Authentication failed.'));
@@ -217,6 +217,29 @@ class SiteGuard_Backup_Remote_Send {
 		}
 
 		wp_send_json_success($result);
+	}
+
+	/**
+	 * Decrypt a stored migration private key.
+	 *
+	 * Keys generated after the at-rest-encryption change carry the 'sgenc:'
+	 * prefix and are decrypted here. Legacy plaintext PEM keys (no prefix) pass
+	 * straight through unchanged. If decryption fails (e.g. AUTH_KEY changed),
+	 * decrypt_option() returns '' and flags the site - the empty key then fails
+	 * key parsing loudly rather than being misused.
+	 *
+	 * @param string $stored Stored private key value.
+	 * @return string Decrypted (or plaintext-legacy) PEM.
+	 */
+	private function decrypt_private_key($stored) {
+		if (!is_string($stored) || $stored === '') return $stored;
+		if (file_exists(SGBACKUP_DIR . 'includes/class-security.php')) {
+			require_once SGBACKUP_DIR . 'includes/class-security.php';
+			if (class_exists('SiteGuard_Backup_Security')) {
+				return SiteGuard_Backup_Security::decrypt_option($stored);
+			}
+		}
+		return $stored;
 	}
 
 	/**
@@ -357,12 +380,23 @@ class SiteGuard_Backup_Remote_Send {
 
 		fseek($fh, $start);
 		$written = fwrite($fh, $chunk_data);
+
+		// A short write (e.g. disk full) previously slipped through the
+		// false===$written check and, on the last chunk, a truncated .tmp got
+		// renamed to the final file and registered as a complete backup. Roll
+		// the file back to its pre-chunk length so the sender can retry the
+		// SAME offset, and never finalize a truncated file.
+		if (false === $written || $written !== strlen($chunk_data)) {
+			@ftruncate($fh, $start);
+			@fflush($fh);
+			fclose($fh);
+			delete_option($chunk_lock_key);
+			$got = (false === $written) ? 'write error' : ($written . ' of ' . strlen($chunk_data) . ' bytes');
+			return new WP_Error('file_write', 'Failed to write full chunk data (' . $got . ') - rolled back for retry.');
+		}
+
 		fclose($fh);
 		delete_option($chunk_lock_key);
-
-		if (false === $written) {
-			return new WP_Error('file_write', 'Failed to write chunk data.');
-		}
 
 		clearstatcache(true, $tmp_file);
 		$result = array(
@@ -445,6 +479,21 @@ class SiteGuard_Backup_Remote_Send {
 			return new WP_Error('missing_param', 'Missing timestamp or nonce');
 		}
 
+		// Serialize this read-modify-write against the semaphore-protected
+		// local history writers (class-backup-history.php) to avoid a lost-update
+		// race. Same acquire/retry pattern as SiteGuard_Backup_History::add_backup().
+		$lock = new SiteGuard_Backup_Semaphore('history');
+		if (!$lock->lock()) {
+			error_log('SiteGuard Backup: Could not acquire history lock in cmd_set_backup_metadata - retrying once');
+			usleep(500000); // 500ms
+			if (!$lock->lock()) {
+				error_log('SiteGuard Backup: History lock failed in cmd_set_backup_metadata, proceeding without lock');
+			}
+		}
+		try {
+		// Flush cache to ensure fresh data inside the locked section
+		wp_cache_delete('sgbackup_backup_history', 'options');
+		wp_cache_delete('sgbackup_backup_history', 'site-options');
 		$history = SiteGuard_Backup_History::get_history_raw();
 		$target_ts = null;
 
@@ -516,6 +565,9 @@ class SiteGuard_Backup_Remote_Send {
 		}
 
 		return array('status' => 'ok', 'timestamp' => $target_ts);
+		} finally {
+			$lock->unlock();
+		}
 	}
 
 	/**
@@ -549,27 +601,44 @@ class SiteGuard_Backup_Remote_Send {
 			}
 		}
 
-		$history = SiteGuard_Backup_History::get_history_raw();
-
-		if (!isset($history[$timestamp])) {
-			$history[$timestamp] = array(
-				'nonce'   => $nonce,
-				'service' => array('remotesend'),
-			);
+		// Serialize against the semaphore-protected local history writers to
+		// avoid a lost-update race. Same pattern as add_backup().
+		$lock = new SiteGuard_Backup_Semaphore('history');
+		if (!$lock->lock()) {
+			error_log('SiteGuard Backup: Could not acquire history lock in register_received_file - retrying once');
+			usleep(500000); // 500ms
+			if (!$lock->lock()) {
+				error_log('SiteGuard Backup: History lock failed in register_received_file, proceeding without lock');
+			}
 		}
+		try {
+			// Flush cache to ensure fresh data inside the locked section
+			wp_cache_delete('sgbackup_backup_history', 'options');
+			wp_cache_delete('sgbackup_backup_history', 'site-options');
+			$history = SiteGuard_Backup_History::get_history_raw();
 
-		if (!isset($history[$timestamp][$entity])) {
-			$history[$timestamp][$entity] = array();
+			if (!isset($history[$timestamp])) {
+				$history[$timestamp] = array(
+					'nonce'   => $nonce,
+					'service' => array('remotesend'),
+				);
+			}
+
+			if (!isset($history[$timestamp][$entity])) {
+				$history[$timestamp][$entity] = array();
+			}
+
+			if (is_string($history[$timestamp][$entity])) {
+				$history[$timestamp][$entity] = array($history[$timestamp][$entity]);
+			}
+
+			if (!in_array($filename, $history[$timestamp][$entity])) {
+				$history[$timestamp][$entity][] = $filename;
+			}
+
+			SiteGuard_Backup_History::save_history($history);
+		} finally {
+			$lock->unlock();
 		}
-
-		if (is_string($history[$timestamp][$entity])) {
-			$history[$timestamp][$entity] = array($history[$timestamp][$entity]);
-		}
-
-		if (!in_array($filename, $history[$timestamp][$entity])) {
-			$history[$timestamp][$entity][] = $filename;
-		}
-
-		SiteGuard_Backup_History::save_history($history);
 	}
 }

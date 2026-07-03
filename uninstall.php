@@ -23,11 +23,17 @@ $wpdb->query($wpdb->prepare(
 ));
 
 // Clear scheduled events for the current site
+// (Mirror every sgbackup_* hook that sgbackup_deactivate() clears in siteguardbackup.php.)
 wp_clear_scheduled_hook('sgbackup_backup');
 wp_clear_scheduled_hook('sgbackup_backup_database');
 wp_clear_scheduled_hook('sgbackup_backup_all');
 wp_clear_scheduled_hook('sgbackup_backup_incremental');
+wp_clear_scheduled_hook('sgbackup_backup_remotesend');
+wp_clear_scheduled_hook('sgbackup_health_check');
 wp_clear_scheduled_hook('sgbackup_backup_resume');
+
+// NOTE: the on-disk backup files under wp-content/sgbackup are intentionally RETAINED on
+// uninstall so backups aren't destroyed by removing the plugin. Users delete them manually.
 
 // Clean up any remaining resume events with args from the cron array
 $crons = _get_cron_array();
@@ -82,6 +88,8 @@ if (is_multisite()) {
 		wp_clear_scheduled_hook('sgbackup_backup_database');
 		wp_clear_scheduled_hook('sgbackup_backup_all');
 		wp_clear_scheduled_hook('sgbackup_backup_incremental');
+		wp_clear_scheduled_hook('sgbackup_backup_remotesend');
+		wp_clear_scheduled_hook('sgbackup_health_check');
 		wp_clear_scheduled_hook('sgbackup_backup_resume');
 
 		$site_crons = _get_cron_array();

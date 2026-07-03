@@ -228,15 +228,17 @@ class SiteGuard_Backup_Method_Onedrive extends SiteGuard_Backup_Module {
             $chunk = fread($fh, $chunk_size);
             $end = $offset + strlen($chunk) - 1;
 
-            $chunk_response = wp_remote_request($upload_url, array(
-                'method'  => 'PUT',
-                'headers' => array(
-                    'Content-Length' => strlen($chunk),
-                    'Content-Range'  => "bytes {$offset}-{$end}/{$filesize}",
-                ),
-                'body'    => $chunk,
-                'timeout' => 120,
-            ));
+            $chunk_response = $this->request_with_retries(function() use ($upload_url, $chunk, $offset, $end, $filesize) {
+                return wp_remote_request($upload_url, array(
+                    'method'  => 'PUT',
+                    'headers' => array(
+                        'Content-Length' => strlen($chunk),
+                        'Content-Range'  => "bytes {$offset}-{$end}/{$filesize}",
+                    ),
+                    'body'    => $chunk,
+                    'timeout' => 120,
+                ));
+            }, 'OneDrive chunk upload');
 
             if (is_wp_error($chunk_response)) {
                 fclose($fh);

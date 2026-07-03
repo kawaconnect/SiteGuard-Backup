@@ -15,8 +15,41 @@ if (!class_exists('SiteGuard_Backup_Method_S3')) {
 
 class SiteGuard_Backup_Method_S3generic extends SiteGuard_Backup_Method_S3 {
 
+	/** @var bool Whether the signature_version check has already run */
+	private $sigv2_checked = false;
+
 	public function get_id() {
 		return 's3generic';
+	}
+
+	/**
+	 * Warn once when the unsupported SigV2 signature version is configured.
+	 *
+	 * The 'v2' option value is accepted for backwards compatibility but only
+	 * SigV4 signing is implemented, so make that explicit in the log rather
+	 * than silently misbehaving.
+	 */
+	private function maybe_warn_sigv2() {
+		if ($this->sigv2_checked) return;
+		$this->sigv2_checked = true;
+
+		$options = $this->get_options();
+		if (isset($options['signature_version']) && 'v2' === $options['signature_version']) {
+			SiteGuard_Backup::instance()->log(
+				'S3-generic: SigV2 is not supported; signing with SigV4. Set signature_version to v4 to silence this warning.',
+				'warning'
+			);
+		}
+	}
+
+	public function backup($file) {
+		$this->maybe_warn_sigv2();
+		return parent::backup($file);
+	}
+
+	public function credentials_test() {
+		$this->maybe_warn_sigv2();
+		return parent::credentials_test();
 	}
 
 	public function get_default_options() {

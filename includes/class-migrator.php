@@ -8,6 +8,26 @@
 
 if (!defined('ABSPATH')) die('No direct access.');
 
+/**
+ * ⚠ DEAD CODE - DO NOT USE WITHOUT FIXING FIRST.
+ *
+ * SiteGuard_Backup_Migrator is not instantiated anywhere in the plugin (confirmed
+ * by grep 2026-07). The live migration URL-rewriting path is restorer.php's
+ * do_search_replace(); this class has diverged from it and carries latent bugs:
+ *
+ *   1. get_search_replace_arrays() does NOT order the search/replace pairs
+ *      longest-needle-first. Because siteurl/home/content/uploads URLs are often
+ *      prefixes of one another (https://x.com  vs  https://x.com/wp-content), a
+ *      shorter needle can fire first and leave a mangled, partially-rewritten URL
+ *      that the longer needle then no longer matches.
+ *   2. The protocol-variant logic only adds the opposite-scheme variant of the
+ *      siteurl and can emit a same-scheme (http->http / https->https) no-op pair,
+ *      and does not apply the same variant handling to home/content/uploads.
+ *
+ * If this class is ever wired up, fix both (sort pairs by descending strlen of the
+ * search needle; skip pairs whose search === replace) and re-verify against
+ * restorer.php before relying on it.
+ */
 class SiteGuard_Backup_Migrator {
 
 	/** @var bool Whether this restore is a migration (URL change detected) */

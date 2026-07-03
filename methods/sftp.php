@@ -318,13 +318,14 @@ class SiteGuard_Backup_Method_Sftp extends SiteGuard_Backup_Module {
 			return new WP_Error('scp_no_lib', 'SCP class not available.');
 		}
 
-		$data = $scp->get($remote_path);
-		if (false === $data) {
+		// Pass the local path so Net_SCP::get() streams to disk instead of
+		// returning the whole file as a string (avoids OOM on large archives).
+		$result = $scp->get($remote_path, $local_path);
+		if (false === $result) {
 			return new WP_Error('scp_download_failed', "Failed to download via SCP: {$remote_path}");
 		}
 
-		$written = file_put_contents($local_path, $data);
-		return (false !== $written) ? true : new WP_Error('scp_download_failed', "Failed to write downloaded file: {$local_path}");
+		return true;
 	}
 
 	public function delete($files) {

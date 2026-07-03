@@ -24,6 +24,21 @@ class SiteGuard_Backup_Method_Email extends SiteGuard_Backup_Module {
 		$filesize = filesize($file);
 		$filename = basename($file);
 
+		// Hard limit: refuse to attach oversized archives, which would exhaust
+		// memory in wp_mail()/PHPMailer and be rejected by virtually all mail servers.
+		$max_bytes = apply_filters('sgbackup_email_max_attachment_bytes', 26214400); // 25MB
+		if ($filesize > $max_bytes) {
+			return new WP_Error(
+				'email_attachment_too_large',
+				sprintf(
+					'File %s is %s, which exceeds the %s email attachment limit. Email is not a viable transport for large archives; please use another storage method (e.g. FTP, SFTP or cloud storage).',
+					$filename,
+					SiteGuard_Backup_Filesystem::format_bytes($filesize),
+					SiteGuard_Backup_Filesystem::format_bytes($max_bytes)
+				)
+			);
+		}
+
 		// Warn if file is very large
 		if ($filesize > SGBACKUP_WARN_EMAIL_SIZE) {
 			SiteGuard_Backup::instance()->log(

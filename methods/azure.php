@@ -4,7 +4,7 @@
  *
  * Uses Azure Blob Storage REST API with SharedKey authorization.
  * No Azure SDK dependency - pure REST via wp_remote_request().
- * Supports: upload (PUT Blob for <256MB, Block Blob for larger), download, delete, list.
+ * Supports: upload (Put Blob for <50MB, Block Blob for larger), download, delete, list.
  */
 
 if (!defined('ABSPATH')) die('No direct access.');
@@ -45,6 +45,20 @@ class SiteGuard_Backup_Method_Azure extends SiteGuard_Backup_Module {
 		$options = $this->get_options();
 		$path = !empty($options['path']) ? trim($options['path'], '/') . '/' : '';
 		return $path . $blob_name;
+	}
+
+	/**
+	 * Encode a URI path per segment (RFC 3986), preserving forward slashes.
+	 *
+	 * The SharedKey canonicalized resource must contain the encoded URI path
+	 * exactly as sent on the wire, so encode once and use the same string for
+	 * both signing and the request URL.
+	 *
+	 * @param string $path URI path (e.g. /container/dir/blob name.zip).
+	 * @return string Encoded path.
+	 */
+	private function encode_uri_path($path) {
+		return implode('/', array_map('rawurlencode', explode('/', $path)));
 	}
 
 	/**
@@ -175,7 +189,7 @@ class SiteGuard_Backup_Method_Azure extends SiteGuard_Backup_Module {
 	public function backup($file) {
 		$options = $this->get_options();
 		$blob_name = $this->get_blob_path(basename($file));
-		$uri = '/' . $options['container'] . '/' . $blob_name;
+		$uri = $this->encode_uri_path('/' . $options['container'] . '/' . $blob_name);
 		$filesize = filesize($file);
 
 		// For files under 50MB, use simple Put Blob
@@ -220,9 +234,11 @@ class SiteGuard_Backup_Method_Azure extends SiteGuard_Backup_Module {
 			$block_ids[] = $block_id;
 
 			$query = 'comp=block&blockid=' . urlencode($block_id);
-			$result = $this->request('PUT', $uri, $chunk, array(
-				'Content-Type' => 'application/octet-stream',
-			), $query);
+			$result = $this->request_with_retries(function() use ($uri, $chunk, $query) {
+				return $this->request('PUT', $uri, $chunk, array(
+					'Content-Type' => 'application/octet-stream',
+				), $query);
+			}, 'Azure Put Block');
 
 			if (is_wp_error($result)) {
 				fclose($fh);
@@ -261,7 +277,7 @@ class SiteGuard_Backup_Method_Azure extends SiteGuard_Backup_Module {
 	public function download($file, $dest_dir) {
 		$options = $this->get_options();
 		$blob_name = $this->get_blob_path($file);
-		$uri = '/' . $options['container'] . '/' . $blob_name;
+		$uri = $this->encode_uri_path('/' . $options['container'] . '/' . $blob_name);
 		$local_path = trailingslashit($dest_dir) . basename($file);
 
 		$headers = array();
@@ -301,7 +317,7 @@ class SiteGuard_Backup_Method_Azure extends SiteGuard_Backup_Module {
 
 		foreach ($files as $file) {
 			$blob_name = $this->get_blob_path($file);
-			$uri = '/' . $options['container'] . '/' . $blob_name;
+			$uri = $this->encode_uri_path('/' . $options['container'] . '/' . $blob_name);
 			$result = $this->request('DELETE', $uri);
 			if (is_wp_error($result)) {
 				$errors[] = $file . ': ' . $result->get_error_message();
@@ -322,7 +338,7 @@ class SiteGuard_Backup_Method_Azure extends SiteGuard_Backup_Module {
 	 */
 	public function listfiles() {
 		$options = $this->get_options();
-		$uri = '/' . $options['container'];
+		$uri = $this->encode_uri_path('/' . $options['container']);
 		$path = !empty($options['path']) ? trim($options['path'], '/') . '/' : '';
 
 		$query_parts = array('restype=container', 'comp=list');
@@ -364,7 +380,7 @@ class SiteGuard_Backup_Method_Azure extends SiteGuard_Backup_Module {
 			return new WP_Error('azure_config', 'Account name, account key, and container are required.');
 		}
 
-		$uri = '/' . $options['container'];
+		$uri = $this->encode_uri_path('/' . $options['container']);
 		$query = 'restype=container';
 		$result = $this->request('HEAD', $uri, '', array(), $query);
 

@@ -233,15 +233,17 @@ class SiteGuard_Backup_Method_Googledrive extends SiteGuard_Backup_Module {
 			}
 			$end = $offset + strlen($chunk) - 1;
 
-			$upload_response = wp_remote_request($upload_uri, array(
-				'method'  => 'PUT',
-				'headers' => array(
-					'Content-Length' => strlen($chunk),
-					'Content-Range'  => "bytes {$offset}-{$end}/{$filesize}",
-				),
-				'body'    => $chunk,
-				'timeout' => 120,
-			));
+			$upload_response = $this->request_with_retries(function() use ($upload_uri, $chunk, $offset, $end, $filesize) {
+				return wp_remote_request($upload_uri, array(
+					'method'  => 'PUT',
+					'headers' => array(
+						'Content-Length' => strlen($chunk),
+						'Content-Range'  => "bytes {$offset}-{$end}/{$filesize}",
+					),
+					'body'    => $chunk,
+					'timeout' => 120,
+				));
+			}, 'Google Drive chunk upload');
 
 			if (is_wp_error($upload_response)) {
 				fclose($fh);

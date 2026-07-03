@@ -35,7 +35,13 @@ class SiteGuard_Backup_Method_Ftp extends SiteGuard_Backup_Module {
 		$port = !empty($options['port']) ? intval($options['port']) : 21;
 
 		if ($ftps_mode === 'implicit') {
-			return $this->connect_implicit($options, $port);
+			// ftp_ssl_connect() only supports explicit FTPS (AUTH TLS after a
+			// plaintext handshake); attempting it against an implicit-TLS port
+			// hangs until timeout, so fail fast with a clear message instead.
+			return new WP_Error(
+				'ftp_implicit_unsupported',
+				"Implicit FTPS (port 990) is not supported by PHP's FTP extension; use explicit FTPS on port 21 or SFTP instead."
+			);
 		}
 
 		if ($ftps_mode === 'explicit' && function_exists('ftp_ssl_connect')) {
@@ -57,76 +63,6 @@ class SiteGuard_Backup_Method_Ftp extends SiteGuard_Backup_Module {
 			if (!@ftp_pasv($conn, true)) {
 				@ftp_close($conn);
 				return new WP_Error('ftp_pasv_failed', 'Failed to enable passive mode.');
-			}
-		}
-
-		return $conn;
-	}
-
-	/**
-	 * Connect using FTPS implicit mode (ssl:// wrapper on port 990).
-	 *
-	 * Returns a stream socket resource wrapped in an array to distinguish from ftp_connect.
-	 *
-	 * @param array $options Method options.
-	 * @param int   $port    Port number (default 990 for implicit).
-	 * @return resource|WP_Error FTP connection resource or error.
-	 */
-	private function connect_implicit($options, $port) {
-		// Implicit FTPS defaults to port 990
-		if ($port === 21) {
-			$port = 990;
-		}
-
-		$ssl_verify = !empty($options['ssl_verify']);
-		$context = stream_context_create(array(
-			'ssl' => array(
-				'verify_peer'      => $ssl_verify,
-				'verify_peer_name' => $ssl_verify,
-				'allow_self_signed' => !$ssl_verify,
-			),
-		));
-
-		if (!$ssl_verify) {
-			$sgbackup = SiteGuard_Backup::instance();
-			$sgbackup->log("FTP implicit SSL: certificate verification disabled. Enable ssl_verify in FTP settings for production use.", 'warning');
-		}
-
-		$stream = @stream_socket_client(
-			"ssl://{$options['host']}:{$port}",
-			$errno,
-			$errstr,
-			30,
-			STREAM_CLIENT_CONNECT,
-			$context
-		);
-
-		if (!$stream) {
-			return new WP_Error('ftp_implicit_failed', "Could not connect via implicit FTPS: {$options['host']}:{$port} ($errstr)");
-		}
-
-		// For implicit FTPS, we still need ftp_ssl_connect but some servers
-		// require raw SSL socket. Fall back to ftp_ssl_connect on the implicit port.
-		fclose($stream);
-
-		if (!function_exists('ftp_ssl_connect')) {
-			return new WP_Error('ftp_no_ssl', 'ftp_ssl_connect function not available. PHP OpenSSL extension required.');
-		}
-
-		$conn = ftp_ssl_connect($options['host'], $port, 30);
-		if (!$conn) {
-			return new WP_Error('ftp_implicit_failed', "Could not establish implicit FTPS connection: {$options['host']}:{$port}");
-		}
-
-		if (!ftp_login($conn, $options['user'], $options['pass'])) {
-			@ftp_close($conn);
-			return new WP_Error('ftp_login_failed', 'FTP login failed (implicit FTPS).');
-		}
-
-		if (!empty($options['passive'])) {
-			if (!@ftp_pasv($conn, true)) {
-				@ftp_close($conn);
-				return new WP_Error('ftp_pasv_failed', 'Failed to enable passive mode (implicit FTPS).');
 			}
 		}
 

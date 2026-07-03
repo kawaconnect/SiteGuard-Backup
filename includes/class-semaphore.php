@@ -42,9 +42,10 @@ class SiteGuard_Backup_Semaphore {
 		$now = time();
 		$option_name = $this->lock_name;
 		$lock_value = wp_generate_password(16, false);
-		// Pipe-delimited format: lock_value|timestamp (MySQL 5.6 compatible, no JSON_EXTRACT)
-		$new_data = $lock_value . '|' . $now;
-		$expired_before = $now - $this->lock_timeout;
+		// Pipe-delimited format: lock_value|timestamp|timeout (MySQL 5.6 compatible,
+		// no JSON_EXTRACT). Storing the timeout lets any instance judge expiry using
+		// the CREATOR's timeout rather than its own (see is_free()).
+		$new_data = $lock_value . '|' . $now . '|' . $this->lock_timeout;
 
 		// Use wp_options (which has a UNIQUE KEY on option_name) for the lock,
 		// even on multisite. wp_sitemeta lacks a UNIQUE KEY on (meta_key, site_id),
@@ -53,27 +54,37 @@ class SiteGuard_Backup_Semaphore {
 		$name_col = 'option_name';
 		$value_col = 'option_value';
 
+		// Overwrite only if the existing lock has expired, judged by its OWN stored
+		// timestamp + timeout. Field layout: value|timestamp|timeout.
+		//   stored_ts      = 2nd field = SUBSTRING_INDEX(SUBSTRING_INDEX(v,'|',-2),'|',1)
+		//   stored_timeout = 3rd field = SUBSTRING_INDEX(v,'|',-1)
+		// For legacy 2-field locks (value|timestamp) the nested extraction yields
+		// the lock_value (CAST → 0) and the timestamp respectively, so they are
+		// treated as immediately overwritable - acceptable for the brief upgrade
+		// window since these locks are short-lived.
 		$result = $wpdb->query($wpdb->prepare(
 			"INSERT INTO {$table} ({$name_col}, {$value_col}, autoload)
 			 VALUES (%s, %s, 'no')
 			 ON DUPLICATE KEY UPDATE
 			   {$value_col} = IF(
-			     CAST(SUBSTRING_INDEX({$value_col}, '|', -1) AS UNSIGNED) < %d,
+			     CAST(SUBSTRING_INDEX(SUBSTRING_INDEX({$value_col}, '|', -2), '|', 1) AS UNSIGNED)
+			       + CAST(SUBSTRING_INDEX({$value_col}, '|', -1) AS UNSIGNED) < %d,
 			     VALUES({$value_col}),
 			     {$value_col}
 			   )",
 			$option_name,
 			$new_data,
-			$expired_before
+			$now
 		));
 
 		// Clear cache and verify we actually hold the lock
 		wp_cache_delete($option_name, 'options');
 		$check = get_option($option_name);
 
-		// Parse pipe-delimited format: lock_value|timestamp
+		// Parse pipe-delimited format: lock_value is the FIRST field (works for
+		// both value|timestamp and value|timestamp|timeout layouts).
 		$check_lock_value = (is_string($check) && strpos($check, '|') !== false)
-			? substr($check, 0, strrpos($check, '|'))
+			? substr($check, 0, strpos($check, '|'))
 			: '';
 
 		if ($check_lock_value === $lock_value) {
@@ -136,12 +147,16 @@ class SiteGuard_Backup_Semaphore {
 	public function is_free() {
 		$check = get_option($this->lock_name);
 		if (empty($check)) return true;
-		// Parse pipe-delimited format: lock_value|timestamp
 		if (!is_string($check) || strpos($check, '|') === false) return true;
-		$lock_time = intval(substr($check, strrpos($check, '|') + 1));
+		// Parse pipe-delimited format: lock_value|timestamp[|timeout]
+		$parts = explode('|', $check);
+		$lock_time = isset($parts[1]) ? intval($parts[1]) : 0;
 		if ($lock_time <= 0) return true;
-		// Check if expired
-		return (time() - $lock_time) > $this->lock_timeout;
+		// Prefer the timeout stored by the lock's CREATOR; fall back to this
+		// instance's timeout only for legacy 2-field locks.
+		$timeout = isset($parts[2]) ? intval($parts[2]) : $this->lock_timeout;
+		if ($timeout <= 0) $timeout = $this->lock_timeout;
+		return (time() - $lock_time) > $timeout;
 	}
 
 	public function __destruct() {

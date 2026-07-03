@@ -12,8 +12,8 @@ if (!defined('ABSPATH')) die('No direct access.');
 
 class SiteGuard_Backup_Method_Openstack extends SiteGuard_Backup_Module {
 
-	/** @var int Chunk size for Static Large Objects (100MB) */
-	private $slo_chunk_size = 104857600;
+	/** @var int Chunk size for Static Large Objects (10MB) */
+	private $slo_chunk_size = 10485760;
 
 	/** @var int Token cache duration in seconds (23 hours) */
 	private $token_cache_duration = 82800;
@@ -83,9 +83,10 @@ class SiteGuard_Backup_Method_Openstack extends SiteGuard_Backup_Module {
 	 */
 	private function authenticate($force_refresh = false) {
 		$opts = SiteGuard_Backup_Options::instance();
+		$cache_key = $this->get_auth_cache_key();
 
 		if (!$force_refresh) {
-			$cached = $opts->get_transient('sgbackup_openstack_auth');
+			$cached = $opts->get_transient($cache_key);
 			if (!empty($cached) && is_array($cached) && !empty($cached['token']) && !empty($cached['storage_url'])) {
 				return $cached;
 			}
@@ -106,9 +107,30 @@ class SiteGuard_Backup_Method_Openstack extends SiteGuard_Backup_Module {
 		}
 
 		// Cache the token
-		$opts->set_transient('sgbackup_openstack_auth', $result, $this->token_cache_duration);
+		$opts->set_transient($cache_key, $result, $this->token_cache_duration);
 
 		return $result;
+	}
+
+	/**
+	 * Build an instance-specific transient key for the Keystone token cache.
+	 *
+	 * Keyed by the auth-relevant options so multiple OpenStack instances
+	 * (different endpoints, users, tenants or regions) do not share tokens.
+	 *
+	 * @return string
+	 */
+	private function get_auth_cache_key() {
+		$options = $this->get_options();
+		$auth_fields = array(
+			'auth_url'     => isset($options['auth_url']) ? $options['auth_url'] : '',
+			'username'     => isset($options['username']) ? $options['username'] : '',
+			'tenant'       => isset($options['tenant']) ? $options['tenant'] : '',
+			'region'       => isset($options['region']) ? $options['region'] : '',
+			'auth_version' => isset($options['auth_version']) ? $options['auth_version'] : '',
+		);
+
+		return 'sgbackup_openstack_auth_' . md5(serialize($auth_fields));
 	}
 
 	/**
@@ -368,7 +390,7 @@ class SiteGuard_Backup_Method_Openstack extends SiteGuard_Backup_Module {
 	/**
 	 * Upload a backup file to Swift container.
 	 *
-	 * Uses PUT for files under 100MB, Static Large Object (SLO) for larger files.
+	 * Uses PUT for files up to 10MB, Static Large Object (SLO) for larger files.
 	 *
 	 * @param string $file Full path to the file to upload.
 	 * @return bool|WP_Error
@@ -386,7 +408,7 @@ class SiteGuard_Backup_Method_Openstack extends SiteGuard_Backup_Module {
 			return $this->upload_slo($file, $object_name, $auth);
 		}
 
-		// Simple PUT for smaller files
+		// Simple PUT for smaller files (<=10MB, acceptable to buffer in memory)
 		$url = $auth['storage_url'] . '/' . rawurlencode($options['container']) . '/' . $this->encode_object_path($object_name);
 
 		$file_contents = file_get_contents($file);
@@ -398,7 +420,7 @@ class SiteGuard_Backup_Method_Openstack extends SiteGuard_Backup_Module {
 			'headers' => array(
 				'Content-Type'   => 'application/octet-stream',
 				'Content-Length' => $file_size,
-				'ETag'           => md5($file_contents),
+				'ETag'           => md5_file($file),
 			),
 			'body'    => $file_contents,
 			'timeout' => 300,
@@ -455,15 +477,17 @@ class SiteGuard_Backup_Method_Openstack extends SiteGuard_Backup_Module {
 			$segment_etag = md5($chunk);
 			$segment_url = $auth['storage_url'] . '/' . $container . '/' . $this->encode_object_path($segment_name);
 
-			$response = $this->swift_request('PUT', $segment_url, array(
-				'headers' => array(
-					'Content-Type'   => 'application/octet-stream',
-					'Content-Length' => $chunk_size,
-					'ETag'           => $segment_etag,
-				),
-				'body'    => $chunk,
-				'timeout' => 300,
-			));
+			$response = $this->request_with_retries(function() use ($segment_url, $chunk, $chunk_size, $segment_etag) {
+				return $this->swift_request('PUT', $segment_url, array(
+					'headers' => array(
+						'Content-Type'   => 'application/octet-stream',
+						'Content-Length' => $chunk_size,
+						'ETag'           => $segment_etag,
+					),
+					'body'    => $chunk,
+					'timeout' => 300,
+				));
+			}, 'Swift SLO segment upload');
 
 			if (is_wp_error($response)) {
 				fclose($fh);

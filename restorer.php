@@ -62,6 +62,15 @@ class SiteGuard_Backup_Restorer {
 	/** @var array|null Search-replace report for restore UI */
 	private $search_replace_report = null;
 
+	/** @var float Epoch (seconds) when this request's restore run began; used to
+	 *  derive the per-request search-replace deadline so a browser/proxy timeout
+	 *  can't kill an un-checkpointed pass. */
+	private $restore_started_at = 0;
+
+	/** @var string Option name persisting the search-replace pairs + pre-SR state
+	 *  so an interrupted migration search-replace resumes across requests. */
+	private $sr_state_option = 'sgbackup_restore_sr_state';
+
 	/** @var int Move-in mode for file restore */
 	private $move_in_mode = 0;
 
@@ -112,6 +121,24 @@ class SiteGuard_Backup_Restorer {
 
 	/** @var int Target blog ID for subsite import (unambiguous for subdirectory installs) */
 	private $target_subsite_id = 0;
+
+	/** @var array Plaintext files produced by decrypt_file(), unlinked on cleanup */
+	private $decrypted_temp_files = array();
+
+	/** @var SiteGuard_Backup_Semaphore|null Restore concurrency lock */
+	private $restore_lock = null;
+
+	/** @var int Number of files move_files() failed to move on its last run */
+	private $last_move_failures = 0;
+
+	/** @var array Memoized get_tables_in_sql_file() results, keyed by resolved file path */
+	private $tables_in_sql_cache = array();
+
+	/** @var array Files already scanned by scan_db_for_old_urls(), keyed by path */
+	private $scanned_url_files = array();
+
+	/** @var bool Whether source user tables were actually skipped during DB import */
+	private $user_tables_skipped = false;
 
 	/**
 	 * @param array $backup_set     Backup set from history.
@@ -204,6 +231,7 @@ class SiteGuard_Backup_Restorer {
 	public function perform_restore() {
 		@set_time_limit(SGBACKUP_SET_TIME_LIMIT);
 		@ignore_user_abort(true);
+		$this->restore_started_at = time();
 
 		$opts = SiteGuard_Backup_Options::instance();
 		$backup_dir = $opts->get_backup_dir();
@@ -217,6 +245,32 @@ class SiteGuard_Backup_Restorer {
 		$this->sgbackup->nonce = 'restore_' . substr(wp_generate_password(8, false), 0, 8);
 		$this->sgbackup->logfile_open($this->sgbackup->nonce);
 
+		// Concurrency guard: only one restore may run at a time. A second restore
+		// (e.g. the JS double-submit bug, or an impatient re-click) would race the
+		// first over the same tables/files and corrupt the result. Hold the lock
+		// for the whole run; it auto-expires so a crashed restore can be resumed.
+		$this->restore_lock = new SiteGuard_Backup_Semaphore('restore', 3600);
+		if (!$this->restore_lock->lock()) {
+			$busy_msg = "Another restore is already running. Refusing to start a second restore concurrently. Wait for it to finish (or up to an hour for a stalled one to time out) before retrying.";
+			$this->progress($busy_msg);
+			$this->sgbackup->log("[Restore] {$busy_msg}", 'error');
+			$this->restore_lock = null; // we do not hold it; nothing to release
+			$result['success'] = false;
+			$result['errors'][] = $busy_msg;
+			$this->end_restore(); $this->sgbackup->logfile_close();
+			return $result;
+		}
+
+		// Resume support: if a previous restore of THIS backup was interrupted
+		// (browser/proxy timeout, crash), its progress transient still records which
+		// entities finished. Skip those instead of re-running everything - the
+		// re-run loop is what makes migration restores appear to "hang".
+		$completed_phases = $this->get_completed_phases();
+		if (!empty($completed_phases)) {
+			$this->progress("Resuming restore - already completed: " . implode(', ', $completed_phases));
+			$this->sgbackup->log("[Restore] Resume detected; skipping completed phases: " . implode(', ', $completed_phases));
+		}
+
 		// Phase 0: Create pre-restore backup if requested
 		if (!empty($this->restore_options['pre_restore_backup'])) {
 			$this->progress("Creating pre-restore backup");
@@ -229,7 +283,7 @@ class SiteGuard_Backup_Restorer {
 		if (is_wp_error($files_result)) {
 			$result['success'] = false;
 			$result['errors'][] = $files_result->get_error_message();
-			$this->sgbackup->logfile_close();
+			$this->end_restore(); $this->sgbackup->logfile_close();
 			return $result;
 		}
 
@@ -242,7 +296,7 @@ class SiteGuard_Backup_Restorer {
 			if (empty($this->restore_options['skip_integrity_check'])) {
 				$result['success'] = false;
 				$result['errors'][] = count($integrity_errors) . ' file(s) failed integrity verification. Restore aborted. Use skip_integrity_check option to override.';
-				$this->sgbackup->logfile_close();
+				$this->end_restore(); $this->sgbackup->logfile_close();
 				return $result;
 			}
 			$this->progress("Integrity check failures overridden by skip_integrity_check option");
@@ -257,7 +311,7 @@ class SiteGuard_Backup_Restorer {
 			if (is_string($db_files)) $db_files = array($db_files);
 			$first_file = $backup_dir . $db_files[0];
 			if (!preg_match('/\.crypt$/', $first_file)) {
-				$scan_tables = SiteGuard_Backup_Database_Utility::get_tables_in_sql_file($first_file);
+				$scan_tables = $this->cached_tables_in_sql_file($first_file);
 				$base = $GLOBALS['wpdb']->base_prefix;
 				$has_main_options = false;
 				$detected_id = 0;
@@ -288,7 +342,7 @@ class SiteGuard_Backup_Restorer {
 			$this->sgbackup->log("Subsite backup restore blocked: subsite_mode={$this->subsite_mode} but IMPORT_AS (4) required", 'error');
 			$result['success'] = false;
 			$result['errors'][] = "This is a per-subsite backup from {$src_domain}. To restore it, use 'Import as subsite' mode and provide a target domain. Standard migrate/overwrite modes cannot handle subsite-only backups.";
-			$this->sgbackup->logfile_close();
+			$this->end_restore(); $this->sgbackup->logfile_close();
 			return $result;
 		}
 
@@ -367,7 +421,7 @@ class SiteGuard_Backup_Restorer {
 			// restore flow gets them).
 			$this->post_restore_cleanup();
 			$result['messages'] = array_merge($this->progress, $result['messages']);
-			$this->sgbackup->logfile_close();
+			$this->end_restore(); $this->sgbackup->logfile_close();
 			return $result;
 		}
 
@@ -383,12 +437,17 @@ class SiteGuard_Backup_Restorer {
 
 			$this->post_restore_cleanup();
 			$result['messages'] = array_merge($this->progress, $result['messages']);
-			$this->sgbackup->logfile_close();
+			$this->end_restore(); $this->sgbackup->logfile_close();
 			return $result;
 		}
 
 		// Restore database first (if requested)
-		if (!empty($this->restore_options['db']) && !empty($this->backup_set['db'])) {
+		if (!empty($this->restore_options['db']) && !empty($this->backup_set['db']) && in_array('db', $completed_phases, true)) {
+			$this->progress("Database already restored in a previous run - skipping (resume)");
+			$this->sgbackup->log("[Restore] Skipping database import: already completed (resume)");
+			$result['messages'][] = "Database: skipped (already restored in interrupted run)";
+		} elseif (!empty($this->restore_options['db']) && !empty($this->backup_set['db'])) {
+			@set_time_limit(SGBACKUP_SET_TIME_LIMIT);
 			$this->progress("Restoring database");
 			$db_result = $this->restore_database($backup_dir);
 			if (!$db_result['success']) {
@@ -399,6 +458,22 @@ class SiteGuard_Backup_Restorer {
 				$result['messages'][] = "Database: skipped (user selected skip-db mode)";
 			} else {
 				$result['messages'][] = "Database: {$db_result['tables_restored']} tables restored";
+			}
+
+			// Browser-mode search-replace resume: the DB was imported but the
+			// migration search-replace ran out of this request's time budget and
+			// checkpointed. Return an 'incomplete' result so the caller resumes
+			// (continuing SR from the saved table cursor) instead of re-importing.
+			// File entities are deferred until the DB phase fully completes so a
+			// resume always continues exactly one phase.
+			if (!empty($db_result['sr_incomplete'])) {
+				$result['incomplete'] = true;
+				$result['status'] = 'incomplete';
+				$result['messages'][] = "Search-replace in progress; the restore will continue automatically.";
+				$this->progress("Search-replace paused (time budget reached); resume to continue.");
+				$this->end_restore();
+				$this->sgbackup->logfile_close();
+				return $result;
 			}
 		}
 
@@ -417,6 +492,15 @@ class SiteGuard_Backup_Restorer {
 			if (empty($this->restore_options[$entity])) continue;
 			if (empty($this->backup_set[$entity])) continue;
 
+			// Resume: a file entity fully moved in a previous run is safe to skip.
+			if (in_array($entity, $completed_phases, true)) {
+				$this->progress(ucfirst($entity) . " already restored in a previous run - skipping (resume)");
+				$this->sgbackup->log("[Restore] Skipping {$entity}: already completed (resume)");
+				$result['messages'][] = ucfirst($entity) . " skipped (already restored in interrupted run)";
+				continue;
+			}
+
+			@set_time_limit(SGBACKUP_SET_TIME_LIMIT);
 			$this->progress("Restoring {$entity}");
 			$entity_result = $this->restore_file_entity($entity, $backup_dir);
 			if (!$entity_result) {
@@ -431,7 +515,8 @@ class SiteGuard_Backup_Restorer {
 		$this->post_restore_cleanup();
 
 		$result['messages'] = array_merge($this->progress, $result['messages']);
-		$this->sgbackup->logfile_close();
+		$result['status'] = 'complete';
+		$this->end_restore(); $this->sgbackup->logfile_close();
 
 		return $result;
 	}
@@ -447,6 +532,206 @@ class SiteGuard_Backup_Restorer {
 			}
 		}
 		return $entities;
+	}
+
+	/**
+	 * Read the restore-progress transient and return the list of entities/phases
+	 * already marked 'completed' for THIS backup, so a re-run (after a browser or
+	 * proxy timeout) can skip them instead of re-importing everything.
+	 *
+	 * Conservative: only returns completions whose transient timestamp matches
+	 * this backup, so an intentional restore of a different backup never inherits
+	 * a stale completion.
+	 *
+	 * @return array Entity keys already completed (e.g. ['db', 'plugins']).
+	 */
+	/**
+	 * Resolve the timestamp identifying the backup being restored (from the set,
+	 * else looked up by nonce in history). Used to scope resume state to this
+	 * specific backup so a stale checkpoint from a different one is never reused.
+	 */
+	private function restore_timestamp() {
+		$this_ts = isset($this->backup_set['timestamp']) ? $this->backup_set['timestamp'] : 0;
+		if (!$this_ts) {
+			$nonce = isset($this->backup_set['nonce']) ? $this->backup_set['nonce'] : '';
+			if ($nonce) {
+				$history = SiteGuard_Backup_History::get_history();
+				foreach ($history as $ts => $set) {
+					if (isset($set['nonce']) && $set['nonce'] === $nonce) { $this_ts = $ts; break; }
+				}
+			}
+		}
+		return $this_ts;
+	}
+
+	private function get_completed_phases() {
+		$opts = SiteGuard_Backup_Options::instance();
+		$progress = $opts->get_transient('sgbackup_restore_progress');
+		if (empty($progress) || !is_array($progress) || empty($progress['entities'])) {
+			return array();
+		}
+
+		$this_ts = $this->restore_timestamp();
+		if (!empty($progress['timestamp']) && $this_ts && (string) $progress['timestamp'] !== (string) $this_ts) {
+			return array();
+		}
+
+		$completed = array();
+		foreach ($progress['entities'] as $entity => $status) {
+			if ($status === 'completed') $completed[] = $entity;
+		}
+		return $completed;
+	}
+
+	/**
+	 * End-of-restore housekeeping run on EVERY exit path: unlink any plaintext
+	 * files left by decrypt_file() and release the restore concurrency lock.
+	 */
+	private function end_restore() {
+		$this->cleanup_decrypted_temp_files();
+		$this->release_restore_lock();
+	}
+
+	/**
+	 * Release the restore concurrency lock if we hold it. Idempotent.
+	 */
+	private function release_restore_lock() {
+		if ($this->restore_lock) {
+			$this->restore_lock->unlock();
+			$this->restore_lock = null;
+		}
+	}
+
+	/**
+	 * Unlink plaintext files produced by decrypt_file(). These are sibling files
+	 * written next to the encrypted .crypt archive; leaving them behind leaks the
+	 * decrypted contents and fills the disk. Idempotent.
+	 */
+	private function cleanup_decrypted_temp_files() {
+		if (empty($this->decrypted_temp_files)) return;
+		foreach ($this->decrypted_temp_files as $f) {
+			if (is_string($f) && $f !== '' && file_exists($f)) {
+				@unlink($f);
+				$this->sgbackup->log("Removed decrypted temp file: {$f}");
+			}
+		}
+		$this->decrypted_temp_files = array();
+	}
+
+	/**
+	 * Memoized wrapper around get_tables_in_sql_file(). The standard restore path
+	 * can otherwise decompress the same .sql.gz up to six times (pre-scan,
+	 * tables-only, filtered import, user-skip, prefix detection). Cache per
+	 * resolved path for the life of this restore run only.
+	 *
+	 * @param string $file_path Resolved (already-decrypted) SQL file path.
+	 * @return array Table names.
+	 */
+	private function cached_tables_in_sql_file($file_path) {
+		if (isset($this->tables_in_sql_cache[$file_path])) {
+			return $this->tables_in_sql_cache[$file_path];
+		}
+		$tables = SiteGuard_Backup_Database_Utility::get_tables_in_sql_file($file_path);
+		$this->tables_in_sql_cache[$file_path] = $tables;
+		return $tables;
+	}
+
+	/**
+	 * Focused, uncapped scan for the SOURCE main-site siteurl.
+	 *
+	 * scan_db_for_old_urls() caps at 200k lines to bound cost; on comment-heavy
+	 * dumps the wp_options INSERT can sit past that cap, so migration goes
+	 * undetected and the user-table-skip decision wrongly imports source users
+	 * (locking the admin out). This walks the whole file but does almost no work
+	 * per line - only cheap context tracking plus one regex when a line clearly
+	 * carries a siteurl value in the MAIN options table.
+	 *
+	 * @param string $file_path
+	 * @return string Source siteurl, or '' if not found.
+	 */
+	private function find_source_main_siteurl($file_path) {
+		$is_gz = (substr($file_path, -3) === '.gz');
+		$fh = $is_gz ? @gzopen($file_path, 'rb') : @fopen($file_path, 'r');
+		if (!$fh) return '';
+
+		$bp = $GLOBALS['wpdb']->base_prefix;
+		$in_main_options = false;
+		$found = '';
+
+		while (!($is_gz ? gzeof($fh) : feof($fh))) {
+			$line = $is_gz ? gzgets($fh, 1048576) : fgets($fh, 1048576);
+			if (false === $line) break;
+			$line_capped = (strlen($line) >= 1048575 && substr($line, -1) !== "\n");
+
+			if (preg_match('/^\s*INSERT INTO\s+`([^`]*options)`/i', $line, $im)) {
+				$in_main_options = ($im[1] === $bp . 'options');
+			} elseif (preg_match('/^\s*(CREATE|DROP|INSERT INTO)\b/i', $line)) {
+				// A new statement that is not a main-options INSERT ends the context.
+				if (!preg_match('/^\s*INSERT INTO\s+`' . preg_quote($bp . 'options', '/') . '`/i', $line)) {
+					$in_main_options = false;
+				}
+			}
+
+			if (($in_main_options || stripos($line, $bp . 'options') !== false) && !$line_capped) {
+				if (preg_match("/'siteurl'\s*,\s*'([^']+)'/i", $line, $m)) {
+					$found = $m[1];
+					break;
+				}
+			}
+		}
+
+		$is_gz ? @gzclose($fh) : @fclose($fh);
+		return $found;
+	}
+
+	/**
+	 * Compute the total uncompressed size of a zip archive by summing per-entry
+	 * sizes. Returns -1 when the size can't be determined (no ZipArchive / open
+	 * failure) so callers can skip the free-space precheck rather than block.
+	 *
+	 * @param string $zip_path
+	 * @return int Uncompressed bytes, or -1 if unknown.
+	 */
+	private function zip_uncompressed_size($zip_path) {
+		if (!class_exists('ZipArchive')) return -1;
+		$zip = new ZipArchive();
+		if (true !== $zip->open($zip_path)) return -1;
+		$total = 0;
+		for ($i = 0; $i < $zip->numFiles; $i++) {
+			$st = $zip->statIndex($i);
+			if (is_array($st) && isset($st['size'])) $total += (int) $st['size'];
+		}
+		$zip->close();
+		return $total;
+	}
+
+	/**
+	 * Move a directory tree into $dest, preferring rename() (instant, no extra
+	 * disk) and falling back to copy+unlink across filesystems. Used for subsite
+	 * upload extraction so we don't need a second full copy of multi-GB uploads.
+	 */
+	private function move_dir_recursive($source, $dest) {
+		if (!is_dir($source)) return;
+		if (!is_dir($dest)) wp_mkdir_p($dest);
+
+		$iterator = new RecursiveIteratorIterator(
+			new RecursiveDirectoryIterator($source, FilesystemIterator::SKIP_DOTS),
+			RecursiveIteratorIterator::SELF_FIRST
+		);
+
+		foreach ($iterator as $item) {
+			$target = $dest . DIRECTORY_SEPARATOR . $iterator->getSubPathname();
+			if ($item->isDir() || is_dir($item->getPathname())) {
+				if (!is_dir($target)) wp_mkdir_p($target);
+			} else {
+				if (file_exists($target)) @unlink($target);
+				if (!@rename($item->getPathname(), $target)) {
+					if (@copy($item->getPathname(), $target)) {
+						@unlink($item->getPathname());
+					}
+				}
+			}
+		}
 	}
 
 	/**
@@ -537,6 +822,23 @@ class SiteGuard_Backup_Restorer {
 		$this->sgbackup->log("Database restore mode: " . ($mode_labels[$this->db_restore_mode] ?? 'unknown'));
 		$this->progress("Database restore mode: " . ($mode_labels[$this->db_restore_mode] ?? 'unknown'));
 
+		// Resume: the DB was already imported in a prior request but the migration
+		// search-replace was interrupted (checkpointed). Skip the whole import and
+		// continue search-replace from its saved table cursor. Detected by the
+		// 'db_import' sub-phase marker being set while 'db' is not yet complete.
+		$completed_phases = $this->get_completed_phases();
+		if (in_array('db_import', $completed_phases, true) && !in_array('db', $completed_phases, true)) {
+			$this->sgbackup->log("[Restore] Resuming search-replace (DB import already completed in a prior run)");
+			$this->progress("Resuming search-replace from checkpoint");
+			$sr_status = $this->do_search_replace();
+			if ($sr_status === 'incomplete') {
+				$result['sr_incomplete'] = true;
+				return $result;
+			}
+			$this->save_restore_progress('db', 'completed');
+			return $result;
+		}
+
 		// Mode 3: Skip DB entirely
 		if ($this->db_restore_mode === self::DB_RESTORE_SKIP_DB) {
 			$this->sgbackup->log("Skipping database restore (mode: skip-db)");
@@ -623,6 +925,39 @@ class SiteGuard_Backup_Restorer {
 			// Parse old URLs from the SQL before import
 			$this->scan_db_for_old_urls($file_path);
 
+			// Full-dump migration detection: scan_db_for_old_urls() caps its scan, so
+			// on comment-heavy dumps the source siteurl (which lives in wp_options,
+			// possibly far into the file) can be missed - leaving is_migration false
+			// and causing the user-table-skip below to import source users and lock
+			// the admin out. Do a focused, uncapped pass so the skip decision is
+			// based on reality, not on where wp_options happened to land.
+			if (!$this->is_migration && empty($this->old_siteurl)) {
+				$full_siteurl = $this->find_source_main_siteurl($file_path);
+				if (!empty($full_siteurl)) {
+					$this->old_siteurl = $full_siteurl;
+					$cmp_siteurl = !empty($this->pre_import_siteurl) ? $this->pre_import_siteurl : get_option('siteurl');
+					if ($full_siteurl !== $cmp_siteurl) {
+						$this->is_migration = true;
+						$this->sgbackup->log("Full siteurl scan detected migration missed by capped scan: {$full_siteurl} -> {$cmp_siteurl}");
+					}
+				}
+			}
+
+			// Cross-prefix guard: a full-DB backup whose tables use a different base
+			// prefix than this install can't be imported by the standard path - the
+			// SQL recreates tables under the OLD prefix while WordPress keeps reading
+			// the current prefix, so the site silently serves stale data. Only the
+			// subsite-remap path (execute_sql_file_remap_prefix) rewrites prefixes,
+			// and that path returns earlier in perform_restore().
+			if (!empty($this->old_table_prefix) && $this->old_table_prefix !== $GLOBALS['wpdb']->base_prefix) {
+				$pmsg = "Table prefix mismatch: backup uses '{$this->old_table_prefix}' but this site uses '{$GLOBALS['wpdb']->base_prefix}'. The standard restore path cannot remap table prefixes, so imported tables would not be served by WordPress. Restore aborted - restore into an install with a matching prefix, or use the subsite import path.";
+				$this->sgbackup->log("[Restore] {$pmsg}", 'error');
+				$this->progress($pmsg);
+				$result['errors'][] = $pmsg;
+				$result['success'] = false;
+				return $result;
+			}
+
 			// Skip user tables during migrations to preserve destination login
 			// credentials. The source backup's wp_users/wp_usermeta have different
 			// password hashes, and importing them would lock out the admin.
@@ -633,7 +968,7 @@ class SiteGuard_Backup_Restorer {
 			// Mode 2 (tables-only): use filtered import with only tables NOT in DB
 			if ($this->db_restore_mode === self::DB_RESTORE_TABLES_ONLY && $selected_tables === null) {
 				// Extract table names from SQL file, then filter to only new ones
-				$backup_tables = SiteGuard_Backup_Database_Utility::get_tables_in_sql_file($file_path);
+				$backup_tables = $this->cached_tables_in_sql_file($file_path);
 				$new_tables = array_diff($backup_tables, $existing_tables);
 				if (empty($new_tables)) {
 					$this->sgbackup->log("Tables-only mode: no new tables to import from {$db_file}");
@@ -645,7 +980,7 @@ class SiteGuard_Backup_Restorer {
 					$file_path,
 					$new_tables,
 					function($lines_done) {
-						$this->progress("Database import: {$lines_done} lines processed");
+						@set_time_limit(SGBACKUP_SET_TIME_LIMIT); $this->progress("Database import: {$lines_done} lines processed");
 					}
 				);
 			} elseif ($selected_tables !== null) {
@@ -654,7 +989,7 @@ class SiteGuard_Backup_Restorer {
 					$file_path,
 					$selected_tables,
 					function($lines_done) {
-						$this->progress("Database import: {$lines_done} lines processed");
+						@set_time_limit(SGBACKUP_SET_TIME_LIMIT); $this->progress("Database import: {$lines_done} lines processed");
 					}
 				);
 			} elseif ($has_skips) {
@@ -666,7 +1001,7 @@ class SiteGuard_Backup_Restorer {
 					// rather than risk silently excluding all subsite tables.
 					$this->sgbackup->log("Warning: could not parse blogs from SQL file - falling back to atomic import for safety");
 				}
-				$all_backup_tables = SiteGuard_Backup_Database_Utility::get_tables_in_sql_file($file_path);
+				$all_backup_tables = $this->cached_tables_in_sql_file($file_path);
 				$tables_to_import = empty($source_blogs) ? $all_backup_tables : $this->compute_selective_tables($all_backup_tables, $source_blogs);
 				$skipped_count = count($all_backup_tables) - count($tables_to_import);
 				if ($skipped_count === 0) {
@@ -675,7 +1010,7 @@ class SiteGuard_Backup_Restorer {
 					$import_result = SiteGuard_Backup_Database_Utility::execute_sql_file_atomic(
 						$file_path,
 						function($lines_done) {
-							$this->progress("Database import: {$lines_done} lines processed");
+							@set_time_limit(SGBACKUP_SET_TIME_LIMIT); $this->progress("Database import: {$lines_done} lines processed");
 						}
 					);
 				} else {
@@ -685,7 +1020,7 @@ class SiteGuard_Backup_Restorer {
 						$file_path,
 						$tables_to_import,
 						function($lines_done) {
-							$this->progress("Database import: {$lines_done} lines processed");
+							@set_time_limit(SGBACKUP_SET_TIME_LIMIT); $this->progress("Database import: {$lines_done} lines processed");
 						}
 					);
 				}
@@ -694,15 +1029,16 @@ class SiteGuard_Backup_Restorer {
 				// to preserve destination login credentials.
 				global $wpdb;
 				$user_tables = array($wpdb->base_prefix . 'users', $wpdb->base_prefix . 'usermeta');
-				$all_tables = SiteGuard_Backup_Database_Utility::get_tables_in_sql_file($file_path);
+				$all_tables = $this->cached_tables_in_sql_file($file_path);
 				$tables_to_import = array_diff($all_tables, $user_tables);
+				$this->user_tables_skipped = true;
 				$this->sgbackup->log("Migration: skipping user tables (" . implode(', ', $user_tables) . ") to preserve destination credentials");
 				$this->progress("Importing " . count($tables_to_import) . " tables (preserving user credentials)");
 				$import_result = SiteGuard_Backup_Database_Utility::execute_sql_file_filtered(
 					$file_path,
 					$tables_to_import,
 					function($lines_done) {
-						$this->progress("Database import: {$lines_done} lines processed");
+						@set_time_limit(SGBACKUP_SET_TIME_LIMIT); $this->progress("Database import: {$lines_done} lines processed");
 					}
 				);
 			} else {
@@ -710,7 +1046,7 @@ class SiteGuard_Backup_Restorer {
 				$import_result = SiteGuard_Backup_Database_Utility::execute_sql_file_atomic(
 					$file_path,
 					function($lines_done) {
-						$this->progress("Database import: {$lines_done} lines processed");
+						@set_time_limit(SGBACKUP_SET_TIME_LIMIT); $this->progress("Database import: {$lines_done} lines processed");
 					}
 				);
 			}
@@ -778,8 +1114,20 @@ class SiteGuard_Backup_Restorer {
 
 		// Perform search-replace if this is a migration (mode 0 only)
 		if ($this->is_migration && $this->db_restore_mode === self::DB_RESTORE_MIGRATE) {
+			// Checkpoint the import ONLY now that we've committed to the resumable
+			// search-replace path. Marking it earlier would let a crash in the
+			// (non-migration) tail below skip those steps on resume; confined here,
+			// 'db_import' means exactly "import done, search-replace may need resuming".
+			$this->save_restore_progress('db_import', 'completed');
 			$this->progress("Performing search-replace for migration");
-			$this->do_search_replace();
+			$sr_status = $this->do_search_replace();
+			if ($sr_status === 'incomplete') {
+				// Search-replace checkpointed at the request deadline. Leave 'db'
+				// unmarked so the resume path continues SR; do not fall through to
+				// the completion checkpoint below.
+				$result['sr_incomplete'] = true;
+				return $result;
+			}
 		} elseif ($this->is_migration && $this->db_restore_mode === self::DB_RESTORE_OVERWRITE && is_multisite()) {
 			// Overwrite mode skips general search-replace, but multisite identity
 			// tables (wp_sitemeta.siteurl, wp_site.domain, wp_blogs blog_id=1)
@@ -936,7 +1284,7 @@ class SiteGuard_Backup_Restorer {
 				if (preg_match('/\.crypt$/', $first_file)) {
 					// Can't scan encrypted files here; rely on source_id
 				} else {
-					$all_tables = SiteGuard_Backup_Database_Utility::get_tables_in_sql_file($first_file);
+					$all_tables = $this->cached_tables_in_sql_file($first_file);
 					$prefix_pattern = '/^' . preg_quote($wpdb->base_prefix, '/') . '(\d+)_/';
 					$detected_ids = array();
 					foreach ($all_tables as $table) {
@@ -1179,6 +1527,15 @@ class SiteGuard_Backup_Restorer {
 
 			$this->sgbackup->log("Subsite search-replace pairs: " . count($search) . " - " . wp_json_encode(array_slice($search, 0, 10)) . " -> " . wp_json_encode(array_slice($replace, 0, 10)));
 
+			// Capture email-bearing options on the target subsite before SR so the
+			// bare-domain pair can't corrupt an address whose domain matches old_domain.
+			$sub_email_keys = array('admin_email', 'new_admin_email', 'woocommerce_email_from_address');
+			$preserved_sub_emails = array();
+			foreach ($sub_email_keys as $eok) {
+				$eval = $wpdb->get_var($wpdb->prepare("SELECT option_value FROM {$target_prefix}options WHERE option_name = %s", $eok));
+				if ($eval !== null) $preserved_sub_emails[$eok] = $eval;
+			}
+
 			$sr = new SiteGuard_Backup_Search_Replace();
 			$report = $sr->run($search, $replace, $tables);
 
@@ -1186,6 +1543,15 @@ class SiteGuard_Backup_Restorer {
 			$this->progress("Search-replace: {$report['changes']} changes in {$report['tables']} tables");
 
 			$result['messages'][] = "Search-replace: {$report['changes']} changes ({$old_domain} -> {$target_domain}" . ($target_path !== '/' ? $target_path : '') . ")";
+
+			// Re-fix any subsite email option the bare-domain replace corrupted.
+			foreach ($preserved_sub_emails as $eok => $orig) {
+				$now = $wpdb->get_var($wpdb->prepare("SELECT option_value FROM {$target_prefix}options WHERE option_name = %s", $eok));
+				if ($now !== null && $now !== $orig) {
+					$wpdb->update($target_prefix . 'options', array('option_value' => $orig), array('option_name' => $eok));
+					$this->sgbackup->log("Restored subsite option '{$eok}' after search-replace altered it ('{$now}' -> '{$orig}')");
+				}
+			}
 
 			// Release the first pass's engine + report before any later passes.
 			unset($sr, $report);
@@ -1816,31 +2182,65 @@ class SiteGuard_Backup_Restorer {
 				$esc_pk  = str_replace('`', '``', $pk_col);
 				$esc_col = str_replace('`', '``', $colname);
 
-				// Pull rows that LOOK serialized. LIKE with binary-safe prefixes.
-				$rows = $wpdb->get_results(
-					"SELECT `{$esc_pk}` AS pk, `{$esc_col}` AS val FROM `{$safe}`" .
-					" WHERE `{$esc_col}` LIKE 'a:%' OR `{$esc_col}` LIKE 's:%' OR `{$esc_col}` LIKE 'O:%'",
-					ARRAY_A
-				);
-				foreach ($rows as $row) {
-					$report['scanned']++;
-					$val = (string) $row['val'];
-					if ($val === '') continue;
-					// Must start with a serialization token
-					if (!preg_match('/^[asOibdNrR]:/', $val)) continue;
-					// Native unserialize first; if it passes, nothing to repair.
-					$ok = @unserialize($val);
-					if ($ok !== false || $val === 'b:0;') continue;
+				// Page by primary key rather than SELECTing every serialized blob at
+				// once - on Elementor subsites the full result set is gigabytes and
+				// OOMs PHP. Numeric PKs page cleanly; string PKs fall back to a single
+				// bounded page (LIMIT still caps memory).
+				$pk_type = '';
+				foreach ($cols as $c2) { if ($c2['Field'] === $pk_col) { $pk_type = strtolower($c2['Type']); break; } }
+				$pk_is_numeric = (bool) preg_match('/int|decimal|float|double|bit/i', $pk_type);
 
-					$report['broken']++;
-					$repaired = $this->repair_serialized_blob($val);
-					if ($repaired !== false && $repaired !== $val && @unserialize($repaired) !== false) {
-						$report['fixed']++;
-						$wpdb->update($safe, array($colname => $repaired), array($pk_col => $row['pk']));
+				$last_pk = 0;
+				$page_size = 500;
+				$max_blob = 8 * 1024 * 1024; // skip repair on blobs larger than this
+				do {
+					@set_time_limit(SGBACKUP_SET_TIME_LIMIT);
+					if ($pk_is_numeric) {
+						$rows = $wpdb->get_results($wpdb->prepare(
+							"SELECT `{$esc_pk}` AS pk, `{$esc_col}` AS val FROM `{$safe}`" .
+							" WHERE (`{$esc_col}` LIKE 'a:%' OR `{$esc_col}` LIKE 's:%' OR `{$esc_col}` LIKE 'O:%')" .
+							" AND `{$esc_pk}` > %d ORDER BY `{$esc_pk}` ASC LIMIT %d",
+							$last_pk, $page_size
+						), ARRAY_A);
 					} else {
-						$report['still_broken'][] = "{$safe}#{$row['pk']}.{$colname}";
+						// Non-numeric PK: one bounded page only (still memory-safe).
+						$rows = $wpdb->get_results(
+							"SELECT `{$esc_pk}` AS pk, `{$esc_col}` AS val FROM `{$safe}`" .
+							" WHERE (`{$esc_col}` LIKE 'a:%' OR `{$esc_col}` LIKE 's:%' OR `{$esc_col}` LIKE 'O:%')" .
+							" LIMIT {$page_size}",
+							ARRAY_A
+						);
 					}
-				}
+					if (empty($rows)) break;
+					$row_count = count($rows);
+
+					foreach ($rows as $row) {
+						$last_pk = $pk_is_numeric ? (int) $row['pk'] : $last_pk;
+						$report['scanned']++;
+						$val = (string) $row['val'];
+						if ($val === '') continue;
+						// Must start with a serialization token
+						if (!preg_match('/^[asOibdNrR]:/', $val)) continue;
+						// Native unserialize first; if it passes, nothing to repair.
+						$ok = @unserialize($val);
+						if ($ok !== false || $val === 'b:0;') continue;
+
+						$report['broken']++;
+						// Guard the regex-based repair against pathological blob sizes.
+						if (strlen($val) > $max_blob) {
+							$report['still_broken'][] = "{$safe}#{$row['pk']}.{$colname} (skipped: >8MB)";
+							continue;
+						}
+						$repaired = $this->repair_serialized_blob($val);
+						if ($repaired !== false && $repaired !== $val && @unserialize($repaired) !== false) {
+							$report['fixed']++;
+							$wpdb->update($safe, array($colname => $repaired), array($pk_col => $row['pk']));
+						} else {
+							$report['still_broken'][] = "{$safe}#{$row['pk']}.{$colname}";
+						}
+					}
+					unset($rows);
+				} while ($pk_is_numeric && $row_count === $page_size);
 			}
 		}
 		return $report;
@@ -2082,7 +2482,7 @@ class SiteGuard_Backup_Restorer {
 					$prefix_map,
 					$base_prefix,
 					function($lines_done) {
-						$this->progress("Database import: {$lines_done} lines processed");
+						@set_time_limit(SGBACKUP_SET_TIME_LIMIT); $this->progress("Database import: {$lines_done} lines processed");
 					}
 				);
 
@@ -2248,8 +2648,12 @@ class SiteGuard_Backup_Restorer {
 			$in_users_insert = false;
 			$in_usermeta_insert = false;
 			while (!($is_gz ? gzeof($fh) : feof($fh))) {
-				$line = $is_gz ? gzgets($fh) : fgets($fh);
+				// Cap the read so a pathologically long line (huge serialized blob)
+				// can't exhaust memory. A capped fragment lacks a trailing newline;
+				// we still do cheap context tracking but skip the heavy regexes on it.
+				$line = $is_gz ? gzgets($fh, 1048576) : fgets($fh, 1048576);
 				if (false === $line) break;
+				$line_capped = (strlen($line) >= 1048575 && substr($line, -1) !== "\n");
 
 				// Detect INSERT INTO wp_users
 				if (preg_match("/INSERT INTO\s+`{$users_table}`/i", $line)) {
@@ -2265,7 +2669,7 @@ class SiteGuard_Backup_Restorer {
 				if ($in_users_insert) {
 					// Extract user rows: (ID, login, pass, nicename, email, ...)
 					// PHP dump quotes integers ('1', ...), mysqldump doesn't (1, ...)
-					if (preg_match_all("/\(\s*'?(\d+)'?\s*,\s*'([^']*)'\s*,\s*'([^']*)'\s*,\s*'([^']*)'\s*,\s*'([^']*)'/", $line, $matches, PREG_SET_ORDER)) {
+					if (!$line_capped && preg_match_all("/\(\s*'?(\d+)'?\s*,\s*'([^']*)'\s*,\s*'([^']*)'\s*,\s*'([^']*)'\s*,\s*'([^']*)'/", $line, $matches, PREG_SET_ORDER)) {
 						foreach ($matches as $m) {
 							$backup_users[$m[5]] = array(
 								'old_id' => intval($m[1]),
@@ -2282,7 +2686,7 @@ class SiteGuard_Backup_Restorer {
 				if ($in_usermeta_insert) {
 					// Extract capability rows: (..., user_id, 'wp_capabilities', 'a:1:{...}')
 					// Only parse lines that contain our target capability key
-					if (strpos($line, $escaped_cap_key) !== false || strpos($line, $source_cap_key) !== false) {
+					if (!$line_capped && (strpos($line, $escaped_cap_key) !== false || strpos($line, $source_cap_key) !== false)) {
 						$cap_pattern = "/\(\s*'?\d+'?\s*,\s*'?(\d+)'?\s*,\s*'" . preg_quote($source_cap_key, '/') . "'\s*,\s*'((?:[^'\\\\]|\\\\.)*)'\s*\)/";
 						if (preg_match_all($cap_pattern, $line, $cap_matches, PREG_SET_ORDER)) {
 							foreach ($cap_matches as $cm) {
@@ -2390,9 +2794,26 @@ class SiteGuard_Backup_Restorer {
 			$zip_path = $backup_dir . $zip_file;
 			if (!file_exists($zip_path)) continue;
 
-			// Extract to a temp directory first
-			$temp_extract = $backup_dir . 'temp_uploads_' . time() . '/';
+			// Extract to a temp directory first. uniqid() defends against two
+			// upload archives extracted within the same second colliding.
+			$temp_extract = $backup_dir . 'temp_uploads_' . time() . '_' . uniqid() . '/';
 			wp_mkdir_p($temp_extract);
+
+			// Disk-space precheck: uploads archives are the largest artefact in a
+			// backup. Extracting onto a full disk corrupts the site; abort cleanly.
+			$needed = $this->zip_uncompressed_size($zip_path);
+			if ($needed > 0) {
+				$free = @disk_free_space($backup_dir);
+				if ($free !== false && $free < $needed * 1.1) {
+					$this->sgbackup->log(sprintf(
+						"[Restore] Not enough free disk space for uploads %s: need ~%s, only %s free. Skipping.",
+						$zip_file, size_format($needed), size_format($free)
+					), 'error');
+					$this->progress("Uploads restore skipped: insufficient disk space for {$zip_file}");
+					$this->remove_dir_recursive($temp_extract);
+					continue;
+				}
+			}
 
 			$extract_ok = $this->unzip($zip_path, $temp_extract);
 			if (!$extract_ok) {
@@ -2401,12 +2822,14 @@ class SiteGuard_Backup_Restorer {
 				continue;
 			}
 
-			// Two-phase copy: multisite backups store uploads in sites/{id}/,
-			// single-site backups store them at root level
+			// Two-phase move: multisite backups store uploads in sites/{id}/,
+			// single-site backups store them at root level. Use rename-based moves
+			// (fall back to copy across filesystems) so we don't need a second full
+			// copy of multi-GB uploads sitting on disk at once.
 			$source_subdir = $temp_extract . 'sites/' . $source_id . '/';
 			if (is_dir($source_subdir)) {
-				// Multisite subsite backup: copy from sites/{source_id}/
-				$this->copy_dir_recursive($source_subdir, $target_dir);
+				// Multisite subsite backup: move from sites/{source_id}/
+				$this->move_dir_recursive($source_subdir, $target_dir);
 			} else {
 				// Single-site backup: copy root-level files, excluding sites/ dir
 				// (which would contain OTHER subsites' uploads)
@@ -2511,8 +2934,12 @@ class SiteGuard_Backup_Restorer {
 		$in_blogs_insert = false;
 
 		while (!($is_gz ? gzeof($fh) : feof($fh))) {
-			$line = $is_gz ? gzgets($fh) : fgets($fh);
+			// Cap the read to bound memory on huge single-line dumps. wp_blogs rows
+			// are tiny, so a capped fragment (no trailing newline) can't hold a full
+			// blogs INSERT worth parsing - skip the heavy regex on it.
+			$line = $is_gz ? gzgets($fh, 1048576) : fgets($fh, 1048576);
 			if (false === $line) break;
+			$line_capped = (strlen($line) >= 1048575 && substr($line, -1) !== "\n");
 			$trimmed = trim($line);
 
 			// Detect INSERT INTO wp_blogs (or wp_N_blogs with a prefix)
@@ -2521,7 +2948,7 @@ class SiteGuard_Backup_Restorer {
 			}
 
 			// Extract (blog_id, site_id, domain, ...) value tuples
-			if ($in_blogs_insert) {
+			if ($in_blogs_insert && !$line_capped) {
 				// Match value rows like (2, 1, 'sub.example.com', ...) or ('2', '1', 'sub.example.com', ...)
 				// PHP dump format quotes integers, mysqldump doesn't - handle both.
 				if (preg_match_all('/\(\s*\'?(\d+)\'?\s*,\s*\'?\d+\'?\s*,\s*\'([^\']+)\'/', $trimmed, $matches, PREG_SET_ORDER)) {
@@ -2697,6 +3124,12 @@ class SiteGuard_Backup_Restorer {
 	 *   (2, 'home', 'https://example.com', 'yes');
 	 */
 	private function scan_db_for_old_urls($file_path) {
+		// Memoize per resolved path: this scanner is one of several full gz
+		// decompressions per restore and its side effects (old_siteurl, is_migration)
+		// persist on the instance, so a repeat call over the same file is wasted work.
+		if (isset($this->scanned_url_files[$file_path])) return;
+		$this->scanned_url_files[$file_path] = true;
+
 		$is_gz = (substr($file_path, -3) === '.gz');
 		$fh = $is_gz ? @gzopen($file_path, 'rb') : @fopen($file_path, 'r');
 		if (!$fh) return;
@@ -2717,8 +3150,12 @@ class SiteGuard_Backup_Restorer {
 			// Stop early once we have both URLs from the MAIN options table.
 			// If we only have subsite values, keep scanning to find wp_options.
 			if ($found_siteurl && $found_home && $siteurl_from_main && $home_from_main) break;
-			$line = $is_gz ? gzgets($fh) : fgets($fh);
+			// Cap the read so a single giant serialized-option line can't OOM the
+			// scanner. siteurl/home/prefix live in short rows, so a capped fragment
+			// (no trailing newline) is safe to skip for the value regexes below.
+			$line = $is_gz ? gzgets($fh, 1048576) : fgets($fh, 1048576);
 			if (false === $line) break;
+			$line_capped = (strlen($line) >= 1048575 && substr($line, -1) !== "\n");
 
 			$lines_scanned++;
 			$trimmed = trim($line);
@@ -2743,7 +3180,7 @@ class SiteGuard_Backup_Restorer {
 			// Match siteurl/home: works for single-line mysqldump format AND
 			// multi-line PHP dump format (value rows within options INSERT).
 			// Prefer values from wp_options (main site) over wp_N_options (subsite).
-			if ($in_options_insert || preg_match('/^INSERT INTO\s+`([^`]*options)`/i', $trimmed, $ins_m2)) {
+			if (!$line_capped && ($in_options_insert || preg_match('/^INSERT INTO\s+`([^`]*options)`/i', $trimmed, $ins_m2))) {
 				// Re-check if this specific INSERT line is for main options
 				$is_main = $in_main_options;
 				if (!$in_options_insert && isset($ins_m2[1])) {
@@ -2844,117 +3281,208 @@ class SiteGuard_Backup_Restorer {
 	/**
 	 * Perform search-replace on the database for migration.
 	 */
+	/**
+	 * Run the migration search-replace.
+	 *
+	 * Resumable across requests: the computed pairs + the pre-SR captures
+	 * (site_admins, email options, real destination URLs) are persisted once, and
+	 * the SR engine checkpoints its per-table cursor. Under AJAX a per-request
+	 * deadline makes it stop and persist before a proxy timeout; the resume path
+	 * (restore_database) calls this again to continue from the cursor.
+	 *
+	 * @return string 'complete' when the search-replace fully finished (or was a
+	 *                no-op), or 'incomplete' when it checkpointed at the deadline.
+	 */
 	private function do_search_replace() {
 		require_once SGBACKUP_DIR . 'includes/class-search-replace.php';
-
-		// Use pre-import URLs saved before the DB was overwritten.
-		// After DB import, get_option('siteurl') returns the OLD site's URL,
-		// making comparison useless. The pre-import values are the DESTINATION URLs.
-		$current_siteurl = $this->pre_import_siteurl;
-		$current_home = $this->pre_import_home;
-		$current_content = $this->pre_import_content_url;
-		$current_uploads = $this->pre_import_uploads_url;
-
-		// Save the REAL destination URLs before any keep-protocol rewrite.
-		// These are used for writing to wp_options - the site must respond
-		// on its actual protocol regardless of keep_protocol.
-		$real_dest_siteurl = $current_siteurl;
-		$real_dest_home = $current_home;
-
-		// Keep original protocol: rewrite destination URLs to use the source scheme
-		// for SEARCH-REPLACE PAIRS ONLY. Does not affect DB identity writes.
-		if ($this->keep_protocol && !empty($this->old_siteurl)) {
-			$old_scheme = parse_url($this->old_siteurl, PHP_URL_SCHEME);
-			$new_scheme = parse_url($current_siteurl, PHP_URL_SCHEME);
-			if ($old_scheme && $new_scheme && $old_scheme !== $new_scheme) {
-				$this->sgbackup->log("Keep-protocol: rewriting destination URLs from {$new_scheme} to {$old_scheme}");
-				$current_siteurl = preg_replace('/^' . preg_quote($new_scheme, '/') . '/', $old_scheme, $current_siteurl);
-				$current_home = preg_replace('/^' . preg_quote($new_scheme, '/') . '/', $old_scheme, $current_home);
-				if ($current_content) $current_content = preg_replace('/^' . preg_quote($new_scheme, '/') . '/', $old_scheme, $current_content);
-				if ($current_uploads) $current_uploads = preg_replace('/^' . preg_quote($new_scheme, '/') . '/', $old_scheme, $current_uploads);
-			}
-		}
-
-		$search = array();
-		$replace = array();
-
-		if (!empty($this->old_siteurl) && $this->old_siteurl !== $current_siteurl) {
-			$search[] = $this->old_siteurl;
-			$replace[] = $current_siteurl;
-
-			// Also add the opposite-protocol variant of old_siteurl in case
-			// some DB values use http:// while old_siteurl was detected as https://
-			$old_scheme = parse_url($this->old_siteurl, PHP_URL_SCHEME);
-			$alt_scheme = ($old_scheme === 'https') ? 'http' : 'https';
-			$alt_old_siteurl = preg_replace('/^' . preg_quote($old_scheme, '/') . '/', $alt_scheme, $this->old_siteurl);
-			if ($alt_old_siteurl !== $current_siteurl && !in_array($alt_old_siteurl, $search, true)) {
-				$search[] = $alt_old_siteurl;
-				$replace[] = $current_siteurl;
-			}
-		}
-
-		if (!empty($this->old_home) && $this->old_home !== $current_home && $this->old_home !== $this->old_siteurl) {
-			$search[] = $this->old_home;
-			$replace[] = $current_home;
-		}
-
-		if (!empty($this->old_uploads) && $this->old_uploads !== $current_uploads) {
-			$search[] = $this->old_uploads;
-			$replace[] = $current_uploads;
-		}
-
-		if (empty($search)) {
-			$this->sgbackup->log("No URL changes detected, skipping search-replace");
-			return;
-		}
-
-		// Multisite: enumerate all blogs and build per-blog replacements
-		if (is_multisite()) {
-			$sr_scheme = $this->keep_protocol ? parse_url($current_siteurl, PHP_URL_SCHEME) : null;
-			$this->build_multisite_replacements($search, $replace, $sr_scheme);
-		}
-
-		// Write the REAL destination siteurl/home (before any keep-protocol rewrite).
-		// The site must respond on its actual protocol regardless of keep_protocol.
-		update_option('siteurl', $real_dest_siteurl);
-		update_option('home', $real_dest_home);
-		wp_cache_delete('alloptions', 'options');
-
-		$this->sgbackup->log("Search-replace: " . count($search) . " replacements");
-		foreach ($search as $i => $s) {
-			$this->sgbackup->log("  Replace: {$s} -> {$replace[$i]}");
-
-			// Gap 27: Additional protocol transition warning during search-replace
-			$old_scheme = parse_url($s, PHP_URL_SCHEME);
-			$new_scheme = parse_url($replace[$i], PHP_URL_SCHEME);
-			if ($old_scheme && $new_scheme && $old_scheme !== $new_scheme) {
-				$this->sgbackup->log("  Protocol change in this replacement: {$old_scheme} -> {$new_scheme}", 'warning');
-			}
-		}
-
 		global $wpdb;
-		$tables = SiteGuard_Backup_Database_Utility::get_tables($wpdb->prefix);
+		$opts = SiteGuard_Backup_Options::instance();
 
-		// Exclude user tables from search-replace during migrations to preserve
-		// destination user logins, emails, and credentials
-		if ($this->is_migration) {
-			$user_tables = array($wpdb->users, $wpdb->usermeta);
-			$tables = array_values(array_diff($tables, $user_tables));
-			$this->sgbackup->log("Search-replace: excluding user tables (" . implode(', ', $user_tables) . ") to preserve destination accounts");
+		// Resume: a prior request already built the pairs and started SR but hit the
+		// request deadline. Reload the EXACT pairs and pre-SR captures - recomputing
+		// them now would read a DB that has already been partly rewritten (corrupting
+		// the captured admin_email / site_admins). Presence of state == resuming, but
+		// only if it belongs to THIS backup - a stale checkpoint from an abandoned
+		// migration of a different backup must never be reused (it would rewrite with
+		// the wrong URLs). On mismatch, discard it and rebuild from scratch.
+		$this_ts = (string) $this->restore_timestamp();
+		$state = $opts->get_option($this->sr_state_option, null);
+		if (is_array($state) && isset($state['timestamp']) && (string) $state['timestamp'] !== $this_ts) {
+			$this->sgbackup->log("Discarding stale search-replace checkpoint (belongs to backup {$state['timestamp']}, restoring {$this_ts})", 'warning');
+			$opts->delete_option($this->sr_state_option);
+			$state = null;
+		}
+		$resuming = (is_array($state) && !empty($state['search']) && !empty($state['tables']));
+
+		if ($resuming) {
+			$search                  = $state['search'];
+			$replace                 = $state['replace'];
+			$tables                  = $state['tables'];
+			$real_dest_siteurl       = isset($state['real_dest_siteurl']) ? $state['real_dest_siteurl'] : '';
+			$real_dest_home          = isset($state['real_dest_home']) ? $state['real_dest_home'] : '';
+			$saved_site_admins       = array_key_exists('saved_site_admins', $state) ? $state['saved_site_admins'] : null;
+			$preserved_email_options = isset($state['preserved_email_options']) ? $state['preserved_email_options'] : array();
+			$this->sgbackup->log("Resuming search-replace: " . count($search) . " pairs across " . count($tables) . " tables (from checkpoint)");
+		} else {
+			// Use pre-import URLs saved before the DB was overwritten.
+			// After DB import, get_option('siteurl') returns the OLD site's URL,
+			// making comparison useless. The pre-import values are the DESTINATION URLs.
+			$current_siteurl = $this->pre_import_siteurl;
+			$current_home = $this->pre_import_home;
+			$current_content = $this->pre_import_content_url;
+			$current_uploads = $this->pre_import_uploads_url;
+
+			// Save the REAL destination URLs before any keep-protocol rewrite.
+			// These are used for writing to wp_options - the site must respond
+			// on its actual protocol regardless of keep_protocol.
+			$real_dest_siteurl = $current_siteurl;
+			$real_dest_home = $current_home;
+
+			// Keep original protocol: rewrite destination URLs to use the source scheme
+			// for SEARCH-REPLACE PAIRS ONLY. Does not affect DB identity writes.
+			if ($this->keep_protocol && !empty($this->old_siteurl)) {
+				$old_scheme = parse_url($this->old_siteurl, PHP_URL_SCHEME);
+				$new_scheme = parse_url($current_siteurl, PHP_URL_SCHEME);
+				if ($old_scheme && $new_scheme && $old_scheme !== $new_scheme) {
+					$this->sgbackup->log("Keep-protocol: rewriting destination URLs from {$new_scheme} to {$old_scheme}");
+					$current_siteurl = preg_replace('/^' . preg_quote($new_scheme, '/') . '/', $old_scheme, $current_siteurl);
+					$current_home = preg_replace('/^' . preg_quote($new_scheme, '/') . '/', $old_scheme, $current_home);
+					if ($current_content) $current_content = preg_replace('/^' . preg_quote($new_scheme, '/') . '/', $old_scheme, $current_content);
+					if ($current_uploads) $current_uploads = preg_replace('/^' . preg_quote($new_scheme, '/') . '/', $old_scheme, $current_uploads);
+				}
+			}
+
+			$search = array();
+			$replace = array();
+
+			if (!empty($this->old_siteurl) && $this->old_siteurl !== $current_siteurl) {
+				$search[] = $this->old_siteurl;
+				$replace[] = $current_siteurl;
+
+				// Also add the opposite-protocol variant of old_siteurl in case
+				// some DB values use http:// while old_siteurl was detected as https://
+				$old_scheme = parse_url($this->old_siteurl, PHP_URL_SCHEME);
+				$alt_scheme = ($old_scheme === 'https') ? 'http' : 'https';
+				$alt_old_siteurl = preg_replace('/^' . preg_quote($old_scheme, '/') . '/', $alt_scheme, $this->old_siteurl);
+				if ($alt_old_siteurl !== $current_siteurl && !in_array($alt_old_siteurl, $search, true)) {
+					$search[] = $alt_old_siteurl;
+					$replace[] = $current_siteurl;
+				}
+			}
+
+			if (!empty($this->old_home) && $this->old_home !== $current_home && $this->old_home !== $this->old_siteurl) {
+				$search[] = $this->old_home;
+				$replace[] = $current_home;
+			}
+
+			if (!empty($this->old_uploads) && $this->old_uploads !== $current_uploads) {
+				$search[] = $this->old_uploads;
+				$replace[] = $current_uploads;
+			}
+
+			if (empty($search)) {
+				$this->sgbackup->log("No URL changes detected, skipping search-replace");
+				return 'complete';
+			}
+
+			// Multisite: enumerate all blogs and build per-blog replacements
+			if (is_multisite()) {
+				$sr_scheme = $this->keep_protocol ? parse_url($current_siteurl, PHP_URL_SCHEME) : null;
+				$this->build_multisite_replacements($search, $replace, $sr_scheme);
+			}
+
+			// Write the REAL destination siteurl/home (before any keep-protocol rewrite).
+			// The site must respond on its actual protocol regardless of keep_protocol.
+			update_option('siteurl', $real_dest_siteurl);
+			update_option('home', $real_dest_home);
+			wp_cache_delete('alloptions', 'options');
+
+			$this->sgbackup->log("Search-replace: " . count($search) . " replacements");
+			foreach ($search as $i => $s) {
+				$this->sgbackup->log("  Replace: {$s} -> {$replace[$i]}");
+
+				// Gap 27: Additional protocol transition warning during search-replace
+				$old_scheme = parse_url($s, PHP_URL_SCHEME);
+				$new_scheme = parse_url($replace[$i], PHP_URL_SCHEME);
+				if ($old_scheme && $new_scheme && $old_scheme !== $new_scheme) {
+					$this->sgbackup->log("  Protocol change in this replacement: {$old_scheme} -> {$new_scheme}", 'warning');
+				}
+			}
+
+			$tables = SiteGuard_Backup_Database_Utility::get_tables($wpdb->prefix);
+
+			// Exclude user tables from search-replace during migrations to preserve
+			// destination user logins, emails, and credentials
+			if ($this->is_migration) {
+				$user_tables = array($wpdb->users, $wpdb->usermeta);
+				$tables = array_values(array_diff($tables, $user_tables));
+				$this->sgbackup->log("Search-replace: excluding user tables (" . implode(', ', $user_tables) . ") to preserve destination accounts");
+			}
+
+			// Save site_admins before search-replace - it contains user_login values
+			// that must stay in sync with wp_users (which we preserve during migration)
+			$saved_site_admins = null;
+			if ($this->is_migration && is_multisite()) {
+				$sitemeta_table = $wpdb->base_prefix . 'sitemeta';
+				$saved_site_admins = $wpdb->get_var($wpdb->prepare(
+					"SELECT meta_value FROM {$sitemeta_table} WHERE meta_key = %s", 'site_admins'
+				));
+			}
+
+			// Email-bearing option values must never be rewritten by the bare-domain
+			// pair: "info@olddomain.com" would become "info@newhost" and silently break
+			// the site's mail. Capture the post-import values now and restore any that
+			// search-replace touched afterward. These options never legitimately contain
+			// a site URL, so restoring is always safe.
+			$email_option_keys = array('admin_email', 'new_admin_email', 'woocommerce_email_from_address', 'mailserver_url', 'mailserver_login', 'mailserver_pass');
+			$preserved_email_options = array();
+			foreach ($email_option_keys as $eok) {
+				$eval = $wpdb->get_var($wpdb->prepare("SELECT option_value FROM {$wpdb->options} WHERE option_name = %s", $eok));
+				if ($eval !== null) $preserved_email_options[$eok] = $eval;
+			}
+
+			// Persist everything the resume path needs so a checkpointed run can
+			// continue with the identical pairs and one-time captures.
+			$opts->update_option($this->sr_state_option, array(
+				'timestamp'               => $this_ts,
+				'search'                  => $search,
+				'replace'                 => $replace,
+				'tables'                  => $tables,
+				'real_dest_siteurl'       => $real_dest_siteurl,
+				'real_dest_home'          => $real_dest_home,
+				'saved_site_admins'       => $saved_site_admins,
+				'preserved_email_options' => $preserved_email_options,
+			), false);
 		}
 
-		// Save site_admins before search-replace - it contains user_login values
-		// that must stay in sync with wp_users (which we preserve during migration)
-		$saved_site_admins = null;
-		if ($this->is_migration && is_multisite()) {
-			$sitemeta_table = $wpdb->base_prefix . 'sitemeta';
-			$saved_site_admins = $wpdb->get_var($wpdb->prepare(
-				"SELECT meta_value FROM {$sitemeta_table} WHERE meta_key = %s", 'site_admins'
-			));
+		// Under AJAX/browser, bound this pass so it checkpoints before a proxy idle
+		// timeout; WP-CLI (no DOING_AJAX) passes no deadline and runs to completion.
+		$deadline = null;
+		if (defined('DOING_AJAX') && DOING_AJAX) {
+			$budget = (int) apply_filters('sgbackup_restore_sr_budget_seconds', 45);
+			$deadline = $this->restore_started_at + max(15, $budget);
 		}
 
 		$sr = new SiteGuard_Backup_Search_Replace();
-		$report = $sr->run($search, $replace, $tables);
+		$report = $sr->run($search, $replace, $tables, false, array(
+			'deadline'     => $deadline,
+			'resume'       => $resuming,
+			'progress_key' => 'sgbackup_sr_progress',
+			'progress_cb'  => function ($done, $total, $table) {
+				$this->emit_sr_progress($done, $total, $table);
+			},
+		));
+
+		// Checkpointed at the deadline - keep the persisted state + cursor and let
+		// the caller resume. The one-time post-SR fixups below must run exactly once,
+		// AFTER search-replace fully completes, so we do not run them here.
+		if (isset($report['status']) && $report['status'] === 'incomplete') {
+			$next = isset($report['next_table']) ? $report['next_table'] : '?';
+			$done = isset($report['completed_tables']) ? count($report['completed_tables']) : 0;
+			$this->sgbackup->log("Search-replace incomplete (time budget) - checkpointed before table {$next}; {$done} tables done, will resume");
+			$this->progress("Search-replace checkpointed ({$done} tables done); resuming");
+			return 'incomplete';
+		}
 
 		// Restore site_admins after search-replace to preserve super-admin grants
 		if ($saved_site_admins !== null) {
@@ -2967,6 +3495,16 @@ class SiteGuard_Backup_Restorer {
 			);
 			$this->sgbackup->log("Restored site_admins after search-replace to preserve super-admin logins");
 		}
+
+		// Re-fix any email-bearing option corrupted by the bare-domain replace.
+		foreach ($preserved_email_options as $eok => $orig) {
+			$now = $wpdb->get_var($wpdb->prepare("SELECT option_value FROM {$wpdb->options} WHERE option_name = %s", $eok));
+			if ($now !== null && $now !== $orig) {
+				$wpdb->update($wpdb->options, array('option_value' => $orig), array('option_name' => $eok));
+				$this->sgbackup->log("Restored option '{$eok}' after search-replace altered it ('{$now}' -> '{$orig}')");
+			}
+		}
+		wp_cache_delete('alloptions', 'options');
 
 		$this->sgbackup->log("Search-replace complete: {$report['changes']} changes across {$report['tables']} tables, {$report['updates']} rows updated");
 		if (!empty($report['errors'])) {
@@ -3001,6 +3539,33 @@ class SiteGuard_Backup_Restorer {
 
 		// Fix multisite-specific tables that string replacement can't handle correctly
 		$this->fix_multisite_sitemeta();
+
+		// Search-replace fully done - drop the persisted pairs/state (the SR engine
+		// already cleared its own per-table cursor on completion).
+		$opts->delete_option($this->sr_state_option);
+
+		return 'complete';
+	}
+
+	/**
+	 * Streaming keepalive + progress line emitted after each search-replace table.
+	 * Without it, search-replace produces no output for the whole pass and a proxy
+	 * closes the idle connection mid-run.
+	 */
+	private function emit_sr_progress($done, $total, $table) {
+		@set_time_limit(SGBACKUP_SET_TIME_LIMIT);
+		$msg = "Search-replace: {$done}/{$total} tables processed";
+		$this->progress($msg);
+		if (defined('DOING_AJAX') && DOING_AJAX) {
+			echo 'RINFO:' . json_encode(array(
+				'type'    => 'sr_progress',
+				'message' => $msg,
+				'done'    => (int) $done,
+				'total'   => (int) $total,
+			)) . "\n";
+			if (ob_get_level()) @ob_flush();
+			@flush();
+		}
 	}
 
 	/**
@@ -3014,10 +3579,14 @@ class SiteGuard_Backup_Restorer {
 	 * @return string The new subdomain
 	 */
 	private function map_independent_domain($domain, $target_host) {
+		// Use the FIRST dns label as the new subdomain. Popping only the last label
+		// mangled multi-label TLDs (foo.co.uk -> "foo.co.old-host.example"); taking
+		// the first label yields "foo.old-host.example" for both .com and .co.uk.
 		$parts = explode('.', $domain);
-		array_pop($parts); // Remove TLD (.com, .net, etc.)
-		$subdomain = implode('.', $parts);
-		return $subdomain . '.' . $target_host;
+		$first = isset($parts[0]) && $parts[0] !== '' ? $parts[0] : $domain;
+		$new_host = $first . '.' . $target_host;
+		$this->sgbackup->log("Independent domain mapped: {$domain} -> {$new_host} (first label '{$first}' prefixed to {$target_host})");
+		return $new_host;
 	}
 
 	/**
@@ -3627,10 +4196,29 @@ class SiteGuard_Backup_Restorer {
 				wp_mkdir_p($temp_dir);
 			}
 
+			// Disk-space precheck: extracting a multi-GB archive onto a nearly-full
+			// disk half-writes files and corrupts the install. Abort this entity
+			// cleanly instead. (needed*1.1 leaves headroom for the later move.)
+			$needed = $this->zip_uncompressed_size($zip_path);
+			if ($needed > 0) {
+				$free = @disk_free_space($backup_dir);
+				if ($free !== false && $free < $needed * 1.1) {
+					$dmsg = sprintf(
+						"Not enough free disk space to restore %s: need ~%s (uncompressed), only %s free. Aborting %s restore.",
+						$zip_file, size_format($needed), size_format($free), $entity
+					);
+					$this->sgbackup->log("[Restore] {$dmsg}", 'error');
+					$this->progress($dmsg);
+					$this->remove_temp_dir($temp_dir);
+					return false;
+				}
+			}
+
 			// Extract
 			$extract_result = $this->unzip($zip_path, $temp_dir);
 			if (!$extract_result) {
 				$this->sgbackup->log("Failed to extract: {$zip_file}", 'error');
+				$this->remove_temp_dir($temp_dir);
 				return false;
 			}
 
@@ -3653,11 +4241,19 @@ class SiteGuard_Backup_Restorer {
 			// Move files to destination
 			$move_result = $this->move_files($temp_dir, $dest_dir, $entity);
 			if (!$move_result) {
-				$this->sgbackup->log("Failed to move files for: {$entity}", 'error');
+				$this->sgbackup->log("Failed to move {$this->last_move_failures} file(s) for: {$entity}", 'error');
+				$this->progress(ucfirst($entity) . ": {$this->last_move_failures} file(s) failed to move - restore of this entity is incomplete");
+				$move_failed = true;
 			}
 
 			// Clean up temp dir
 			$this->remove_temp_dir($temp_dir);
+		}
+
+		// A partial move must not be reported as a clean success - bail before
+		// marking the entity 'completed' so a retry/resume re-runs it.
+		if (!empty($move_failed)) {
+			return false;
 		}
 
 		// After plugins restore: detect and remove duplicate plugins (same Plugin Name,
@@ -3839,8 +4435,9 @@ class SiteGuard_Backup_Restorer {
 		$progress['entities'][$entity] = $status;
 		$progress['last_update'] = time();
 
-		// Save with 1-hour expiry
-		$opts->set_transient('sgbackup_restore_progress', $progress, 3600);
+		// Save with 24-hour expiry so an interrupted restore can still be resumed
+		// long after a browser/proxy timeout (was 1 hour - too short for large sites).
+		$opts->set_transient('sgbackup_restore_progress', $progress, 86400);
 
 		// Clear progress when all entities are completed
 		$entities_to_restore = $this->get_entities_to_restore();
@@ -3935,10 +4532,12 @@ class SiteGuard_Backup_Restorer {
 	 *   MOVEIN_MERGE_CONTENTS (3)   - for dirs merge contents; for files overwrite
 	 */
 	private function move_files($source, $dest, $entity) {
+		$this->last_move_failures = 0;
 		if (!is_dir($source)) return false;
 		if (!is_dir($dest)) wp_mkdir_p($dest);
 
 		$mode = $this->move_in_mode;
+		$moved_count = 0;
 
 		// For MERGE mode at the top-level, we iterate individual items
 		// For SKIP mode at the top-level directory items, check existence
@@ -4006,15 +4605,22 @@ class SiteGuard_Backup_Restorer {
 				// rename() fails silently cross-filesystem; fall back to copy+unlink
 				if (!@rename($item->getPathname(), $target)) {
 					if (!@copy($item->getPathname(), $target)) {
+						$this->last_move_failures++;
 						$this->sgbackup->log("Failed to move file: " . basename($item->getPathname()), 'error');
 					} else {
 						@unlink($item->getPathname());
 					}
 				}
+
+				// Refresh the execution-time budget periodically on large trees.
+				if ((++$moved_count % 200) === 0) {
+					@set_time_limit(SGBACKUP_SET_TIME_LIMIT);
+				}
 			}
 		}
 
-		return true;
+		// Honest result: any file we couldn't place makes this a partial move.
+		return $this->last_move_failures === 0;
 	}
 
 	/**
@@ -4055,6 +4661,9 @@ class SiteGuard_Backup_Restorer {
 	 */
 	private function post_restore_cleanup() {
 		$this->progress("Running post-restore cleanup");
+
+		// Unlink any plaintext files left by decrypt_file() (confidentiality + disk).
+		$this->cleanup_decrypted_temp_files();
 
 		// Flush rewrite rules
 		flush_rewrite_rules(true);
@@ -4120,13 +4729,21 @@ class SiteGuard_Backup_Restorer {
 				}
 			}
 
-			// User tables are now preserved during migrations (wp_users/wp_usermeta
-			// skipped in import), so destination credentials remain valid.
+			// Only claim credentials were preserved when we ACTUALLY skipped the
+			// source user tables. If detection failed earlier and source
+			// wp_users/wp_usermeta were imported, saying "preserved" is a
+			// dangerous lie - warn the admin their login may have changed instead.
 			$old_host = parse_url($this->old_siteurl, PHP_URL_HOST);
-			$auth_msg = "Database restored from {$old_host}. Your login credentials have been preserved.";
-			$this->sgbackup->log("[Restore] {$auth_msg}");
+			if ($this->user_tables_skipped) {
+				$auth_msg = "Database restored from {$old_host}. Your login credentials have been preserved.";
+				$auth_type = 'info';
+			} else {
+				$auth_msg = "Database restored from {$old_host}, but the source user tables were imported (migration was not detected before import). Your login credentials may now match the SOURCE site. If you cannot log in, use the source site's admin username/password, or reset via WP-CLI.";
+				$auth_type = 'warning';
+			}
+			$this->sgbackup->log("[Restore] {$auth_msg}", $auth_type === 'warning' ? 'warning' : 'info');
 			if (defined('DOING_AJAX') && DOING_AJAX) {
-				echo 'RINFO:' . json_encode(array('type' => 'info', 'message' => $auth_msg)) . "\n";
+				echo 'RINFO:' . json_encode(array('type' => $auth_type, 'message' => $auth_msg)) . "\n";
 				if (ob_get_level()) @ob_flush();
 				@flush();
 			}
@@ -4437,6 +5054,14 @@ class SiteGuard_Backup_Restorer {
 		}
 
 		$decrypted = SiteGuard_Backup_Encryption::decrypt($file_path, $key);
+
+		// Track the plaintext sibling so we can unlink it on every restore exit
+		// path (see cleanup_decrypted_temp_files()). Leaving it behind leaks the
+		// decrypted database/archive contents and fills the disk.
+		if (is_string($decrypted) && $decrypted !== '' && $decrypted !== $file_path) {
+			$this->decrypted_temp_files[] = $decrypted;
+		}
+
 		return $decrypted;
 	}
 
@@ -4561,7 +5186,7 @@ class SiteGuard_Backup_Restorer {
 			// Size check
 			if (isset($file_info['size']) && $file_info['size'] > 0) {
 				$actual_size = filesize($file_path);
-				if ($actual_size !== $file_info['size']) {
+				if ((int) $actual_size !== (int) $file_info['size']) {
 					$errors[] = "{$file_info['name']}: size mismatch (expected {$file_info['size']}, got {$actual_size})";
 				}
 			}

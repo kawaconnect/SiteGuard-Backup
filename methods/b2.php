@@ -42,7 +42,13 @@ class SiteGuard_Backup_Method_B2 extends SiteGuard_Backup_Method_S3 {
 
 		// Use custom endpoint if explicitly set
 		if (!empty($options['endpoint'])) {
-			return rtrim($options['endpoint'], '/');
+			$endpoint = rtrim($options['endpoint'], '/');
+			// Enforce HTTPS to prevent credential exposure (same as parent S3 method)
+			if (strpos($endpoint, 'https://') !== 0) {
+				error_log('SiteGuard Backup: B2 custom endpoint must use HTTPS. Got: ' . $endpoint);
+				$endpoint = str_replace('http://', 'https://', $endpoint);
+			}
+			return $endpoint;
 		}
 
 		$region = !empty($options['region']) ? $options['region'] : 'us-west-004';

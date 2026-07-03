@@ -476,7 +476,10 @@ class SiteGuard_Backup_Admin {
 		// Verify the file is in the backup directory (prevent directory traversal)
 		$real_path = realpath($path);
 		$real_dir = realpath($backup_dir);
-		if (!$real_path || !$real_dir || strpos($real_path, $real_dir) !== 0) wp_die('Invalid file path');
+		// Compare against the directory WITH a trailing separator so /…/sgbackupEVIL
+		// is not treated as a child of /…/sgbackup.
+		$real_dir_sep = $real_dir ? rtrim($real_dir, DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR : '';
+		if (!$real_path || !$real_dir || strpos($real_path, $real_dir_sep) !== 0) wp_die('Invalid file path');
 
 		// Only allow downloading actual backup files (not .htaccess, index.php, etc.)
 		if (!preg_match('/\.(zip|gz|sql|crypt|json|txt)$/', $file)) wp_die('Invalid file type');
@@ -543,6 +546,25 @@ class SiteGuard_Backup_Admin {
 		}
 
 		if (empty($files)) wp_die('No backup files found');
+
+		// ZIP64 guard: the streaming writer emits only classic (32-bit) ZIP records, so any
+		// entry or total payload over 4 GiB (0xFFFFFFFF) would produce a structurally corrupt
+		// archive. Refuse up front (before any headers) rather than hand the user a broken zip.
+		$zip64_limit = 0xFFFFFFFF;
+		$bundle_total = 0;
+		foreach ($files as $f) {
+			$fp = $backup_dir . $f;
+			clearstatcache(true, $fp);
+			$fsize = @filesize($fp);
+			if ($fsize === false) continue;
+			if ($fsize > $zip64_limit) {
+				wp_die('One or more backup files exceeds 4 GB, which cannot be bundled into a single ZIP by this server. Please download the individual backup files instead.');
+			}
+			$bundle_total += $fsize;
+		}
+		if ($bundle_total > $zip64_limit) {
+			wp_die('This backup exceeds 4 GB total, which cannot be streamed as a single ZIP by this server. Please download the individual backup files instead.');
+		}
 
 		$nonce = isset($backup['nonce']) ? preg_replace('/[^a-zA-Z0-9]/', '', $backup['nonce']) : 'unknown';
 		$bundle_name = 'sgbackup_bundle_' . date('Y-m-d', $timestamp) . '_' . $nonce . '.zip';
@@ -876,6 +898,19 @@ class SiteGuard_Backup_Admin {
 			$result['success'] ? 'restore_complete' : 'restore_failed',
 			array('timestamp' => $timestamp, 'success' => $result['success'])
 		);
+
+		// A migration search-replace that checkpointed at the request deadline
+		// returns 'incomplete'. Signal that distinctly so the client resumes the
+		// same restore (continuing search-replace from its saved cursor) instead of
+		// treating it as an error or a finished restore.
+		if (!empty($result['incomplete'])) {
+			echo 'RINFO:' . json_encode(array(
+				'type'      => 'incomplete',
+				'timestamp' => $timestamp,
+				'messages'  => $result['messages'],
+			)) . "\n";
+			exit;
+		}
 
 		echo 'RINFO:' . json_encode(array(
 			'type'     => 'complete',
@@ -1248,6 +1283,11 @@ class SiteGuard_Backup_Admin {
 		$manifest_json = $zip->getFromName('_sgbackup_bundle.json');
 		$manifest = $manifest_json ? json_decode($manifest_json, true) : null;
 
+		// In-zip extension allowlist and explicit protection-file denylist so a crafted
+		// bundle cannot drop .php/.htaccess/.user.ini/etc into the backup dir.
+		$allowed_ext = array('zip', 'gz', 'sql', 'crypt', 'json');
+		$protected_names = array('.htaccess', '.user.ini', 'index.php', 'web.config', '.nginx-deny');
+
 		$extracted = array();
 		for ($i = 0; $i < $zip->numFiles; $i++) {
 			$entry = $zip->getNameIndex($i);
@@ -1257,14 +1297,38 @@ class SiteGuard_Backup_Admin {
 			$safe_name = sanitize_file_name($entry);
 			if (empty($safe_name)) continue;
 
-			if (!$zip->extractTo($backup_dir, $entry)) continue;
-			clearstatcache(true, $backup_dir . $entry);
-			// Rename if sanitized name differs (with copy+unlink fallback for CIFS)
-			if ($safe_name !== $entry && file_exists($backup_dir . $entry)) {
-				if (!@rename($backup_dir . $entry, $backup_dir . $safe_name)) {
-					if (@copy($backup_dir . $entry, $backup_dir . $safe_name)) {
-						@unlink($backup_dir . $entry);
-					}
+			// Reject protection/config files (case-insensitive), whether by raw or sanitized name.
+			if (in_array(strtolower($entry), $protected_names, true) || in_array(strtolower($safe_name), $protected_names, true)) continue;
+
+			// Enforce the in-zip extension allowlist.
+			$ext = strtolower(pathinfo($safe_name, PATHINFO_EXTENSION));
+			if (!in_array($ext, $allowed_ext, true)) continue;
+
+			// Never extract to the raw entry name: stream the entry into a unique temp file,
+			// then move it to the sanitized target. This prevents the archive from creating
+			// (even briefly) a file with an attacker-chosen name in the backup directory.
+			$stream = $zip->getStream($entry);
+			if (!$stream) continue;
+			$tmp_path = $backup_dir . 'sgbundle_tmp_' . wp_generate_password(16, false) . '.part';
+			$out = @fopen($tmp_path, 'wb');
+			if (!$out) { @fclose($stream); continue; }
+			while (!feof($stream)) {
+				$buf = fread($stream, 65536);
+				if ($buf === false) break;
+				fwrite($out, $buf);
+			}
+			fclose($out);
+			fclose($stream);
+			clearstatcache(true, $tmp_path);
+
+			$target = $backup_dir . $safe_name;
+			// Move temp into place (rename; copy+unlink fallback for CIFS).
+			if (!@rename($tmp_path, $target)) {
+				if (@copy($tmp_path, $target)) {
+					@unlink($tmp_path);
+				} else {
+					@unlink($tmp_path);
+					continue;
 				}
 			}
 			$extracted[] = $safe_name;

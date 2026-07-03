@@ -208,22 +208,24 @@ class SiteGuard_Backup_Method_Dropbox extends SiteGuard_Backup_Module {
 
 			$is_last = ($offset + strlen($chunk) >= $filesize);
 
-			if ($is_last) {
-				// Finish
-				$response = wp_remote_post($this->content_url . '/files/upload_session/finish', array(
-					'headers' => array(
-						'Authorization'   => "Bearer {$token}",
-						'Content-Type'    => 'application/octet-stream',
-						'Dropbox-API-Arg' => json_encode(array(
-							'cursor' => array('session_id' => $session_id, 'offset' => $offset),
-							'commit' => array('path' => $remote_path, 'mode' => 'overwrite', 'autorename' => false),
-						)),
-					),
-					'body'    => $chunk,
-					'timeout' => 120,
-				));
-			} else {
-				$response = wp_remote_post($this->content_url . '/files/upload_session/append_v2', array(
+			$response = $this->request_with_retries(function() use ($is_last, $token, $session_id, $offset, $chunk, $remote_path) {
+				if ($is_last) {
+					// Finish
+					return wp_remote_post($this->content_url . '/files/upload_session/finish', array(
+						'headers' => array(
+							'Authorization'   => "Bearer {$token}",
+							'Content-Type'    => 'application/octet-stream',
+							'Dropbox-API-Arg' => json_encode(array(
+								'cursor' => array('session_id' => $session_id, 'offset' => $offset),
+								'commit' => array('path' => $remote_path, 'mode' => 'overwrite', 'autorename' => false),
+							)),
+						),
+						'body'    => $chunk,
+						'timeout' => 120,
+					));
+				}
+
+				return wp_remote_post($this->content_url . '/files/upload_session/append_v2', array(
 					'headers' => array(
 						'Authorization'   => "Bearer {$token}",
 						'Content-Type'    => 'application/octet-stream',
@@ -235,7 +237,7 @@ class SiteGuard_Backup_Method_Dropbox extends SiteGuard_Backup_Module {
 					'body'    => $chunk,
 					'timeout' => 120,
 				));
-			}
+			}, 'Dropbox chunk upload');
 
 			if (is_wp_error($response)) {
 				fclose($fh);

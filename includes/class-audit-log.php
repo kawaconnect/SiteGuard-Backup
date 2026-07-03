@@ -227,16 +227,14 @@ class SiteGuard_Backup_Audit_Log {
 	private function get_client_ip() {
 		$ip = '0.0.0.0';
 
-		// Cloudflare
+		// Cloudflare sets this header - most trustworthy when present.
 		if (!empty($_SERVER['HTTP_CF_CONNECTING_IP'])) {
 			$ip = $_SERVER['HTTP_CF_CONNECTING_IP'];
-		} elseif (!empty($_SERVER['HTTP_X_FORWARDED_FOR'])) {
-			// Take the first (client) IP from the chain
-			$parts = explode(',', $_SERVER['HTTP_X_FORWARDED_FOR']);
-			$ip = trim($parts[0]);
-		} elseif (!empty($_SERVER['HTTP_X_REAL_IP'])) {
-			$ip = $_SERVER['HTTP_X_REAL_IP'];
 		} elseif (!empty($_SERVER['REMOTE_ADDR'])) {
+			// Fall back to REMOTE_ADDR directly. X-Forwarded-For / X-Real-IP are
+			// client-spoofable and must NOT be trusted for a forensic audit log -
+			// an attacker could otherwise forge the recorded IP. (Matches the
+			// approach in class-health-monitor.php::get_client_ip().)
 			$ip = $_SERVER['REMOTE_ADDR'];
 		}
 

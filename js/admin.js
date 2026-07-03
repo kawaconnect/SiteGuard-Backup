@@ -25,7 +25,7 @@
 		mirrorDomain: function(srcDomain, oldHost, newHost) {
 			if (!oldHost) return srcDomain;
 			if (srcDomain.indexOf(oldHost) !== -1) {
-				return srcDomain.replace(new RegExp(oldHost.replace(/\./g, '\\\\.'), 'g'), newHost);
+				return srcDomain.replace(new RegExp(oldHost.replace(/\./g, '\\.'), 'g'), newHost);
 			}
 			var parts = srcDomain.split('.');
 			parts.pop();
@@ -98,7 +98,11 @@
 			this.pollActiveJobs();
 
 			$(window).on('beforeunload', function(e) {
-				if (SGB.pollTimer) { clearInterval(SGB.pollTimer); SGB.pollTimer = null; }
+				if (SGB.pollTimer) { clearTimeout(SGB.pollTimer); SGB.pollTimer = null; }
+				if (SGB._restoreInProgress) {
+					e.preventDefault();
+					return 'A restore is in progress. Leaving now may leave the site in a partially restored state.';
+				}
 				if (SGB.uploadAbortController) {
 					e.preventDefault();
 					return 'A file upload is in progress. Are you sure you want to leave?';
@@ -107,8 +111,9 @@
 		},
 
 		// ===== AJAX Helper =====
-		ajax: function(subaction, data, callback, errorCallback) {
-			$.ajax({
+		// opts (optional): extra $.ajax options merged in, e.g. { timeout: 15000 }.
+		ajax: function(subaction, data, callback, errorCallback, opts) {
+			var settings = {
 				url: sgbackup_settings.ajax_url,
 				type: 'POST',
 				data: {
@@ -134,7 +139,9 @@
 					if (errorCallback) errorCallback(msg);
 					else alert(msg);
 				}
-			});
+			};
+			if (opts) { $.extend(settings, opts); }
+			$.ajax(settings);
 		},
 
 		// ===== Tabs =====
@@ -210,6 +217,7 @@
 		},
 
 		doBackupNow: function() {
+			var self = this;
 			// Prevent launching a second backup while one is running
 			if (this._activeJobNonce) {
 				SGB.showNotice('A backup is already running (job: ' + this._activeJobNonce + '). Please wait for it to finish before starting another.', 'error');
@@ -284,16 +292,23 @@
 					sgbackup_settings.strings.backup_started +
 					' <span class="sgbackup-spinner"></span> Job: ' + data.nonce
 				);
+			}, function(msg) {
+				// Launch failed - abandon the grace period and stop the poller so
+				// it can't later mistake an empty job list for a completed backup.
+				self._backupStartedAt = null;
+				if (self.pollTimer) { clearTimeout(self.pollTimer); self.pollTimer = null; }
+				$('#sgbackup-backup-status').text('Backup could not be started: ' + msg).addClass('error');
+				SGB.showNotice('Backup could not be started: ' + msg, 'error');
 			});
 
-			// Start interval polling immediately since we just launched a backup
+			// Start polling immediately since we just launched a backup
 			this.startJobPolling();
 		},
 
 		// ===== Active Jobs Polling =====
 		pollActiveJobs: function() {
 			var self = this;
-			if (this.pollTimer) clearInterval(this.pollTimer);
+			if (this.pollTimer) clearTimeout(this.pollTimer);
 			this.pollTimer = null;
 
 			// Single initial check - only start interval polling if jobs are active
@@ -326,64 +341,116 @@
 
 		startJobPolling: function() {
 			var self = this;
-			if (this.pollTimer) clearInterval(this.pollTimer);
+			if (this.pollTimer) clearTimeout(this.pollTimer);
+			this.pollTimer = null;
 
-			this.pollTimer = setInterval(function() {
+			// Polling state (self-rescheduling setTimeout loop instead of a fixed
+			// setInterval so we can guard against overlap, time out slow requests,
+			// and back off on repeated failures).
+			this._pollInFlight = false;   // 4b: a request is outstanding
+			this._pollFailCount = 0;      // 4d: consecutive failures for backoff
+			this._pollObservedJob = false; // 4a: have we ever seen a running job?
+
+			var BASE_DELAY = 5000;
+			var MAX_DELAY = 30000;
+
+			var scheduleNext = function(delay) {
+				self.pollTimer = setTimeout(tick, delay);
+			};
+
+			var finishComplete = function() {
+				$('#sgbackup-active-jobs').hide();
+				$('#sgbackup-active-jobs-list').empty();
+				$('#sgbackup-backup-status').text('').removeClass('success error');
+				self.pollTimer = null;
+				self._activeJobNonce = null;
+				self._backupStartedAt = null;
+
+				// Check last known jobs for errors or warnings
+				var hadErrors = false;
+				$.each(self.lastKnownJobs, function(nonce, job) {
+					if (job.jobstatus === 'error' || job.jobstatus === 'failed' || job.jobstatus === 'aborted' || job.has_errors) {
+						hadErrors = true;
+						var errMsg = 'Backup job failed';
+						if (job.errors && job.errors.length) {
+							errMsg = job.errors[job.errors.length - 1];
+						} else if (job.last_log) {
+							errMsg = job.last_log;
+						}
+						self.showNotice(errMsg, 'error');
+					} else if (job.jobstatus === 'warning') {
+						hadErrors = true;
+						var warnMsg = 'Backup finished with errors - some entities failed. Check the log for details.';
+						if (job.errors && job.errors.length) {
+							warnMsg = job.errors[job.errors.length - 1];
+						}
+						self.showNotice(warnMsg, 'error');
+					}
+				});
+
+				if (!hadErrors) {
+					self.showNotice('Backup complete!', 'success');
+				}
+				self.refreshBackupsList();
+				self.lastKnownJobs = {};
+			};
+
+			var tick = function() {
+				// 4b: don't stack a second request on top of a slow one.
+				if (self._pollInFlight) { scheduleNext(BASE_DELAY); return; }
+				self._pollInFlight = true;
+
 				self.ajax('activejobs_list', {}, function(data) {
+					self._pollInFlight = false;
+					self._pollFailCount = 0; // 4d: reset backoff on success
+
 					if ($.isEmptyObject(data)) {
 						// Grace period: if we just started a backup, don't declare
 						// "complete" for 20s - the job may not be visible yet due to
 						// cron event timing during the direct-chain execution.
 						if (self._backupStartedAt && (Date.now() - self._backupStartedAt) < 20000) {
-							return; // keep polling
+							scheduleNext(BASE_DELAY); // keep polling
+							return;
 						}
 
-						$('#sgbackup-active-jobs').hide();
-						$('#sgbackup-active-jobs-list').empty();
-						$('#sgbackup-backup-status').text('').removeClass('success error');
-						clearInterval(self.pollTimer);
-						self.pollTimer = null;
-						self._activeJobNonce = null;
-						self._backupStartedAt = null;
-
-						// Check last known jobs for errors or warnings
-						var hadErrors = false;
-						$.each(self.lastKnownJobs, function(nonce, job) {
-							if (job.jobstatus === 'error' || job.jobstatus === 'failed' || job.jobstatus === 'aborted' || job.has_errors) {
-								hadErrors = true;
-								var errMsg = 'Backup job failed';
-								if (job.errors && job.errors.length) {
-									errMsg = job.errors[job.errors.length - 1];
-								} else if (job.last_log) {
-									errMsg = job.last_log;
-								}
-								self.showNotice(errMsg, 'error');
-							} else if (job.jobstatus === 'warning') {
-								hadErrors = true;
-								var warnMsg = 'Backup finished with errors - some entities failed. Check the log for details.';
-								if (job.errors && job.errors.length) {
-									warnMsg = job.errors[job.errors.length - 1];
-								}
-								self.showNotice(warnMsg, 'error');
-							}
-						});
-
-						if (!hadErrors) {
-							self.showNotice('Backup complete!', 'success');
+						// 4a: only ever declare completion if a running job was
+						// actually observed by an earlier poll. An empty list on the
+						// first polls (slow registration) must NOT be reported as a
+						// finished backup.
+						if (!self._pollObservedJob) {
+							// Never saw the job. Stop quietly without claiming success.
+							$('#sgbackup-active-jobs').hide();
+							$('#sgbackup-active-jobs-list').empty();
+							$('#sgbackup-backup-status').text('').removeClass('success error');
+							self.pollTimer = null;
+							self._activeJobNonce = null;
+							self._backupStartedAt = null;
+							self.lastKnownJobs = {};
+							return;
 						}
-						self.refreshBackupsList();
-						self.lastKnownJobs = {};
+
+						// A job was observed and is now gone => genuine completion.
+						finishComplete();
 						return;
 					}
-					// Job found - clear grace period since we've confirmed visibility
+					// Job found - record that we've confirmed visibility.
+					self._pollObservedJob = true;
 					self._backupStartedAt = null;
 					self.lastKnownJobs = data;
 					self._activeJobNonce = Object.keys(data)[0];
 					self.renderActiveJobs(data);
+					scheduleNext(BASE_DELAY);
 				}, function() {
-					// Silently ignore errors during polling
-				});
-			}, 5000);
+					// 4d: back off exponentially on consecutive poll failures
+					// (5s → 10s → 20s, capped ~30s) instead of hammering.
+					self._pollInFlight = false;
+					self._pollFailCount++;
+					var delay = Math.min(BASE_DELAY * Math.pow(2, self._pollFailCount - 1), MAX_DELAY);
+					scheduleNext(delay);
+				}, { timeout: 15000 }); // 4c
+			};
+
+			scheduleNext(BASE_DELAY);
 		},
 
 		renderActiveJobs: function(data) {
@@ -629,10 +696,15 @@
 				$('.sgbackup-restore-next-btn').show();
 			});
 
-			// Close button after restore completes
+			// Close button after restore completes (or after resume attempts are
+			// exhausted). Clear restore state so a fresh restore can be launched
+			// and unlock the launch controls.
 			$(document).on('click', '#sgbackup-restore-close', function() {
 				$('#sgbackup-restore-modal').dialog('close');
 				$('#sgbackup-restore-done').hide();
+				$('#sgbackup-restore-resume').remove();
+				self._restoreInProgress = false;
+				self._setRestoreLocked(false);
 			});
 
 			// Destructive entity warning: plugins/themes default OFF. When the
@@ -1438,6 +1510,12 @@
 		},
 
 		doRestore: function(timestamp) {
+			// 3a: prevent a second concurrent restore from the same tab.
+			if (this._restoreInProgress) {
+				SGB.showNotice('A restore is already in progress. Please wait for it to finish.', 'error');
+				return;
+			}
+
 			// Capture subsite state BEFORE hiding divs (visibility check needs them shown)
 			var importPickerVisible = $('#sgbackup-subsite-import').is(':visible');
 			var subsiteMode = $('select[name="sgbackup_subsite_mode"]').val();
@@ -1585,76 +1663,274 @@
 				formData.append('restore_themes_items[]', $(this).val());
 			});
 
-			// Streaming XHR
+			// 3a: mark restore in progress and lock out re-launch until it ends.
+			this._restoreInProgress = true;
+			this._restoreComplete = false;
+			this._restoreTimestamp = timestamp;
+			this._restoreResumeAttempts = 0;
+			this._setRestoreLocked(true);
+
+			// Open the streaming restore connection.
+			this._startRestoreStream(formData);
+		},
+
+		// Auto-resume backoff schedule (ms) - up to 3 automatic attempts.
+		_restoreResumeDelays: [5000, 10000, 20000],
+
+		/**
+		 * Enable/disable the controls that can launch a restore so a second
+		 * concurrent restore can't be started while one is open (item 3a).
+		 */
+		_setRestoreLocked: function(locked) {
+			$('.sgbackup-restore-btn, #sgbackup-verify-proceed').prop('disabled', !!locked);
+		},
+
+		/**
+		 * Parse a chunk of streamed restore output, rendering each RINFO line.
+		 * Returns true if a 'complete' RINFO line was seen in this chunk.
+		 */
+		_renderRestoreChunk: function(text) {
+			var sawComplete = false;
+			var lines = text.split('\n');
+			for (var i = 0; i < lines.length; i++) {
+				if (lines[i].indexOf('RINFO:') !== 0) continue;
+				try {
+					var info = JSON.parse(lines[i].substring(6));
+					var cls = '';
+					if (info.type === 'error') cls = 'restore-error';
+					if (info.type === 'warning') cls = 'restore-warning';
+					if (info.type === 'complete' && info.success) cls = 'restore-success';
+
+					if (info.type === 'search_replace') {
+						var srHtml = '<div class="sgbackup-sr-report">';
+						srHtml += '<h4>Migration Search-Replace</h4>';
+						srHtml += '<p>' + SGB.esc(String(info.changes)) + ' changes across ' + SGB.esc(String(info.tables)) + ' tables</p>';
+						if (info.pairs) {
+							srHtml += '<ul>';
+							$.each(info.pairs, function(oldVal, newVal) {
+								srHtml += '<li>' + SGB.esc(oldVal) + ' &rarr; ' + SGB.esc(newVal) + '</li>';
+							});
+							srHtml += '</ul>';
+						}
+						srHtml += '</div>';
+						$('#sgbackup-restore-log').append(srHtml);
+					} else {
+						$('#sgbackup-restore-log').append(
+							'<div class="' + cls + '">' + SGB.esc(info.message || '') + '</div>'
+						);
+					}
+					$('#sgbackup-restore-log').scrollTop($('#sgbackup-restore-log')[0].scrollHeight);
+
+					// Orderly checkpoint: the server ran search-replace up to the
+					// request time budget and saved its place. This is progress, not
+					// a failure - continue the SAME restore, which resumes from the
+					// saved table cursor. Reset the resume budget since we advanced.
+					if (info.type === 'incomplete') {
+						// A terminal line WAS seen, so this is not a dropped connection.
+						// _continueRestore opens a fresh stream; the active-xhr guard in
+						// _startRestoreStream stops this (now superseded) request's onload
+						// from also firing the interrupted path.
+						$('#sgbackup-restore-log').append('<div class="restore-warning">Search-replace is large; continuing automatically...</div>');
+						this._restoreResumeAttempts = 0;
+						this._continueRestore();
+					}
+
+					if (info.type === 'complete') {
+						sawComplete = true;
+						if (info.success) {
+							$('#sgbackup-restore-log').append('<div class="restore-success">Restore complete!</div>');
+						} else {
+							$('#sgbackup-restore-log').append('<div class="restore-error">Restore finished with errors.</div>');
+							if (info.errors) {
+								for (var e = 0; e < info.errors.length; e++) {
+									$('#sgbackup-restore-log').append('<div class="restore-error">' + SGB.esc(info.errors[e]) + '</div>');
+								}
+							}
+						}
+						this._finishRestore();
+						$('#sgbackup-restore-done').show();
+					}
+				} catch (ex) { /* skip invalid JSON */ }
+			}
+			return sawComplete;
+		},
+
+		/**
+		 * Open a streaming XHR to the restore endpoint and wire progress,
+		 * completion, connection-loss and resume handling (items 2 & 3).
+		 */
+		_startRestoreStream: function(formData) {
+			var self = this;
 			var xhr = new XMLHttpRequest();
+			// Mark this as the active stream. When search-replace checkpoints, we
+			// open a fresh stream to continue; the previous request's onload then
+			// fires, and this guard stops it from also treating the (orderly) end
+			// as a dropped connection.
+			this._activeRestoreXhr = xhr;
 			xhr.open('POST', sgbackup_settings.ajax_url, true);
+			xhr.timeout = 0; // restore streams for a long time; rely on onerror/status
 			var lastIndex = 0;
 
 			xhr.onprogress = function() {
 				var newData = xhr.responseText.substring(lastIndex);
 				lastIndex = xhr.responseText.length;
+				self._renderRestoreChunk(newData);
+			};
 
-				var lines = newData.split('\n');
-				for (var i = 0; i < lines.length; i++) {
-					if (lines[i].indexOf('RINFO:') === 0) {
-						try {
-							var info = JSON.parse(lines[i].substring(6));
-							var cls = '';
-							if (info.type === 'error') cls = 'restore-error';
-							if (info.type === 'warning') cls = 'restore-warning';
-							if (info.type === 'complete' && info.success) cls = 'restore-success';
-
-							if (info.type === 'search_replace') {
-								var srHtml = '<div class="sgbackup-sr-report">';
-								srHtml += '<h4>Migration Search-Replace</h4>';
-								srHtml += '<p>' + SGB.esc(String(info.changes)) + ' changes across ' + SGB.esc(String(info.tables)) + ' tables</p>';
-								if (info.pairs) {
-									srHtml += '<ul>';
-									$.each(info.pairs, function(oldVal, newVal) {
-										srHtml += '<li>' + SGB.esc(oldVal) + ' &rarr; ' + SGB.esc(newVal) + '</li>';
-									});
-									srHtml += '</ul>';
-								}
-								srHtml += '</div>';
-								$('#sgbackup-restore-log').append(srHtml);
-							} else {
-								$('#sgbackup-restore-log').append(
-									'<div class="' + cls + '">' + SGB.esc(info.message || '') + '</div>'
-								);
-							}
-							$('#sgbackup-restore-log').scrollTop($('#sgbackup-restore-log')[0].scrollHeight);
-
-							if (info.type === 'complete') {
-								if (info.success) {
-									$('#sgbackup-restore-log').append('<div class="restore-success">Restore complete!</div>');
-								} else {
-									$('#sgbackup-restore-log').append('<div class="restore-error">Restore finished with errors.</div>');
-									if (info.errors) {
-										for (var e = 0; e < info.errors.length; e++) {
-											$('#sgbackup-restore-log').append('<div class="restore-error">' + SGB.esc(info.errors[e]) + '</div>');
-										}
-									}
-								}
-								// Show the close button
-								$('#sgbackup-restore-done').show();
-							}
-						} catch (e) { /* skip invalid JSON */ }
-					}
+			xhr.onload = function() {
+				// Flush any trailing buffered output.
+				if (lastIndex < xhr.responseText.length) {
+					self._renderRestoreChunk(xhr.responseText.substring(lastIndex));
+					lastIndex = xhr.responseText.length;
+				}
+				// Superseded by a continuation stream (search-replace checkpoint)?
+				// Then this request already handed off; do nothing.
+				if (xhr !== self._activeRestoreXhr) return;
+				// 2a: if the request ended without a terminal 'complete' line, or
+				// with a non-200 status, the restore did not finish cleanly.
+				if (self._restoreComplete) return;
+				if (xhr.status !== 200) {
+					self._handleRestoreInterrupted('Restore stopped: server returned HTTP ' + xhr.status + '.');
+				} else {
+					self._handleRestoreInterrupted('The restore connection ended before completion.');
 				}
 			};
 
 			xhr.onerror = function() {
-				$('#sgbackup-restore-log').append('<div class="restore-error">Connection error during restore.</div>');
-				$('#sgbackup-restore-done').show();
+				if (xhr !== self._activeRestoreXhr) return;
+				if (self._restoreComplete) return;
+				self._handleRestoreInterrupted('Connection lost during restore.');
 			};
 
-			xhr.onload = function() {
-				if (lastIndex < xhr.responseText.length) {
-					xhr.onprogress();
-				}
+			xhr.ontimeout = function() {
+				if (xhr !== self._activeRestoreXhr) return;
+				if (self._restoreComplete) return;
+				self._handleRestoreInterrupted('The restore connection timed out.');
 			};
 
 			xhr.send(formData);
+		},
+
+		/**
+		 * Continue a restore that the server checkpointed (search-replace budget
+		 * reached). Unlike _resumeRestore this skips the resume_restore command
+		 * round-trip: the streaming endpoint re-runs perform_restore, which picks
+		 * up the saved progress transient + search-replace cursor on its own. It is
+		 * semaphore-guarded server-side, and the prior stream has already exited
+		 * (it sent the 'incomplete' terminal), so the lock is free.
+		 */
+		_continueRestore: function() {
+			if (this._restoreComplete) return;
+			var resumeData = new FormData();
+			resumeData.append('action', 'sgbackup_restore');
+			resumeData.append('nonce', (sgbackup_settings.nonces && sgbackup_settings.nonces.restore) || sgbackup_settings.nonce);
+			resumeData.append('timestamp', this._restoreTimestamp);
+			resumeData.append('resume', '1');
+			this._startRestoreStream(resumeData);
+		},
+
+		/**
+		 * Handle an interrupted restore (item 2b): auto-resume with backoff a
+		 * bounded number of times, then surface a manual Resume button.
+		 */
+		_handleRestoreInterrupted: function(message) {
+			// Never resume a restore that already reported completion (guard flag).
+			if (this._restoreComplete) return;
+
+			var self = this;
+			$('#sgbackup-restore-log').append('<div class="restore-warning">' + SGB.esc(message) + '</div>');
+
+			if (this._restoreResumeAttempts < this._restoreResumeDelays.length) {
+				var delay = this._restoreResumeDelays[this._restoreResumeAttempts];
+				this._restoreResumeAttempts++;
+				$('#sgbackup-restore-log').append(
+					'<div class="restore-warning">Attempting to resume automatically in ' + (delay / 1000) +
+					's (attempt ' + this._restoreResumeAttempts + ' of ' + this._restoreResumeDelays.length + ')...</div>'
+				);
+				setTimeout(function() {
+					if (self._restoreComplete) return;
+					self._resumeRestore();
+				}, delay);
+			} else {
+				// Automatic attempts exhausted - offer a manual Resume plus Close.
+				this._showRestoreResumeControls();
+			}
+		},
+
+		/**
+		 * Render the manual "Resume restore" control and the Close button after
+		 * automatic resume attempts are exhausted.
+		 */
+		_showRestoreResumeControls: function() {
+			var self = this;
+			$('#sgbackup-restore-log').append(
+				'<div class="restore-error">Could not resume the restore automatically. ' +
+				'You can retry the resume, or close and check the server log.</div>'
+			);
+			// Add a Resume button next to the (now shown) Close button, once.
+			$('#sgbackup-restore-done').show();
+			if (!$('#sgbackup-restore-resume').length) {
+				var $btn = $('<button type="button" id="sgbackup-restore-resume" class="button button-primary" style="margin-right:8px;">Resume restore</button>');
+				$btn.on('click', function() {
+					$(this).prop('disabled', true).text('Resuming...');
+					self._restoreResumeAttempts = 0; // reset budget for manual retry
+					self._resumeRestore();
+				});
+				$('#sgbackup-restore-done').prepend($btn);
+			} else {
+				$('#sgbackup-restore-resume').prop('disabled', false).text('Resume restore');
+			}
+		},
+
+		/**
+		 * Ask the server to resume the interrupted restore, then re-attach to the
+		 * progress stream. The server command is semaphore-guarded and resumable:
+		 * if it reports the restore is already running we simply re-attach to the
+		 * stream rather than starting a second restore.
+		 */
+		_resumeRestore: function() {
+			var self = this;
+			if (this._restoreComplete) return;
+
+			$('#sgbackup-restore-resume').prop('disabled', true);
+			$('#sgbackup-restore-log').append('<div class="restore-warning">Requesting restore resume...</div>');
+
+			this.ajax('resume_restore', { timestamp: this._restoreTimestamp }, function(data) {
+				// Server resumed (or was already running). If it reports the restore
+				// already finished, treat as complete and stop.
+				if (data && data.status === 'complete') {
+					self._restoreComplete = true;
+					$('#sgbackup-restore-log').append('<div class="restore-success">Restore already completed on the server.</div>');
+					self._finishRestore();
+					$('#sgbackup-restore-done').show();
+					return;
+				}
+				// Re-attach to the progress stream. resume=1 tells the server to
+				// tail/continue the in-progress (or just-resumed) restore instead
+				// of starting a fresh one.
+				var resumeData = new FormData();
+				resumeData.append('action', 'sgbackup_restore');
+				resumeData.append('nonce', (sgbackup_settings.nonces && sgbackup_settings.nonces.restore) || sgbackup_settings.nonce);
+				resumeData.append('timestamp', self._restoreTimestamp);
+				resumeData.append('resume', '1');
+				$('#sgbackup-restore-log').append('<div class="restore-warning">Reconnecting to restore progress...</div>');
+				self._startRestoreStream(resumeData);
+			}, function(msg) {
+				// resume_restore call itself failed - count it and fall back to the
+				// manual/auto-retry ladder.
+				self._handleRestoreInterrupted('Resume request failed: ' + msg);
+			}, { timeout: 20000 });
+		},
+
+		/**
+		 * Reset restore-in-progress state and re-enable the launch controls.
+		 * Called when a restore reaches a terminal 'complete' state.
+		 */
+		_finishRestore: function() {
+			this._restoreComplete = true;
+			this._restoreInProgress = false;
+			this._setRestoreLocked(false);
+			$('#sgbackup-restore-resume').remove();
 		},
 
 		// ===== Delete =====
@@ -1866,6 +2142,10 @@
 					if ($(this).closest('.sgbackup-retention-rule').length) return;
 					// M9: Skip extra directory inputs (collected separately below)
 					if ($(this).hasClass('sgbackup-extra-dir-input')) return;
+					// Skip structured email recipient rows (collected separately below).
+					// Their flat names (email_recipients[0][address] etc.) would
+					// otherwise be POSTed as literal keys the server ignores.
+					if (name.indexOf('email_recipients[') === 0) return;
 
 					if ($(this).is(':checkbox')) {
 						if (name.indexOf('[]') > -1) {
@@ -1976,6 +2256,22 @@
 					}
 				});
 
+				// Collect structured email recipients into a real array so they
+				// POST as email_recipients[i][field] (the server expects an array;
+				// the flat name[i][field] keys from the generic loop were dropped).
+				params.email_recipients = [];
+				$('#sgbackup-email-recipients-list .sgbackup-recipient-row').each(function() {
+					var $row = $(this);
+					var address = $.trim($row.find('input[name*="[address]"]').val() || '');
+					if (!address) return; // skip blank rows
+					params.email_recipients.push({
+						address: address,
+						warnings_only: $row.find('input[name*="[warnings_only]"]').is(':checked') ? 1 : 0,
+						send_backup: $row.find('input[name*="[send_backup]"]').is(':checked') ? 1 : 0,
+						send_db_only: $row.find('input[name*="[send_db_only]"]').is(':checked') ? 1 : 0
+					});
+				});
+
 					var $saveBtn = $('#sgbackup-save-settings');
 				$saveBtn.prop('disabled', true);
 				$('#sgbackup-settings-status').text('Saving...').removeClass('success error');
@@ -1989,15 +2285,35 @@
 					$('#sgbackup-settings-status').text('Error: ' + msg).addClass('error');
 				});
 			});
+
+			// Email recipients: add a new row (mirrors templates/tab-settings.php)
+			$(document).on('click', '#sgbackup-add-recipient', function(e) {
+				e.preventDefault();
+				var $tbody = $('#sgbackup-email-recipients-list table tbody');
+				var idx = $tbody.find('.sgbackup-recipient-row').length;
+				var row = '<tr class="sgbackup-recipient-row">' +
+					'<td><input type="text" name="email_recipients[' + idx + '][address]" value="" class="regular-text" /></td>' +
+					'<td style="text-align:center;"><input type="checkbox" name="email_recipients[' + idx + '][warnings_only]" value="1" /></td>' +
+					'<td style="text-align:center;"><input type="checkbox" name="email_recipients[' + idx + '][send_backup]" value="1" /></td>' +
+					'<td style="text-align:center;"><input type="checkbox" name="email_recipients[' + idx + '][send_db_only]" value="1" /></td>' +
+					'<td><button type="button" class="button-link sgbackup-remove-recipient" title="Remove">&times;</button></td>' +
+					'</tr>';
+				$tbody.append(row);
+			});
+
+			// Email recipients: remove a row (keep at least one blank row present)
+			$(document).on('click', '.sgbackup-remove-recipient', function(e) {
+				e.preventDefault();
+				var $tbody = $(this).closest('tbody');
+				$(this).closest('tr').remove();
+				if (!$tbody.find('.sgbackup-recipient-row').length) {
+					$('#sgbackup-add-recipient').trigger('click');
+				}
+			});
 		},
 
 		// ===== Upload =====
-		formatBytes: function(bytes) {
-			if (bytes === 0) return '0 B';
-			var units = ['B', 'KB', 'MB', 'GB', 'TB'];
-			var i = Math.floor(Math.log(bytes) / Math.log(1024));
-			return (bytes / Math.pow(1024, i)).toFixed(i > 0 ? 1 : 0) + ' ' + units[i];
-		},
+		// (formatBytes defined once below in the Utility section, ~line 3353)
 
 		bindUpload: function() {
 			var self = this;
@@ -2123,7 +2439,7 @@
 
 						retries = 0;
 						var data = response.data;
-						offset = data.size; // Use server-reported size as next offset
+						offset = parseInt(data.size, 10); // Use server-reported size as next offset
 
 						if (data.status === 1) {
 							// Upload complete
@@ -3953,13 +4269,13 @@
 				var responseMs = Math.round(s.response_time * 1000);
 
 				html += '<tr>';
-				html += '<td><span class="sgbackup-health-status ' + statusClass + '">' + statusLabel + '</span></td>';
+				html += '<td><span class="sgbackup-health-status ' + statusClass + '">' + this.esc(statusLabel) + '</span></td>';
 				html += '<td><a href="' + this.esc(s.url) + '" target="_blank">' + this.esc(s.domain || s.url) + '</a></td>';
-				html += '<td>' + (s.http_code || '-') + '</td>';
+				html += '<td>' + this.esc(s.http_code || '-') + '</td>';
 				html += '<td>' + responseMs + ' ms</td>';
 				html += '<td' + sslClass + '>' + sslText + (s.ssl_issuer ? ' (' + this.esc(s.ssl_issuer) + ')' : '') + '</td>';
-				html += '<td>' + (s.check_method || '-') + '</td>';
-				html += '<td>' + lastCheck + '</td>';
+				html += '<td>' + this.esc(s.check_method || '-') + '</td>';
+				html += '<td>' + this.esc(lastCheck) + '</td>';
 				html += '</tr>';
 
 				if (s.error) {

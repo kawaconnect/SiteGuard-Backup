@@ -9,6 +9,13 @@ if (!defined('ABSPATH')) die('No direct access.');
 
 class SiteGuard_Backup_Job_Scheduler {
 
+	/** @var int Hard ceiling on the adaptive resume interval (seconds). */
+	const MAX_RESUME_INTERVAL = 900;
+
+	/** @var int Fixed activity-overlap window (seconds). Decoupled from the
+	 *  resume_interval so backoff can't feed on its own ever-growing value. */
+	const ACTIVITY_WINDOW = 300;
+
 	/**
 	 * Record that something useful happened during this resumption.
 	 * Schedules the next resumption if needed.
@@ -123,12 +130,14 @@ class SiteGuard_Backup_Job_Scheduler {
 	public static function increase_resume_and_reschedule($increase_by) {
 		$sgbackup = SiteGuard_Backup::instance();
 		$resume_interval = $sgbackup->jobdata_get('resume_interval', 300);
-		$new_interval = $resume_interval + $increase_by;
+		// Cap the interval so repeated contention backoffs can't grow it without
+		// bound (which would leave the job idling for many minutes per resumption).
+		$new_interval = min($resume_interval + $increase_by, self::MAX_RESUME_INTERVAL);
 		$sgbackup->jobdata_set('resume_interval', $new_interval);
 
 		self::reschedule($new_interval);
 
-		$sgbackup->log("Increased resume interval to {$new_interval}s (+{$increase_by}s)");
+		$sgbackup->log("Increased resume interval to {$new_interval}s (+{$increase_by}s, capped at " . self::MAX_RESUME_INTERVAL . "s)");
 	}
 
 	/**
@@ -141,11 +150,16 @@ class SiteGuard_Backup_Job_Scheduler {
 	 */
 	public static function terminate_due_to_activity($reason, $time_now, $last_activity) {
 		$sgbackup = SiteGuard_Backup::instance();
-		$resume_interval = $sgbackup->jobdata_get('resume_interval', 300);
+
+		// Use a FIXED window, not the ever-growing resume_interval. Basing the
+		// trigger on resume_interval created a feedback loop: each backoff raised
+		// resume_interval, which widened this window, which triggered more often,
+		// which backed off further.
+		$window = self::ACTIVITY_WINDOW;
 
 		// If another resumption was active recently, back off
-		if (($time_now - $last_activity) < $resume_interval) {
-			$sgbackup->log("Terminating: {$reason} (last activity " . ($time_now - $last_activity) . "s ago, interval={$resume_interval}s)");
+		if (($time_now - $last_activity) < $window) {
+			$sgbackup->log("Terminating: {$reason} (last activity " . ($time_now - $last_activity) . "s ago, window={$window}s)");
 
 			// Increase interval to reduce conflicts
 			self::increase_resume_and_reschedule(120);

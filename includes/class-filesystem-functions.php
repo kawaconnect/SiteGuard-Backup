@@ -83,15 +83,22 @@ class SiteGuard_Backup_Filesystem {
 		$size = 0;
 		if (!is_dir($path)) return $size;
 
-		$iterator = new RecursiveIteratorIterator(
-			new RecursiveDirectoryIterator($path, FilesystemIterator::SKIP_DOTS),
-			RecursiveIteratorIterator::LEAVES_ONLY
-		);
+		try {
+			$iterator = new RecursiveIteratorIterator(
+				new RecursiveDirectoryIterator($path, FilesystemIterator::SKIP_DOTS),
+				RecursiveIteratorIterator::LEAVES_ONLY,
+				// A permission-denied child dir would otherwise throw
+				// UnexpectedValueException and abort the whole size scan.
+				RecursiveIteratorIterator::CATCH_GET_CHILD
+			);
 
-		foreach ($iterator as $file) {
-			if ($file->isFile() && !is_dir($file->getPathname())) {
-				$size += $file->getSize();
+			foreach ($iterator as $file) {
+				if ($file->isFile() && !is_dir($file->getPathname())) {
+					$size += $file->getSize();
+				}
 			}
+		} catch (Exception $e) {
+			// Permission denied or vanished entry mid-scan - return what we have.
 		}
 
 		return $size;
@@ -117,7 +124,10 @@ class SiteGuard_Backup_Filesystem {
 		try {
 			$iterator = new RecursiveIteratorIterator(
 				new RecursiveDirectoryIterator($path, FilesystemIterator::SKIP_DOTS | 0),
-				RecursiveIteratorIterator::SELF_FIRST
+				RecursiveIteratorIterator::SELF_FIRST,
+				// One unreadable subdir (permission denied) must not abort the
+				// entire scan - skip it and continue enumerating the rest.
+				RecursiveIteratorIterator::CATCH_GET_CHILD
 			);
 			$iterator->setMaxDepth(32); // Prevent infinite loops from circular symlinks
 
@@ -185,6 +195,93 @@ class SiteGuard_Backup_Filesystem {
 		}
 
 		return $files;
+	}
+
+	/**
+	 * Streaming generator variant of enumerate_files().
+	 *
+	 * Yields one entry at a time instead of building the entire file tree in
+	 * memory, avoiding OOM on very large sites. Each yielded value has the same
+	 * shape as an element of enumerate_files()'s return array:
+	 *   ['path' => relative_path, 'size' => bytes, 'mtime' => timestamp, 'full_path' => resolved_path]
+	 *
+	 * NOTE (coordinator): the backup.php owner should adopt this in place of
+	 * enumerate_files() when building the streaming JSONL cache. enumerate_files()
+	 * is intentionally left untouched so existing callers keep working.
+	 *
+	 * @param string   $path          Directory to scan.
+	 * @param array    $excludes      Relative paths/names to exclude.
+	 * @param int|null $altered_since Only include files modified after this timestamp.
+	 * @param string   $strip_prefix  Prefix to strip from paths in results.
+	 * @return \Generator
+	 */
+	public static function enumerate_files_stream($path, $excludes = array(), $altered_since = null, $strip_prefix = '') {
+		if (!is_dir($path)) return;
+
+		$path = trailingslashit($path);
+		$abspath_real = defined('ABSPATH') ? realpath(ABSPATH) : false;
+
+		try {
+			$iterator = new RecursiveIteratorIterator(
+				new RecursiveDirectoryIterator($path, FilesystemIterator::SKIP_DOTS | 0),
+				RecursiveIteratorIterator::SELF_FIRST,
+				RecursiveIteratorIterator::CATCH_GET_CHILD
+			);
+			$iterator->setMaxDepth(32);
+
+			foreach ($iterator as $item) {
+				if ($item->isDir() || is_dir($item->getPathname())) continue;
+				if (!$item->isFile() && !$item->isLink()) continue;
+
+				$full_path = $item->getPathname();
+				$original_path = $full_path;
+
+				if ($item->isLink()) {
+					$real = realpath($full_path);
+					if (false === $real) continue;
+					if ($abspath_real && strpos($real, $abspath_real . DIRECTORY_SEPARATOR) !== 0 && $real !== $abspath_real) {
+						continue;
+					}
+					if (!is_file($real)) continue;
+					$full_path = $real;
+				}
+
+				if (!$item->isFile() && !is_file($full_path)) continue;
+				$relative = str_replace($path, '', $original_path);
+
+				$skip = false;
+				foreach ($excludes as $exclude) {
+					if ('' === $exclude) continue;
+					if (strpbrk($exclude, '*?[') !== false) {
+						if (fnmatch($exclude, $relative, FNM_PATHNAME) || fnmatch($exclude, basename($relative))) {
+							$skip = true;
+							break;
+						}
+					} elseif (0 === strpos($relative, $exclude) || false !== strpos($relative, DIRECTORY_SEPARATOR . $exclude)) {
+						$skip = true;
+						break;
+					}
+				}
+				if ($skip) continue;
+
+				$mtime = $item->getMTime();
+				if (null !== $altered_since && $mtime <= $altered_since) continue;
+
+				$file_path = $relative;
+				if (!empty($strip_prefix)) {
+					$file_path = str_replace($strip_prefix, '', $relative);
+				}
+
+				yield array(
+					'path'      => $file_path,
+					'size'      => $item->getSize(),
+					'mtime'     => $mtime,
+					'full_path' => $full_path,
+				);
+			}
+		} catch (Exception $e) {
+			// Permission denied or similar - stop early with what we've yielded.
+		}
 	}
 
 	/**

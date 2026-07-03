@@ -123,6 +123,7 @@ class SiteGuard_Backup_Engine {
 			$current_batch = $this->sgbackup->jobdata_get('maxzipbatch', 26214400);
 			if ($adjusted_batch < $current_batch) {
 				$this->sgbackup->jobdata_set('maxzipbatch', $adjusted_batch);
+				$this->sgbackup->jobdata_set('maxzipbatch_forced_low', true);
 				$this->sgbackup->log("Reduced zip batch size to " .
 					SiteGuard_Backup_Filesystem::format_bytes($adjusted_batch) .
 					" for OpenVZ memory constraints");
@@ -133,6 +134,7 @@ class SiteGuard_Backup_Engine {
 			$conservative_batch = 10485760; // 10MB
 			if ($conservative_batch < $current_batch) {
 				$this->sgbackup->jobdata_set('maxzipbatch', $conservative_batch);
+				$this->sgbackup->jobdata_set('maxzipbatch_forced_low', true);
 				$this->sgbackup->log("Reduced zip batch size to " .
 					SiteGuard_Backup_Filesystem::format_bytes($conservative_batch) .
 					" (OpenVZ detected, memory limit unknown)");
@@ -230,8 +232,12 @@ class SiteGuard_Backup_Engine {
 				implode(', ', $failed_entities) . " - backup is INCOMPLETE", 'error');
 		}
 
-		// Record enumeration time for incremental reference
-		$this->sgbackup->jobdata_set('files_enumerated_at', time());
+		// Fallback only: files_enumerated_at is normally stamped just before the
+		// first enumerate_files() call (see backup_entity), which closes the
+		// incremental blind-spot window between enumeration and completion.
+		if (null === $this->sgbackup->jobdata_get('files_enumerated_at', null)) {
+			$this->sgbackup->jobdata_set('files_enumerated_at', time());
+		}
 		$this->sgbackup->jobdata_set('backup_files_array', $backup_files_array);
 
 		// Store failed entities in jobdata so backup_finish can report them
@@ -310,23 +316,53 @@ class SiteGuard_Backup_Engine {
 		}
 
 		// Enumerate files - cache the list in a temp file to avoid re-scanning
-		// the entire directory tree on every resumption (saves ~2s per cycle on CIFS)
+		// the entire directory tree on every resumption (saves ~2s per cycle on CIFS).
+		// The cache is newline-delimited JSON (one entry per line) so resumptions
+		// can stream it lazily instead of loading the whole list into memory.
 		$last_index = $this->sgbackup->jobdata_get("entity_{$entity}_last_file_index", 0);
 		$cache_file = $this->backup_dir . 'filecache_' . $this->sgbackup->nonce . '_' . $entity . '.php';
 
+		$files = null;
 		if ($last_index > 0 && file_exists($cache_file)) {
-			$files = @unserialize(@file_get_contents($cache_file));
-			if (!is_array($files)) $files = array(); // corrupt cache - will re-enumerate below
+			$cached_count = (int) $this->sgbackup->jobdata_get("entity_{$entity}_file_count", 0);
+			$files = SiteGuard_Backup_FileList::open($cache_file, $cached_count);
+			if (!$files) {
+				// Unreadable/empty/legacy cache - delete and re-enumerate below
+				@unlink($cache_file);
+				$files = null;
+			}
 		}
 
-		if (empty($files)) {
+		if (null === $files) {
+			// Stamp enumeration start (only once per job) so incrementals measure
+			// from BEFORE the scan, not after the whole files phase completed.
+			if (null === $this->sgbackup->jobdata_get('files_enumerated_at', null)) {
+				$this->sgbackup->jobdata_set('files_enumerated_at', time());
+			}
 			$files = SiteGuard_Backup_Filesystem::enumerate_files($source_path, $excludes, $altered_since);
 			$this->sgbackup->log("Enumerated " . count($files) . " files in {$entity}");
-			// Cache for subsequent resumptions
-			@file_put_contents($cache_file, serialize($files));
-		}
+			$this->sgbackup->jobdata_set("entity_{$entity}_file_count", count($files));
+			// Cache for subsequent resumptions - streamed one json_encode per entry,
+			// never serializing the whole array to a single string
+			$cfh = @fopen($cache_file, 'wb');
+			if ($cfh) {
+				$cache_ok = true;
+				foreach ($files as $file_entry) {
+					$encoded = json_encode($file_entry);
+					if (false === $encoded || false === fwrite($cfh, $encoded . "\n")) {
+						$cache_ok = false;
+						break;
+					}
+				}
+				fclose($cfh);
+				if (!$cache_ok) {
+					$this->sgbackup->log("Could not write file-list cache for {$entity} - resumptions will re-enumerate", 'warning');
+					@unlink($cache_file);
+				}
+			}
 
-		if (empty($files)) return true;
+			if (empty($files)) return true;
+		}
 
 		// Gap 18: Warn about large files (only on first pass)
 		if ($last_index === 0) {
@@ -344,6 +380,13 @@ class SiteGuard_Backup_Engine {
 		// Create zip(s)
 		$result = $this->create_zips($files, $source_path, $entity);
 
+		// Corrupt file-list cache detected mid-zip: delete it and resume - the
+		// next resumption will re-enumerate from scratch (checkpoint is kept).
+		if ($result === 'cache_corrupt') {
+			@unlink($cache_file);
+			return 'needs_resumption';
+		}
+
 		// Clean up file cache when entity is complete
 		if (is_array($result) && file_exists($cache_file)) {
 			@unlink($cache_file);
@@ -355,10 +398,11 @@ class SiteGuard_Backup_Engine {
 	/**
 	 * Create zip file(s) from a list of files.
 	 *
-	 * @param array  $files       Array of file info arrays.
+	 * @param array|SiteGuard_Backup_FileList $files Array of file info arrays,
+	 *                            or a lazy JSONL reader on resumption.
 	 * @param string $source_path Base path to strip.
 	 * @param string $entity      Entity name for the zip filename.
-	 * @return array|string       Array of zip filenames or 'needs_resumption'.
+	 * @return array|string       Array of zip filenames, 'needs_resumption', or 'cache_corrupt'.
 	 */
 	private function create_zips($files, $source_path, $entity) {
 		$created_files = array();
@@ -369,8 +413,11 @@ class SiteGuard_Backup_Engine {
 		// The default 25MB was designed for shared hosting with 30s timeouts.
 		// ZipArchive stores paths (not data), so memory is not the concern -
 		// only disk I/O time during close() matters.
+		// Skip the raise entirely when the batch was deliberately lowered
+		// (OpenVZ detection, missed-checkin backoff) - see maxzipbatch_forced_low.
 		$max_exec = (int) ini_get('max_execution_time');
-		if ($max_exec <= 0 || $max_exec >= 300) {
+		if (($max_exec <= 0 || $max_exec >= 300)
+			&& !$this->sgbackup->jobdata_get('maxzipbatch_forced_low', false)) {
 			$maxbatch = max($maxbatch, 104857600);        // 100MB min
 			$maxbatch_ceiling = max($maxbatch_ceiling, 209715200); // 200MB ceiling
 		}
@@ -381,23 +428,46 @@ class SiteGuard_Backup_Engine {
 		$zip_filename = $this->get_zip_filename($entity, $this->index);
 		$zip_path = $this->backup_dir . $zip_filename;
 
-		// Detect if another process is actively writing to this zip's temp file
-		$tmp_path = $zip_path . '.tmp';
-		if (file_exists($tmp_path)) {
-			clearstatcache(true, $tmp_path);
-			$tmp_mtime = filemtime($tmp_path);
+		// Detect if another process is actively writing temp parts for this zip.
+		// libzip names its temp files {zip}.XXXXXX (not {zip}.tmp), so scan any
+		// {zip}.* sibling and back off if one was touched in the last 30s.
+		$temp_candidates = glob($zip_path . '.*');
+		if (!empty($temp_candidates)) {
 			$time_now = time();
-			if ($tmp_mtime > 100 && ($time_now - $tmp_mtime) < 30) {
-				$this->sgbackup->log("Zip temp file {$zip_filename}.tmp was modified " .
-					($time_now - $tmp_mtime) . "s ago - another process may be active. Backing off.");
-				SiteGuard_Backup_Job_Scheduler::terminate_due_to_activity(
-					"active zip temp file: {$zip_filename}", $time_now, $tmp_mtime
-				);
-				return 'needs_resumption';
+			foreach ($temp_candidates as $tmp_path) {
+				clearstatcache(true, $tmp_path);
+				$tmp_mtime = @filemtime($tmp_path);
+				if ($tmp_mtime > 100 && ($time_now - $tmp_mtime) < 30) {
+					$this->sgbackup->log("Zip temp file " . basename($tmp_path) . " was modified " .
+						($time_now - $tmp_mtime) . "s ago - another process may be active. Backing off.");
+					SiteGuard_Backup_Job_Scheduler::terminate_due_to_activity(
+						"active zip temp file: " . basename($tmp_path), $time_now, $tmp_mtime
+					);
+					return 'needs_resumption';
+				}
 			}
 		}
 
-		$total_files = count($files);
+		// Restart-at-zero: a leftover zip from a run killed before the first
+		// checkpoint would get the same files re-added, duplicating entries.
+		if ($last_file_index === 0 && file_exists($zip_path)) {
+			clearstatcache(true, $zip_path);
+			if (filesize($zip_path) > 0) {
+				$this->sgbackup->log("Deleting leftover zip {$zip_filename} from an interrupted run (no checkpoint recorded) to avoid duplicate entries");
+				@unlink($zip_path);
+			}
+		}
+
+		// $files is either a plain array (first pass, right after enumeration) or
+		// a forward-only SiteGuard_Backup_FileList reader (resumption from the
+		// JSONL cache). Abstract the two behind $total_files + $get_entry.
+		$is_reader = is_object($files);
+		$total_files = $is_reader ? $files->count() : count($files);
+		if ($is_reader && !$files->seek_to($last_file_index)) {
+			$this->sgbackup->log("File-list cache is corrupt (could not seek to entry {$last_file_index}) - will re-enumerate", 'error');
+			return 'cache_corrupt';
+		}
+
 		if ($last_file_index === 0) {
 			$this->sgbackup->log("Creating zip: {$zip_filename}");
 		}
@@ -410,12 +480,29 @@ class SiteGuard_Backup_Engine {
 			"{$entity}: {$pct}% ({$last_file_index}/{$total_files} files)");
 
 		for ($i = $last_file_index; $i < $total_files; $i++) {
-			$file = $files[$i];
+			if ($is_reader) {
+				$file = $files->next_entry();
+				if (false === $file) {
+					$this->sgbackup->log("File-list cache is corrupt or short at entry {$i}/{$total_files} - will re-enumerate", 'error');
+					$this->close_ziparchive();
+					return 'cache_corrupt';
+				}
+			} else {
+				$file = $files[$i];
+			}
 
 			// Check batch limits
 			if ($this->zipfiles_batched >= $maxbatch || $this->zipfiles_batched >= $maxbatch_ceiling) {
-				// Save progress and request resumption
-				$total_files = count($files);
+				// Close the current zip FIRST. If the close fails the archive is
+				// suspect, so do NOT persist the new checkpoint or record the zip -
+				// otherwise the resumed job would trust a corrupt file and skip
+				// the batch that was never actually flushed.
+				if (!$this->close_ziparchive()) {
+					$this->sgbackup->log("Failed to finalize zip {$zip_filename} at batch limit - not checkpointing; marking entity as failed", 'error');
+					return false;
+				}
+
+				// Close succeeded: save progress and request resumption
 				$pct = round($i / $total_files * 100);
 				$this->sgbackup->jobdata_set("entity_{$entity}_last_file_index", $i);
 				$this->sgbackup->jobdata_set('files_added_count', $i);
@@ -426,8 +513,6 @@ class SiteGuard_Backup_Engine {
 				$this->sgbackup->log("Batch limit reached at file {$i}/{$total_files} " .
 					"({$pct}%, " . SiteGuard_Backup_Filesystem::format_bytes($this->zipfiles_batched) . ")");
 
-				// Close current zip before returning for resumption
-				$this->close_ziparchive();
 				if ($this->zipfiles_added > 0) {
 					$created_files[] = $zip_filename;
 				}
@@ -476,13 +561,27 @@ class SiteGuard_Backup_Engine {
 			}
 		}
 
-		// Final zip
+		// Finalize the archive BEFORE anything downstream (encryption, manifest
+		// hashing, upload) reads it. Without this, a files-only backup leaves the
+		// last ZipArchive handle open (up to 199 unflushed entries) until object
+		// destruction, so the manifest hashes - and the upload ships - a
+		// truncated zip.
+		if (!$this->close_ziparchive()) {
+			$this->sgbackup->log("Failed to finalize zip {$zip_filename} - marking entity as failed", 'error');
+			return false;
+		}
+
+		// Final zip - verify integrity before recording it as a backup file
 		if ($this->zipfiles_added > 0 || file_exists($zip_path)) {
+			if (!$this->verify_zip($zip_path)) {
+				$this->sgbackup->log("Zip failed verification, not recording it: {$zip_filename} - marking entity as failed", 'error');
+				return false;
+			}
 			$created_files[] = $zip_filename;
 		}
 
-		if ($this->zipfiles_added === 0 && count($files) > 0) {
-			$this->sgbackup->log("WARNING: {$entity} had " . count($files) .
+		if ($this->zipfiles_added === 0 && $total_files > 0) {
+			$this->sgbackup->log("WARNING: {$entity} had " . $total_files .
 				" files enumerated but 0 were added to zip. Check file permissions and " .
 				"whether the files resolve within ABSPATH (" . ABSPATH . ")", 'warning');
 		}
@@ -495,6 +594,22 @@ class SiteGuard_Backup_Engine {
 			$temp_base = $this->backup_dir . 'ziptemp_' . $this->sgbackup->nonce;
 			if (is_dir($temp_base)) {
 				$this->recursive_rmdir($temp_base);
+			}
+		}
+
+		// Clean up stale zip temp fragments (libzip {zip}.XXXXXX files left by
+		// killed runs). Only this job's basename can match, and only files
+		// untouched for over an hour are removed.
+		$stale_temps = glob($this->backup_dir . "{$this->zip_basename}-{$entity}*.zip.*");
+		if (!empty($stale_temps)) {
+			$time_now = time();
+			foreach ($stale_temps as $stale) {
+				clearstatcache(true, $stale);
+				$stale_mtime = @filemtime($stale);
+				if ($stale_mtime && ($time_now - $stale_mtime) > 3600) {
+					@unlink($stale);
+					$this->sgbackup->log("Removed stale zip temp file: " . basename($stale));
+				}
 			}
 		}
 
@@ -564,12 +679,35 @@ class SiteGuard_Backup_Engine {
 
 		// Fallback: if primary method failed, try PclZip (unless already PclZip)
 		if (!$result && $this->zip_method !== 'pclzip') {
-			if (!$this->zip_fallback_warned) {
-				$this->sgbackup->log("Primary zip method '{$this->zip_method}' failed for {$archive_name}, falling back to PclZip", 'warning');
-				$this->zip_fallback_warned = true;
+			// A stale ZipArchive handle is a common transient cause - retry the
+			// add once with a fresh handle before falling back to PclZip.
+			if ($this->zip_method === 'ziparchive') {
+				$this->close_ziparchive();
+				$result = $this->add_to_zip_ziparchive($zip_path, $file_path, $archive_name);
 			}
-			$this->close_ziparchive(); // Close any open ZipArchive handle
-			$result = $this->add_to_zip_pclzip($zip_path, $file_path, $archive_name);
+
+			if (!$result && $file_size > 52428800) {
+				// PclZip loads whole files into memory - a >50MB file would risk
+				// an OOM kill. Skip it and record the loss instead.
+				$this->sgbackup->log("file skipped: primary zip method failed and file too large for PclZip fallback: {$archive_name} (" .
+					SiteGuard_Backup_Filesystem::format_bytes($file_size) . ")", 'error');
+				$skipped = $this->sgbackup->jobdata_get('zip_skipped_files', array());
+				if (!is_array($skipped)) $skipped = array();
+				if (count($skipped) < 200) {
+					$skipped[] = $archive_name;
+					$this->sgbackup->jobdata_set('zip_skipped_files', $skipped);
+				}
+				return false;
+			}
+
+			if (!$result) {
+				if (!$this->zip_fallback_warned) {
+					$this->sgbackup->log("Primary zip method '{$this->zip_method}' failed for {$archive_name}, falling back to PclZip", 'warning');
+					$this->zip_fallback_warned = true;
+				}
+				$this->close_ziparchive(); // Close any open ZipArchive handle
+				$result = $this->add_to_zip_pclzip($zip_path, $file_path, $archive_name);
+			}
 		}
 
 		return $result;
@@ -676,6 +814,28 @@ class SiteGuard_Backup_Engine {
 				return false;
 			}
 		}
+		return true;
+	}
+
+	/**
+	 * Verify a finished zip's consistency before recording it as a backup file.
+	 *
+	 * @param string $path Full path to the zip.
+	 * @return bool True if the zip passes ZipArchive::CHECKCONS (or ZipArchive
+	 *              is unavailable, which is logged and treated as a pass).
+	 */
+	private function verify_zip($path) {
+		if (!class_exists('ZipArchive')) {
+			$this->sgbackup->log("Zip verification skipped (ZipArchive unavailable): " . basename($path));
+			return true;
+		}
+		$zip = new ZipArchive();
+		$open_result = $zip->open($path, ZipArchive::CHECKCONS);
+		if (true !== $open_result) {
+			$this->sgbackup->log("Zip verification FAILED (code {$open_result}): " . basename($path), 'error');
+			return false;
+		}
+		$zip->close();
 		return true;
 	}
 
@@ -811,7 +971,7 @@ class SiteGuard_Backup_Engine {
 		}
 
 		// Check which tables are already done
-		$completed_tables = $this->sgbackup->jobdata_get('db_completed_tables', array());
+		$completed_tables = $this->sgbackup->dbtables_get();
 		$failed_tables = $this->sgbackup->jobdata_get('db_failed_tables', array());
 
 		// Output file
@@ -844,7 +1004,7 @@ class SiteGuard_Backup_Engine {
 				// any stale failed_tables entries for them (gives a fresh attempt)
 				$orphaned_names = array_diff($completed_tables, $valid_completed);
 				$completed_tables = $valid_completed;
-				$this->sgbackup->jobdata_set('db_completed_tables', $completed_tables);
+				$this->sgbackup->dbtables_set($completed_tables);
 				if (!empty($failed_tables) && !empty($orphaned_names)) {
 					$failed_tables = array_diff($failed_tables, $orphaned_names);
 					$this->sgbackup->jobdata_set('db_failed_tables', $failed_tables);
@@ -907,7 +1067,7 @@ class SiteGuard_Backup_Engine {
 
 			if ($success) {
 				$completed_tables[] = $table;
-				$this->sgbackup->jobdata_set('db_completed_tables', $completed_tables);
+				$this->sgbackup->dbtables_set($completed_tables);
 				$this->sgbackup->jobdata_set('db_tables_done', count($completed_tables));
 				$this->sgbackup->jobdata_set('db_tables_total', count($tables));
 				$this->sgbackup->jobdata_set('last_activity', "DB: {$table} (" . count($completed_tables) . "/" . count($tables) . ")");
@@ -959,7 +1119,7 @@ class SiteGuard_Backup_Engine {
 		}
 		if ($unattempted > 0) {
 			$this->sgbackup->log("WARNING: {$unattempted}/" . count($tables) . " tables have no dump file and haven't failed - re-dumping");
-			$this->sgbackup->jobdata_set('db_completed_tables', $stitch_tables);
+			$this->sgbackup->dbtables_set($stitch_tables);
 			return 'needs_resumption';
 		}
 		if (!empty($failed_tables)) {
@@ -989,7 +1149,17 @@ class SiteGuard_Backup_Engine {
 			$size = file_exists($db_path) ? SiteGuard_Backup_Filesystem::format_bytes(filesize($db_path)) : '0 B';
 			$this->sgbackup->log("Database backup complete: {$db_filename} ({$size})");
 		} else {
-			$this->sgbackup->log("Failed to stitch database files", 'error');
+			// Do NOT remove the temp dir: the per-table dumps are the only copy
+			// of the data and a stitch failure is often transient (disk pressure).
+			$stitch_failures = intval($this->sgbackup->jobdata_get('db_stitch_failures', 0)) + 1;
+			$this->sgbackup->jobdata_set('db_stitch_failures', $stitch_failures);
+			if ($stitch_failures < 3) {
+				$this->sgbackup->log("Failed to stitch database files (attempt {$stitch_failures}/3) - keeping per-table dumps, will retry on next resumption", 'error');
+				return 'needs_resumption';
+			}
+			$this->sgbackup->log("Failed to stitch database files after {$stitch_failures} attempts - keeping per-table dumps in {$temp_dir} for manual salvage", 'error');
+			$this->sgbackup->jobdata_set('db_backup_files', $db_backup_files);
+			return false;
 		}
 
 		// M3: Backup external databases
@@ -1000,6 +1170,18 @@ class SiteGuard_Backup_Engine {
 				$extdb_index++;
 				if (empty($extdb['host']) || empty($extdb['name'])) {
 					$this->sgbackup->log("External DB #{$extdb_index}: missing host or name, skipping", 'warning');
+					continue;
+				}
+
+				// Already stitched on a previous resumption (its temp dir is gone,
+				// so re-running would overwrite the good file with an empty one)
+				$extdb_filename = $this->zip_basename . "-extdb{$extdb_index}.gz";
+				$extdb_path = $this->backup_dir . $extdb_filename;
+				if (in_array("ext{$extdb_index}__stitched", $this->sgbackup->dbtables_get())) {
+					if (file_exists($extdb_path) && filesize($extdb_path) > 0) {
+						$db_backup_files[] = $extdb_filename;
+					}
+					$this->sgbackup->log("External DB #{$extdb_index}: already backed up on a previous resumption - skipping");
 					continue;
 				}
 
@@ -1037,27 +1219,43 @@ class SiteGuard_Backup_Engine {
 					wp_mkdir_p($extdb_temp_dir);
 				}
 
+				$completed_tables = $this->sgbackup->dbtables_get();
 				foreach ($ext_tables as $ext_table) {
 					$safe_table_name = preg_replace('/[^a-zA-Z0-9_]/', '', $ext_table);
 					if (empty($safe_table_name) || $safe_table_name !== $ext_table) {
 						$this->sgbackup->log("External DB #{$extdb_index}: skipping table with unsafe name: {$ext_table}", 'warning');
 						continue;
 					}
+					// Track external tables in the completed store with an ext{i}_
+					// prefix so a resumption doesn't re-dump them.
+					$ext_completed_key = "ext{$extdb_index}_{$safe_table_name}";
+					if (in_array($ext_completed_key, $completed_tables)) continue;
+
 					$ext_table_file = $extdb_temp_dir . $safe_table_name . '.sql.gz';
 					$ext_success = SiteGuard_Backup_Database_Utility::php_dump_table_with_connection($ext_table, $ext_table_file, $ext_wpdb);
 					if (!$ext_success) {
 						$this->sgbackup->log("External DB #{$extdb_index}: failed to backup table {$ext_table}", 'error');
+					} else {
+						$completed_tables[] = $ext_completed_key;
+						$this->sgbackup->dbtables_set($completed_tables);
 					}
 					SiteGuard_Backup_Job_Scheduler::something_useful_happened();
+
+					$elapsed = microtime(true) - $this->sgbackup->job_time_ms;
+					if ($elapsed > (SGBACKUP_SET_TIME_LIMIT * 0.7)) {
+						$this->sgbackup->log("Approaching time limit during external DB backup, requesting resumption");
+						return 'needs_resumption';
+					}
 				}
 
 				// Stitch external DB into its own file
-				$extdb_filename = $this->zip_basename . "-extdb{$extdb_index}.gz";
-				$extdb_path = $this->backup_dir . $extdb_filename;
 				$ext_result = $this->stitch_db_files($extdb_temp_dir, $extdb_path, $ext_tables);
 
 				if ($ext_result) {
 					$db_backup_files[] = $extdb_filename;
+					$completed_tables = $this->sgbackup->dbtables_get();
+					$completed_tables[] = "ext{$extdb_index}__stitched";
+					$this->sgbackup->dbtables_set($completed_tables);
 					$ext_size = file_exists($extdb_path) ? SiteGuard_Backup_Filesystem::format_bytes(filesize($extdb_path)) : '0 B';
 					$this->sgbackup->log("External DB #{$extdb_index} backup complete: {$extdb_filename} ({$ext_size})");
 				} else {
@@ -1103,6 +1301,17 @@ class SiteGuard_Backup_Engine {
 
 		$this->sgbackup->log("Subsite backup (blog #{$blog_id}): " . count($subsite_tables) . " tables with prefix {$subsite_prefix}");
 
+		// Initialise the anonymiser if enabled. Subsite dumps previously ignored
+		// db_anonymise entirely, so per-subsite PII shipped in cleartext despite
+		// the "anonymisation enabled" log. Route dumps through the anonymiser too.
+		$anonymiser = null;
+		if ($this->sgbackup->jobdata_get('db_anonymise', false)) {
+			$anonymise_mode = $this->sgbackup->jobdata_get('db_anonymise_mode', 'all');
+			require_once SGBACKUP_DIR . 'includes/class-db-anonymiser.php';
+			$anonymiser = new SiteGuard_Backup_DB_Anonymiser($anonymise_mode, get_current_user_id());
+			$this->sgbackup->log("Subsite backup: anonymisation enabled (mode: {$anonymise_mode})");
+		}
+
 		// Get user IDs associated with this subsite
 		$user_ids = SiteGuard_Backup_Database_Utility::get_subsite_user_ids($blog_id);
 		$this->sgbackup->log("Subsite backup: " . count($user_ids) . " users associated with blog #{$blog_id}");
@@ -1116,7 +1325,7 @@ class SiteGuard_Backup_Engine {
 			wp_mkdir_p($temp_dir);
 		}
 
-		$completed_tables = $this->sgbackup->jobdata_get('db_completed_tables', array());
+		$completed_tables = $this->sgbackup->dbtables_get();
 		$failed_tables = $this->sgbackup->jobdata_get('db_failed_tables', array());
 		$all_tables = $subsite_tables;
 
@@ -1136,7 +1345,7 @@ class SiteGuard_Backup_Engine {
 			if ($orphaned > 0) {
 				$this->sgbackup->log("Found {$orphaned} completed tables with missing dump files - will re-dump them");
 				$completed_tables = $valid_completed;
-				$this->sgbackup->jobdata_set('db_completed_tables', $completed_tables);
+				$this->sgbackup->dbtables_set($completed_tables);
 			}
 		}
 
@@ -1148,11 +1357,11 @@ class SiteGuard_Backup_Engine {
 			$this->sgbackup->log("Backing up table: {$table}");
 			$table_file = $temp_dir . $table . '.sql.gz';
 
-			$success = SiteGuard_Backup_Database_Utility::php_dump_table($table, $table_file);
+			$success = SiteGuard_Backup_Database_Utility::php_dump_table($table, $table_file, 1000, false, '', $anonymiser);
 
 			if ($success) {
 				$completed_tables[] = $table;
-				$this->sgbackup->jobdata_set('db_completed_tables', $completed_tables);
+				$this->sgbackup->dbtables_set($completed_tables);
 				$this->sgbackup->jobdata_set('db_tables_done', count($completed_tables));
 				$this->sgbackup->jobdata_set('db_tables_total', count($all_tables) + 2); // +2 for users tables
 				SiteGuard_Backup_Job_Scheduler::something_useful_happened();
@@ -1178,10 +1387,10 @@ class SiteGuard_Backup_Engine {
 			if (!in_array($users_table, $completed_tables) && !in_array($users_table, $failed_tables)) {
 				$users_file = $temp_dir . $users_table . '.sql.gz';
 				$id_list = implode(',', array_map('intval', $user_ids));
-				$success = SiteGuard_Backup_Database_Utility::php_dump_table($users_table, $users_file, 1000, false, "ID IN ({$id_list})");
+				$success = SiteGuard_Backup_Database_Utility::php_dump_table($users_table, $users_file, 1000, false, "ID IN ({$id_list})", $anonymiser);
 				if ($success) {
 					$completed_tables[] = $users_table;
-					$this->sgbackup->jobdata_set('db_completed_tables', $completed_tables);
+					$this->sgbackup->dbtables_set($completed_tables);
 					$this->sgbackup->log("Backed up {$users_table} (filtered: " . count($user_ids) . " users)");
 				} else {
 					$this->sgbackup->log("Failed to backup table: {$users_table}", 'error');
@@ -1195,10 +1404,10 @@ class SiteGuard_Backup_Engine {
 			if (!in_array($usermeta_table, $completed_tables) && !in_array($usermeta_table, $failed_tables)) {
 				$usermeta_file = $temp_dir . $usermeta_table . '.sql.gz';
 				$id_list = implode(',', array_map('intval', $user_ids));
-				$success = SiteGuard_Backup_Database_Utility::php_dump_table($usermeta_table, $usermeta_file, 1000, false, "user_id IN ({$id_list})");
+				$success = SiteGuard_Backup_Database_Utility::php_dump_table($usermeta_table, $usermeta_file, 1000, false, "user_id IN ({$id_list})", $anonymiser);
 				if ($success) {
 					$completed_tables[] = $usermeta_table;
-					$this->sgbackup->jobdata_set('db_completed_tables', $completed_tables);
+					$this->sgbackup->dbtables_set($completed_tables);
 					$this->sgbackup->log("Backed up {$usermeta_table} (filtered: " . count($user_ids) . " users)");
 				} else {
 					$this->sgbackup->log("Failed to backup table: {$usermeta_table}", 'error');
@@ -1228,7 +1437,7 @@ class SiteGuard_Backup_Engine {
 		}
 		if ($unattempted > 0) {
 			$this->sgbackup->log("WARNING: {$unattempted}/" . count($all_dump_tables) . " subsite tables have no dump file - re-dumping");
-			$this->sgbackup->jobdata_set('db_completed_tables', $valid_completed);
+			$this->sgbackup->dbtables_set($valid_completed);
 			return 'needs_resumption';
 		}
 
@@ -1359,7 +1568,11 @@ class SiteGuard_Backup_Engine {
 
 		$w = gzwrite($out, "\nSET FOREIGN_KEY_CHECKS = 1;\n");
 		if (false === $w) { $write_error = true; }
-		gzclose($out);
+		if (!gzclose($out)) {
+			$this->sgbackup->log("stitch_db_files: gzclose() failed for output file {$output_path} - output may be truncated", 'error');
+			@unlink($output_path);
+			return false;
+		}
 
 		if ($write_error) {
 			@unlink($output_path);
@@ -1395,7 +1608,11 @@ class SiteGuard_Backup_Engine {
 		}
 
 		fclose($in);
-		gzclose($out);
+		if (!gzclose($out)) {
+			$this->sgbackup->log("gzip_file: gzclose() failed for {$dest} - output may be truncated", 'error');
+			@unlink($dest);
+			return false;
+		}
 
 		if ($write_error) {
 			$this->sgbackup->log("gzip_file: write failed for {$source}", 'error');
@@ -1429,5 +1646,90 @@ class SiteGuard_Backup_Engine {
 			}
 		}
 		@rmdir($dir);
+	}
+}
+
+/**
+ * Forward-only reader over a JSONL (newline-delimited JSON) file-list cache.
+ *
+ * Lets create_zips() resume a large entity without unserializing the entire
+ * enumerated file list into memory: entries are read one line at a time with
+ * fgets(). create_zips() only needs the total count and sequential access
+ * starting from the resume checkpoint, so a forward-only reader suffices.
+ */
+class SiteGuard_Backup_FileList {
+
+	/** @var resource Open read handle on the JSONL cache */
+	private $fh;
+
+	/** @var int Total entries, as recorded in jobdata at enumeration time */
+	private $count;
+
+	/** @var int Index of the entry the next next_entry() call returns */
+	private $pos = 0;
+
+	private function __construct($fh, $count) {
+		$this->fh = $fh;
+		$this->count = $count;
+	}
+
+	/**
+	 * Open a cache file for reading.
+	 *
+	 * @param string $path  Cache file path.
+	 * @param int    $count Expected entry count (from jobdata).
+	 * @return SiteGuard_Backup_FileList|false False if unusable (caller should re-enumerate).
+	 */
+	public static function open($path, $count) {
+		if ($count <= 0) return false;
+		$fh = @fopen($path, 'rb');
+		if (!$fh) return false;
+		return new self($fh, $count);
+	}
+
+	/** @return int Total number of entries. */
+	public function count() {
+		return $this->count;
+	}
+
+	/**
+	 * Skip forward so the next next_entry() call returns entry $index.
+	 *
+	 * @param int $index Target entry index.
+	 * @return bool False if the file ended before reaching $index (corrupt/short cache).
+	 */
+	public function seek_to($index) {
+		while ($this->pos < $index) {
+			$line = fgets($this->fh, 65536);
+			if (false === $line) return false;
+			$this->pos++;
+		}
+		return true;
+	}
+
+	/**
+	 * Read the next entry.
+	 *
+	 * @return array|false Decoded entry, or false on EOF / undecodable line
+	 *                     (caller should treat the cache as corrupt).
+	 */
+	public function next_entry() {
+		$line = fgets($this->fh, 65536);
+		if (false === $line) return false;
+		$this->pos++;
+		$entry = json_decode($line, true);
+		if (!is_array($entry)) return false;
+		return $entry;
+	}
+
+	public function close() {
+		if ($this->fh) {
+			fclose($this->fh);
+			$this->fh = null;
+		}
+	}
+
+	public function __destruct() {
+		$this->close();
 	}
 }

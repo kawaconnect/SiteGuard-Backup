@@ -109,7 +109,20 @@ class SiteGuard_Backup_Method_Remotesend extends SiteGuard_Backup_Module {
 			// Ensure file position matches offset (allows true retry on error)
 			fseek($fh, $offset);
 			$chunk = fread($fh, $this->chunk_size);
-			if (false === $chunk || strlen($chunk) === 0) break;
+			if (false === $chunk || strlen($chunk) === 0) {
+				// Short read: the file ended before all bytes were sent. Do NOT
+				// signal upload_complete - the remote copy would be truncated.
+				fclose($fh);
+				return new WP_Error(
+					'short_read',
+					sprintf(
+						'Short read while sending %s: read failed at offset %d of %d bytes. Upload not completed.',
+						$filename,
+						$offset,
+						$filesize
+					)
+				);
+			}
 
 			$is_last = ($offset + strlen($chunk) >= $filesize);
 
@@ -124,6 +137,24 @@ class SiteGuard_Backup_Method_Remotesend extends SiteGuard_Backup_Module {
 				$errors++;
 				$err_msg = $result->get_error_message();
 				$sgbackup->log("Chunk send error at offset {$offset}: " . $err_msg, 'warning');
+
+				// Out-of-sequence recovery: a lost response can leave the receiver
+				// having written a chunk the sender thinks failed. Re-syncing the
+				// offset from the receiver's authoritative size turns an otherwise
+				// unrecoverable deterministic mismatch into a clean resume, instead
+				// of burning the retry budget re-sending the same rejected offset.
+				if ($result->get_error_code() === 'out_of_sequence') {
+					$resync = $rpc->send_message($site, 'get_file_status', array('file' => $filename));
+					if (is_array($resync) && isset($resync['size'])) {
+						$new_offset = intval($resync['size']);
+						if ($new_offset >= 0 && $new_offset <= $filesize && $new_offset !== $offset) {
+							$sgbackup->log("Re-syncing offset from {$offset} to {$new_offset} after out-of-sequence");
+							$offset = $new_offset;
+							$errors = 0; // genuine progress signal, not a hard failure
+						}
+					}
+					continue; // Retry from the corrected offset
+				}
 
 				// Back off on rate limit errors to let the window reset
 				if (stripos($err_msg, 'rate limit') !== false) {
@@ -155,7 +186,14 @@ class SiteGuard_Backup_Method_Remotesend extends SiteGuard_Backup_Module {
 		fclose($fh);
 
 		// Signal upload complete
-		$rpc->send_message($site, 'upload_complete', array('file' => $filename));
+		$complete = $rpc->send_message($site, 'upload_complete', array('file' => $filename));
+		if (is_wp_error($complete)) {
+			$sgbackup->log("RemoteSend: upload_complete failed: " . $complete->get_error_message(), 'error');
+			return new WP_Error(
+				'upload_complete_failed',
+				'All chunks were sent but the remote site did not acknowledge upload completion: ' . $complete->get_error_message()
+			);
+		}
 
 		return true;
 	}

@@ -222,6 +222,84 @@ abstract class SiteGuard_Backup_Module {
 	}
 
 	/**
+	 * Determine whether a chunk upload response warrants a retry.
+	 *
+	 * Retries on transport errors and HTTP 429/5xx. WP_Error values that were
+	 * derived from an HTTP status embed the code in their message (e.g.
+	 * "S3 error (HTTP 503): ..."); those are retried only for 429/5xx, while
+	 * WP_Error values without an HTTP code (pure transport/cURL failures) are
+	 * always retryable.
+	 *
+	 * @param array|WP_Error $response wp_remote_request() response or error.
+	 * @return bool Whether the request should be retried.
+	 */
+	protected function should_retry_response($response) {
+		if (is_wp_error($response)) {
+			if (preg_match('/HTTP (\d{3})/', $response->get_error_message(), $m)) {
+				$code = (int) $m[1];
+				return (429 === $code || $code >= 500);
+			}
+			return true;
+		}
+
+		$code = (int) wp_remote_retrieve_response_code($response);
+		return (429 === $code || $code >= 500);
+	}
+
+	/**
+	 * Sleep before a retry attempt using exponential backoff (2s, 4s, 8s).
+	 *
+	 * @param int    $attempt Attempt number that just failed (1-based).
+	 * @param string $context Description of the operation for the log entry.
+	 * @param string $detail  Failure detail for the log entry.
+	 */
+	protected function retry_sleep($attempt, $context, $detail = '') {
+		$delay = (int) pow(2, $attempt); // 2, 4, 8 seconds
+		SiteGuard_Backup::instance()->log(
+			"{$context}: attempt {$attempt} failed" . ('' !== $detail ? " ({$detail})" : '') .
+			" - retrying in {$delay}s", 'warning'
+		);
+
+		if (class_exists('SiteGuard_Backup_Job_Scheduler')) {
+			SiteGuard_Backup_Job_Scheduler::record_still_alive();
+		}
+
+		sleep($delay);
+	}
+
+	/**
+	 * Execute a chunk upload request with per-chunk retries.
+	 *
+	 * Runs the callback up to 4 times, retrying only when
+	 * should_retry_response() says the failure is transient (transport
+	 * error or HTTP 429/5xx). Returns the final response (or WP_Error) so
+	 * callers keep their existing error handling.
+	 *
+	 * @param callable $do_request Callback performing the request. No args.
+	 * @param string   $context    Description of the operation for logging.
+	 * @return array|WP_Error Final response or error.
+	 */
+	protected function request_with_retries($do_request, $context) {
+		$max_attempts = 4;
+		$response = null;
+
+		for ($attempt = 1; $attempt <= $max_attempts; $attempt++) {
+			$response = call_user_func($do_request);
+
+			if (!$this->should_retry_response($response) || $attempt === $max_attempts) {
+				return $response;
+			}
+
+			$detail = is_wp_error($response)
+				? $response->get_error_message()
+				: 'HTTP ' . wp_remote_retrieve_response_code($response);
+			$this->retry_sleep($attempt, $context, $detail);
+		}
+
+		return $response;
+	}
+
+	/**
 	 * Get the instance label from options, defaulting to the method description.
 	 *
 	 * @return string

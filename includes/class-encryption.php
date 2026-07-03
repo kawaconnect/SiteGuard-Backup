@@ -44,6 +44,30 @@ class SiteGuard_Backup_Encryption {
 	 * @param int    $chunk_index Chunk number.
 	 * @return string 12-byte IV unique to this chunk.
 	 */
+	/**
+	 * Write the full buffer to a stream, tolerating short writes.
+	 *
+	 * fwrite() may write fewer bytes than requested (e.g. when the disk is
+	 * filling up). A single unchecked fwrite() can therefore silently produce
+	 * a truncated file. This loops until everything is written and returns
+	 * false the moment the stream stops accepting bytes.
+	 *
+	 * @param resource $fh   Open write stream.
+	 * @param string   $data Bytes to write.
+	 * @return bool True if every byte was written, false on any short/failed write.
+	 */
+	private static function fwrite_all($fh, $data) {
+		$len = strlen($data);
+		if ($len === 0) return true;
+		$written_total = 0;
+		while ($written_total < $len) {
+			$w = fwrite($fh, substr($data, $written_total));
+			if (false === $w || 0 === $w) return false;
+			$written_total += $w;
+		}
+		return true;
+	}
+
 	private static function chunk_iv($base_iv, $chunk_index) {
 		if ($chunk_index > 0xFFFFFFFF) {
 			throw new \RuntimeException('Chunk index overflow: encryption IV would repeat');
@@ -90,6 +114,29 @@ class SiteGuard_Backup_Encryption {
 
 		$encrypted_file = $file . '.crypt';
 
+		// Pre-flight disk-space check. A short write mid-encryption produces a
+		// truncated .crypt that the caller would trust as success and then
+		// unlink the plaintext original - destroying the only good copy. Bail
+		// early if there is not enough room for the ciphertext (source size
+		// plus GCM/HMAC/framing overhead, ~5%).
+		$src_size = @filesize($file);
+		if (false !== $src_size) {
+			$needed = (int) ($src_size * 1.05) + 1024;
+			$free = false;
+			if (class_exists('SiteGuard_Backup_Filesystem') && method_exists('SiteGuard_Backup_Filesystem', 'check_disk_space')) {
+				$ds = SiteGuard_Backup_Filesystem::check_disk_space(dirname($encrypted_file));
+				if (is_array($ds) && isset($ds['free']) && false !== $ds['free']) {
+					$free = $ds['free'];
+				}
+			} elseif (function_exists('disk_free_space')) {
+				$free = @disk_free_space(dirname($encrypted_file));
+			}
+			if (false !== $free && $free < $needed) {
+				SiteGuard_Backup::instance()->log("Encryption aborted: insufficient disk space (need ~{$needed} bytes, have {$free}) - keeping plaintext original", 'error');
+				return false;
+			}
+		}
+
 		// Generate IV (12 bytes for GCM) and salt
 		$iv_length = 12; // GCM standard
 		$base_iv = random_bytes($iv_length);
@@ -116,7 +163,13 @@ class SiteGuard_Backup_Encryption {
 		$header .= chr(self::$header_version); // 1 byte
 		$header .= $salt;                    // 32 bytes
 		$header .= $base_iv;                 // 12 bytes
-		fwrite($out, $header);
+		if (!self::fwrite_all($out, $header)) {
+			fclose($in);
+			fclose($out);
+			@unlink($encrypted_file);
+			SiteGuard_Backup::instance()->log("Encryption failed: short write on header (disk full?) - keeping plaintext original", 'error');
+			return false;
+		}
 
 		// Initialize HMAC context
 		$hmac_ctx = hash_init('sha256', HASH_HMAC, $hmac_key);
@@ -153,8 +206,13 @@ class SiteGuard_Backup_Encryption {
 
 			// Write: length prefix (4 bytes) + tag (16 bytes) + encrypted data
 			$chunk_header = pack('N', strlen($encrypted)) . $tag;
-			fwrite($out, $chunk_header);
-			fwrite($out, $encrypted);
+			if (!self::fwrite_all($out, $chunk_header) || !self::fwrite_all($out, $encrypted)) {
+				fclose($in);
+				fclose($out);
+				@unlink($encrypted_file);
+				SiteGuard_Backup::instance()->log("Encryption failed: short write on chunk {$chunk_index} (disk full?) - keeping plaintext original", 'error');
+				return false;
+			}
 
 			// Update HMAC
 			hash_update($hmac_ctx, $chunk_header);
@@ -165,7 +223,23 @@ class SiteGuard_Backup_Encryption {
 
 		// Write HMAC trailer
 		$hmac = hash_final($hmac_ctx, true);
-		fwrite($out, $hmac);
+		if (!self::fwrite_all($out, $hmac)) {
+			fclose($in);
+			fclose($out);
+			@unlink($encrypted_file);
+			SiteGuard_Backup::instance()->log("Encryption failed: short write on HMAC trailer (disk full?) - keeping plaintext original", 'error');
+			return false;
+		}
+
+		// Flush and verify the OS accepted all buffered bytes before we declare
+		// success (the caller will unlink the plaintext original on success).
+		if (false === fflush($out)) {
+			fclose($in);
+			fclose($out);
+			@unlink($encrypted_file);
+			SiteGuard_Backup::instance()->log("Encryption failed: fflush on output failed (disk full?) - keeping plaintext original", 'error');
+			return false;
+		}
 
 		fclose($in);
 		fclose($out);
@@ -318,8 +392,22 @@ class SiteGuard_Backup_Encryption {
 				return false;
 			}
 
-			fwrite($out, $decrypted);
+			if (!self::fwrite_all($out, $decrypted)) {
+				fclose($in);
+				fclose($out);
+				@unlink($tmp_file);
+				SiteGuard_Backup::instance()->log("Decryption failed: short write to output at chunk {$chunk_index} (disk full?) - restored archive would be truncated", 'error');
+				return false;
+			}
 			$chunk_index++;
+		}
+
+		if (false === fflush($out)) {
+			fclose($in);
+			fclose($out);
+			@unlink($tmp_file);
+			SiteGuard_Backup::instance()->log("Decryption failed: fflush on output failed (disk full?)", 'error');
+			return false;
 		}
 
 		fclose($in);
@@ -416,7 +504,21 @@ class SiteGuard_Backup_Encryption {
 			$block_size = openssl_cipher_iv_length($legacy_cipher);
 			$current_iv = substr($encrypted, -$block_size);
 
-			fwrite($out, $decrypted);
+			if (!self::fwrite_all($out, $decrypted)) {
+				fclose($in);
+				fclose($out);
+				@unlink($tmp_file);
+				SiteGuard_Backup::instance()->log("Legacy decryption failed: short write to output (disk full?) - restored archive would be truncated", 'error');
+				return false;
+			}
+		}
+
+		if (false === fflush($out)) {
+			fclose($in);
+			fclose($out);
+			@unlink($tmp_file);
+			SiteGuard_Backup::instance()->log("Legacy decryption failed: fflush on output failed (disk full?)", 'error');
+			return false;
 		}
 
 		fclose($in);

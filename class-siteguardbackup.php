@@ -125,6 +125,17 @@ class SiteGuard_Backup {
 		if (!$skip_dblog && 'error' === $level) {
 			$errors = $this->jobdata_get('errors', array());
 			$errors[] = array('time' => time(), 'message' => $message, 'level' => $level);
+			// Cap the errors kept in jobdata at 100 entries (first 20 + last 80)
+			// so a failure loop cannot bloat the jobdata blob unboundedly.
+			if (count($errors) > 100) {
+				$errors = array_merge(array_slice($errors, 0, 20), array_slice($errors, -80));
+				if (!$this->jobdata_get('errors_truncated', false)) {
+					$this->jobdata_set('errors_truncated', true);
+					if ($this->logfile_handle) {
+						@fwrite($this->logfile_handle, "[" . gmdate('Y-m-d H:i:s') . "] Errors list in jobdata truncated to 100 entries (first 20 + last 80 kept); full detail remains in this log file\n");
+					}
+				}
+			}
 			$this->jobdata_set('errors', $errors);
 		}
 
@@ -189,10 +200,23 @@ class SiteGuard_Backup {
 	 */
 	public function get_log($nonce) {
 		$file = $this->get_logfile_name($nonce);
-		if (file_exists($file)) {
-			return file_get_contents($file);
+		if (!file_exists($file)) {
+			return '';
 		}
-		return '';
+		// Only read the last 512KB - huge logs would otherwise be loaded whole
+		$max_bytes = 524288;
+		clearstatcache(true, $file);
+		$size = filesize($file);
+		if (false === $size || $size <= $max_bytes) {
+			$contents = file_get_contents($file);
+			return (false === $contents) ? '' : $contents;
+		}
+		$fh = @fopen($file, 'rb');
+		if (!$fh) return '';
+		fseek($fh, -$max_bytes, SEEK_END);
+		$contents = stream_get_contents($fh);
+		fclose($fh);
+		return "[log truncated]\n" . ((false === $contents) ? '' : $contents);
 	}
 
 	// ==========================================
@@ -275,6 +299,39 @@ class SiteGuard_Backup {
 		if (!$nonce) return;
 		$opts = SiteGuard_Backup_Options::instance();
 		$opts->delete_option('sgbackup_jobdata_' . $nonce);
+		$opts->delete_option('sgbackup_dbtables_' . $nonce);
+	}
+
+	/**
+	 * Get the completed-tables list for the current job.
+	 *
+	 * Stored in its own option (not the main jobdata blob) because it can grow
+	 * to thousands of entries and the jobdata blob is rewritten constantly.
+	 */
+	public function dbtables_get() {
+		if (!$this->nonce) return array();
+		$opts = SiteGuard_Backup_Options::instance();
+		$data = $opts->get_option('sgbackup_dbtables_' . $this->nonce, array());
+		return is_array($data) ? $data : array();
+	}
+
+	/**
+	 * Persist the completed-tables list for the current job (autoload off).
+	 */
+	public function dbtables_set($tables) {
+		if (!$this->nonce) return;
+		$opts = SiteGuard_Backup_Options::instance();
+		$opts->update_option('sgbackup_dbtables_' . $this->nonce, is_array($tables) ? $tables : array(), false);
+	}
+
+	/**
+	 * Delete the completed-tables store for a nonce.
+	 */
+	public function dbtables_delete($nonce = null) {
+		if (null === $nonce) $nonce = $this->nonce;
+		if (!$nonce) return;
+		$opts = SiteGuard_Backup_Options::instance();
+		$opts->delete_option('sgbackup_dbtables_' . $nonce);
 	}
 
 	// ==========================================
@@ -578,6 +635,18 @@ class SiteGuard_Backup {
 		}
 		try {
 
+		// TOCTOU guard: another request may have created a job between the
+		// check above and acquiring the semaphore. Re-check now that we hold it.
+		$active_jobs = SiteGuard_Backup_Job_Scheduler::get_active_jobs();
+		if (!empty($active_jobs)) {
+			$existing_nonce = key($active_jobs);
+			$existing = $active_jobs[$existing_nonce];
+			$msg = "Cannot start backup: another job is already running (nonce: {$existing_nonce}, resumption: {$existing['resumption']})";
+			error_log('SiteGuard Backup: ' . $msg);
+			$this->boot_error = $msg;
+			return; // finally releases the semaphore
+		}
+
 		$opts = SiteGuard_Backup_Options::instance();
 
 		// Generate unique nonce for this backup job
@@ -634,7 +703,6 @@ class SiteGuard_Backup {
 			'always_keep'      => !empty($options['always_keep']),
 			'backup_files_array'   => array(),
 			'db_backup_files'      => array(),
-			'db_completed_tables'  => array(),
 		);
 
 		// Incremental-specific data
@@ -897,6 +965,9 @@ class SiteGuard_Backup {
 			if ($new_batch < $maxzipbatch) {
 				$this->jobdata_set('maxzipbatch', $new_batch);
 				$this->jobdata_set('maxzipbatch_ceiling', $new_batch);
+				// Mark the batch as deliberately lowered so create_zips() doesn't
+				// override it with the generous-execution-time raise.
+				$this->jobdata_set('maxzipbatch_forced_low', true);
 				$this->log("Previous resumption had no checkin - reduced maxzipbatch + ceiling to " .
 					SiteGuard_Backup_Filesystem::format_bytes($new_batch));
 			}
@@ -1040,39 +1111,48 @@ class SiteGuard_Backup {
 					$this->log("Starting encryption phase");
 					require_once SGBACKUP_DIR . 'includes/class-encryption.php';
 
-					$backup_array = $this->jobdata_get('backup_files_array', array());
-					$db_files = $this->jobdata_get('db_backup_files', array());
-					$all_to_encrypt = array_merge($backup_array, $db_files);
-					$encrypted_backup_array = array();
-					$encrypted_db_files = array();
+					// Encrypt in place over the current jobdata arrays. Each file's
+					// name swap is persisted BEFORE the plaintext original is
+					// unlinked, so a crash between the two can never leave a file
+					// that is neither recorded nor recoverable. Nothing is built in
+					// a local array that could be lost on interruption.
+					$backup_dir_enc = $this->get_backup_dir();
+					foreach (array('backup_files_array', 'db_backup_files') as $enc_array_key) {
+						$enc_file_list = $this->jobdata_get($enc_array_key, array());
+						foreach ($enc_file_list as $enc_idx => $file) {
+							if ('.crypt' === substr($file, -6)) continue; // already encrypted (resume)
 
-					foreach ($all_to_encrypt as $file) {
-						$filepath = $this->get_backup_dir() . $file;
-						if (!file_exists($filepath)) continue;
+							$filepath = $backup_dir_enc . $file;
+							$crypt_path = $filepath . '.crypt';
 
-						$encrypted_path = SiteGuard_Backup_Encryption::encrypt($filepath, $enc_key);
-						if ($encrypted_path) {
-							$encrypted_name = basename($encrypted_path);
-							if (in_array($file, $db_files)) {
-								$encrypted_db_files[] = $encrypted_name;
-							} else {
-								$encrypted_backup_array[] = $encrypted_name;
+							if (!file_exists($filepath)) {
+								// Self-heal: a previous resumption encrypted this file but
+								// crashed before persisting the swap - the .crypt on disk
+								// is the surviving copy, so record it and continue.
+								if (file_exists($crypt_path)) {
+									$enc_file_list[$enc_idx] = basename($crypt_path);
+									$this->jobdata_set($enc_array_key, $enc_file_list);
+									$this->log("Encryption resume: {$file} was already encrypted - recorded " . basename($crypt_path));
+								}
+								continue;
 							}
-							@unlink($filepath);
-							$this->log("Encrypted: {$file} -> {$encrypted_name}");
-						} else {
-							$this->log("Encryption failed for: {$file}", 'error');
-							if (in_array($file, $db_files)) {
-								$encrypted_db_files[] = $file;
+
+							$encrypted_path = SiteGuard_Backup_Encryption::encrypt($filepath, $enc_key);
+							if ($encrypted_path) {
+								$encrypted_name = basename($encrypted_path);
+								// Persist the swap BEFORE unlinking the original
+								$enc_file_list[$enc_idx] = $encrypted_name;
+								$this->jobdata_set($enc_array_key, $enc_file_list);
+								@unlink($filepath);
+								$this->log("Encrypted: {$file} -> {$encrypted_name}");
 							} else {
-								$encrypted_backup_array[] = $file;
+								// Keep the plaintext name in the array (file stays usable)
+								$this->log("Encryption failed for: {$file}", 'error');
 							}
+							SiteGuard_Backup_Job_Scheduler::something_useful_happened();
 						}
-						SiteGuard_Backup_Job_Scheduler::something_useful_happened();
 					}
 
-					$this->jobdata_set('backup_files_array', $encrypted_backup_array);
-					$this->jobdata_set('db_backup_files', $encrypted_db_files);
 					$this->log("Encryption phase complete");
 				}
 			}
@@ -1109,9 +1189,15 @@ class SiteGuard_Backup {
 			$this->jobdata_set('upload_phase_complete', true);
 		}
 
-		// Validate that the backup actually produced files
+		// Validate that the backup actually produced files. The manifest is
+		// appended unconditionally in the manifest phase, so exclude it -
+		// otherwise this check can never fire.
 		$backup_array = $this->jobdata_get('backup_files_array', array());
 		$db_files = $this->jobdata_get('db_backup_files', array());
+		$manifest_filename = $this->jobdata_get('manifest_filename', '');
+		if (!empty($manifest_filename)) {
+			$backup_array = array_values(array_diff($backup_array, array($manifest_filename)));
+		}
 		if (empty($backup_array) && empty($db_files)) {
 			$wanted_files = ($this->jobdata_get('backup_files') === 'yes');
 			$wanted_db = ($this->jobdata_get('backup_database') === 'yes');
@@ -1146,6 +1232,11 @@ class SiteGuard_Backup {
 
 		$backup_dir = $this->get_backup_dir();
 		$any_service_succeeded = false;
+
+		// Per-service upload checkpoints: service => list of filenames already
+		// uploaded, so a resumption doesn't re-upload completed files.
+		$uploaded_files = $this->jobdata_get('uploaded_files', array());
+		if (!is_array($uploaded_files)) $uploaded_files = array();
 
 		foreach ($services as $service) {
 			if ('none' === $service) continue;
@@ -1196,6 +1287,12 @@ class SiteGuard_Backup {
 			$upload_total = count($all_files);
 			foreach ($all_files as $file) {
 				$upload_index++;
+
+				// Skip files this service already received on a previous resumption
+				if (isset($uploaded_files[$service]) && in_array($file, $uploaded_files[$service], true)) {
+					continue;
+				}
+
 				$this->jobdata_set('last_activity', "Uploading {$upload_index}/{$upload_total}: {$file}");
 				// Prevent path traversal via tainted jobdata filenames
 				if (basename($file) !== $file || strpos($file, '..') !== false) {
@@ -1216,6 +1313,10 @@ class SiteGuard_Backup {
 						$service_all_ok = false;
 					} else {
 						$this->log("Uploaded {$file} to {$service}");
+						// Checkpoint each successful upload immediately
+						if (!isset($uploaded_files[$service])) $uploaded_files[$service] = array();
+						$uploaded_files[$service][] = $file;
+						$this->jobdata_set('uploaded_files', $uploaded_files);
 					}
 				} catch (Exception $e) {
 					$this->log("Upload exception ({$service}): " . $e->getMessage(), 'error');
@@ -1322,10 +1423,30 @@ class SiteGuard_Backup {
 			$this->jobdata_set('jobstatus', 'aborted');
 			$this->log("Backup aborted");
 		} else {
+			// Honest status: if remote storage was configured and every service
+			// failed, this is not a plain 'complete' - local copies are kept
+			// (see the remote_upload_succeeded gate on delete_local below).
+			$services = $this->jobdata_get('service', array('none'));
+			$has_remote_services = false;
+			foreach ((array) $services as $svc) {
+				if ('none' !== $svc && '' !== $svc && null !== $svc) {
+					$has_remote_services = true;
+					break;
+				}
+			}
+			$remote_all_failed = $has_remote_services
+				&& $this->jobdata_get('upload_phase_complete', false)
+				&& !$this->jobdata_get('remote_upload_succeeded', false);
+
 			if ($has_entity_errors) {
 				$failed = $this->jobdata_get('failed_entities', array());
 				$this->jobdata_set('jobstatus', 'warning');
 				$this->log("Backup finished with ERRORS - missing entities: " . implode(', ', $failed), 'error');
+			} elseif ($remote_all_failed) {
+				$this->jobdata_set('jobstatus', 'warning');
+				$this->log("Backup files were created, but ALL configured remote uploads failed (" .
+					implode(', ', array_filter((array) $services, function($s) { return 'none' !== $s; })) .
+					"). Local copies have been kept.", 'error');
 			} else {
 				$this->jobdata_set('jobstatus', 'complete');
 				$this->log("Backup complete");
@@ -1398,6 +1519,9 @@ class SiteGuard_Backup {
 		// Clean up temp files
 		SiteGuard_Backup_Filesystem::clean_temp_files($this->get_backup_dir());
 
+		// The completed-tables store is only needed while the DB phase can resume
+		$this->dbtables_delete();
+
 		if ($do_cleanup) {
 			// Keep job data for 14 days for debugging
 			$this->jobdata_set('cleanup_time', time() + (14 * DAY_IN_SECONDS));
@@ -1449,12 +1573,14 @@ class SiteGuard_Backup {
 			'service' => $this->jobdata_get('service', array('none')),
 		);
 
-		// Add file entities
+		// Add file entities. Anchored match: "-{entity}" substring matching would
+		// mis-attribute files across entities whose names share a prefix.
 		$entities = $this->jobdata_get('job_file_entities', array());
 		foreach ($entities as $entity => $info) {
+			$entity_pattern = '/-' . preg_quote($entity, '/') . '(-\d+)?\.zip(\.crypt)?$/';
 			$entity_files = array();
 			foreach ($backup_array as $file) {
-				if (strpos($file, "-{$entity}") !== false) {
+				if (preg_match($entity_pattern, $file)) {
 					$entity_files[] = $file;
 				}
 			}
@@ -1487,9 +1613,10 @@ class SiteGuard_Backup {
 		// Per-entity file sizes
 		$backup_dir_path = $this->get_backup_dir();
 		foreach ($entities as $entity => $info) {
+			$entity_pattern = '/-' . preg_quote($entity, '/') . '(-\d+)?\.zip(\.crypt)?$/';
 			$entity_size = 0;
 			foreach ($backup_array as $f) {
-				if (strpos($f, "-{$entity}") !== false) {
+				if (preg_match($entity_pattern, $f)) {
 					$p = $backup_dir_path . $f;
 					if (file_exists($p)) $entity_size += filesize($p);
 				}
@@ -1701,13 +1828,21 @@ class SiteGuard_Backup {
 			$body .= '<th style="padding:8px 12px;text-align:left;border-bottom:2px solid #ddd;">SHA-256</th>';
 			$body .= '</tr></thead><tbody>';
 
+			// Reuse hashes computed (and cached) during manifest generation
+			$file_hashes = $this->jobdata_get('file_hashes', array());
+			if (!is_array($file_hashes)) $file_hashes = array();
 			foreach ($all_files as $file) {
 				$fpath = $backup_dir . $file;
 				clearstatcache(true, $fpath);
 				$fsize = file_exists($fpath) ? filesize($fpath) : 0;
 				$total_size += $fsize;
 				$size_str = file_exists($fpath) ? SiteGuard_Backup_Filesystem::format_bytes($fsize) : '?';
-				$sha256 = file_exists($fpath) ? hash_file('sha256', $fpath) : 'N/A';
+				if (!empty($file_hashes[$file]['sha256'])) {
+					$sha256 = $file_hashes[$file]['sha256'];
+				} else {
+					$sha256 = file_exists($fpath) ? self::hash_file_dual($fpath)['sha256'] : 'N/A';
+					if ('' === $sha256) $sha256 = 'N/A';
+				}
 				$sha256_short = (strlen($sha256) > 16) ? substr($sha256, 0, 16) . '...' : $sha256;
 
 				$body .= '<tr>';
@@ -2013,8 +2148,11 @@ class SiteGuard_Backup {
 
 		$manifest_filename = $this->write_manifest($all_files, array(), $total_size);
 		if ($manifest_filename) {
-			$backup_array[] = $manifest_filename;
-			$this->jobdata_set('backup_files_array', $backup_array);
+			// A crash-resume can re-run this phase; don't record the manifest twice
+			if (!in_array($manifest_filename, $backup_array, true)) {
+				$backup_array[] = $manifest_filename;
+				$this->jobdata_set('backup_files_array', $backup_array);
+			}
 			$this->jobdata_set('manifest_filename', $manifest_filename);
 			$this->log("Manifest generated for upload: {$manifest_filename}");
 		}
@@ -2151,6 +2289,27 @@ class SiteGuard_Backup {
 	}
 
 	/**
+	 * Compute MD5 and SHA-256 of a file in a single read pass.
+	 *
+	 * @param string $path Full path to the file.
+	 * @return array array('md5' => ..., 'sha256' => ...); empty strings if unreadable.
+	 */
+	public static function hash_file_dual($path) {
+		$fh = @fopen($path, 'rb');
+		if (!$fh) return array('md5' => '', 'sha256' => '');
+		$md5_ctx = hash_init('md5');
+		$sha_ctx = hash_init('sha256');
+		while (!feof($fh)) {
+			$chunk = fread($fh, 1048576);
+			if (false === $chunk || '' === $chunk) break;
+			hash_update($md5_ctx, $chunk);
+			hash_update($sha_ctx, $chunk);
+		}
+		fclose($fh);
+		return array('md5' => hash_final($md5_ctx), 'sha256' => hash_final($sha_ctx));
+	}
+
+	/**
 	 * Write a manifest file alongside the backup files.
 	 */
 	private function write_manifest($all_files, $backup_data, $total_size) {
@@ -2178,16 +2337,25 @@ class SiteGuard_Backup {
 			'files'          => array(),
 		);
 
+		// Hash each file once (single read pass for md5+sha256) and cache the
+		// results in jobdata so later consumers (email report) don't re-hash.
+		$file_hashes = $this->jobdata_get('file_hashes', array());
+		if (!is_array($file_hashes)) $file_hashes = array();
 		foreach ($all_files as $file) {
 			$path = $backup_dir . $file;
 			clearstatcache(true, $path);
+			$exists = file_exists($path);
+			if ($exists && !isset($file_hashes[$file])) {
+				$file_hashes[$file] = self::hash_file_dual($path);
+			}
 			$manifest['files'][] = array(
 				'name' => $file,
-				'size' => file_exists($path) ? filesize($path) : 0,
-				'md5'  => file_exists($path) ? md5_file($path) : '',
-				'sha256' => file_exists($path) ? hash_file('sha256', $path) : '',
+				'size' => $exists ? filesize($path) : 0,
+				'md5'  => ($exists && isset($file_hashes[$file])) ? $file_hashes[$file]['md5'] : '',
+				'sha256' => ($exists && isset($file_hashes[$file])) ? $file_hashes[$file]['sha256'] : '',
 			);
 		}
+		$this->jobdata_set('file_hashes', $file_hashes);
 
 		$written = file_put_contents($manifest_file, json_encode($manifest, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES));
 		if ($written !== false) {

@@ -4,7 +4,7 @@
  *
  * Uses pCloud REST API with OAuth 2.0 access token.
  * Supports US (api.pcloud.com) and EU (eapi.pcloud.com) data regions.
- * Simple upload for files under 150MB, chunked upload for larger files.
+ * Simple upload for files under 20MB, chunked upload for larger files.
  */
 
 if (!defined('ABSPATH')) die('No direct access.');
@@ -93,7 +93,7 @@ class SiteGuard_Backup_Method_Pcloud extends SiteGuard_Backup_Module {
 	/**
 	 * Upload a backup file to pCloud.
 	 *
-	 * Uses uploadfile API for files under 150MB, chunked upload for larger files.
+	 * Uses uploadfile API for files under 20MB, chunked upload for larger files.
 	 *
 	 * @param string $file Full path to the file to upload.
 	 * @return bool|WP_Error
@@ -201,14 +201,16 @@ class SiteGuard_Backup_Method_Pcloud extends SiteGuard_Backup_Module {
 				'uploadoffset' => $offset,
 			));
 
-			$response = wp_remote_post($url, array(
-				'headers' => array(
-					'Content-Type'  => 'application/octet-stream',
-					'Authorization' => 'Bearer ' . $options['access_token'],
-				),
-				'body'    => $chunk,
-				'timeout' => 300,
-			));
+			$response = $this->request_with_retries(function() use ($url, $chunk, $options) {
+				return wp_remote_post($url, array(
+					'headers' => array(
+						'Content-Type'  => 'application/octet-stream',
+						'Authorization' => 'Bearer ' . $options['access_token'],
+					),
+					'body'    => $chunk,
+					'timeout' => 300,
+				));
+			}, 'pCloud chunk upload');
 
 			if (is_wp_error($response)) {
 				fclose($fh);

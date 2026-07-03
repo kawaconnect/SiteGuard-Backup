@@ -43,69 +43,129 @@ class SiteGuard_Backup_DB_Anonymiser {
 	 * @return bool True if the row should be anonymised.
 	 */
 	public function should_anonymise_row($table, $row) {
-		global $wpdb;
+		// Match by table-name SUFFIX rather than exact current-prefix name (H3).
+		// Subsite tables (wp_5_*) and external-DB tables carry a different prefix,
+		// so an exact `$wpdb->prefix . 'users'` comparison never matched them and
+		// their PII was dumped verbatim.
+		$suffix = $this->match_suffix($table);
+		if ('' === $suffix) return false;
 
-		// WooCommerce orders mode: only anonymise order meta and WC-specific tables
+		// WooCommerce orders mode: only anonymise order-related tables.
 		if ($this->mode === 'wc_orders') {
-			return $this->is_wc_anonymisable_table($table);
-		}
-
-		// Users table
-		if ($table === $wpdb->prefix . 'users') {
-			$user_id = isset($row['ID']) ? intval($row['ID']) : 0;
-
-			// Never anonymise the current user
-			if ($user_id === $this->current_user_id) {
-				return false;
+			if ($suffix === '_postmeta') {
+				$meta_key = isset($row['meta_key']) ? $row['meta_key'] : '';
+				return $this->is_wc_pii_meta_key($meta_key);
 			}
-
-			if ($this->mode === 'non_staff') {
-				return !$this->is_staff_user($user_id);
-			}
-
-			// 'all' mode: anonymise everyone except current user
-			return true;
+			return in_array($suffix, array('_wc_orders', '_wc_order_addresses'), true);
 		}
 
-		// User meta table
-		if ($table === $wpdb->prefix . 'usermeta') {
-			$user_id = isset($row['user_id']) ? intval($row['user_id']) : 0;
+		switch ($suffix) {
+			case '_users':
+				$user_id = isset($row['ID']) ? intval($row['ID']) : 0;
+				if ($user_id === $this->current_user_id) return false;
+				if ($this->mode === 'non_staff') return !$this->is_staff_user($user_id);
+				return true; // 'all' mode: everyone except current user
 
-			if ($user_id === $this->current_user_id) {
-				return false;
-			}
-
-			if ($this->mode === 'non_staff') {
-				return !$this->is_staff_user($user_id);
-			}
-
-			return true;
-		}
-
-		// WooCommerce order meta (postmeta for shop_order posts)
-		if ($table === $wpdb->prefix . 'postmeta') {
-			$meta_key = isset($row['meta_key']) ? $row['meta_key'] : '';
-			return $this->is_wc_pii_meta_key($meta_key);
-		}
-
-		// WooCommerce HPOS orders table
-		if ($table === $wpdb->prefix . 'wc_orders') {
-			return true;
-		}
-
-		// WooCommerce HPOS order addresses
-		if ($table === $wpdb->prefix . 'wc_order_addresses') {
-			return true;
-		}
-
-		// Comments table (anonymise comment author info)
-		if ($table === $wpdb->prefix . 'comments') {
-			if ($this->mode === 'all') {
+			case '_usermeta':
+				$user_id = isset($row['user_id']) ? intval($row['user_id']) : 0;
+				if ($user_id === $this->current_user_id) return false;
+				if ($this->mode === 'non_staff') return !$this->is_staff_user($user_id);
 				return true;
+
+			case '_postmeta':
+				$meta_key = isset($row['meta_key']) ? $row['meta_key'] : '';
+				return $this->is_wc_pii_meta_key($meta_key);
+
+			case '_wc_orders':
+			case '_wc_order_addresses':
+				return true;
+
+			case '_comments':
+				return $this->mode === 'all';
+
+			default:
+				return false;
+		}
+	}
+
+	/**
+	 * Match a (possibly prefixed / external) table name against the anonymisable
+	 * table suffixes. Returns the matched suffix (e.g. '_postmeta') or '' if none.
+	 */
+	private function match_suffix($table) {
+		// Check longest suffixes first so '_wc_order_addresses' is not shadowed by
+		// '_wc_orders' etc.
+		$suffixes = $this->get_anonymisable_tables();
+		usort($suffixes, function($a, $b) { return strlen($b) - strlen($a); });
+		foreach ($suffixes as $suffix) {
+			$slen = strlen($suffix);
+			if ($slen > 0 && strlen($table) >= $slen && substr($table, -$slen) === $suffix) {
+				return $suffix;
 			}
 		}
+		return '';
+	}
 
-		return false;
+	/**
+	 * Anonymise a whole row in a table-aware way and return the modified row.
+	 *
+	 * Dispatching on column name alone is wrong for postmeta / wc_order_addresses
+	 * where PII lives in a value column keyed by another column (H2). Callers must
+	 * gate with should_anonymise_row() first.
+	 *
+	 * @param string $table Table name.
+	 * @param array  $row   Row as an associative array.
+	 * @return array Modified row.
+	 */
+	public function anonymise_row($table, $row) {
+		$suffix = $this->match_suffix($table);
+
+		switch ($suffix) {
+			case '_postmeta':
+				// PII sits in meta_value, addressed by meta_key.
+				$meta_key = isset($row['meta_key']) ? $row['meta_key'] : '';
+				if ($this->is_wc_pii_meta_key($meta_key) && isset($row['meta_value']) && $row['meta_value'] !== null) {
+					$row['meta_value'] = $this->anonymise_value($meta_key, $row['meta_value']);
+				}
+				return $row;
+
+			case '_wc_order_addresses':
+				// HPOS address columns are bare (first_name, email, address_1, …).
+				foreach (array('first_name','last_name','company','email','phone','address_1','address_2','city','state','postcode') as $c) {
+					if (isset($row[$c]) && $row[$c] !== null && $row[$c] !== '') {
+						$row[$c] = $this->anonymise_wc_address_field($c, $row[$c]);
+					}
+				}
+				return $row;
+
+			default:
+				// users / usermeta / wc_orders / comments: dispatch per column name.
+				foreach ($row as $col => $val) {
+					if ($val !== null) {
+						$row[$col] = $this->anonymise_value($col, $val);
+					}
+				}
+				return $row;
+		}
+	}
+
+	/**
+	 * Anonymise a bare WooCommerce HPOS address column (wc_order_addresses).
+	 */
+	private function anonymise_wc_address_field($col, $value) {
+		switch ($col) {
+			case 'email':      return $this->hash_email($value);
+			case 'phone':      return '555-' . str_pad(abs(crc32($value)) % 10000, 4, '0', STR_PAD_LEFT);
+			case 'first_name':
+			case 'last_name':  return 'Anon_' . $this->anon_hash($value, 6);
+			case 'company':    return 'Anon Company';
+			case 'address_1':  return '123 Anonymous St';
+			case 'address_2':  return '';
+			case 'city':       return 'Anytown';
+			case 'state':      return 'XX';
+			case 'postcode':   return '00000';
+			default:           return $value;
+		}
 	}
 
 	/**
@@ -126,7 +186,9 @@ class SiteGuard_Backup_DB_Anonymiser {
 			case 'user_nicename':
 				return 'Anonymous ' . $this->anon_hash($value, 6);
 			case 'user_pass':
-				return '$P$BAnonymised' . $this->anon_hash($value . microtime(), 22);
+				// Deterministic (no microtime) so re-running anonymisation over the
+				// same backup is stable (L6). The value is an unusable placeholder hash.
+				return '$P$BAnonymised' . $this->anon_hash($value, 22);
 			case 'user_url':
 				return '';
 
