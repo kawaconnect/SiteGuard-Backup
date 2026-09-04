@@ -433,6 +433,7 @@ class SiteGuard_Backup_Commands {
 			'health_interval',
 			'health_timeout',
 			'health_ssl_warn_days',
+			'low_memory_mode',
 		);
 
 		// Validate up-front, BEFORE any update_option, so a validation failure can't leave
@@ -615,6 +616,8 @@ class SiteGuard_Backup_Commands {
 				if ($key === 'health_interval') {
 					$valid_intervals = array('every5min', 'every10min', 'every15min', 'every30min', 'everyhour', 'every2hours', 'every4hours', 'every8hours', 'twicedaily', 'daily');
 					$value = in_array($value, $valid_intervals, true) ? $value : 'every10min';
+				} elseif ($key === 'low_memory_mode') {
+					$value = in_array($value, array('auto', 'on', 'off'), true) ? $value : 'auto';
 				} elseif (in_array($key, array('retain', 'retain_db', 'split_every', 'max_split', 'delete_local', 'debug_mode', 'encryption_enabled', 'syslog_enabled', 'lock_admin', 'lock_admin_session_length', 'backupdb_nonwp', 'db_anonymise', 'max_incrementals_before_full', 'ssl_disableverify', 'ssl_useservercerts', 'auto_update', 'encrypt_credentials', 'failover_enabled', 'default_db_restore_mode', 'default_subsite_mode', 'default_keep_protocol', 'health_enabled', 'health_timeout', 'health_ssl_warn_days'))) {
 					$value = intval($value);
 				} elseif ($key === 'email') {
@@ -1117,6 +1120,8 @@ class SiteGuard_Backup_Commands {
 			'multisite'      => is_multisite(),
 			'os'             => PHP_OS,
 			'memory_limit'   => ini_get('memory_limit'),
+			'system_memory'  => SiteGuard_Backup::system_memory_bytes() > 0 ? size_format(SiteGuard_Backup::system_memory_bytes()) : 'unknown',
+			'low_memory_mode' => $opts->get_option('sgbackup_low_memory_mode', 'auto') . ' (' . (SiteGuard_Backup::instance()->is_low_memory() ? 'active' : 'inactive') . ')',
 			'max_execution'  => ini_get('max_execution_time'),
 			'upload_max'     => ini_get('upload_max_filesize'),
 			'post_max'       => ini_get('post_max_size'),

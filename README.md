@@ -74,6 +74,25 @@ wp siteguardbackup cron_events [--sgbackup-only]
 
 Run `wp help siteguardbackup` for the full command list.
 
+## Low-Memory Hosts
+
+The backup engine is built to run inside a small PHP memory limit (64-128 MB) on servers with 512 MB of RAM or less:
+
+- File enumeration streams straight to an on-disk file list; the tree is never held in memory
+- Database rows are fetched in byte-bounded batches and written to the gzip stream as they are produced
+- Zip batches, remote-send chunks, and the PclZip fallback shrink automatically when the host is small
+- `memory_limit` is raised for backup/restore runs the same way wp-admin does, capped at half the host's RAM
+- Jobs resume via WP-Cron, so a small host simply takes more resumptions rather than failing
+
+**Low Memory Mode** (Settings tab > Include in File Backups) is `auto` by default and switches on when PHP's `memory_limit` is under 128 MB or the host/container has under 1 GB of RAM. Force it with `on`, or disable with `off`:
+
+```bash
+wp siteguardbackup settings set --low_memory_mode=on
+wp siteguardbackup sysinfo      # shows memory_limit, system_memory, and whether the mode is active
+```
+
+Finished backups can be downloaded as one streamed zip bundle (no temp file, constant memory) or pushed to another WordPress site in 1-2 MB encrypted chunks.
+
 ## Requirements
 
 - WordPress 5.6+

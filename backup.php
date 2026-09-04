@@ -68,6 +68,25 @@ class SiteGuard_Backup_Engine {
 
 		// Gap 19: Detect OpenVZ and adjust batch size for memory constraints
 		$this->detect_openvz_adjust_batch();
+
+		// Low-RAM hosts (512 MB VPS, small containers, memory_limit < 128M): shrink
+		// the per-resumption zip batch so each cron/AJAX hit does a bounded amount
+		// of work and ZipArchive::close() never has hundreds of MB of pending
+		// entries to flush at once. Marked forced_low so create_zips() does not
+		// re-raise it on hosts that also happen to have a long max_execution_time.
+		if ($this->sgbackup->is_low_memory()) {
+			$low_batch = 10485760; // 10MB
+			$current_batch = $this->sgbackup->jobdata_get('maxzipbatch', 26214400);
+			if ($low_batch < $current_batch) {
+				$this->sgbackup->jobdata_set('maxzipbatch', $low_batch);
+				$this->sgbackup->jobdata_set('maxzipbatch_forced_low', true);
+			}
+			if (!$this->sgbackup->jobdata_get('low_memory_logged', false)) {
+				$this->sgbackup->jobdata_set('low_memory_logged', true);
+				$this->sgbackup->log("Low-memory mode active (" . SiteGuard_Backup::memory_summary() . "): "
+					. "streaming file enumeration, 10MB zip batches, byte-bounded DB fetches, 1MB remote-send chunks");
+			}
+		}
 	}
 
 	/**
@@ -339,43 +358,45 @@ class SiteGuard_Backup_Engine {
 			if (null === $this->sgbackup->jobdata_get('files_enumerated_at', null)) {
 				$this->sgbackup->jobdata_set('files_enumerated_at', time());
 			}
-			$files = SiteGuard_Backup_Filesystem::enumerate_files($source_path, $excludes, $altered_since);
-			$this->sgbackup->log("Enumerated " . count($files) . " files in {$entity}");
-			$this->sgbackup->jobdata_set("entity_{$entity}_file_count", count($files));
-			// Cache for subsequent resumptions - streamed one json_encode per entry,
-			// never serializing the whole array to a single string
-			$cfh = @fopen($cache_file, 'wb');
-			if ($cfh) {
-				$cache_ok = true;
-				foreach ($files as $file_entry) {
-					$encoded = json_encode($file_entry);
-					if (false === $encoded || false === fwrite($cfh, $encoded . "\n")) {
-						$cache_ok = false;
-						break;
+
+			// Stream the directory walk straight into the JSONL cache, one entry per
+			// line, and then read it back through the forward-only reader. The whole
+			// file list is never held in PHP memory - previously a 100k-file uploads
+			// tree cost ~50-80MB here on the first pass, enough to OOM a 64-128M
+			// memory_limit before a single file was zipped (and, because the cache
+			// was only written after a *complete* scan, every resumption repeated
+			// the same fatal until the no-progress guard aborted the job).
+			$scan = $this->enumerate_to_cache($source_path, $excludes, $altered_since, $cache_file, $entity);
+
+			if (false === $scan) {
+				// Cache file unwritable (disk full / permissions): fall back to the
+				// in-memory list so the backup still proceeds on hosts with room.
+				$this->sgbackup->log("Could not write file-list cache for {$entity} - falling back to in-memory enumeration", 'warning');
+				$files = SiteGuard_Backup_Filesystem::enumerate_files($source_path, $excludes, $altered_since);
+				$this->sgbackup->log("Enumerated " . count($files) . " files in {$entity}");
+				$this->sgbackup->jobdata_set("entity_{$entity}_file_count", count($files));
+				if (empty($files)) return true;
+				foreach ($files as $file_info) {
+					if (isset($file_info['size']) && $file_info['size'] > SGBACKUP_WARN_FILE_SIZE) {
+						$this->sgbackup->log("Warning: Large file detected: " . $file_info['path'] .
+							" (" . SiteGuard_Backup_Filesystem::format_bytes($file_info['size']) . ")", 'warning');
 					}
 				}
-				fclose($cfh);
-				if (!$cache_ok) {
-					$this->sgbackup->log("Could not write file-list cache for {$entity} - resumptions will re-enumerate", 'warning');
+			} else {
+				$this->sgbackup->log("Enumerated {$scan} files in {$entity}");
+				$this->sgbackup->jobdata_set("entity_{$entity}_file_count", $scan);
+				if (0 === $scan) {
 					@unlink($cache_file);
+					return true;
+				}
+				$files = SiteGuard_Backup_FileList::open($cache_file, $scan);
+				if (!$files) {
+					$this->sgbackup->log("File-list cache for {$entity} could not be reopened after writing - will re-enumerate", 'error');
+					@unlink($cache_file);
+					return 'needs_resumption';
 				}
 			}
-
-			if (empty($files)) return true;
 		}
-
-		// Gap 18: Warn about large files (only on first pass)
-		if ($last_index === 0) {
-		foreach ($files as $file_info) {
-			if (isset($file_info['size']) && $file_info['size'] > SGBACKUP_WARN_FILE_SIZE) {
-				$this->sgbackup->log(
-					"Warning: Large file detected: " . $file_info['path'] .
-					" (" . SiteGuard_Backup_Filesystem::format_bytes($file_info['size']) . ")",
-					'warning'
-				);
-			}
-		}
-		} // end if ($last_index === 0) for large file warnings
 
 		// Create zip(s)
 		$result = $this->create_zips($files, $source_path, $entity);
@@ -387,12 +408,70 @@ class SiteGuard_Backup_Engine {
 			return 'needs_resumption';
 		}
 
-		// Clean up file cache when entity is complete
+		// Clean up file cache when entity is complete (close the reader first so
+		// the unlink also succeeds on filesystems that refuse to delete open files)
+		if (is_object($files)) $files->close();
 		if (is_array($result) && file_exists($cache_file)) {
 			@unlink($cache_file);
 		}
 
 		return $result;
+	}
+
+	/**
+	 * Walk an entity directory and write the file list to a JSONL cache without
+	 * ever holding the list in memory.
+	 *
+	 * Large-file warnings are emitted during the walk (capped) since there is no
+	 * array to loop over afterwards. Filenames that are not valid UTF-8 cannot be
+	 * json_encode()d directly; they are stored base64-wrapped and transparently
+	 * decoded by SiteGuard_Backup_FileList so no file is silently dropped.
+	 *
+	 * @return int|false Number of entries written, or false if the cache file
+	 *                   could not be opened/written (caller falls back).
+	 */
+	private function enumerate_to_cache($source_path, $excludes, $altered_since, $cache_file, $entity) {
+		$cfh = @fopen($cache_file, 'wb');
+		if (!$cfh) return false;
+
+		$count = 0;
+		$large_warned = 0;
+		$ok = true;
+		foreach (SiteGuard_Backup_Filesystem::enumerate_files_stream($source_path, $excludes, $altered_since) as $file_entry) {
+			if (isset($file_entry['size']) && $file_entry['size'] > SGBACKUP_WARN_FILE_SIZE && $large_warned < 20) {
+				$large_warned++;
+				$this->sgbackup->log("Warning: Large file detected: " . $file_entry['path'] .
+					" (" . SiteGuard_Backup_Filesystem::format_bytes($file_entry['size']) . ")", 'warning');
+			}
+
+			$encoded = json_encode($file_entry);
+			if (false === $encoded) {
+				// Non-UTF-8 filename: wrap the two path strings in base64.
+				$encoded = json_encode(array(
+					'path_b64'      => base64_encode($file_entry['path']),
+					'full_path_b64' => base64_encode($file_entry['full_path']),
+					'size'          => $file_entry['size'],
+					'mtime'         => $file_entry['mtime'],
+				));
+				if (false === $encoded) { $ok = false; break; }
+			}
+			if (false === fwrite($cfh, $encoded . "\n")) { $ok = false; break; }
+			$count++;
+
+			// Long walks on slow disks (CIFS, tiny VPS): keep the job's heartbeat
+			// fresh so a concurrent status poll does not misreport it as stalled.
+			if (0 === ($count % 5000)) {
+				$this->sgbackup->jobdata_set('last_activity', "{$entity}: scanning… {$count} files found");
+			}
+		}
+		if (false === fflush($cfh)) $ok = false;
+		fclose($cfh);
+
+		if (!$ok) {
+			@unlink($cache_file);
+			return false;
+		}
+		return $count;
 	}
 
 	/**
@@ -686,9 +765,12 @@ class SiteGuard_Backup_Engine {
 				$result = $this->add_to_zip_ziparchive($zip_path, $file_path, $archive_name);
 			}
 
-			if (!$result && $file_size > 52428800) {
-				// PclZip loads whole files into memory - a >50MB file would risk
-				// an OOM kill. Skip it and record the loss instead.
+			// PclZip loads whole files into memory (plus a copy while deflating), so
+			// cap the fallback at 50MB or a quarter of the remaining headroom,
+			// whichever is smaller - on a 64M memory_limit that is ~10MB, not 50.
+			$pclzip_max = (int) min(52428800, max(1048576, SiteGuard_Backup::memory_headroom() / 4));
+			if (!$result && $file_size > $pclzip_max) {
+				// Skip it and record the loss instead of risking an OOM kill.
 				$this->sgbackup->log("file skipped: primary zip method failed and file too large for PclZip fallback: {$archive_name} (" .
 					SiteGuard_Backup_Filesystem::format_bytes($file_size) . ")", 'error');
 				$skipped = $this->sgbackup->jobdata_get('zip_skipped_files', array());
@@ -1719,6 +1801,12 @@ class SiteGuard_Backup_FileList {
 		$this->pos++;
 		$entry = json_decode($line, true);
 		if (!is_array($entry)) return false;
+		// Non-UTF-8 filenames are stored base64-wrapped (see enumerate_to_cache)
+		if (isset($entry['path_b64'])) {
+			$entry['path'] = base64_decode($entry['path_b64']);
+			$entry['full_path'] = isset($entry['full_path_b64']) ? base64_decode($entry['full_path_b64']) : $entry['path'];
+			unset($entry['path_b64'], $entry['full_path_b64']);
+		}
 		return $entry;
 	}
 

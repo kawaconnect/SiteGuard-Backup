@@ -232,6 +232,9 @@ class SiteGuard_Backup_Restorer {
 		@set_time_limit(SGBACKUP_SET_TIME_LIMIT);
 		@ignore_user_abort(true);
 		$this->restore_started_at = time();
+		// WP-CLI / cron restores run at php.ini's memory_limit; lift it the same
+		// way wp-admin does (capped to half the host's RAM - see raise_memory_limit).
+		$this->sgbackup->raise_memory_limit();
 
 		$opts = SiteGuard_Backup_Options::instance();
 		$backup_dir = $opts->get_backup_dir();

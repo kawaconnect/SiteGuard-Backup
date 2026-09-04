@@ -240,6 +240,39 @@ $period_labels = array(
 				<input type="number" name="split_every" value="<?php echo esc_attr($settings['split_every']); ?>" min="25" max="5000" style="width:80px;" /> MB
 			</td>
 		</tr>
+		<tr>
+			<th><?php esc_html_e('Low Memory Mode', 'siteguardbackup'); ?></th>
+			<td>
+				<?php
+				$low_mem_setting = isset($settings['low_memory_mode']) ? $settings['low_memory_mode'] : 'auto';
+				$low_mem_active = SiteGuard_Backup::instance()->is_low_memory();
+				$low_mem_limit = SiteGuard_Backup::memory_limit_bytes();
+				$low_mem_sys = SiteGuard_Backup::system_memory_bytes();
+				?>
+				<select name="low_memory_mode">
+					<option value="auto" <?php selected($low_mem_setting, 'auto'); ?>><?php esc_html_e('Auto-detect (recommended)', 'siteguardbackup'); ?></option>
+					<option value="on" <?php selected($low_mem_setting, 'on'); ?>><?php esc_html_e('Always on', 'siteguardbackup'); ?></option>
+					<option value="off" <?php selected($low_mem_setting, 'off'); ?>><?php esc_html_e('Off', 'siteguardbackup'); ?></option>
+				</select>
+				<span style="margin-left:8px;">
+					<?php if ($low_mem_active): ?>
+						<strong style="color:#996800;"><?php esc_html_e('Currently active', 'siteguardbackup'); ?></strong>
+					<?php else: ?>
+						<span style="color:#666;"><?php esc_html_e('Currently inactive', 'siteguardbackup'); ?></span>
+					<?php endif; ?>
+					-
+					<?php
+					printf(
+						/* translators: 1: PHP memory_limit, 2: host RAM */
+						esc_html__('PHP memory_limit %1$s, host RAM %2$s', 'siteguardbackup'),
+						esc_html($low_mem_limit > 0 ? size_format($low_mem_limit) : __('unlimited', 'siteguardbackup')),
+						esc_html($low_mem_sys > 0 ? size_format($low_mem_sys) : __('unknown', 'siteguardbackup'))
+					);
+					?>
+				</span>
+				<p class="description"><?php esc_html_e('For small servers (512 MB RAM or less, or a PHP memory_limit under 128 MB). Uses 10 MB zip batches per run, fetches database rows in small byte-bounded batches, and sends 1 MB chunks to remote sites. Auto-detect turns this on when either threshold is met. Backups take more resumptions but stay well under the memory limit.', 'siteguardbackup'); ?></p>
+			</td>
+		</tr>
 	</table>
 
 	<!-- M4: Non-WordPress Tables -->

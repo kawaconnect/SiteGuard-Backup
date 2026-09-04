@@ -114,86 +114,13 @@ class SiteGuard_Backup_Filesystem {
 	 * @return array   Array of ['path' => relative_path, 'size' => bytes, 'mtime' => timestamp].
 	 */
 	public static function enumerate_files($path, $excludes = array(), $altered_since = null, $strip_prefix = '') {
+		// Thin wrapper over the streaming generator so the two can never diverge.
+		// Prefer enumerate_files_stream() directly when the caller can consume
+		// entries one at a time - this variant holds the whole tree in memory.
 		$files = array();
-		if (!is_dir($path)) return $files;
-
-		$path = trailingslashit($path);
-
-		$abspath_real = defined('ABSPATH') ? realpath(ABSPATH) : false;
-
-		try {
-			$iterator = new RecursiveIteratorIterator(
-				new RecursiveDirectoryIterator($path, FilesystemIterator::SKIP_DOTS | 0),
-				RecursiveIteratorIterator::SELF_FIRST,
-				// One unreadable subdir (permission denied) must not abort the
-				// entire scan - skip it and continue enumerating the rest.
-				RecursiveIteratorIterator::CATCH_GET_CHILD
-			);
-			$iterator->setMaxDepth(32); // Prevent infinite loops from circular symlinks
-
-			foreach ($iterator as $item) {
-				// Skip directories - use is_dir() as primary check because
-				// SplFileInfo::isFile() incorrectly returns true for directories
-				// on CIFS/SMB mounts (Azure App Service, NAS storage, etc.)
-				if ($item->isDir() || is_dir($item->getPathname())) continue;
-				if (!$item->isFile() && !$item->isLink()) continue;
-
-				$full_path = $item->getPathname();
-				$original_path = $full_path;
-
-				// Resolve symlinks and verify they stay within ABSPATH
-				if ($item->isLink()) {
-					$real = realpath($full_path);
-					if (false === $real) continue; // Broken symlink
-					if ($abspath_real && strpos($real, $abspath_real . DIRECTORY_SEPARATOR) !== 0 && $real !== $abspath_real) {
-						continue; // Symlink target outside ABSPATH boundary
-					}
-					if (!is_file($real)) continue; // Symlink to directory - skip, we only want files
-					$full_path = $real;
-				}
-
-				if (!$item->isFile() && !is_file($full_path)) continue;
-				// Use original (pre-symlink-resolution) path for relative path computation
-				$relative = str_replace($path, '', $original_path);
-
-				// Check exclusions (supports exact prefix match and glob-style wildcards via fnmatch)
-				$skip = false;
-				foreach ($excludes as $exclude) {
-					if ('' === $exclude) continue;
-					// Support glob-style wildcards (e.g., *.log, cache/*)
-					if (strpbrk($exclude, '*?[') !== false) {
-						if (fnmatch($exclude, $relative, FNM_PATHNAME) || fnmatch($exclude, basename($relative))) {
-							$skip = true;
-							break;
-						}
-					} elseif (0 === strpos($relative, $exclude) || false !== strpos($relative, DIRECTORY_SEPARATOR . $exclude)) {
-						$skip = true;
-						break;
-					}
-				}
-				if ($skip) continue;
-
-				$mtime = $item->getMTime();
-
-				// Filter by mtime if incremental
-				if (null !== $altered_since && $mtime <= $altered_since) continue;
-
-				$file_path = $relative;
-				if (!empty($strip_prefix)) {
-					$file_path = str_replace($strip_prefix, '', $relative);
-				}
-
-				$files[] = array(
-					'path'  => $file_path,
-					'size'  => $item->getSize(),
-					'mtime' => $mtime,
-					'full_path' => $full_path,
-				);
-			}
-		} catch (Exception $e) {
-			// Permission denied or similar - skip
+		foreach (self::enumerate_files_stream($path, $excludes, $altered_since, $strip_prefix) as $entry) {
+			$files[] = $entry;
 		}
-
 		return $files;
 	}
 
@@ -205,9 +132,8 @@ class SiteGuard_Backup_Filesystem {
 	 * shape as an element of enumerate_files()'s return array:
 	 *   ['path' => relative_path, 'size' => bytes, 'mtime' => timestamp, 'full_path' => resolved_path]
 	 *
-	 * NOTE (coordinator): the backup.php owner should adopt this in place of
-	 * enumerate_files() when building the streaming JSONL cache. enumerate_files()
-	 * is intentionally left untouched so existing callers keep working.
+	 * backup.php streams this straight into the JSONL file-list cache so a
+	 * 100k-file uploads tree costs O(1) memory to enumerate.
 	 *
 	 * @param string   $path          Directory to scan.
 	 * @param array    $excludes      Relative paths/names to exclude.

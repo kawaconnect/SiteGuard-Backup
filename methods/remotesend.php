@@ -94,6 +94,13 @@ class SiteGuard_Backup_Method_Remotesend extends SiteGuard_Backup_Module {
 			$this->chunk_size = $adaptive_chunk;
 		}
 
+		// Each chunk exists ~5× over in memory while in flight (raw, base64, JSON,
+		// AES ciphertext, HTTP body) and the receiver mirrors that. On low-RAM
+		// hosts halve the default so a 2MB chunk cannot become a 10MB+ spike.
+		if ($sgbackup->is_low_memory()) {
+			$this->chunk_size = min($this->chunk_size, 1048576);
+		}
+
 		// Send in chunks
 		$fh = fopen($file, 'rb');
 		if (!$fh) return new WP_Error('file_open', "Cannot open file: {$filename}");

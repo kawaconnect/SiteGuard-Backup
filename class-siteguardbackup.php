@@ -349,6 +349,139 @@ class SiteGuard_Backup {
 	}
 
 	// ==========================================
+	// MEMORY (low-RAM hosts)
+	// ==========================================
+
+	/**
+	 * PHP memory_limit in bytes. 0 means unlimited/unknown.
+	 */
+	public static function memory_limit_bytes() {
+		$raw = trim((string) ini_get('memory_limit'));
+		if ('' === $raw || '-1' === $raw) return 0;
+		$unit = strtolower(substr($raw, -1));
+		$val = (float) $raw;
+		switch ($unit) {
+			case 'g': $val *= 1024; // fall through
+			case 'm': $val *= 1024; // fall through
+			case 'k': $val *= 1024;
+		}
+		return (int) $val;
+	}
+
+	/**
+	 * Total memory available to this host/container in bytes, or 0 if unknown.
+	 *
+	 * Takes the smallest of: cgroup v2 memory.max, cgroup v1 limit_in_bytes,
+	 * and /proc/meminfo MemTotal. Containers routinely report the host's RAM
+	 * in meminfo while the cgroup caps them far lower, hence the minimum.
+	 */
+	public static function system_memory_bytes() {
+		static $cached = null;
+		if (null !== $cached) return $cached;
+
+		$candidates = array();
+		foreach (array('/sys/fs/cgroup/memory.max', '/sys/fs/cgroup/memory/memory.limit_in_bytes') as $cg) {
+			if (!@is_readable($cg)) continue;
+			$v = trim((string) @file_get_contents($cg));
+			// "max" (v2) or a huge sentinel (v1) means "no cgroup limit"
+			if ('' === $v || 'max' === $v || !ctype_digit($v) || (float) $v > 1.0e15) continue;
+			$candidates[] = (int) $v;
+		}
+		if (@is_readable('/proc/meminfo')) {
+			$fh = @fopen('/proc/meminfo', 'r');
+			if ($fh) {
+				while (($line = fgets($fh, 256)) !== false) {
+					if (preg_match('/^MemTotal:\s+(\d+)\s*kB/i', $line, $m)) {
+						$candidates[] = (int) $m[1] * 1024;
+						break;
+					}
+				}
+				fclose($fh);
+			}
+		}
+		$cached = empty($candidates) ? 0 : min($candidates);
+		return $cached;
+	}
+
+	/**
+	 * Bytes left before memory_limit is hit. Returns a generous figure when the
+	 * limit is unlimited/unknown so callers can treat the result as a budget.
+	 */
+	public static function memory_headroom() {
+		$limit = self::memory_limit_bytes();
+		if ($limit <= 0) return 1073741824; // 1 GB: "plenty"
+		return max(0, $limit - memory_get_usage(true));
+	}
+
+	/**
+	 * Whether the low-memory profile is in force.
+	 *
+	 * Setting sgbackup_low_memory_mode: 'on' | 'off' | 'auto' (default).
+	 * Auto triggers when PHP's memory_limit is under 128 MB or the host/container
+	 * has under 1 GB of RAM - the 512 MB VPS / small container case where the
+	 * default batch sizes get the PHP worker OOM-killed before the first zip closes.
+	 */
+	public function is_low_memory() {
+		static $cached = null;
+		if (null !== $cached) return $cached;
+
+		$opts = SiteGuard_Backup_Options::instance();
+		$mode = (string) $opts->get_option('sgbackup_low_memory_mode', 'auto');
+		if ('on' === $mode) {
+			$cached = true;
+		} elseif ('off' === $mode) {
+			$cached = false;
+		} else {
+			$limit = self::memory_limit_bytes();
+			$sys = self::system_memory_bytes();
+			$cached = ($limit > 0 && $limit < 134217728) || ($sys > 0 && $sys < 1073741824);
+		}
+		$cached = (bool) apply_filters('sgbackup_low_memory', $cached);
+		return $cached;
+	}
+
+	/**
+	 * Human-readable memory summary for logs and sysinfo.
+	 */
+	public static function memory_summary() {
+		$limit = self::memory_limit_bytes();
+		$sys = self::system_memory_bytes();
+		return 'memory_limit=' . ($limit > 0 ? SiteGuard_Backup_Filesystem::format_bytes($limit) : 'unlimited')
+			. ', system=' . ($sys > 0 ? SiteGuard_Backup_Filesystem::format_bytes($sys) : 'unknown')
+			. ', in use=' . SiteGuard_Backup_Filesystem::format_bytes(memory_get_usage(true));
+	}
+
+	/**
+	 * Raise PHP's memory_limit for a backup/restore run.
+	 *
+	 * wp-cron.php and WP-CLI requests run at php.ini's memory_limit (often 64-128 MB
+	 * on small hosts); only wp-admin raises it. Lift it to WP_MAX_MEMORY_LIMIT like
+	 * core does for admin screens, but never above half the host's RAM so a spike
+	 * fails as a clean PHP fatal (resumable) instead of the kernel OOM-killer taking
+	 * out the worker (and sometimes MySQL) on a 512 MB box. Only ever raises.
+	 *
+	 * @return bool True if the limit was changed.
+	 */
+	public function raise_memory_limit() {
+		$current = self::memory_limit_bytes();
+		if ($current <= 0) return false; // unlimited already
+
+		$target = defined('WP_MAX_MEMORY_LIMIT') ? wp_convert_hr_to_bytes(WP_MAX_MEMORY_LIMIT) : 268435456;
+		$sys = self::system_memory_bytes();
+		if ($sys > 0) {
+			$target = min($target, max(134217728, (int) ($sys / 2)));
+		}
+		$target = (int) apply_filters('sgbackup_memory_limit', $target, $current, $sys);
+
+		if ($target <= $current) return false;
+		if (false === @ini_set('memory_limit', (string) $target)) return false;
+		$this->log("Raised memory_limit from " . SiteGuard_Backup_Filesystem::format_bytes($current)
+			. " to " . SiteGuard_Backup_Filesystem::format_bytes($target)
+			. ($sys > 0 ? " (host RAM " . SiteGuard_Backup_Filesystem::format_bytes($sys) . ")" : ''));
+		return true;
+	}
+
+	// ==========================================
 	// SCHEDULING
 	// ==========================================
 
@@ -903,7 +1036,8 @@ class SiteGuard_Backup {
 		// Open log
 		$this->logfile_open($this->nonce);
 		$this->log("=== Resumption {$resumption_no} ===");
-		$this->log("Memory: " . SiteGuard_Backup_Filesystem::format_bytes(memory_get_usage(true)));
+		$this->raise_memory_limit();
+		$this->log("Memory: " . self::memory_summary() . ($this->is_low_memory() ? ' - LOW-MEMORY MODE' : ''));
 
 		// Check for abort
 		if (SiteGuard_Backup_Job_Scheduler::is_abort_requested($bnonce)) {
