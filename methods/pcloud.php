@@ -218,9 +218,12 @@ class SiteGuard_Backup_Method_Pcloud extends SiteGuard_Backup_Module {
 			}
 
 			$data = json_decode(wp_remote_retrieve_body($response), true);
-			if (isset($data['result']) && (int) $data['result'] !== 0) {
+			if (!is_array($data) || !isset($data['result']) || (int) $data['result'] !== 0
+				|| wp_remote_retrieve_response_code($response) >= 400) {
+				// A non-JSON (5xx/HTML) reply used to pass as success and the offset
+				// advanced, committing a truncated file via upload_save.
 				fclose($fh);
-				$error_msg = isset($data['error']) ? $data['error'] : 'Chunk upload failed';
+				$error_msg = (is_array($data) && isset($data['error'])) ? $data['error'] : ('Chunk upload failed (HTTP ' . wp_remote_retrieve_response_code($response) . ')');
 				return new WP_Error('pcloud_chunk', "pCloud chunk error: {$error_msg}");
 			}
 
@@ -277,7 +280,10 @@ class SiteGuard_Backup_Method_Pcloud extends SiteGuard_Backup_Module {
 			'filename' => $local_path,
 		));
 
-		if (is_wp_error($response)) return $response;
+		if (is_wp_error($response)) {
+			@unlink($local_path); // a transport error mid-stream leaves a truncated file
+			return $response;
+		}
 
 		$code = wp_remote_retrieve_response_code($response);
 		if ($code >= 400) {

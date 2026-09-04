@@ -342,11 +342,19 @@ class SiteGuard_Backup {
 	 * Get the backup directory, creating it if needed.
 	 */
 	public function get_backup_dir() {
-		if (!empty($this->backup_dir)) return $this->backup_dir;
+		// Cache per blog: the multisite cron dispatcher runs several subsites' jobs
+		// through this singleton under switch_to_blog(), and a single cached path
+		// sent every later subsite's zips/logs into the first subsite's directory.
+		$blog_id = is_multisite() ? (int) get_current_blog_id() : 0;
+		if (!empty($this->backup_dir) && $this->backup_dir_blog === $blog_id) return $this->backup_dir;
 		$opts = SiteGuard_Backup_Options::instance();
 		$this->backup_dir = $opts->get_backup_dir();
+		$this->backup_dir_blog = $blog_id;
 		return $this->backup_dir;
 	}
+
+	/** @var int|null Blog id the cached backup_dir belongs to */
+	private $backup_dir_blog = null;
 
 	// ==========================================
 	// MEMORY (low-RAM hosts)
@@ -366,6 +374,17 @@ class SiteGuard_Backup {
 			case 'k': $val *= 1024;
 		}
 		return (int) $val;
+	}
+
+	/**
+	 * memory_limit as it was BEFORE raise_memory_limit() touched it (bytes, 0 = unlimited).
+	 * Recorded on first call so the low-memory decision reflects the host's real
+	 * php.ini value, not the limit this plugin raised it to.
+	 */
+	public static function initial_memory_limit() {
+		static $initial = null;
+		if (null === $initial) $initial = self::memory_limit_bytes();
+		return $initial;
 	}
 
 	/**
@@ -432,7 +451,7 @@ class SiteGuard_Backup {
 		} elseif ('off' === $mode) {
 			$cached = false;
 		} else {
-			$limit = self::memory_limit_bytes();
+			$limit = self::initial_memory_limit();
 			$sys = self::system_memory_bytes();
 			$cached = ($limit > 0 && $limit < 134217728) || ($sys > 0 && $sys < 1073741824);
 		}
@@ -464,9 +483,11 @@ class SiteGuard_Backup {
 	 */
 	public function raise_memory_limit() {
 		$current = self::memory_limit_bytes();
+		self::initial_memory_limit(); // remember the pre-raise value for is_low_memory()
 		if ($current <= 0) return false; // unlimited already
 
 		$target = defined('WP_MAX_MEMORY_LIMIT') ? wp_convert_hr_to_bytes(WP_MAX_MEMORY_LIMIT) : 268435456;
+		if ($target <= 0) $target = 268435456; // WP_MAX_MEMORY_LIMIT = -1 means "unlimited"; use core's default cap
 		$sys = self::system_memory_bytes();
 		if ($sys > 0) {
 			$target = min($target, max(134217728, (int) ($sys / 2)));
@@ -707,10 +728,21 @@ class SiteGuard_Backup {
 		$parent_timestamp = null;
 
 		foreach ($history as $timestamp => $backup) {
-			if (!empty($backup['nonce']) && empty($backup['incremental_parent'])) {
-				$parent_timestamp = $timestamp;
-				break;
+			if (empty($backup['nonce']) || !empty($backup['incremental_parent'])) continue;
+			if (!empty($backup['imported'])) continue;
+			// The parent must contain file archives: a DB-only set has no base to
+			// layer changed files onto, and its timestamp would hide every change
+			// made between the last real file backup and that DB run.
+			$has_files = false;
+			foreach ($backup as $k => $v) {
+				if (!empty($v) && (in_array($k, array('plugins', 'themes', 'uploads', 'others', 'wpcore'), true) || strpos($k, 'extradir_') === 0)) {
+					$has_files = true;
+					break;
+				}
 			}
+			if (!$has_files) continue;
+			$parent_timestamp = $timestamp;
+			break;
 		}
 
 		if (!$parent_timestamp) {
@@ -1303,7 +1335,7 @@ class SiteGuard_Backup {
 		// Phase 3: Upload to remote storage
 		$upload_status = $this->jobdata_get('upload_phase_complete', false);
 		if (!$upload_status) {
-			$services = $this->jobdata_get('service', array('none'));
+			$services = (array) $this->jobdata_get('service', array('none'));
 			$has_remote = false;
 			foreach ($services as $svc) {
 				if ('none' !== $svc) {
@@ -1345,9 +1377,15 @@ class SiteGuard_Backup {
 			}
 		}
 
-		// Check for failed entities - mark backup as having errors
+		// Check for failed entities - mark backup as having errors. Files that had
+		// to be skipped (unzippable + too large for the PclZip fallback) count too:
+		// the archive is missing data and must not be reported as fully complete.
 		$failed_entities = $this->jobdata_get('failed_entities', array());
-		$has_entity_failures = !empty($failed_entities);
+		$skipped_files = $this->jobdata_get('zip_skipped_files', array());
+		$has_entity_failures = !empty($failed_entities) || !empty($skipped_files);
+		if (!empty($skipped_files)) {
+			$this->log(count($skipped_files) . " file(s) could not be added to any archive - see 'file skipped' errors above; backup will finish with warnings", 'warning');
+		}
 
 		// All phases complete
 		$this->backup_finish(true, true, false, $has_entity_failures);
@@ -1357,7 +1395,7 @@ class SiteGuard_Backup {
 	 * Upload backup files to remote storage.
 	 */
 	private function upload_to_remote() {
-		$services = $this->jobdata_get('service', array('none'));
+		$services = (array) $this->jobdata_get('service', array('none'));
 		$backup_array = $this->jobdata_get('backup_files_array', array());
 		$db_files = $this->jobdata_get('db_backup_files', array());
 		$all_files = array_values(array_unique(array_merge($backup_array, $db_files)));
@@ -1797,9 +1835,15 @@ class SiteGuard_Backup {
 		if ('incremental' === $job_type) {
 			$parent_timestamp = $this->jobdata_get('incremental_parent');
 			if ($parent_timestamp) {
-				SiteGuard_Backup_History::merge_incremental($parent_timestamp, $backup_data);
-				$this->log("Incremental merged into parent backup (timestamp: {$parent_timestamp})");
-				return;
+				$merged_ts = SiteGuard_Backup_History::merge_incremental($parent_timestamp, $backup_data);
+				if (false !== $merged_ts) {
+					$this->log("Incremental merged into parent backup (timestamp: {$parent_timestamp})");
+					return;
+				}
+				// Parent was pruned while this job ran: register the set standalone
+				// rather than leaving its zips on disk with no history entry.
+				$this->log("Parent backup {$parent_timestamp} no longer exists - registering incremental as a standalone set", 'warning');
+				unset($backup_data['incremental_parent']);
 			}
 		}
 

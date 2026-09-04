@@ -152,15 +152,27 @@ class SiteGuard_Backup_Method_Remotesend extends SiteGuard_Backup_Module {
 				// of burning the retry budget re-sending the same rejected offset.
 				if ($result->get_error_code() === 'out_of_sequence') {
 					$resync = $rpc->send_message($site, 'get_file_status', array('file' => $filename));
+					$resynced = false;
 					if (is_array($resync) && isset($resync['size'])) {
 						$new_offset = intval($resync['size']);
 						if ($new_offset >= 0 && $new_offset <= $filesize && $new_offset !== $offset) {
 							$sgbackup->log("Re-syncing offset from {$offset} to {$new_offset} after out-of-sequence");
 							$offset = $new_offset;
 							$errors = 0; // genuine progress signal, not a hard failure
+							$resynced = true;
 						}
 					}
-					continue; // Retry from the corrected offset
+					if (!$resynced) {
+						// Same offset (or resync failed): this counts against the retry
+						// budget and backs off, otherwise the loop spun with two RPCs per
+						// iteration until max_execution_time killed the job.
+						if ($errors > 5) {
+							fclose($fh);
+							return new WP_Error('too_many_errors', 'Too many out-of-sequence errors without progress');
+						}
+						sleep(min(10, 2 * $errors));
+					}
+					continue; // Retry from the (possibly corrected) offset
 				}
 
 				// Back off on rate limit errors to let the window reset

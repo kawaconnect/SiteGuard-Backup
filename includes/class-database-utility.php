@@ -24,10 +24,34 @@ class SiteGuard_Backup_Database_Utility {
 			$prefix = $wpdb->prefix;
 		}
 
-		$tables = $wpdb->get_col($wpdb->prepare("SHOW TABLES LIKE %s", $wpdb->esc_like($prefix) . '%'));
+		$tables = self::base_tables();
+		$tables = array_values(array_filter($tables, function($t) use ($prefix) {
+			return strpos($t, $prefix) === 0;
+		}));
 		if (empty($tables)) return array();
 
 		return self::sort_tables($tables);
+	}
+
+	/**
+	 * All BASE TABLEs in the current database (views excluded).
+	 *
+	 * SHOW TABLES lists views too. Dumping a view as a table produces a
+	 * DROP TABLE + CREATE VIEW pair that the atomic importer cannot stage, which
+	 * made every restore of a database containing a view fail. Views are dumped
+	 * separately by dump_views().
+	 */
+	public static function base_tables() {
+		global $wpdb;
+		$rows = $wpdb->get_results("SHOW FULL TABLES", ARRAY_N);
+		if (!is_array($rows) || empty($rows)) return array();
+		$out = array();
+		foreach ($rows as $r) {
+			if (!isset($r[0])) continue;
+			if (isset($r[1]) && strtoupper((string) $r[1]) !== 'BASE TABLE') continue;
+			$out[] = $r[0];
+		}
+		return $out;
 	}
 
 	/**
@@ -38,7 +62,7 @@ class SiteGuard_Backup_Database_Utility {
 	public static function get_all_tables() {
 		global $wpdb;
 
-		$tables = $wpdb->get_col("SHOW TABLES");
+		$tables = self::base_tables();
 		if (empty($tables)) return array();
 
 		return self::sort_tables($tables);
@@ -205,7 +229,7 @@ class SiteGuard_Backup_Database_Utility {
 			$charset = (defined('DB_CHARSET') && DB_CHARSET) ? DB_CHARSET : 'utf8mb4';
 			$stderr_file = $opts_file . '.err';
 			$cmd = sprintf(
-				'mysqldump --defaults-extra-file=%s --no-tablespaces --single-transaction --quick --skip-lock-tables --skip-add-locks --hex-blob --default-character-set=%s %s %s %s %s > %s 2>%s',
+				'mysqldump --defaults-extra-file=%s --no-tablespaces --single-transaction --quick --skip-lock-tables --skip-add-locks --skip-triggers --hex-blob --default-character-set=%s %s %s %s %s > %s 2>%s',
 				escapeshellarg($opts_file),
 				escapeshellarg($charset),
 				$port,
@@ -700,6 +724,12 @@ class SiteGuard_Backup_Database_Utility {
 					} else {
 						$skipping_table = false;
 					}
+				} elseif ($skipping_table && empty($buffer)
+					&& preg_match('/^(?:DROP\s+VIEW|CREATE\s+(?:OR\s+REPLACE\s+)?(?:ALGORITHM|DEFINER|SQL\s+SECURITY|VIEW|PROCEDURE|FUNCTION)|SET\s|DELIMITER\s|\/\*!)/i', $trimmed)) {
+					// A non-table statement (views/routines tail, SET) after a skipped
+					// table must run: the skip flag used to stay sticky and silently
+					// dropped every view/routine when wp_users sorted last.
+					$skipping_table = false;
 				}
 			}
 
@@ -932,17 +962,35 @@ class SiteGuard_Backup_Database_Utility {
 					}
 				}
 
-				// Rewrite table names to use temp prefix
-				if (preg_match('/^(DROP TABLE\s+IF\s+EXISTS\s+)`([^`]+)`/i', $query, $m)) {
+				// Rewrite table names to use temp prefix. Only the LEADING identifier is
+				// rewritten (never a blind str_replace over the whole statement, which
+				// rewrote row data that happened to quote a table name). Unbackticked
+				// identifiers are accepted too.
+				$ident = '`?([A-Za-z0-9_$]+)`?';
+				if (preg_match('/^(DROP\s+TABLE\s+(?:IF\s+EXISTS\s+)?)' . $ident . '/i', $query, $m)) {
 					$original = $m[2];
 					$temp = $make_temp($original);
 					$tables_created[$original] = $temp;
 					$query = $m[1] . '`' . $temp . '`';
-				} elseif (preg_match('/^(CREATE TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?)`([^`]+)`/i', $query, $m)) {
+				} elseif (preg_match('/^(CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?)' . $ident . '/i', $query, $m)) {
 					$original = $m[2];
 					$temp = $make_temp($original);
 					$tables_created[$original] = $temp;
-					$query = str_replace('`' . $original . '`', '`' . $temp . '`', $query);
+					$query = $m[1] . '`' . $temp . '`' . substr($query, strlen($m[0]));
+					// Foreign keys: InnoDB requires constraint names to be unique per
+					// schema even with FOREIGN_KEY_CHECKS=0, so a named constraint on the
+					// staged copy collides with the live table's and fails the whole
+					// restore. Drop the label (InnoDB auto-names) and point REFERENCES
+					// at the staged parent so the swap keeps the relationship intact.
+					if (stripos($query, 'FOREIGN KEY') !== false) {
+						$query = preg_replace('/CONSTRAINT\s+`[^`]+`\s+FOREIGN\s+KEY/i', 'FOREIGN KEY', $query);
+						$query = preg_replace_callback('/(REFERENCES\s+)`([^`]+)`/i', function($rm) use (&$tables_created, $make_temp) {
+							if (!isset($tables_created[$rm[2]])) {
+								$tables_created[$rm[2]] = $make_temp($rm[2]);
+							}
+							return $rm[1] . '`' . $tables_created[$rm[2]] . '`';
+						}, $query);
+					}
 					// Engine compatibility
 					if (preg_match('/ENGINE\s*=\s*(\w+)/i', $query, $eng_m)) {
 						if (!isset($supported_engines[strtolower($eng_m[1])])) {
@@ -950,10 +998,16 @@ class SiteGuard_Backup_Database_Utility {
 							$query = preg_replace('/ENGINE\s*=\s*\w+/i', 'ENGINE=' . $fb_eng, $query);
 						}
 					}
-				} elseif (preg_match('/^(INSERT\s+INTO\s+)`([^`]+)`/i', $query, $m)) {
+				} elseif (preg_match('/^((?:INSERT(?:\s+IGNORE)?|REPLACE)\s+INTO\s+)' . $ident . '/i', $query, $m)
+					|| preg_match('/^(TRUNCATE\s+(?:TABLE\s+)?|ALTER\s+TABLE\s+|DELETE\s+FROM\s+|UPDATE\s+)' . $ident . '/i', $query, $m)) {
 					$original = $m[2];
 					if (isset($tables_created[$original])) {
-						$query = str_replace('`' . $original . '`', '`' . $tables_created[$original] . '`', $query);
+						$query = $m[1] . '`' . $tables_created[$original] . '`' . substr($query, strlen($m[0]));
+					} else {
+						// No staged copy for this table: executing it would hit the LIVE
+						// table while the (empty) staged one is later swapped over it.
+						$result['errors'][] = "Statement on line {$line_count} targets `{$original}` which has no CREATE TABLE in this dump - refusing to run it against the live table";
+						continue;
 					}
 				}
 
@@ -993,6 +1047,7 @@ class SiteGuard_Backup_Database_Utility {
 					}
 				}
 
+				if (!empty($wpdb->queries)) $wpdb->queries = array(); // SAVEQUERIES would pin every INSERT in RAM
 				$res = $wpdb->query($query);
 				if (false === $res) {
 					$result['errors'][] = "SQL error on line {$line_count}: " . $wpdb->last_error;
@@ -1411,6 +1466,13 @@ class SiteGuard_Backup_Database_Utility {
 		if (preg_match('/^\s*(?:INSERT|REPLACE)\b/i', $query)) {
 			return false;
 		}
+		// Likewise CREATE/ALTER TABLE: column comments and defaults are free text
+		// ("used to load data into cache") and a table definition cannot contain a
+		// file or privilege operation. Matching them here dropped the live table's
+		// replacement and failed atomic restores.
+		if (preg_match('/^\s*(?:CREATE|ALTER)\s+TABLE\b/i', $query)) {
+			return false;
+		}
 
 		$dangerous_patterns = array(
 			'/^\s*GRANT\s/i',
@@ -1426,9 +1488,9 @@ class SiteGuard_Backup_Database_Utility {
 			'/\bLOAD\s+DATA\b/i',
 			'/^\s*SOURCE\s/i',
 			'/^\s*SYSTEM\s/i',
-			'/^\s*CREATE\s+TRIGGER\b/i',
-			'/^\s*CREATE\s+EVENT\b/i',
-			'/\bSET\s+GLOBAL\b/i',
+			// mysqldump emits CREATE DEFINER=`u`@`h` TRIGGER …; also OR REPLACE forms
+			'/^\s*CREATE\s+(?:OR\s+REPLACE\s+)?(?:DEFINER\s*=\s*\S+(?:\s*@\s*\S+)?\s+)?(?:TRIGGER|EVENT)\b/i',
+			'/\bSET\s+(?:@@)?(?:GLOBAL|PERSIST(?:_ONLY)?)\b/i',
 			'/^\s*CALL\s/i',
 			'/^\s*EXECUTE\s/i',
 		);
@@ -1506,6 +1568,7 @@ class SiteGuard_Backup_Database_Utility {
 		$string_char = '';
 		$current_table = '';
 		$skipping_table = false;
+		$skipped_foreign = array();
 
 		// max_allowed_packet for splitting oversized INSERT statements
 		$max_packet = 16777216;
@@ -1529,14 +1592,24 @@ class SiteGuard_Backup_Database_Utility {
 				if (empty($buffer) && (0 === strpos($trimmed, '--') || 0 === strpos($trimmed, '#') || 0 === strpos($trimmed, '/*'))) continue;
 				if (preg_match('/^(LOCK\s+TABLES|UNLOCK\s+TABLES)/i', $trimmed)) continue;
 
-				// Track current table and decide whether to skip
+				// Track current table and decide whether to skip. ONLY tables under the
+				// source prefix may be imported: a full-network dump fed to a subsite
+				// import used to run its wp_options / wp_blogs / other-subsite
+				// statements verbatim against the live network.
 				if (preg_match('/^(?:DROP TABLE|CREATE TABLE)\s+(?:IF\s+(?:NOT\s+)?EXISTS\s+)?`([^`]+)`/i', $trimmed, $m)) {
 					$current_table = $m[1];
-					$skipping_table = in_array($current_table, $skip_tables);
-				}
-				if (preg_match('/^INSERT\s+INTO\s+`([^`]+)`/i', $trimmed, $m)) {
+					$skipping_table = in_array($current_table, $skip_tables) || strpos($current_table, $source_prefix) !== 0;
+					if ($skipping_table && !in_array($current_table, $skip_tables) && !isset($skipped_foreign[$current_table])) {
+						$skipped_foreign[$current_table] = true;
+					}
+				} elseif (preg_match('/^INSERT\s+INTO\s+`([^`]+)`/i', $trimmed, $m)) {
 					$current_table = $m[1];
-					$skipping_table = in_array($current_table, $skip_tables);
+					$skipping_table = in_array($current_table, $skip_tables) || strpos($current_table, $source_prefix) !== 0;
+				} elseif (empty($buffer) && preg_match('/^(?:DROP\s+VIEW|CREATE\s+(?:OR\s+REPLACE\s+)?(?:ALGORITHM|DEFINER|SQL\s+SECURITY|VIEW|PROCEDURE|FUNCTION|TRIGGER|EVENT)|DELIMITER\s|ALTER\s|TRUNCATE\s|DELETE\s|UPDATE\s|REPLACE\s|INSERT\s+IGNORE)/i', $trimmed)) {
+					// Views/routines/other DML belong to the source network, not this one.
+					$skipping_table = true;
+				} elseif (empty($buffer) && preg_match('/^(?:SET\s|\/\*!)/i', $trimmed)) {
+					$skipping_table = false; // session settings are harmless and needed
 				}
 			}
 
@@ -1597,7 +1670,7 @@ class SiteGuard_Backup_Database_Utility {
 				}
 
 				$dbh_before = $wpdb->dbh;
-				$wpdb->check_connection();
+				$wpdb->check_connection(false);
 				if ($wpdb->dbh !== $dbh_before) self::apply_import_session_state();
 
 				// Split oversized INSERTs at row boundaries to stay under
@@ -1640,7 +1713,7 @@ class SiteGuard_Backup_Database_Utility {
 				$query = self::remap_leading_table_prefix($query, $source_prefix, $target_prefix);
 				if (!self::is_dangerous_sql($query)) {
 					$dbh_before = $wpdb->dbh;
-					$wpdb->check_connection();
+					$wpdb->check_connection(false);
 					if ($wpdb->dbh !== $dbh_before) self::apply_import_session_state();
 					$res = $wpdb->query($query);
 					if (false === $res) {
@@ -1652,6 +1725,11 @@ class SiteGuard_Backup_Database_Utility {
 
 		$wpdb->query('SET FOREIGN_KEY_CHECKS = 1');
 		$is_gz ? @gzclose($fh) : @fclose($fh);
+
+		if (!empty($skipped_foreign)) {
+			$result['skipped_tables'] = array_keys($skipped_foreign);
+			error_log('SiteGuard Backup: subsite import skipped ' . count($skipped_foreign) . ' table(s) outside prefix ' . $source_prefix . ': ' . implode(', ', array_slice(array_keys($skipped_foreign), 0, 15)));
+		}
 
 		if (!empty($result['errors'])) {
 			$result['success'] = false;
@@ -1805,7 +1883,7 @@ class SiteGuard_Backup_Database_Utility {
 				}
 
 				$dbh_before = $wpdb->dbh;
-				$wpdb->check_connection();
+				$wpdb->check_connection(false);
 				if ($wpdb->dbh !== $dbh_before) self::apply_import_session_state();
 
 				// Split oversized INSERTs at row boundaries to stay under
@@ -1851,7 +1929,7 @@ class SiteGuard_Backup_Database_Utility {
 				}
 				if (!self::is_dangerous_sql($query)) {
 					$dbh_before = $wpdb->dbh;
-					$wpdb->check_connection();
+					$wpdb->check_connection(false);
 					if ($wpdb->dbh !== $dbh_before) self::apply_import_session_state();
 					$res = $wpdb->query($query);
 					if (false === $res) {

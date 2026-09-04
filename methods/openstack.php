@@ -566,7 +566,10 @@ class SiteGuard_Backup_Method_Openstack extends SiteGuard_Backup_Module {
 			'filename' => $dest_path,
 		));
 
-		if (is_wp_error($response)) return $response;
+		if (is_wp_error($response)) {
+			@unlink($dest_path); // a transport error mid-stream leaves a truncated file
+			return $response;
+		}
 
 		$code = wp_remote_retrieve_response_code($response);
 		if ($code < 200 || $code >= 300) {
@@ -594,17 +597,34 @@ class SiteGuard_Backup_Method_Openstack extends SiteGuard_Backup_Module {
 			$object_name = $this->get_object_path($file);
 			$url = $auth['storage_url'] . '/' . rawurlencode($options['container']) . '/' . $this->encode_object_path($object_name);
 
-			// Delete with multipart-manifest=delete to clean up SLO segments too
-			$response = $this->swift_request('DELETE', $url . '?multipart-manifest=delete', array(
-				'timeout' => 60,
-			));
+			// Only Static Large Objects take ?multipart-manifest=delete (which is a
+			// bulk delete answering HTTP 200 with a status body). Sending it for a
+			// plain object returns 200 + "Not an SLO manifest" and deletes nothing,
+			// and requiring 204 rejected every successful manifest delete - so
+			// retention never removed anything from Swift.
+			$head = $this->swift_request('HEAD', $url, array('timeout' => 30));
+			if (is_wp_error($head)) return $head;
+			$head_code = wp_remote_retrieve_response_code($head);
+			if ($head_code === 404) continue; // already gone
+			$is_slo = (strtolower((string) wp_remote_retrieve_header($head, 'x-static-large-object')) === 'true');
 
-			if (is_wp_error($response)) return $response;
-
-			$code = wp_remote_retrieve_response_code($response);
-			// 204 = deleted, 404 = already gone (both acceptable)
-			if ($code !== 204 && $code !== 404) {
-				return new WP_Error('delete_failed', 'Swift delete failed with HTTP ' . $code . ' for ' . $file);
+			if ($is_slo) {
+				$response = $this->swift_request('DELETE', $url . '?multipart-manifest=delete', array('timeout' => 120));
+				if (is_wp_error($response)) return $response;
+				$code = wp_remote_retrieve_response_code($response);
+				$body = (string) wp_remote_retrieve_body($response);
+				$ok = ($code === 204 || $code === 404
+					|| ($code === 200 && (preg_match('/Response Status:\s*2\d\d/i', $body) || stripos($body, '"Response Status": "2') !== false)));
+				if (!$ok) {
+					return new WP_Error('delete_failed', 'Swift SLO delete failed with HTTP ' . $code . ' for ' . $file . ': ' . substr($body, 0, 200));
+				}
+			} else {
+				$response = $this->swift_request('DELETE', $url, array('timeout' => 60));
+				if (is_wp_error($response)) return $response;
+				$code = wp_remote_retrieve_response_code($response);
+				if ($code !== 204 && $code !== 404 && $code !== 200) {
+					return new WP_Error('delete_failed', 'Swift delete failed with HTTP ' . $code . ' for ' . $file);
+				}
 			}
 		}
 
@@ -622,34 +642,43 @@ class SiteGuard_Backup_Method_Openstack extends SiteGuard_Backup_Module {
 
 		$options = $this->get_options();
 		$prefix = !empty($options['path']) ? trim($options['path'], '/') . '/' : '';
-		$url = $auth['storage_url'] . '/' . rawurlencode($options['container']) . '?format=json';
-
+		$base_url = $auth['storage_url'] . '/' . rawurlencode($options['container']) . '?format=json';
 		if (!empty($prefix)) {
-			$url .= '&prefix=' . rawurlencode($prefix);
+			$base_url .= '&prefix=' . rawurlencode($prefix);
 		}
-
-		$response = $this->swift_request('GET', $url, array('timeout' => 30));
-		if (is_wp_error($response)) return array();
-
-		$code = wp_remote_retrieve_response_code($response);
-		if ($code < 200 || $code >= 300) return array();
-
-		$body = wp_remote_retrieve_body($response);
-		$items = json_decode($body, true);
-		if (!is_array($items)) return array();
 
 		$files = array();
-		foreach ($items as $item) {
-			if (!isset($item['name'])) continue;
-			// Strip prefix to return just the filename
-			$name = $item['name'];
-			if (!empty($prefix) && 0 === strpos($name, $prefix)) {
-				$name = substr($name, strlen($prefix));
-			}
-			if (!empty($name)) {
+		$marker = '';
+		$pages = 0;
+		do {
+			$url = $base_url . ($marker !== '' ? '&marker=' . rawurlencode($marker) : '');
+			$response = $this->swift_request('GET', $url, array('timeout' => 30));
+			if (is_wp_error($response)) return $files;
+
+			$code = wp_remote_retrieve_response_code($response);
+			if ($code < 200 || $code >= 300) return $files;
+
+			$items = json_decode(wp_remote_retrieve_body($response), true);
+			if (!is_array($items) || empty($items)) break;
+
+			$last_name = '';
+			foreach ($items as $item) {
+				if (!isset($item['name'])) continue;
+				$last_name = $item['name'];
+				// Strip prefix to return just the filename
+				$name = $item['name'];
+				if (!empty($prefix) && 0 === strpos($name, $prefix)) {
+					$name = substr($name, strlen($prefix));
+				}
+				// SLO segments live at <object>/slo/<n> under the same prefix; they are
+				// not backup files (remote rescan used to import them as such).
+				if ($name === '' || strpos($name, '/') !== false) continue;
 				$files[] = $name;
 			}
-		}
+			// Swift pages at 10,000 objects; follow with marker=<last name>.
+			$marker = (count($items) >= 10000 && $last_name !== '') ? $last_name : '';
+			$pages++;
+		} while ($marker !== '' && $pages < 100);
 
 		return $files;
 	}

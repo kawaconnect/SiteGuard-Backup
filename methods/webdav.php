@@ -179,7 +179,10 @@ class SiteGuard_Backup_Method_Webdav extends SiteGuard_Backup_Module {
             'filename' => $local_path,
         ));
 
-        if (is_wp_error($response)) return $response;
+        if (is_wp_error($response)) {
+            @unlink($local_path); // a transport error mid-stream leaves a truncated file
+            return $response;
+        }
 
         $code = wp_remote_retrieve_response_code($response);
         if ($code >= 400) {

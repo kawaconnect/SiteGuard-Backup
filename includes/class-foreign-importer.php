@@ -129,8 +129,9 @@ class SiteGuard_Backup_Foreign_Importer {
 			$entity = 'others'; // Mixed: contains both files and DB
 		}
 
-		// For pure SQL files, use the db entity
-		if (in_array($ext, array('sql', 'gz'), true)) {
+		// For pure SQL files, use the db entity (x.tar.gz reports ext 'gz' - it's a files archive)
+		$is_targz = (strlen($filename) > 7 && substr(strtolower($filename), -7) === '.tar.gz');
+		if (in_array($ext, array('sql', 'gz'), true) && !$is_targz) {
 			$entity = 'db';
 		}
 
@@ -433,7 +434,8 @@ class SiteGuard_Backup_Foreign_Importer {
 			'timestamp' => filemtime($filepath),
 		);
 
-		if (in_array($ext, array('sql', 'gz'), true)) {
+		$is_targz = (strlen($filename) > 7 && substr(strtolower($filename), -7) === '.tar.gz');
+		if (in_array($ext, array('sql', 'gz'), true) && !$is_targz) {
 			$result['entities'] = array('db');
 			return $result;
 		}
@@ -506,8 +508,8 @@ class SiteGuard_Backup_Foreign_Importer {
 		$filename = basename($filepath);
 		$ext = strtolower(pathinfo($filename, PATHINFO_EXTENSION));
 
-		// SQL files are always DB
-		if (in_array($ext, array('sql', 'gz'), true)) {
+		// SQL files are always DB (but a .tar.gz is a files archive, not a dump)
+		if (in_array($ext, array('sql', 'gz'), true) && !(strlen($filename) > 7 && substr(strtolower($filename), -7) === '.tar.gz')) {
 			return 'db';
 		}
 

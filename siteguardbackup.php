@@ -2,7 +2,7 @@
 /**
  * Plugin Name: SiteGuard Backup
  * Description: Complete WordPress backup, restore, and migration solution with scheduled, incremental, and site-to-site migration support.
- * Version: 1.4.15
+ * Version: 1.4.16
  * Author: KawaConnect LLC
  * License: GPL-2.0-or-later
  * Requires at least: 5.6
@@ -13,7 +13,7 @@
 if (!defined('ABSPATH')) die('No direct access.');
 
 // Core constants
-define('SGBACKUP_VERSION', '1.4.15');
+define('SGBACKUP_VERSION', '1.4.16');
 define('SGBACKUP_DIR', plugin_dir_path(__FILE__));
 define('SGBACKUP_URL', plugin_dir_url(__FILE__));
 define('SGBACKUP_PLUGIN_SLUG', plugin_basename(__FILE__));
@@ -274,6 +274,9 @@ function sgbackup_cron_health_check() {
  * WordPress cron events can silently disappear (plugin updates, DB issues, etc).
  */
 function sgbackup_ensure_health_cron() {
+	if ( ! sgbackup_should_load() ) {
+		return; // never load the full class set on anonymous front-end views
+	}
 	sgbackup_load_classes();
 	$opts = SiteGuard_Backup_Options::instance();
 	if ( ! $opts->get_option( 'sgbackup_health_enabled', false ) ) {
@@ -283,6 +286,10 @@ function sgbackup_ensure_health_cron() {
 		return; // Already scheduled, nothing to do
 	}
 	$interval = $opts->get_option( 'sgbackup_health_interval', 'every10min' );
+	$schedules = wp_get_schedules();
+	if ( ! isset( $schedules[ $interval ] ) ) {
+		$interval = 'every10min'; // unknown recurrence would fail (and retry) on every request
+	}
 	wp_schedule_event( time() + 60, $interval, 'sgbackup_health_check' );
 	if ( function_exists( 'sgbackup_health_log' ) ) {
 		sgbackup_health_log( 'Re-registered missing health check cron (interval: ' . $interval . ')' );

@@ -265,16 +265,53 @@ class SiteGuard_Backup_Security {
 	 * @return string Client IP address.
 	 */
 	public static function get_client_ip() {
-		// Cloudflare: CF-Connecting-IP is the original client IP
-		if (!empty($_SERVER['HTTP_CF_CONNECTING_IP'])) {
-			return sanitize_text_field($_SERVER['HTTP_CF_CONNECTING_IP']);
+		$remote = !empty($_SERVER['REMOTE_ADDR']) ? sanitize_text_field($_SERVER['REMOTE_ADDR']) : '';
+
+		// CF-Connecting-IP is only meaningful when the TCP peer actually is a
+		// proxy we trust (a Cloudflare edge, or a local reverse proxy on a
+		// loopback/private address). Honouring it unconditionally let any client
+		// pick its own "IP" and walk straight past the allowlist and the rate
+		// limiters. When the peer is a public non-Cloudflare address, the header
+		// is attacker-supplied and is ignored.
+		if (!empty($_SERVER['HTTP_CF_CONNECTING_IP']) && $remote !== '' && self::is_trusted_proxy($remote)) {
+			$cf = sanitize_text_field($_SERVER['HTTP_CF_CONNECTING_IP']);
+			if (filter_var($cf, FILTER_VALIDATE_IP)) {
+				return $cf;
+			}
 		}
 
-		if (!empty($_SERVER['REMOTE_ADDR'])) {
-			return sanitize_text_field($_SERVER['REMOTE_ADDR']);
-		}
+		return $remote;
+	}
 
-		return '';
+	/**
+	 * Is $ip a proxy whose forwarded-client headers we accept?
+	 *
+	 * Cloudflare's published ranges plus loopback/RFC1918/link-local (a reverse
+	 * proxy or container gateway in front of PHP). Extend via the
+	 * sgbackup_trusted_proxy_cidrs filter.
+	 */
+	public static function is_trusted_proxy($ip) {
+		static $cidrs = null;
+		if (null === $cidrs) {
+			$cidrs = array(
+				// Loopback / private / link-local: a local reverse proxy
+				'127.0.0.0/8', '10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16', '169.254.0.0/16',
+				'::1/128', 'fc00::/7', 'fe80::/10',
+				// Cloudflare IPv4 (https://www.cloudflare.com/ips-v4)
+				'173.245.48.0/20', '103.21.244.0/22', '103.22.200.0/22', '103.31.4.0/22',
+				'141.101.64.0/18', '108.162.192.0/18', '190.93.240.0/20', '188.114.96.0/20',
+				'197.234.240.0/22', '198.41.128.0/17', '162.158.0.0/15', '104.16.0.0/13',
+				'104.24.0.0/14', '172.64.0.0/13', '131.0.72.0/22',
+				// Cloudflare IPv6 (https://www.cloudflare.com/ips-v6)
+				'2400:cb00::/32', '2606:4700::/32', '2803:f800::/32', '2405:b500::/32',
+				'2405:8100::/32', '2a06:98c0::/29', '2c0f:f248::/32',
+			);
+			$cidrs = (array) apply_filters('sgbackup_trusted_proxy_cidrs', $cidrs);
+		}
+		foreach ($cidrs as $cidr) {
+			if (self::ip_in_cidr($ip, $cidr)) return true;
+		}
+		return false;
 	}
 
 	/**

@@ -77,9 +77,17 @@ class SiteGuard_Backup_Semaphore {
 			$now
 		));
 
-		// Clear cache and verify we actually hold the lock
+		// Verify we actually hold the lock. Read the row directly: get_option()
+		// consults the 'notoptions' cache, which a previous miss (is_free() from
+		// CLI, or a persistent object cache) can poison - the raw INSERT above
+		// never clears it, so a successfully written lock read back as "absent".
 		wp_cache_delete($option_name, 'options');
-		$check = get_option($option_name);
+		$check = $wpdb->get_var($wpdb->prepare("SELECT {$value_col} FROM {$table} WHERE {$name_col} = %s", $option_name));
+		$notoptions = wp_cache_get('notoptions', 'options');
+		if (is_array($notoptions) && isset($notoptions[$option_name])) {
+			unset($notoptions[$option_name]);
+			wp_cache_set('notoptions', $notoptions, 'options');
+		}
 
 		// Parse pipe-delimited format: lock_value is the FIRST field (works for
 		// both value|timestamp and value|timestamp|timeout layouts).
@@ -145,7 +153,9 @@ class SiteGuard_Backup_Semaphore {
 	 * @return bool True if the lock is free.
 	 */
 	public function is_free() {
-		$check = get_option($this->lock_name);
+		global $wpdb;
+		// Direct read: see lock() for why get_option() is unreliable here.
+		$check = $wpdb->get_var($wpdb->prepare("SELECT option_value FROM {$wpdb->options} WHERE option_name = %s", $this->lock_name));
 		if (empty($check)) return true;
 		if (!is_string($check) || strpos($check, '|') === false) return true;
 		// Parse pipe-delimited format: lock_value|timestamp[|timeout]
@@ -163,5 +173,48 @@ class SiteGuard_Backup_Semaphore {
 		if ($this->locked) {
 			$this->unlock();
 		}
+	}
+
+	/**
+	 * Enumerate every lock this plugin can hold, with age and expiry state.
+	 *
+	 * @return array name => ['held_since' => ts, 'timeout' => s, 'expired' => bool]
+	 */
+	public static function list_locks() {
+		global $wpdb;
+		$rows = $wpdb->get_results($wpdb->prepare(
+			"SELECT option_name, option_value FROM {$wpdb->options}
+			 WHERE option_name LIKE %s OR option_name IN ('sgbackup_boot', 'sgbackup_history', 'sgbackup_restore', 'sgbackup_lock')",
+			$wpdb->esc_like('sgbackup_sem_') . '%'
+		), ARRAY_A);
+		$out = array();
+		if (!is_array($rows)) return $out;
+		foreach ($rows as $r) {
+			$v = (string) $r['option_value'];
+			if (strpos($v, '|') === false) continue;
+			$parts = explode('|', $v);
+			$ts = isset($parts[1]) ? (int) $parts[1] : 0;
+			$timeout = isset($parts[2]) ? (int) $parts[2] : 900;
+			if ($timeout <= 0) $timeout = 900;
+			$out[$r['option_name']] = array(
+				'held_since' => $ts,
+				'timeout'    => $timeout,
+				'expired'    => ($ts <= 0) || (time() - $ts) > $timeout,
+			);
+		}
+		return $out;
+	}
+
+	/**
+	 * Force-release every lock (all names). Returns the number removed.
+	 */
+	public static function clear_all_locks() {
+		$count = 0;
+		foreach (array_keys(self::list_locks()) as $name) {
+			$sem = new self($name);
+			$sem->force_unlock();
+			$count++;
+		}
+		return $count;
 	}
 }

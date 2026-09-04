@@ -91,12 +91,17 @@ class SiteGuard_Backup_Search_Replace {
 			return $this->report;
 		}
 
-		// Load resume cursor: the set of tables already fully processed.
+		// Load resume cursor: the set of tables already fully processed, plus the
+		// row position inside the table that was interrupted mid-way.
 		$completed = array();
+		$partial = null;
 		if ($options['resume']) {
 			$saved = get_option($options['progress_key']);
 			if (is_array($saved) && !empty($saved['completed_tables']) && is_array($saved['completed_tables'])) {
 				$completed = array_flip($saved['completed_tables']);
+			}
+			if (is_array($saved) && !empty($saved['partial']) && is_array($saved['partial'])) {
+				$partial = $saved['partial'];
 			}
 		}
 		$done_tables = count($completed);
@@ -114,18 +119,23 @@ class SiteGuard_Backup_Search_Replace {
 				return $this->report;
 			}
 
-			// process_table returns false if it hit the deadline mid-table. That table
-			// is NOT marked complete, so a resumed pass restarts it from the top -
-			// which is safe because search-replace is idempotent (already-rewritten
-			// rows no longer contain the search needle and are skipped on the fast path).
-			$finished = $this->process_table($table, $search, $replace, $options['deadline']);
+			// process_table returns false if it hit the deadline mid-table. The row
+			// cursor it reached is persisted so the resumed pass continues from that
+			// row instead of restarting the table: re-processing rows is NOT
+			// idempotent when a replacement contains its own search string
+			// (example.com -> example.com.au, https://x -> https://x/wp), and a table
+			// whose scan alone outlives the budget would otherwise never finish.
+			$cursor = ($partial && isset($partial['table']) && $partial['table'] === $table) ? $partial : null;
+			$this->partial_cursor = null;
+			$finished = $this->process_table($table, $search, $replace, $options['deadline'], $cursor);
 
 			if (!$finished) {
 				$this->report['status'] = 'incomplete';
 				$this->report['next_table'] = $table;
-				$this->persist_progress($options['progress_key'], $completed);
+				$this->persist_progress($options['progress_key'], $completed, $this->partial_cursor);
 				return $this->report;
 			}
+			$partial = null;
 
 			$completed[$table] = true;
 			$this->report['completed_tables'][] = $table;
@@ -162,13 +172,17 @@ class SiteGuard_Backup_Search_Replace {
 	 * Persist the resume cursor (set of completed tables) so an interrupted
 	 * search-replace can be resumed on the next scheduled run.
 	 */
-	private function persist_progress($key, $completed) {
+	private function persist_progress($key, $completed, $partial = null) {
 		if ($this->dry_run) return;
 		update_option($key, array(
 			'completed_tables' => array_keys($completed),
+			'partial'          => $partial,
 			'updated'          => time(),
 		), false);
 	}
+
+	/** @var array|null Row position reached when process_table() stopped at the deadline */
+	private $partial_cursor = null;
 
 	/**
 	 * Clear the persisted resume cursor after a fully-completed pass.
@@ -188,7 +202,7 @@ class SiteGuard_Backup_Search_Replace {
 	 * @return bool True if the whole table was processed, false if it stopped early
 	 *              due to the deadline (table NOT complete - safe to restart).
 	 */
-	private function process_table($table, $search, $replace, $deadline = null) {
+	private function process_table($table, $search, $replace, $deadline = null, $cursor = null) {
 		global $wpdb;
 
 		// Sanitize table name and escape backticks for SQL interpolation
@@ -252,6 +266,16 @@ class SiteGuard_Backup_Search_Replace {
 		$last_pk = null;
 		$esc_single = ($single_pk !== null) ? str_replace('`', '``', $single_pk) : '';
 
+		// Resume inside this table from the persisted row cursor.
+		if (is_array($cursor)) {
+			if ($single_pk !== null && array_key_exists('last_pk', $cursor) && $cursor['last_pk'] !== null) {
+				$have_last = true;
+				$last_pk = $cursor['last_pk'];
+			} elseif ($single_pk === null && !empty($cursor['offset'])) {
+				$offset = (int) $cursor['offset'];
+			}
+		}
+
 		while (true) {
 			if ($single_pk !== null) {
 				// Keyset pagination on the single-column PK: stable and O(n).
@@ -299,8 +323,14 @@ class SiteGuard_Backup_Search_Replace {
 				SiteGuard_Backup_Job_Scheduler::record_still_alive();
 			}
 
-			// Deadline check between pages - bail without marking the table complete.
+			// Deadline check between pages - bail without marking the table complete,
+			// recording where to pick up.
 			if ($deadline !== null && time() >= $deadline) {
+				$this->partial_cursor = array(
+					'table'   => $table,
+					'last_pk' => ($single_pk !== null) ? $last_pk : null,
+					'offset'  => ($single_pk === null) ? $offset : 0,
+				);
 				return false;
 			}
 
@@ -349,6 +379,17 @@ class SiteGuard_Backup_Search_Replace {
 		// so the guid skip misfired (L4). Match the 'posts' suffix directly.
 		$is_posts_table = (bool) preg_match('/(^|_)posts$/', $table);
 		$pk_lookup = array_flip($pk_cols);
+
+		// Never rewrite this plugin's own rows in an options table: the persisted
+		// search-replace checkpoint/cursor and restore progress live there, and
+		// rewriting the checkpoint's search strings turned every resumed pair into
+		// a new->new no-op (leaving the rest of the DB with old URLs).
+		if (preg_match('/(^|_)(options|sitemeta)$/', $table)) {
+			$name_col = isset($row['option_name']) ? $row['option_name'] : (isset($row['meta_key']) ? $row['meta_key'] : '');
+			if (is_string($name_col) && preg_match('/^(?:_site_)?(?:_transient_(?:timeout_)?)?sgbackup_/', $name_col)) {
+				return;
+			}
+		}
 
 		foreach ($col_names as $col) {
 			// Binary/blob columns are not fetched (process_table omits them), so they

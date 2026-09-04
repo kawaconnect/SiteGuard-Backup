@@ -12,9 +12,11 @@
 
 		// HTML escape utility to prevent XSS
 		esc: function(str) {
+			// textContent->innerHTML escapes & < > only; this helper is also used
+			// inside value="..." / data-*="..." so quotes must be escaped as well.
 			var div = document.createElement('div');
-			div.textContent = str;
-			return div.innerHTML;
+			div.textContent = (str === null || str === undefined) ? '' : String(str);
+			return div.innerHTML.replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 		},
 
 		/**
@@ -148,6 +150,7 @@
 		bindTabs: function() {
 			// Restore active tab from URL hash on page load
 			var hash = window.location.hash.replace('#', '');
+			if (!/^[a-z0-9_-]+$/i.test(hash)) hash = ''; // a crafted hash would throw inside the selector and abort init()
 			if (hash) {
 				var $tab = $('.sgbackup-tabs .nav-tab[data-tab="' + hash + '"]');
 				if ($tab.length) {
@@ -612,11 +615,13 @@
 			var self = this;
 			$.get(window.location.href, function(responseHtml) {
 				var $newPage = $(responseHtml);
-				var $newTable = $newPage.find('.sgbackup-backups-table').closest('#tab-backup-restore');
-				if ($newTable.length) {
-					$('#tab-backup-restore').html($newTable.html());
-					self.bindMassActions();
-					self.bindPagination();
+				var $newList = $newPage.find('#sgbackup-existing-backups');
+				if ($newList.length) {
+					// Replace only the list: replacing the whole tab dropped the direct
+					// handlers on Backup Now / Upload / Rescan and re-added the
+					// document-delegated mass-action handlers on every refresh
+					// (N confirm dialogs after N backups).
+					$('#sgbackup-existing-backups').html($newList.html());
 				}
 				setTimeout(function() { $('#sgbackup-backup-status').text('').removeClass('success error'); }, 3000);
 			}).fail(function() {
@@ -1332,8 +1337,8 @@
 					html += '</td></tr>';
 
 					// HTTPS/HTTP transition warning
-					var oldScheme = data.old_siteurl.split('://')[0];
-					var newScheme = data.current_siteurl.split('://')[0];
+					var oldScheme = String(data.old_siteurl || '').split('://')[0];
+					var newScheme = String(data.current_siteurl || '').split('://')[0];
 					if (oldScheme !== newScheme) {
 						if (oldScheme === 'http' && newScheme === 'https') {
 							warnings.push('Protocol change detected: HTTP to HTTPS. Mixed content issues may occur after restore.');
@@ -1341,7 +1346,7 @@
 							warnings.push('Security downgrade: HTTPS to HTTP. Data will be transmitted unencrypted.');
 						}
 						var keepChecked = sgbackup_settings.default_keep_protocol ? ' checked' : '';
-						warnings.push('<label><input type="checkbox" id="sgbackup-keep-protocol" value="1"' + keepChecked + ' /> Keep original protocol (' + oldScheme.toUpperCase() + ') - do not convert URLs to ' + newScheme.toUpperCase() + '</label>');
+						warnings.push('<label><input type="checkbox" id="sgbackup-keep-protocol" value="1"' + keepChecked + ' /> Keep original protocol (' + SGB.esc(oldScheme.toUpperCase()) + ') - do not convert URLs to ' + SGB.esc(newScheme.toUpperCase()) + '</label>');
 					}
 
 					// Multisite blog mapping
@@ -1770,18 +1775,37 @@
 			xhr.open('POST', sgbackup_settings.ajax_url, true);
 			xhr.timeout = 0; // restore streams for a long time; rely on onerror/status
 			var lastIndex = 0;
+			// Line buffer: an RINFO line split across two onprogress chunks used to be
+			// dropped (no prefix / truncated JSON). If that line was the terminal
+			// 'complete', the client then ran the "connection lost" recovery on a
+			// restore that had in fact succeeded.
+			var lineBuf = '';
+			var feed = function(data, flush) {
+				lineBuf += data;
+				var cut = lineBuf.lastIndexOf('\n');
+				if (cut >= 0) {
+					self._renderRestoreChunk(lineBuf.substring(0, cut + 1));
+					lineBuf = lineBuf.substring(cut + 1);
+				}
+				if (flush && lineBuf.length) {
+					self._renderRestoreChunk(lineBuf);
+					lineBuf = '';
+				}
+			};
 
 			xhr.onprogress = function() {
 				var newData = xhr.responseText.substring(lastIndex);
 				lastIndex = xhr.responseText.length;
-				self._renderRestoreChunk(newData);
+				feed(newData, false);
 			};
 
 			xhr.onload = function() {
 				// Flush any trailing buffered output.
 				if (lastIndex < xhr.responseText.length) {
-					self._renderRestoreChunk(xhr.responseText.substring(lastIndex));
+					feed(xhr.responseText.substring(lastIndex), true);
 					lastIndex = xhr.responseText.length;
+				} else {
+					feed('', true);
 				}
 				// Superseded by a continuation stream (search-replace checkpoint)?
 				// Then this request already handed off; do nothing.
@@ -2155,6 +2179,10 @@
 						} else {
 							params[name] = $(this).is(':checked') ? 1 : 0;
 						}
+					} else if ($(this).is(':radio')) {
+						// Only the checked radio counts; the last one in DOM order used to win
+						// (email_mode silently saved as "never", anonymise mode as "wc_orders").
+						if ($(this).is(':checked')) params[name] = $(this).val();
 					} else if ($(this).is('textarea') && name === 'exclude_files') {
 						params[name] = $(this).val().split('\n').filter(function(l) { return l.trim(); });
 					} else {
@@ -2332,11 +2360,19 @@
 
 				var chunkSize = parseInt(sgbackup_settings.chunk_size, 10) || (2 * 1024 * 1024);
 
+				// A second click during the status round-trip started two chunk loops
+				// on the same file that then fought via out-of-sequence resyncs.
+				if (self._uploadStarting) return;
+				self._uploadStarting = true;
+				$('#sgbackup-upload-btn').prop('disabled', true);
+
 				// Check for existing partial upload
 				self.ajax('upload_chunk_status', { filename: file.name }, function(statusData) {
+					self._uploadStarting = false;
 					if (statusData.status === 1) {
 						// Already fully uploaded
 						self.showNotice('This file has already been uploaded.', 'warning');
+						$('#sgbackup-upload-btn').prop('disabled', false);
 						return;
 					}
 					if (statusData.status === 0 && statusData.size > 0) {
@@ -2356,6 +2392,7 @@
 					self.startChunkedUpload(file, chunkSize, 0);
 				}, function() {
 					// Status check failed - start fresh
+					self._uploadStarting = false;
 					self.startChunkedUpload(file, chunkSize, 0);
 				});
 			});
@@ -3641,12 +3678,14 @@
 
 			$('.sgbackup-test-webhook').on('click', function() {
 				var url = $('input[name="webhook_url"]').val();
+				var $btn = $(this);
+				// Scope to this button's own result span - '.sgbackup-test-result' is
+				// shared with every storage method's "Test Connection" span.
+				var $result = $btn.siblings('.sgbackup-test-result').length ? $btn.siblings('.sgbackup-test-result') : $btn.closest('td, p, div').find('.sgbackup-test-result').first();
 				if (!url) {
-					$('.sgbackup-test-result').text('Enter a webhook URL first.').removeClass('success').addClass('error');
+					$result.text('Enter a webhook URL first.').removeClass('success').addClass('error');
 					return;
 				}
-				var $btn = $(this);
-				var $result = $('.sgbackup-test-result');
 				$btn.prop('disabled', true);
 				$result.text('Sending...').removeClass('success error');
 

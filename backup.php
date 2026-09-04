@@ -48,6 +48,9 @@ class SiteGuard_Backup_Engine {
 	/** @var bool Whether we've already logged a fallback warning */
 	private $zip_fallback_warned = false;
 
+	/** @var bool Set when a periodic ZipArchive::close() failed (queued entries lost) */
+	private $zip_close_failed = false;
+
 	public function __construct($sgbackup) {
 		$this->sgbackup = $sgbackup;
 		$this->backup_dir = $sgbackup->get_backup_dir();
@@ -236,6 +239,8 @@ class SiteGuard_Backup_Engine {
 			$this->sgbackup->jobdata_set('job_file_entities', $entities);
 			// Persist after each entity so files aren't lost on resumption
 			$this->sgbackup->jobdata_set('backup_files_array', $backup_files_array);
+			// Only now clear the per-entity checkpoint (status is already durable)
+			$this->sgbackup->jobdata_set("entity_{$entity}_last_file_index", 0);
 			SiteGuard_Backup_Job_Scheduler::something_useful_happened();
 		}
 
@@ -351,6 +356,11 @@ class SiteGuard_Backup_Engine {
 				$files = null;
 			}
 		}
+		if (null === $files && $last_index > 0) {
+			// Checkpoint without its list: the index is meaningless against a new walk.
+			$this->restart_entity($entity);
+			$last_index = 0;
+		}
 
 		if (null === $files) {
 			// Stamp enumeration start (only once per job) so incrementals measure
@@ -431,7 +441,10 @@ class SiteGuard_Backup_Engine {
 	 *                   could not be opened/written (caller falls back).
 	 */
 	private function enumerate_to_cache($source_path, $excludes, $altered_since, $cache_file, $entity) {
-		$cfh = @fopen($cache_file, 'wb');
+		// Write to a .partial and rename on success so a walk killed mid-way can
+		// never be mistaken for a complete cache by the next resumption.
+		$partial = $cache_file . '.partial';
+		$cfh = @fopen($partial, 'wb');
 		if (!$cfh) return false;
 
 		$count = 0;
@@ -455,7 +468,9 @@ class SiteGuard_Backup_Engine {
 				));
 				if (false === $encoded) { $ok = false; break; }
 			}
-			if (false === fwrite($cfh, $encoded . "\n")) { $ok = false; break; }
+			$line = $encoded . "\n";
+			$w = fwrite($cfh, $line);
+			if (false === $w || $w !== strlen($line)) { $ok = false; break; } // short write = disk full
 			$count++;
 
 			// Long walks on slow disks (CIFS, tiny VPS): keep the job's heartbeat
@@ -467,11 +482,39 @@ class SiteGuard_Backup_Engine {
 		if (false === fflush($cfh)) $ok = false;
 		fclose($cfh);
 
-		if (!$ok) {
+		if (!$ok || !@rename($partial, $cache_file)) {
+			@unlink($partial);
 			@unlink($cache_file);
 			return false;
 		}
 		return $count;
+	}
+
+	/**
+	 * Restart an entity from scratch after its file-list cache was lost mid-way.
+	 *
+	 * The checkpoint index refers to the ORDER of the previous enumeration; once
+	 * that list is gone a fresh walk of a changed tree would resume at the wrong
+	 * file (skipping some, duplicating others) or never seek far enough and loop
+	 * forever. Dropping this entity's zips and restarting is the only safe move.
+	 */
+	private function restart_entity($entity) {
+		$this->sgbackup->log("File-list cache for {$entity} was lost mid-entity - restarting the entity from the first file", 'warning');
+		$existing = $this->sgbackup->jobdata_get('backup_files_array', array());
+		$pattern = '/^' . preg_quote($this->zip_basename . '-' . $entity, '/') . '(-\d+)?\.zip$/';
+		$kept = array();
+		foreach ((array) $existing as $f) {
+			if (preg_match($pattern, $f)) {
+				@unlink($this->backup_dir . $f);
+				continue;
+			}
+			$kept[] = $f;
+		}
+		$this->sgbackup->jobdata_set('backup_files_array', array_values($kept));
+		$this->sgbackup->jobdata_set("entity_{$entity}_last_file_index", 0);
+		$this->index = 0;
+		$this->zipfiles_added = 0;
+		$this->zipfiles_batched = 0;
 	}
 
 	/**
@@ -610,6 +653,12 @@ class SiteGuard_Backup_Engine {
 			if ($should_check_split && file_exists($zip_path)) {
 				clearstatcache(true, $zip_path);
 				if (filesize($zip_path) >= $this->split_every) {
+					// Finalize and verify the full archive BEFORE recording it; a failed
+					// close here used to be silently ignored and the short zip recorded.
+					if (!$this->close_ziparchive() || !$this->verify_zip($zip_path)) {
+						$this->sgbackup->log("Failed to finalize split zip {$zip_filename} - marking entity as failed", 'error');
+						return false;
+					}
 					$created_files[] = $zip_filename;
 					$this->index++;
 					$zip_filename = $this->get_zip_filename($entity, $this->index);
@@ -620,6 +669,10 @@ class SiteGuard_Backup_Engine {
 
 			// Add file to zip
 			$result = $this->add_to_zip($zip_path, $file['full_path'], $file['path'], $file['size']);
+			if ($this->zip_close_failed) {
+				$this->sgbackup->log("ZipArchive flush failed for {$zip_filename}; queued files were not written - marking entity as failed", 'error');
+				return false;
+			}
 			if ($result) {
 				$this->zipfiles_added++;
 				$this->zipfiles_batched += $file['size'];
@@ -665,8 +718,9 @@ class SiteGuard_Backup_Engine {
 				"whether the files resolve within ABSPATH (" . ABSPATH . ")", 'warning');
 		}
 
-		// Clear progress tracker
-		$this->sgbackup->jobdata_set("entity_{$entity}_last_file_index", 0);
+		// (The entity_*_last_file_index checkpoint is reset by backup_files() only
+		// after the entity's 'complete' status has been persisted, so a crash in
+		// between cannot re-zip the whole entity.)
 
 		// Clean up binzip temp directory
 		if ($this->zip_method === 'binzip') {
@@ -732,7 +786,8 @@ class SiteGuard_Backup_Engine {
 		if ($is_symlink) {
 			$real_resolved = realpath($resolved);
 			$real_abspath = realpath(ABSPATH);
-			if ($real_resolved && $real_abspath && strpos($real_resolved, $real_abspath) !== 0) {
+			if ($real_resolved && $real_abspath && $real_resolved !== $real_abspath
+				&& strpos($real_resolved, rtrim($real_abspath, DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR) !== 0) {
 				if (!isset($this->_zip_abspath_logged)) $this->_zip_abspath_logged = 0;
 				if ($this->_zip_abspath_logged < 3) {
 					$this->sgbackup->log("Zip skip: symlink target outside ABSPATH: {$real_resolved} (ABSPATH={$real_abspath})", 'warning');
@@ -823,12 +878,15 @@ class SiteGuard_Backup_Engine {
 		}
 
 		// cd into temp base and zip the relative path
+		// './' prefix: a root-level name starting with '-' would otherwise be
+		// parsed by zip as an option (escapeshellarg protects the shell, not zip).
+		// zip strips the leading './' from stored names.
 		$cmd = sprintf(
 			'cd %s && zip %s %s %s 2>&1',
 			escapeshellarg($temp_base),
 			$store,
 			escapeshellarg($zip_path),
-			escapeshellarg($archive_name)
+			escapeshellarg('./' . $archive_name)
 		);
 
 		$output = array();
@@ -850,7 +908,9 @@ class SiteGuard_Backup_Engine {
 	private function add_to_zip_ziparchive($zip_path, $file_path, $archive_name) {
 		// Reuse open ZipArchive handle for same zip path (avoids O(n^2) central directory rewrites)
 		if ($this->ziparchive_handle === null || $this->ziparchive_path !== $zip_path) {
-			$this->close_ziparchive();
+			if (!$this->close_ziparchive()) {
+				$this->zip_close_failed = true;
+			}
 			$zip = new ZipArchive();
 			if (true !== $zip->open($zip_path, ZipArchive::CREATE)) {
 				$this->sgbackup->log("ZipArchive: failed to open {$zip_path}", 'warning');
@@ -873,7 +933,12 @@ class SiteGuard_Backup_Engine {
 		// Note: zipfiles_added is incremented by the caller (create_zips), not here
 		$this->zipfiles_added_unflushed++;
 		if ($this->zipfiles_added_unflushed >= 200) {
-			$this->close_ziparchive();
+			// addFile() only queues paths; libzip reads them at close(). A failed
+			// close drops every queued entry, so it must fail the entity rather than
+			// be swallowed (the previous behaviour marked such backups complete).
+			if (!$this->close_ziparchive()) {
+				$this->zip_close_failed = true;
+			}
 			$this->zipfiles_added_unflushed = 0;
 		}
 
@@ -1072,6 +1137,13 @@ class SiteGuard_Backup_Engine {
 			$valid_completed = array();
 			$orphaned = 0;
 			foreach ($completed_tables as $ct) {
+				// External-DB markers (ext{N}_{table}, ext{N}__stitched) live in their
+				// own dbtemp_ext{N}_ dir - they must not be treated as orphans here,
+				// or every resumption re-dumps the external DBs from scratch.
+				if (preg_match('/^ext\d+_/', $ct)) {
+					$valid_completed[] = $ct;
+					continue;
+				}
 				$ct_file = $temp_dir . $ct . '.sql.gz';
 				clearstatcache(true, $ct_file);
 				if (file_exists($ct_file) && filesize($ct_file) > 0) {

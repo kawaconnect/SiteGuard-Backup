@@ -61,9 +61,9 @@ class SiteGuard_Backup_Remote_Send {
 		// Uses a stored window start time so the counter resets properly even
 		// during sustained transfers (set_transient alone resets TTL on every
 		// call, which would make the counter never expire).
-		$ip = isset($_SERVER['HTTP_CF_CONNECTING_IP'])
-			? sanitize_text_field($_SERVER['HTTP_CF_CONNECTING_IP'])
-			: (isset($_SERVER['REMOTE_ADDR']) ? sanitize_text_field($_SERVER['REMOTE_ADDR']) : 'unknown');
+		require_once SGBACKUP_DIR . 'includes/class-security.php';
+		$ip = SiteGuard_Backup_Security::get_client_ip();
+		if ('' === $ip) $ip = 'unknown';
 		$rate_key = 'sgbackup_rpc_rate_' . md5($ip);
 		$rate_data = get_transient($rate_key);
 		if (!is_array($rate_data) || !isset($rate_data['t']) || (time() - $rate_data['t']) >= 60) {
@@ -167,9 +167,9 @@ class SiteGuard_Backup_Remote_Send {
 		if (empty($_POST['encrypted']) || empty($_POST['key'])) return;
 
 		// Rate limiting (shares counter with authenticated path above)
-		$ip = isset($_SERVER['HTTP_CF_CONNECTING_IP'])
-			? sanitize_text_field($_SERVER['HTTP_CF_CONNECTING_IP'])
-			: (isset($_SERVER['REMOTE_ADDR']) ? sanitize_text_field($_SERVER['REMOTE_ADDR']) : 'unknown');
+		require_once SGBACKUP_DIR . 'includes/class-security.php';
+		$ip = SiteGuard_Backup_Security::get_client_ip();
+		if ('' === $ip) $ip = 'unknown';
 		$rate_key = 'sgbackup_rpc_rate_' . md5($ip);
 		$rate_data = get_transient($rate_key);
 		if (!is_array($rate_data) || !isset($rate_data['t']) || (time() - $rate_data['t']) >= 60) {
@@ -291,6 +291,9 @@ class SiteGuard_Backup_Remote_Send {
 			error_log("SiteGuard Backup RPC Receiver: send_chunk missing params - file=" . (isset($data['file']) ? 'yes' : 'no') . " data=" . (isset($data['data']) ? 'yes' : 'no') . " start=" . (isset($data['start']) ? 'yes' : 'no'));
 			return new WP_Error('invalid_chunk', 'Missing required chunk parameters.');
 		}
+		if (!is_string($data['file']) || !is_string($data['data']) || !is_scalar($data['start'])) {
+			return new WP_Error('invalid_chunk', 'Chunk parameters have the wrong type.');
+		}
 
 		// Use basename() to strip any path components, then sanitize
 		$filename = sanitize_file_name(basename($data['file']));
@@ -407,6 +410,12 @@ class SiteGuard_Backup_Remote_Send {
 		// On last chunk, rename to final filename
 		if ($is_last) {
 			if (file_exists($final_file)) {
+				// A peer may replace its own earlier transfer, never a file that
+				// belongs to a backup this site made itself.
+				if (false === $this->file_owned_by_remote_set($final_file)) {
+					@unlink($tmp_file);
+					return new WP_Error('file_exists', 'A local backup file with this name already exists and will not be overwritten.');
+				}
 				@unlink($final_file);
 			}
 			if (!@rename($tmp_file, $final_file)) {
@@ -431,7 +440,7 @@ class SiteGuard_Backup_Remote_Send {
 	 * Get file status - check if a file exists or is partially uploaded.
 	 */
 	private function cmd_get_file_status($data) {
-		if (empty($data['file'])) {
+		if (empty($data['file']) || !is_string($data['file'])) {
 			return new WP_Error('missing_file', 'Missing file parameter.');
 		}
 
@@ -464,7 +473,7 @@ class SiteGuard_Backup_Remote_Send {
 	 * Upload complete - acknowledge that all files for a backup have been received.
 	 */
 	private function cmd_upload_complete($data) {
-		$filename = isset($data['file']) ? sanitize_file_name($data['file']) : '';
+		$filename = (isset($data['file']) && is_string($data['file'])) ? sanitize_file_name($data['file']) : '';
 		return array('status' => 'acknowledged', 'file' => $filename);
 	}
 
@@ -472,8 +481,12 @@ class SiteGuard_Backup_Remote_Send {
 	 * Set metadata (label, always_keep, source_url) on a received backup.
 	 */
 	private function cmd_set_backup_metadata($data) {
-		$timestamp = isset($data['timestamp']) ? intval($data['timestamp']) : 0;
-		$nonce = isset($data['nonce']) ? sanitize_text_field($data['nonce']) : '';
+		$timestamp = (isset($data['timestamp']) && is_scalar($data['timestamp'])) ? intval($data['timestamp']) : 0;
+		$nonce = (isset($data['nonce']) && is_string($data['nonce'])) ? sanitize_text_field($data['nonce']) : '';
+		// Scalar fields must be strings - an array here is a TypeError on PHP 8.
+		foreach (array('label', 'source_url', 'subsite_domain', 'subsite_path', 'subsite_url', 'subsite_home_url', 'subsite_scheme', 'subsite_stylesheet', 'subsite_template') as $sk) {
+			if (isset($data[$sk]) && !is_string($data[$sk])) unset($data[$sk]);
+		}
 
 		if (empty($timestamp) && empty($nonce)) {
 			return new WP_Error('missing_param', 'Missing timestamp or nonce');
@@ -514,6 +527,14 @@ class SiteGuard_Backup_Remote_Send {
 
 		if (!$target_ts) {
 			return new WP_Error('not_found', 'No matching backup found in history');
+		}
+
+		// Only sets this site RECEIVED may be edited by a peer. Without this, a
+		// key-bundle holder could flip a local full-site backup into a "subsite
+		// backup" with an attacker-chosen source URL and steer the next restore.
+		$target_services = isset($history[$target_ts]['service']) ? (array) $history[$target_ts]['service'] : array();
+		if (!in_array('remotesend', $target_services, true)) {
+			return new WP_Error('not_remote', 'Backup set was not received from a remote site; metadata cannot be changed remotely.');
 		}
 
 		$changed = false;
@@ -571,6 +592,30 @@ class SiteGuard_Backup_Remote_Send {
 	}
 
 	/**
+	 * Does $path (a final backup file in the backup dir) belong to a set this
+	 * site received from a remote peer?
+	 *
+	 * @return bool|null True: in a remotesend set. False: in a locally created
+	 *                   set (must not be touched by a peer). Null: not in history.
+	 */
+	private function file_owned_by_remote_set($path) {
+		$name = basename($path);
+		$history = SiteGuard_Backup_History::get_history_raw();
+		foreach ($history as $entry) {
+			if (!is_array($entry)) continue;
+			foreach (array('db', 'plugins', 'themes', 'uploads', 'others', 'wpcore', 'manifest', 'unknown') as $ent) {
+				if (empty($entry[$ent])) continue;
+				$files = is_array($entry[$ent]) ? $entry[$ent] : array($entry[$ent]);
+				if (in_array($name, $files, true)) {
+					$services = isset($entry['service']) ? (array) $entry['service'] : array();
+					return in_array('remotesend', $services, true);
+				}
+			}
+		}
+		return null;
+	}
+
+	/**
 	 * Register a received file in backup history.
 	 */
 	private function register_received_file($filename) {
@@ -617,6 +662,17 @@ class SiteGuard_Backup_Remote_Send {
 			wp_cache_delete('sgbackup_backup_history', 'site-options');
 			$history = SiteGuard_Backup_History::get_history_raw();
 
+			// Merge only into the set this transfer belongs to (same nonce, received
+			// remotely). A minute-granular timestamp collision with a LOCAL backup
+			// must not splice a peer's archive into that trusted set - walk forward
+			// to a free key instead.
+			while (isset($history[$timestamp])) {
+				$existing = $history[$timestamp];
+				$existing_services = isset($existing['service']) ? (array) $existing['service'] : array();
+				$same_nonce = isset($existing['nonce']) && $existing['nonce'] === $nonce;
+				if ($same_nonce && in_array('remotesend', $existing_services, true)) break;
+				$timestamp++;
+			}
 			if (!isset($history[$timestamp])) {
 				$history[$timestamp] = array(
 					'nonce'   => $nonce,

@@ -795,7 +795,14 @@ class SiteGuard_Backup_Restorer {
 
 			$this->sgbackup->log("Downloading {$file} from {$service}");
 			$result = $method->download($file, $backup_dir);
-			if ($result && file_exists($backup_dir . $file)) {
+			// A WP_Error object is truthy - it used to pass this check and a
+			// truncated partial download was restored as if complete.
+			if (is_wp_error($result)) {
+				$this->sgbackup->log("Download of {$file} from {$service} failed: " . $result->get_error_message(), 'error');
+				@unlink($backup_dir . $file);
+				continue;
+			}
+			if ($result === true && file_exists($backup_dir . $file)) {
 				return true;
 			}
 		}
@@ -876,6 +883,11 @@ class SiteGuard_Backup_Restorer {
 
 		// Save progress for resume support
 		$this->save_restore_progress('db', 'started');
+		// Fresh import: discard any search-replace checkpoint/cursor from an earlier
+		// run of this backup, otherwise a later restore "resumes" with a stale cursor
+		// and skips tables that were just re-imported.
+		$opts->delete_option($this->sr_state_option);
+		delete_option('sgbackup_sr_progress');
 
 		// Detect whether custom/mirror mode has __skip__ entries - if so we must
 		// use filtered import to avoid destroying destination subsite tables.
@@ -1006,6 +1018,16 @@ class SiteGuard_Backup_Restorer {
 				}
 				$all_backup_tables = $this->cached_tables_in_sql_file($file_path);
 				$tables_to_import = empty($source_blogs) ? $all_backup_tables : $this->compute_selective_tables($all_backup_tables, $source_blogs);
+				if ($skip_user_tables) {
+					// A migration with skipped subsites used to take this branch and
+					// import the SOURCE wp_users/wp_usermeta, locking out the
+					// destination admin. Preserve credentials here too.
+					global $wpdb;
+					$user_tables = array($wpdb->base_prefix . 'users', $wpdb->base_prefix . 'usermeta');
+					$tables_to_import = array_values(array_diff($tables_to_import, $user_tables));
+					$this->user_tables_skipped = true;
+					$this->sgbackup->log("Migration: skipping user tables (" . implode(', ', $user_tables) . ") to preserve destination credentials");
+				}
 				$skipped_count = count($all_backup_tables) - count($tables_to_import);
 				if ($skipped_count === 0) {
 					// Nothing was actually excluded - use atomic import for crash safety
@@ -1202,6 +1224,16 @@ class SiteGuard_Backup_Restorer {
 			return $result;
 		}
 
+		// Resolve (decrypt) the DB archives BEFORE touching the target: a wrong
+		// passphrase used to be discovered only after the target's tables had been
+		// dropped, leaving an empty subsite and a "complete" message.
+		$predecrypted = $this->predecrypt_db_files($backup_dir);
+		if (is_wp_error($predecrypted)) {
+			$result['success'] = false;
+			$result['errors'][] = $predecrypted->get_error_message();
+			return $result;
+		}
+
 		$source_label = $source_id > 0 ? "subsite blog #{$source_id}" : "single-site backup";
 		$this->sgbackup->log("Subsite import: {$source_label} -> target domain {$target_domain}");
 		$this->progress("Importing {$source_label} to {$target_domain}");
@@ -1325,9 +1357,9 @@ class SiteGuard_Backup_Restorer {
 			foreach ($db_files as $db_file) {
 				$file_path = $backup_dir . $db_file;
 
-				// Decrypt if needed
+				// Decrypt if needed (normally already done up front by predecrypt_db_files)
 				if (preg_match('/\.crypt$/', $db_file)) {
-					$file_path = $this->decrypt_file($file_path);
+					$file_path = isset($predecrypted[$db_file]) ? $predecrypted[$db_file] : $this->decrypt_file($file_path);
 					if (!$file_path) {
 						$result['errors'][] = "Failed to decrypt: {$db_file}";
 						$result['success'] = false;
@@ -2360,6 +2392,14 @@ class SiteGuard_Backup_Restorer {
 
 		$base_prefix = $wpdb->base_prefix;
 
+		// Decrypt DB archives before any target tables are dropped (see restore_as_subsite).
+		$predecrypted = $this->predecrypt_db_files($backup_dir);
+		if (is_wp_error($predecrypted)) {
+			$result['success'] = false;
+			$result['errors'][] = $predecrypted->get_error_message();
+			return $result;
+		}
+
 		// Step 1: Prepare targets and build prefix map
 		$prefix_map = array();
 		$target_map = array(); // source_blog_id => target_blog_id
@@ -2468,9 +2508,9 @@ class SiteGuard_Backup_Restorer {
 			foreach ($db_files as $db_file) {
 				$file_path = $backup_dir . $db_file;
 
-				// Decrypt if needed
+				// Decrypt if needed (normally already done up front by predecrypt_db_files)
 				if (preg_match('/\.crypt$/', $db_file)) {
-					$file_path = $this->decrypt_file($file_path);
+					$file_path = isset($predecrypted[$db_file]) ? $predecrypted[$db_file] : $this->decrypt_file($file_path);
 					if (!$file_path) {
 						$result['errors'][] = "Failed to decrypt: {$db_file}";
 						$result['success'] = false;
@@ -2556,9 +2596,22 @@ class SiteGuard_Backup_Restorer {
 						$search[] = 'http://' . $old_domain;
 						$replace[] = $target_url_base;
 					}
-					if ($old_domain !== $new_domain) {
+					if ($old_domain !== $new_domain && strpos($new_domain, $old_domain) === false) {
 						$search[] = $old_domain;
 						$replace[] = $new_domain;
+					}
+
+					// Uploads path remap when the blog id changed (same pairs as the
+					// single subsite import) - without it every image 404s after a
+					// batch import onto different blog ids.
+					if ((int) $source_id !== (int) $target_id) {
+						foreach (array(
+							array('/wp-content/uploads/sites/' . $source_id . '/', '/wp-content/uploads/sites/' . $target_id . '/'),
+							array('\/wp-content\/uploads\/sites\/' . $source_id . '\/', '\/wp-content\/uploads\/sites\/' . $target_id . '\/'),
+							array('wp-content/uploads/sites/' . $source_id . '/', 'wp-content/uploads/sites/' . $target_id . '/'),
+						) as $pp) {
+							if (!in_array($pp[0], $search, true)) { $search[] = $pp[0]; $replace[] = $pp[1]; }
+						}
 					}
 
 					$sr = new SiteGuard_Backup_Search_Replace();
@@ -2793,9 +2846,21 @@ class SiteGuard_Backup_Restorer {
 			wp_mkdir_p($target_dir);
 		}
 
+		$uploads_ok = true;
 		foreach ($upload_files as $zip_file) {
 			$zip_path = $backup_dir . $zip_file;
-			if (!file_exists($zip_path)) continue;
+			if (!file_exists($zip_path)) { $uploads_ok = false; continue; }
+
+			// Encrypted archive: decrypt first (was handed straight to unzip and
+			// silently "restored").
+			if (preg_match('/\.crypt$/', $zip_file)) {
+				$zip_path = $this->decrypt_file($zip_path);
+				if (!$zip_path) {
+					$this->sgbackup->log("Failed to decrypt uploads archive: {$zip_file}", 'error');
+					$uploads_ok = false;
+					continue;
+				}
+			}
 
 			// Extract to a temp directory first. uniqid() defends against two
 			// upload archives extracted within the same second colliding.
@@ -2822,6 +2887,7 @@ class SiteGuard_Backup_Restorer {
 			if (!$extract_ok) {
 				$this->sgbackup->log("Failed to extract uploads zip: {$zip_file}", 'error');
 				$this->remove_dir_recursive($temp_extract);
+				$uploads_ok = false;
 				continue;
 			}
 
@@ -2843,7 +2909,31 @@ class SiteGuard_Backup_Restorer {
 			$this->sgbackup->log("Restored uploads from {$zip_file} to /sites/{$target_id}/");
 		}
 
-		return true;
+		return $uploads_ok;
+	}
+
+	/**
+	 * Decrypt every encrypted DB archive of the backup set up front.
+	 *
+	 * @return array|WP_Error Map of db filename => decrypted path (only .crypt
+	 *                        entries), or WP_Error if any could not be decrypted.
+	 */
+	private function predecrypt_db_files($backup_dir) {
+		$map = array();
+		if (empty($this->restore_options['db']) || empty($this->backup_set['db'])) return $map;
+		$db_files = $this->backup_set['db'];
+		if (is_string($db_files)) $db_files = array($db_files);
+		foreach ($db_files as $db_file) {
+			if (!preg_match('/\.crypt$/', $db_file)) continue;
+			$path = $backup_dir . $db_file;
+			if (!file_exists($path)) continue; // reported by the caller's own checks
+			$dec = $this->decrypt_file($path);
+			if (!$dec) {
+				return new WP_Error('decrypt_failed', "Failed to decrypt {$db_file} (wrong passphrase?) - aborting before any target tables are touched");
+			}
+			$map[$db_file] = $dec;
+		}
+		return $map;
 	}
 
 	/**
@@ -3075,6 +3165,7 @@ class SiteGuard_Backup_Restorer {
 			foreach ($sitemeta_rows as $row) {
 				if (strpos($row['meta_key'], 'sgbackup_jobdata_') === 0) continue;
 				if (strpos($row['meta_key'], 'sgbackup_sem_') === 0) continue;
+				if (in_array($row['meta_key'], array('sgbackup_restore_sr_state', 'sgbackup_sr_progress'), true)) continue;
 				$this->pre_import_sgbackup_options['sitemeta:' . $row['meta_key']] = $row['meta_value'];
 				$sitemeta_count++;
 			}
@@ -3088,6 +3179,7 @@ class SiteGuard_Backup_Restorer {
 			foreach ($options_rows as $row) {
 				if (strpos($row['option_name'], 'sgbackup_jobdata_') === 0) continue;
 				if (strpos($row['option_name'], 'sgbackup_sem_') === 0) continue;
+				if (in_array($row['option_name'], array('sgbackup_restore_sr_state', 'sgbackup_sr_progress'), true)) continue;
 				$this->pre_import_sgbackup_options['options:' . $row['option_name']] = array(
 					'value' => $row['option_value'],
 					'autoload' => $row['autoload'],
@@ -3106,6 +3198,7 @@ class SiteGuard_Backup_Restorer {
 			foreach ($rows as $row) {
 				if (strpos($row['option_name'], 'sgbackup_jobdata_') === 0) continue;
 				if (strpos($row['option_name'], 'sgbackup_sem_') === 0) continue;
+				if (in_array($row['option_name'], array('sgbackup_restore_sr_state', 'sgbackup_sr_progress'), true)) continue;
 				$this->pre_import_sgbackup_options[$row['option_name']] = array(
 					'value' => $row['option_value'],
 					'autoload' => $row['autoload'],
@@ -3325,6 +3418,11 @@ class SiteGuard_Backup_Restorer {
 			$real_dest_home          = isset($state['real_dest_home']) ? $state['real_dest_home'] : '';
 			$saved_site_admins       = array_key_exists('saved_site_admins', $state) ? $state['saved_site_admins'] : null;
 			$preserved_email_options = isset($state['preserved_email_options']) ? $state['preserved_email_options'] : array();
+			if (!empty($state['instance_state']) && is_array($state['instance_state'])) {
+				foreach ($state['instance_state'] as $prop => $val) {
+					if (property_exists($this, $prop)) $this->$prop = $val;
+				}
+			}
 			$this->sgbackup->log("Resuming search-replace: " . count($search) . " pairs across " . count($tables) . " tables (from checkpoint)");
 		} else {
 			// Use pre-import URLs saved before the DB was overwritten.
@@ -3455,6 +3553,21 @@ class SiteGuard_Backup_Restorer {
 				'real_dest_home'          => $real_dest_home,
 				'saved_site_admins'       => $saved_site_admins,
 				'preserved_email_options' => $preserved_email_options,
+				// Instance state a resumed run (fresh object) needs for the post-SR
+				// fixups: without it restore_plugin_options() and
+				// fix_multisite_sitemeta() silently no-op on resume.
+				'instance_state'          => array(
+					'pre_import_siteurl'          => $this->pre_import_siteurl,
+					'pre_import_home'             => $this->pre_import_home,
+					'pre_import_content_url'      => $this->pre_import_content_url,
+					'pre_import_uploads_url'      => $this->pre_import_uploads_url,
+					'pre_import_blogs'            => $this->pre_import_blogs,
+					'pre_import_sgbackup_options' => $this->pre_import_sgbackup_options,
+					'is_migration'                => $this->is_migration,
+					'user_tables_skipped'         => $this->user_tables_skipped,
+					'old_siteurl'                 => $this->old_siteurl,
+					'old_home'                    => $this->old_home,
+				),
 			), false);
 		}
 
@@ -3631,7 +3744,7 @@ class SiteGuard_Backup_Restorer {
 				$search[] = $old_main_http;
 				$replace[] = $new_main_url;
 			}
-			if (!in_array($old_domain, $search, true)) {
+			if (!in_array($old_domain, $search, true) && strpos($new_domain, $old_domain) === false) {
 				$search[] = $old_domain;
 				$replace[] = $new_domain;
 			}
@@ -3732,11 +3845,19 @@ class SiteGuard_Backup_Restorer {
 			$replace[] = $new_main_url;
 		}
 
-		// Bare domain catch-all (LAST so specific replacements run first)
+		// Bare domain catch-all (LAST so specific replacements run first). Pairs are
+		// applied sequentially to the same value, so when the new host CONTAINS the
+		// old one (example.com -> www.example.com / example.com.au) this pair would
+		// re-match the URL pairs' output and yield www.www.example.com - including in
+		// the main site's siteurl/home. Skip it in that case.
 		if (!in_array($old_domain, $search, true)) {
-			$search[] = $old_domain;
-			$replace[] = $new_domain;
-			$this->sgbackup->log("  Bare domain catch-all: {$old_domain} -> {$new_domain}");
+			if (strpos($new_domain, $old_domain) === false) {
+				$search[] = $old_domain;
+				$replace[] = $new_domain;
+				$this->sgbackup->log("  Bare domain catch-all: {$old_domain} -> {$new_domain}");
+			} else {
+				$this->sgbackup->log("  Bare domain catch-all skipped: {$new_domain} contains {$old_domain} (would double-rewrite)");
+			}
 		}
 
 		// Protocol normalization for the new domain: if destination uses https,
@@ -4230,6 +4351,16 @@ class SiteGuard_Backup_Restorer {
 				$this->filter_extracted_items($temp_dir, $selected_items, $entity);
 			}
 
+			// wp-config.php belongs to the destination install (DB credentials,
+			// salts, table prefix). Local-only backups include it for disaster
+			// recovery, but restoring it over a running site swaps in the SOURCE's
+			// credentials and takes the site down. Keep the archive copy for manual use.
+			if ($entity === 'wpcore' && file_exists($temp_dir . 'wp-config.php')) {
+				@unlink($temp_dir . 'wp-config.php');
+				$this->sgbackup->log("wpcore: not restoring wp-config.php over the destination's - the archive copy remains in the backup zip for manual recovery");
+				$this->progress("Skipped wp-config.php (destination config preserved)");
+			}
+
 			// Exclude our own plugin directory during migration to prevent
 			// overwriting destination's encryption keys, config, and version.
 			if ($entity === 'plugins' && $this->is_migration) {
@@ -4361,10 +4492,13 @@ class SiteGuard_Backup_Restorer {
 						$keep_dir = $existing['dir'];
 					}
 
-					$this->remove_temp_dir($remove_dir);
-					$removed++;
-					$this->sgbackup->log("Removed duplicate plugin '{$name}': deleted " . basename($remove_dir) . "/ (kept {$keep_dir}/ v" . $seen[$name]['version'] . ")");
-					$this->progress("Removed duplicate plugin: " . basename($remove_dir) . "/ (kept {$keep_dir}/)");
+					if ($this->remove_plugin_dir($remove_dir, $plugins_dir)) {
+						$removed++;
+						$this->sgbackup->log("Removed duplicate plugin '{$name}': deleted " . basename($remove_dir) . "/ (kept {$keep_dir}/ v" . $seen[$name]['version'] . ")");
+						$this->progress("Removed duplicate plugin: " . basename($remove_dir) . "/ (kept {$keep_dir}/)");
+					} else {
+						$this->sgbackup->log("Could not remove duplicate plugin directory " . basename($remove_dir) . "/ - both copies of '{$name}' remain; deactivate one manually", 'warning');
+					}
 				} else {
 					$seen[$name] = array('dir' => $dir, 'version' => $version);
 				}
@@ -4376,6 +4510,31 @@ class SiteGuard_Backup_Restorer {
 		if ($removed > 0) {
 			$this->sgbackup->log("Duplicate plugin cleanup: removed {$removed} duplicate(s)");
 		}
+	}
+
+	/**
+	 * Remove a plugin directory, bounded to the plugins directory.
+	 * (remove_temp_dir() is bounded to the backup dir and refuses these paths.)
+	 */
+	private function remove_plugin_dir($dir, $plugins_dir) {
+		$real_dir = realpath($dir);
+		$real_plugins = realpath($plugins_dir);
+		if (false === $real_dir || false === $real_plugins) return false;
+		$real_plugins = rtrim($real_plugins, DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR;
+		if (strpos($real_dir, $real_plugins) !== 0 || $real_dir === rtrim($real_plugins, DIRECTORY_SEPARATOR)) return false;
+		if (!is_dir($real_dir) || is_link($dir)) return false;
+		$iterator = new RecursiveIteratorIterator(
+			new RecursiveDirectoryIterator($real_dir, FilesystemIterator::SKIP_DOTS),
+			RecursiveIteratorIterator::CHILD_FIRST
+		);
+		foreach ($iterator as $item) {
+			if ($item->isDir() && !$item->isLink()) {
+				@rmdir($item->getPathname());
+			} else {
+				@unlink($item->getPathname());
+			}
+		}
+		return @rmdir($real_dir);
 	}
 
 	/**
@@ -4636,7 +4795,8 @@ class SiteGuard_Backup_Restorer {
 		$backup_dir = SiteGuard_Backup_Options::instance()->get_backup_dir();
 		$real_dir = realpath($dir);
 		$real_backup = realpath($backup_dir);
-		if (false === $real_dir || false === $real_backup || strpos($real_dir, $real_backup) !== 0) {
+		if (false === $real_dir || false === $real_backup
+			|| strpos($real_dir, rtrim($real_backup, DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR) !== 0) {
 			$this->sgbackup->log("SECURITY: Refusing to remove directory outside backup path: {$dir}", 'error');
 			return;
 		}
@@ -5307,7 +5467,7 @@ class SiteGuard_Backup_Restorer {
 
 		// 3. Delete cached CSS files from uploads/elementor/css/
 		$upload_dir = wp_upload_dir();
-		$base_upload = dirname($upload_dir['basedir']); // wp-content/uploads
+		$base_upload = $upload_dir['basedir']; // wp-content/uploads (dirname() pointed at wp-content and deleted nothing)
 		$css_dirs = array($base_upload . '/elementor/css');
 
 		if (is_multisite()) {

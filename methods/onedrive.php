@@ -95,6 +95,12 @@ class SiteGuard_Backup_Method_Onedrive extends SiteGuard_Backup_Module {
             if (isset($body['error'])) {
                 return new WP_Error('onedrive_refresh', $body['error_description'] ?? $body['error']);
             }
+            if (!is_array($body) || empty($body['access_token']) || !is_string($body['access_token'])) {
+                // A 5xx/HTML/proxy response used to be written back as access_token=null,
+                // after which every call failed "Not authenticated" before ever retrying
+                // the still-valid refresh token. Leave the stored token untouched.
+                return new WP_Error('onedrive_refresh', 'Token refresh returned an unexpected response (HTTP ' . wp_remote_retrieve_response_code($response) . '); will retry later.');
+            }
 
             $options['token']['access_token'] = $body['access_token'];
             $options['token']['expires_in'] = $body['expires_in'];

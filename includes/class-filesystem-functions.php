@@ -190,7 +190,15 @@ class SiteGuard_Backup_Filesystem {
 				}
 				if ($skip) continue;
 
-				$mtime = $item->getMTime();
+				// A file removed between the directory read and the stat throws
+				// RuntimeException; skip that one file instead of ending the whole
+				// walk (which would record a truncated list as complete).
+				try {
+					$mtime = $item->getMTime();
+					$size = $item->getSize();
+				} catch (\Throwable $stat_err) {
+					continue;
+				}
 				if (null !== $altered_since && $mtime <= $altered_since) continue;
 
 				$file_path = $relative;
@@ -200,7 +208,7 @@ class SiteGuard_Backup_Filesystem {
 
 				yield array(
 					'path'      => $file_path,
-					'size'      => $item->getSize(),
+					'size'      => $size,
 					'mtime'     => $mtime,
 					'full_path' => $full_path,
 				);

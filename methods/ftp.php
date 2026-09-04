@@ -97,7 +97,11 @@ class SiteGuard_Backup_Method_Ftp extends SiteGuard_Backup_Module {
 		$result = ftp_get($conn, $local_path, $remote_path, FTP_BINARY);
 		@ftp_close($conn);
 
-		return $result ? true : new WP_Error('ftp_download_failed', "Failed to download from FTP: {$remote_path}");
+		if (!$result) {
+			@unlink($local_path); // never leave a truncated archive that a restore could pick up
+			return new WP_Error('ftp_download_failed', "Failed to download from FTP: {$remote_path}");
+		}
+		return true;
 	}
 
 	public function delete($files) {

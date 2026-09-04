@@ -283,7 +283,11 @@ class SiteGuard_Backup_Method_Sftp extends SiteGuard_Backup_Module {
 			$result = $conn['sftp']->get($remote_path, $local_path);
 		}
 
-		return $result ? true : new WP_Error('sftp_download_failed', "Failed to download via SFTP: {$remote_path}");
+		if (!$result) {
+			@unlink($local_path); // never leave a truncated archive that a restore could pick up
+			return new WP_Error('sftp_download_failed', "Failed to download via SFTP: {$remote_path}");
+		}
+		return true;
 	}
 
 	/**

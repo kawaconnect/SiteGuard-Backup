@@ -65,8 +65,8 @@ abstract class SiteGuard_Backup_Module {
 		// Multi-instance format
 		if (isset($stored['settings']) && is_array($stored['settings'])) {
 			$instance = $this->instance_id ?: 's-0';
-			$this->options = isset($stored['settings'][$instance])
-				? $stored['settings'][$instance]
+			$this->options = isset($stored['settings'][$instance]) && is_array($stored['settings'][$instance])
+				? wp_parse_args($stored['settings'][$instance], $this->get_default_options())
 				: $this->get_default_options();
 		} else {
 			$this->options = wp_parse_args($stored, $this->get_default_options());
@@ -95,7 +95,15 @@ abstract class SiteGuard_Backup_Module {
 		if (!isset($stored['settings'])) {
 			$stored = array('version' => 1, 'settings' => array());
 		}
-		$stored['settings'][$instance] = $options;
+		// get_options() hands back DECRYPTED credentials; re-encrypt before storing
+		// (token refreshes and the SFTP TOFU fingerprint save used to write them in
+		// plaintext, silently defeating "encrypt credentials at rest").
+		$to_store = $options;
+		if ($opts->get_option('sgbackup_encrypt_credentials', false)) {
+			require_once SGBACKUP_DIR . 'includes/class-security.php';
+			$to_store = SiteGuard_Backup_Security::encrypt_method_options($this->method_id, $to_store);
+		}
+		$stored['settings'][$instance] = $to_store;
 		$opts->update_option('sgbackup_' . $this->method_id, $stored);
 	}
 

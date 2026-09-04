@@ -250,7 +250,7 @@ class SiteGuard_Backup_CLI_Command extends WP_CLI_Command {
                 'nonce'    => $nonce,
                 'size'     => SiteGuard_Backup_Filesystem::format_bytes($size),
                 'entities' => implode(',', $entities),
-                'storage'  => implode(',', isset($backup['service']) ? $backup['service'] : array('none')),
+                'storage'  => implode(',', isset($backup['service']) ? (array) $backup['service'] : array('none')),
                 'local'    => $exists ? 'yes' : 'partial',
                 'keep'     => !empty($backup['always_keep']) ? 'yes' : 'no',
             );
@@ -332,6 +332,9 @@ class SiteGuard_Backup_CLI_Command extends WP_CLI_Command {
      *
      * [--restore-themes=<items>]
      * : Comma-separated theme directories to restore (selective).
+     *
+     * [--yes]
+     * : Skip the confirmation prompt (for scripted/non-interactive use).
      *
      * ## EXAMPLES
      *
@@ -514,7 +517,7 @@ class SiteGuard_Backup_CLI_Command extends WP_CLI_Command {
             $restore_options['restore_themes'] = array_filter(array_map('trim', explode(',', $assoc_args['restore-themes'])), 'strlen');
         }
 
-        WP_CLI::confirm('This will restore the backup. Continue?');
+        WP_CLI::confirm('This will restore the backup. Continue?', $assoc_args);
 
         WP_CLI::log('Starting restore...');
 
@@ -665,6 +668,9 @@ class SiteGuard_Backup_CLI_Command extends WP_CLI_Command {
 
         WP_CLI::log('Creating export backup...');
         $sgbackup->backup_all($options);
+        if (!empty($sgbackup->boot_error) || empty($sgbackup->nonce)) {
+            WP_CLI::error('Could not start export backup: ' . (!empty($sgbackup->boot_error) ? $sgbackup->boot_error : 'unknown boot error'));
+        }
 
         // Run the cron to complete the backup synchronously
         $nonce = $sgbackup->nonce;
@@ -941,6 +947,9 @@ class SiteGuard_Backup_CLI_Command extends WP_CLI_Command {
 
         $sgbackup->backup_all($options);
         $nonce = $sgbackup->nonce;
+        if (!empty($sgbackup->boot_error) || empty($nonce)) {
+            WP_CLI::error('Could not start pre-failover backup: ' . (!empty($sgbackup->boot_error) ? $sgbackup->boot_error : 'unknown boot error'));
+        }
 
         // Run resume loop synchronously
         for ($i = 0; $i < 20; $i++) {
@@ -1307,6 +1316,9 @@ class SiteGuard_Backup_CLI_Command extends WP_CLI_Command {
      * [--dry-run]
      * : Preview changes without applying. Default: true.
      *
+     * [--yes]
+     * : Skip the confirmation prompt when applying changes (non-interactive use).
+     *
      * ## EXAMPLES
      *
      *     wp siteguardbackup search_replace "http://old.example.com" "https://new.example.com"
@@ -1334,7 +1346,7 @@ class SiteGuard_Backup_CLI_Command extends WP_CLI_Command {
         WP_CLI::log("Dry run: " . ($dry_run ? 'yes' : 'no'));
 
         if (!$dry_run) {
-            WP_CLI::confirm('This will modify the database. Continue?');
+            WP_CLI::confirm('This will modify the database. Continue?', $assoc_args);
         }
 
         require_once SGBACKUP_DIR . 'includes/class-commands.php';
@@ -1476,11 +1488,10 @@ class SiteGuard_Backup_CLI_Command extends WP_CLI_Command {
         if ($stuck_jobs > 0) $has_warnings = true;
 
         // 7. Semaphore lock status
-        $lock = new SiteGuard_Backup_Semaphore('backup');
-        $lock_free = $lock->is_free();
+        $active_locks = array_filter(SiteGuard_Backup_Semaphore::list_locks(), function($l) { return !$l['expired']; });
         $checks['semaphore'] = array(
-            'status'  => $lock_free ? 'ok' : 'warning',
-            'message' => $lock_free ? 'No active locks' : 'Backup lock held (job may be running)',
+            'status'  => empty($active_locks) ? 'ok' : 'warning',
+            'message' => empty($active_locks) ? 'No active locks' : (count($active_locks) . ' lock(s) held: ' . implode(', ', array_keys($active_locks)) . ' (job may be running)'),
         );
 
         // 8. Cron schedules
@@ -1636,21 +1647,17 @@ class SiteGuard_Backup_CLI_Command extends WP_CLI_Command {
             }
         }
 
-        // 4. Clear stale semaphore locks (older than 1 hour)
-        // Semaphore stores in wp_options as sgbackup_backup with format: lock_value|timestamp
-        $lock_option = get_option('sgbackup_backup', '');
-        if (!empty($lock_option) && is_string($lock_option) && strpos($lock_option, '|') !== false) {
-            $lock_time = intval(substr($lock_option, strrpos($lock_option, '|') + 1));
-            if ($lock_time > 0 && (time() - $lock_time) > 3600) {
-                if ($dry_run) {
-                    WP_CLI::log("  Would clear stale lock (held since " . gmdate('Y-m-d H:i', $lock_time) . " UTC)");
-                } else {
-                    delete_option('sgbackup_backup');
-                    wp_cache_delete('sgbackup_backup', 'options');
-                    WP_CLI::log("  Cleared stale semaphore lock");
-                }
-                $cleaned++;
+        // 4. Clear expired semaphore locks (per-job, boot, history, restore)
+        foreach (SiteGuard_Backup_Semaphore::list_locks() as $lock_name => $lock_info) {
+            if (!$lock_info['expired']) continue;
+            if ($dry_run) {
+                WP_CLI::log("  Would clear expired lock {$lock_name} (held since " . gmdate('Y-m-d H:i', $lock_info['held_since']) . " UTC)");
+            } else {
+                $sem = new SiteGuard_Backup_Semaphore($lock_name);
+                $sem->force_unlock();
+                WP_CLI::log("  Cleared expired lock {$lock_name}");
             }
+            $cleaned++;
         }
 
         // 5. Clear restore progress transient if stale
@@ -2133,37 +2140,23 @@ class SiteGuard_Backup_CLI_Command extends WP_CLI_Command {
         $action = !empty($args[0]) ? $args[0] : 'status';
 
         if ($action === 'clear') {
-            // Semaphore stores locks in wp_options with sgbackup_ prefix
-            delete_option('sgbackup_backup');
-            delete_option('sgbackup_history');
-            wp_cache_delete('sgbackup_backup', 'options');
-            wp_cache_delete('sgbackup_history', 'options');
-            WP_CLI::success('All locks cleared.');
+            // Locks are per-job (sgbackup_sem_<nonce>) plus boot/history/restore;
+            // the old code cleared a 'sgbackup_backup' key that nothing ever takes.
+            $n = SiteGuard_Backup_Semaphore::clear_all_locks();
+            WP_CLI::success("Cleared {$n} lock(s).");
             return;
         }
 
         // Status
-        $lock = new SiteGuard_Backup_Semaphore('backup');
-        $is_free = $lock->is_free();
-
-        if ($is_free) {
-            WP_CLI::log('Backup lock: FREE');
-        } else {
-            WP_CLI::log('Backup lock: HELD');
-            // Semaphore format: lock_value|timestamp in wp_options
-            $lock_data = get_option('sgbackup_backup', '');
-            if (!empty($lock_data) && is_string($lock_data) && strpos($lock_data, '|') !== false) {
-                $lock_time = intval(substr($lock_data, strrpos($lock_data, '|') + 1));
-                if ($lock_time > 0) {
-                    $held_for = $this->format_duration(time() - $lock_time);
-                    WP_CLI::log("  Held for: {$held_for}");
-                }
-            }
+        $locks = SiteGuard_Backup_Semaphore::list_locks();
+        if (empty($locks)) {
+            WP_CLI::log('No locks held.');
+            return;
         }
-
-        $history_lock = new SiteGuard_Backup_Semaphore('history');
-        $hist_free = $history_lock->is_free();
-        WP_CLI::log('History lock: ' . ($hist_free ? 'FREE' : 'HELD'));
+        foreach ($locks as $name => $info) {
+            $held_for = $info['held_since'] > 0 ? $this->format_duration(time() - $info['held_since']) : 'unknown';
+            WP_CLI::log(sprintf('%-40s %s (held for %s, timeout %ds)', $name, $info['expired'] ? 'EXPIRED' : 'HELD', $held_for, $info['timeout']));
+        }
     }
 
     /**
@@ -2196,7 +2189,7 @@ class SiteGuard_Backup_CLI_Command extends WP_CLI_Command {
         $status = isset($jobdata['jobstatus']) ? $jobdata['jobstatus'] : 'unknown';
         WP_CLI::log("Job status: {$status}");
 
-        if (in_array($status, array('complete', 'error', 'aborted'), true)) {
+        if (self::backup_status_terminal($status)) {
             WP_CLI::error("Job is already in terminal state: {$status}");
         }
 

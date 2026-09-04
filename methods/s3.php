@@ -131,11 +131,15 @@ class SiteGuard_Backup_Method_S3 extends SiteGuard_Backup_Module {
 		return $headers;
 	}
 
-	protected function request($method, $key, $body = '', $extra_headers = array()) {
+	protected function request($method, $key, $body = '', $extra_headers = array(), $bucket_level = false) {
 		$options = $this->get_options();
 		$endpoint = $this->get_endpoint();
 		$bucket = $options['bucket'];
-		$path = !empty($options['path']) ? trim($options['path'], '/') . '/' : '';
+		// Bucket-level operations (ListObjects, HeadBucket) must not have the
+		// configured folder prefix inserted into the URI - that turned them into
+		// GetObject/HeadObject on a "dir/" key and broke listing + the connection
+		// test whenever a path was configured.
+		$path = (!$bucket_level && !empty($options['path'])) ? trim($options['path'], '/') . '/' : '';
 
 		// Separate key from query string for proper SigV4 signing
 		$query_string = '';
@@ -345,8 +349,17 @@ class SiteGuard_Backup_Method_S3 extends SiteGuard_Backup_Module {
 		$complete = $this->request('POST', $key . '?uploadId=' . urlencode($upload_id), $complete_xml, array(
 			'Content-Type' => 'application/xml',
 		));
+		if (is_wp_error($complete)) return $complete;
 
-		return is_wp_error($complete) ? $complete : true;
+		// S3 may answer CompleteMultipartUpload with HTTP 200 and an <Error> body
+		// (e.g. InternalError). Treat that as failure so the caller aborts the
+		// upload instead of checkpointing a file that was never assembled.
+		$complete_body = wp_remote_retrieve_body($complete);
+		if (stripos($complete_body, '<Error>') !== false || stripos($complete_body, 'CompleteMultipartUploadResult') === false) {
+			return new WP_Error('s3_complete', 'CompleteMultipartUpload did not confirm success: ' . substr(strip_tags($complete_body), 0, 200));
+		}
+
+		return true;
 	}
 
 	/**
@@ -390,7 +403,10 @@ class SiteGuard_Backup_Method_S3 extends SiteGuard_Backup_Module {
 			'filename' => $local_path,
 		));
 
-		if (is_wp_error($response)) return $response;
+		if (is_wp_error($response)) {
+			@unlink($local_path); // a transport error mid-stream leaves a truncated file
+			return $response;
+		}
 
 		$code = wp_remote_retrieve_response_code($response);
 		if ($code >= 400) {
@@ -424,29 +440,44 @@ class SiteGuard_Backup_Method_S3 extends SiteGuard_Backup_Module {
 		$prefix = ltrim($options['path'], '/');
 		if (!empty($prefix)) $prefix = rtrim($prefix, '/') . '/';
 
-		$query = '?list-type=2&prefix=' . rawurlencode($prefix) . '&max-keys=1000';
-		$response = $this->request('GET', $query);
-
-		if (is_wp_error($response)) return array();
-
-		$body = wp_remote_retrieve_body($response);
 		$files = array();
+		$continuation = '';
+		$pages = 0;
+		do {
+			$query = '?list-type=2&prefix=' . rawurlencode($prefix) . '&max-keys=1000';
+			if ($continuation !== '') {
+				$query .= '&continuation-token=' . rawurlencode($continuation);
+			}
+			$response = $this->request('GET', $query, '', array(), true);
+			if (is_wp_error($response)) return $files;
 
-		// Parse XML response
-		if (preg_match_all('/<Key>([^<]+)<\/Key>/', $body, $matches)) {
-			foreach ($matches[1] as $key) {
-				$filename = basename($key);
-				if (!empty($filename)) {
-					$files[] = $filename;
+			$body = wp_remote_retrieve_body($response);
+
+			// Parse XML response - only objects directly under the prefix are backup files
+			if (preg_match_all('/<Key>([^<]+)<\/Key>/', $body, $matches)) {
+				foreach ($matches[1] as $key) {
+					$key = html_entity_decode($key, ENT_QUOTES | ENT_XML1);
+					$rel = ($prefix !== '' && strpos($key, $prefix) === 0) ? substr($key, strlen($prefix)) : $key;
+					if ($rel === '' || strpos($rel, '/') !== false) continue;
+					$files[] = $rel;
 				}
 			}
-		}
+
+			// Pagination: without following the continuation token only the first
+			// 1000 objects were ever seen by remote rescan / orphan detection.
+			$continuation = '';
+			if (preg_match('/<IsTruncated>true<\/IsTruncated>/i', $body)
+				&& preg_match('/<NextContinuationToken>([^<]+)<\/NextContinuationToken>/', $body, $tm)) {
+				$continuation = html_entity_decode($tm[1], ENT_QUOTES | ENT_XML1);
+			}
+			$pages++;
+		} while ($continuation !== '' && $pages < 100);
 
 		return $files;
 	}
 
 	public function credentials_test() {
-		$result = $this->request('HEAD', '');
+		$result = $this->request('HEAD', '', '', array(), true); // HeadBucket, not HeadObject on the folder
 		return is_wp_error($result) ? $result : true;
 	}
 }

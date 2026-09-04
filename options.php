@@ -41,12 +41,33 @@ class SiteGuard_Backup_Options {
 			$sentinel = '__sgbackup_undefined_' . $key;
 			$value = get_option($key, $sentinel);
 			if ($sentinel === $value) {
+				// The legacy network fallback exists so the MAIN site keeps settings
+				// stored before options went per-site. Job/history state must never
+				// leak to a subsite: it would append its own backups to the main
+				// site's history copy and then prune (and remotely delete) the main
+				// site's sets against its own retention.
+				if (!is_main_site() && self::is_site_scoped_state($key)) {
+					return $default;
+				}
 				$network = get_site_option($key, $sentinel);
 				return ($sentinel !== $network) ? $network : $default;
 			}
 			return $value;
 		}
 		return get_option($key, $default);
+	}
+
+	/**
+	 * Keys holding per-site job/history state (never inherited across sites).
+	 */
+	private static function is_site_scoped_state($key) {
+		if (in_array($key, array('sgbackup_backup_history', 'sgbackup_active_job_nonce', 'sgbackup_restore_sr_state', 'sgbackup_sr_progress', 'sgbackup_migrator_keys_used'), true)) {
+			return true;
+		}
+		foreach (array('sgbackup_jobdata_', 'sgbackup_dbtables_', 'sgbackup_sem_', 'sgbackup_rl_') as $prefix) {
+			if (strpos($key, $prefix) === 0) return true;
+		}
+		return false;
 	}
 
 	/**

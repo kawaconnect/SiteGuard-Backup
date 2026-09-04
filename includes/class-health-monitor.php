@@ -762,13 +762,10 @@ class SiteGuard_Backup_Health_Monitor {
 	}
 
 	public static function get_client_ip() {
-		// Cloudflare sets this header - most trustworthy when present.
-		if (!empty($_SERVER['HTTP_CF_CONNECTING_IP'])) {
-			return sanitize_text_field($_SERVER['HTTP_CF_CONNECTING_IP']);
-		}
-		// Fall back to REMOTE_ADDR directly. X-Forwarded-For is client-spoofable
-		// and must not be trusted for rate limiting unless behind a known proxy
-		// that strips/rewrites it.
-		return sanitize_text_field($_SERVER['REMOTE_ADDR'] ?? '0.0.0.0');
+		// Single source of truth: CF-Connecting-IP is honoured only when the TCP
+		// peer is a trusted proxy (see SiteGuard_Backup_Security::get_client_ip).
+		require_once SGBACKUP_DIR . 'includes/class-security.php';
+		$ip = SiteGuard_Backup_Security::get_client_ip();
+		return '' === $ip ? '0.0.0.0' : $ip;
 	}
 }

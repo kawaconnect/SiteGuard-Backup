@@ -292,7 +292,10 @@ class SiteGuard_Backup_Method_Azure extends SiteGuard_Backup_Module {
 			'filename' => $local_path,
 		));
 
-		if (is_wp_error($response)) return $response;
+		if (is_wp_error($response)) {
+			@unlink($local_path); // a transport error mid-stream leaves a truncated file
+			return $response;
+		}
 
 		$code = wp_remote_retrieve_response_code($response);
 		if ($code >= 400) {
@@ -341,30 +344,44 @@ class SiteGuard_Backup_Method_Azure extends SiteGuard_Backup_Module {
 		$uri = $this->encode_uri_path('/' . $options['container']);
 		$path = !empty($options['path']) ? trim($options['path'], '/') . '/' : '';
 
-		$query_parts = array('restype=container', 'comp=list');
-		if (!empty($path)) {
-			$query_parts[] = 'prefix=' . urlencode($path);
-		}
-		$query = implode('&', $query_parts);
-
-		$result = $this->request('GET', $uri, '', array(), $query);
-		if (is_wp_error($result)) return array();
-
-		$body = wp_remote_retrieve_body($result);
 		$files = array();
+		$marker = '';
+		$pages = 0;
+		do {
+			$query_parts = array('restype=container', 'comp=list');
+			if (!empty($path)) {
+				$query_parts[] = 'prefix=' . urlencode($path);
+			}
+			if ($marker !== '') {
+				$query_parts[] = 'marker=' . urlencode($marker);
+			}
+			$query = implode('&', $query_parts);
 
-		// Parse XML response for blob names
-		if (preg_match_all('/<Blob>\s*<Name>([^<]+)<\/Name>/s', $body, $matches)) {
-			foreach ($matches[1] as $name) {
-				// Strip path prefix to return just filenames
-				if (!empty($path) && strpos($name, $path) === 0) {
-					$name = substr($name, strlen($path));
-				}
-				if (!empty($name)) {
+			$result = $this->request('GET', $uri, '', array(), $query);
+			if (is_wp_error($result)) return $files;
+
+			$body = wp_remote_retrieve_body($result);
+
+			// Parse XML response for blob names
+			if (preg_match_all('/<Blob>\s*<Name>([^<]+)<\/Name>/s', $body, $matches)) {
+				foreach ($matches[1] as $name) {
+					$name = html_entity_decode($name, ENT_QUOTES | ENT_XML1);
+					// Strip path prefix to return just filenames
+					if (!empty($path) && strpos($name, $path) === 0) {
+						$name = substr($name, strlen($path));
+					}
+					if ($name === '' || strpos($name, '/') !== false) continue;
 					$files[] = $name;
 				}
 			}
-		}
+
+			// Azure pages at 5000 blobs; NextMarker is empty on the last page.
+			$marker = '';
+			if (preg_match('/<NextMarker>([^<]+)<\/NextMarker>/', $body, $mm)) {
+				$marker = html_entity_decode($mm[1], ENT_QUOTES | ENT_XML1);
+			}
+			$pages++;
+		} while ($marker !== '' && $pages < 100);
 
 		return $files;
 	}

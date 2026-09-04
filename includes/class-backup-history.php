@@ -233,6 +233,13 @@ class SiteGuard_Backup_History {
 			$files[] = $backup['manifest'];
 		}
 
+		// History file references are always bare filenames inside the backup
+		// dir. Drop anything else so a poisoned entry can never be followed to
+		// another directory by the download/delete/restore consumers.
+		$files = array_filter($files, function($f) {
+			return is_string($f) && $f !== '' && basename($f) === $f;
+		});
+
 		return array_unique($files);
 	}
 
@@ -305,6 +312,7 @@ class SiteGuard_Backup_History {
 		if ($retain < 1) return;
 
 		$history = self::get_history_raw();
+		krsort($history); // newest first - retention keeps the most recent N
 		$count = 0;
 		$to_delete = array();
 
@@ -316,7 +324,7 @@ class SiteGuard_Backup_History {
 			if ($type === 'db' && empty($backup['db'])) continue;
 
 			// For full pruning, only count sets that have files
-			if ($type === 'full' && empty($backup['plugins']) && empty($backup['themes']) && empty($backup['uploads'])) continue;
+			if ($type === 'full' && empty(self::file_entity_keys($backup))) continue;
 
 			$count++;
 			if ($count > $retain) {
@@ -324,9 +332,97 @@ class SiteGuard_Backup_History {
 			}
 		}
 
+		// Delete only the pruned TYPE's files. Deleting the whole set made the two
+		// retention settings destroy each other's copies (retain=2, retain_db=10
+		// still left only 2 DB dumps). The set is removed once nothing is left.
 		foreach ($to_delete as $timestamp) {
-			self::delete_backup_set($timestamp, true);
+			$entity_keys = ($type === 'db') ? array('db') : self::file_entity_keys($history[$timestamp]);
+			self::delete_backup_entities($timestamp, $entity_keys, true);
 		}
+	}
+
+	/**
+	 * Keys of the file-archive entities present in a set.
+	 */
+	public static function file_entity_keys($backup) {
+		$keys = array();
+		if (!is_array($backup)) return $keys;
+		foreach ($backup as $k => $v) {
+			if (empty($v)) continue;
+			if (in_array($k, array('plugins', 'themes', 'uploads', 'others', 'wpcore'), true) || strpos($k, 'extradir_') === 0) {
+				$keys[] = $k;
+			}
+		}
+		return $keys;
+	}
+
+	/**
+	 * Delete only some entities of a set (local + remote). Removes the whole set
+	 * (log, jobdata, manifest, history row) when no entity remains.
+	 */
+	public static function delete_backup_entities($timestamp, $entity_keys, $delete_remote = false) {
+		$history = self::get_history_raw();
+		if (!isset($history[$timestamp])) return array();
+		$backup = $history[$timestamp];
+
+		$remaining = array_diff(array_merge(self::file_entity_keys($backup), !empty($backup['db']) ? array('db') : array()), $entity_keys);
+		if (empty($remaining)) {
+			return self::delete_backup_set($timestamp, $delete_remote);
+		}
+
+		$opts = SiteGuard_Backup_Options::instance();
+		$backup_dir = $opts->get_backup_dir();
+		$files = array();
+		foreach ($entity_keys as $k) {
+			if (empty($backup[$k])) continue;
+			$list = is_array($backup[$k]) ? $backup[$k] : array($backup[$k]);
+			foreach ($list as $f) {
+				if (is_string($f) && $f !== '' && basename($f) === $f) $files[] = $f;
+			}
+		}
+		$files = array_values(array_unique($files));
+
+		$deleted = array();
+		foreach ($files as $file) {
+			$path = $backup_dir . $file;
+			if (file_exists($path)) {
+				@unlink($path);
+				$deleted[] = $file;
+			}
+		}
+
+		if ($delete_remote && !empty($backup['service']) && !empty($files)) {
+			$services = is_array($backup['service']) ? $backup['service'] : array($backup['service']);
+			foreach ($services as $service) {
+				if ('none' === $service) continue;
+				$method = self::get_storage_method($service);
+				if ($method && method_exists($method, 'delete')) {
+					try { $method->delete($files); } catch (Exception $e) { /* log-only */ }
+				}
+			}
+		}
+
+		$lock = new SiteGuard_Backup_Semaphore('history');
+		if (!$lock->lock()) { usleep(500000); $lock->lock(); }
+		try {
+			$history = self::get_history_raw();
+			if (isset($history[$timestamp])) {
+				foreach ($entity_keys as $k) unset($history[$timestamp][$k]);
+				if (isset($history[$timestamp]['size'])) {
+					$size = 0;
+					foreach (self::get_all_files($history[$timestamp]) as $f) {
+						$p = $backup_dir . $f;
+						if (file_exists($p)) $size += filesize($p);
+					}
+					$history[$timestamp]['size'] = $size;
+				}
+				self::save_history($history);
+			}
+		} finally {
+			$lock->unlock();
+		}
+
+		return $deleted;
 	}
 
 	/**

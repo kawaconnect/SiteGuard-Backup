@@ -18,8 +18,9 @@ $wpdb->query($wpdb->prepare(
 
 // Remove transients from main site's wp_options
 $wpdb->query($wpdb->prepare(
-	"DELETE FROM {$wpdb->options} WHERE option_name LIKE %s",
-	'%' . $wpdb->esc_like('_transient_sgbackup_') . '%'
+	"DELETE FROM {$wpdb->options} WHERE option_name LIKE %s OR option_name LIKE %s",
+	'%' . $wpdb->esc_like('_transient_sgbackup_') . '%',
+	'%' . $wpdb->esc_like('_transient_timeout_sgbackup_') . '%'
 ));
 
 // Clear scheduled events for the current site
@@ -54,12 +55,14 @@ if (is_multisite()) {
 		$wpdb->esc_like('sgbackup_') . '%'
 	));
 	$wpdb->query($wpdb->prepare(
-		"DELETE FROM {$wpdb->sitemeta} WHERE meta_key LIKE %s",
-		'%' . $wpdb->esc_like('_transient_sgbackup_') . '%'
+		"DELETE FROM {$wpdb->sitemeta} WHERE meta_key LIKE %s OR meta_key LIKE %s",
+		'%' . $wpdb->esc_like('_transient_sgbackup_') . '%',
+		'%' . $wpdb->esc_like('_transient_timeout_sgbackup_') . '%'
 	));
 	$wpdb->query($wpdb->prepare(
-		"DELETE FROM {$wpdb->sitemeta} WHERE meta_key LIKE %s",
-		$wpdb->esc_like('_site_transient_sgbackup_') . '%'
+		"DELETE FROM {$wpdb->sitemeta} WHERE meta_key LIKE %s OR meta_key LIKE %s",
+		$wpdb->esc_like('_site_transient_sgbackup_') . '%',
+		$wpdb->esc_like('_site_transient_timeout_sgbackup_') . '%'
 	));
 
 	// Clean up per-site options, transients, and cron from each subsite
@@ -79,8 +82,9 @@ if (is_multisite()) {
 
 		// Per-site transients
 		$wpdb->query($wpdb->prepare(
-			"DELETE FROM {$wpdb->options} WHERE option_name LIKE %s",
-			'%' . $wpdb->esc_like('_transient_sgbackup_') . '%'
+			"DELETE FROM {$wpdb->options} WHERE option_name LIKE %s OR option_name LIKE %s",
+			'%' . $wpdb->esc_like('_transient_sgbackup_') . '%',
+			'%' . $wpdb->esc_like('_transient_timeout_sgbackup_') . '%'
 		));
 
 		// Per-site cron hooks

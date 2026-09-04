@@ -332,7 +332,13 @@ class SiteGuard_Backup_Commands {
 		$jobdata = $sgbackup->jobdata_getarray($nonce);
 		if (!empty($jobdata)) {
 			$jobdata['jobstatus'] = 'aborted';
-			$sgbackup->jobdata_set($nonce, $jobdata);
+			// jobdata_set($key,$value) writes to the CURRENT job (nonce is null in a
+			// fresh CLI/AJAX process) - it never persisted this, so an aborted stuck
+			// job stayed "running" and blocked every new backup.
+			SiteGuard_Backup_Options::instance()->update_option('sgbackup_jobdata_' . $nonce, $jobdata, false);
+		}
+		if (get_option('sgbackup_active_job_nonce') === $nonce) {
+			delete_option('sgbackup_active_job_nonce');
 		}
 
 		return array('success' => true, 'nonce' => $nonce);
@@ -352,7 +358,7 @@ class SiteGuard_Backup_Commands {
 		}
 
 		$status = isset($jobdata['jobstatus']) ? $jobdata['jobstatus'] : '';
-		if (in_array($status, array('complete', 'error', 'aborted'), true)) {
+		if (in_array($status, array('complete', 'finished', 'warning', 'error', 'aborted', 'failed'), true)) {
 			return new WP_Error('invalid_state', "Job is already in terminal state: {$status}");
 		}
 
@@ -435,6 +441,20 @@ class SiteGuard_Backup_Commands {
 			'health_ssl_warn_days',
 			'low_memory_mode',
 		);
+
+		// Type discipline: every setting except the known list-valued ones must be a
+		// scalar. An array here would be a TypeError in trim()/substr()/sanitize_*
+		// on PHP 8 (500 mid-save) or get persisted raw and break scheduling.
+		$array_keys = array('include_entities', 'exclude_files', 'service', 'include_tables', 'exclude_tables',
+			'email_recipients', 'webhook_events', 'extra_dirs', 'retain_extrarules', 'extradbs', 'method_settings');
+		foreach ($settings_keys as $sk) {
+			if (isset($params[$sk]) && !in_array($sk, $array_keys, true) && !is_scalar($params[$sk])) {
+				unset($params[$sk]);
+			}
+		}
+		foreach (array('ip_allowlist', 'lock_admin_password', 'encryption_key', 'email') as $sk) {
+			if (isset($params[$sk]) && !is_string($params[$sk])) unset($params[$sk]);
+		}
 
 		// Validate up-front, BEFORE any update_option, so a validation failure can't leave
 		// settings half-applied. IP allowlist self-lockout guard must run before we commit
@@ -673,6 +693,8 @@ class SiteGuard_Backup_Commands {
 					}
 				} elseif (is_string($value)) {
 					$value = sanitize_text_field($value);
+				} elseif (!is_scalar($value) && !in_array($key, $array_keys, true)) {
+					continue; // never persist an unexpected structure
 				}
 				$opts->update_option('sgbackup_' . $key, $value);
 			}
@@ -920,8 +942,11 @@ class SiteGuard_Backup_Commands {
 		foreach (array('db', 'plugins', 'themes', 'uploads', 'others', 'wpcore') as $entity) {
 			$restore_options[$entity] = !empty($params['restore_' . $entity]);
 		}
-		if (!empty($params['encryption_key'])) {
-			$restore_options['encryption_key'] = sanitize_text_field($params['encryption_key']);
+		if (!empty($params['encryption_key']) && is_string($params['encryption_key'])) {
+			// Keep the passphrase verbatim (minus NULs) - sanitize_text_field()
+			// mangles characters that are perfectly valid in a passphrase and the
+			// browser restore path (ajax_restore) already passes it through raw.
+			$restore_options['encryption_key'] = str_replace("\0", '', $params['encryption_key']);
 		}
 		if (isset($params['move_in_mode'])) {
 			$restore_options['move_in_mode'] = min(3, max(0, intval($params['move_in_mode'])));
@@ -2242,7 +2267,8 @@ class SiteGuard_Backup_Commands {
 			$new_count = 0;
 			foreach ($remote_files as $remote_file) {
 				$filename = is_array($remote_file) ? (isset($remote_file['name']) ? $remote_file['name'] : '') : $remote_file;
-				if (empty($filename) || isset($known_files[$filename])) continue;
+				if (!is_string($filename) || empty($filename) || isset($known_files[$filename])) continue;
+				if (basename($filename) !== $filename) continue; // sub-paths (e.g. Swift SLO segments) are not backup files
 
 				if (!preg_match('/^backup_(\d{4}-\d{2}-\d{2}-\d{4})_[^_]+_([a-zA-Z0-9]+)-([a-zA-Z]+)/', $filename, $m)) {
 					continue;
@@ -3210,8 +3236,8 @@ class SiteGuard_Backup_Commands {
 
 		// On last chunk, finalize the file
 		if ($is_last) {
-			// Validate total size
-			if (abs($current_size - $total_size) > 1024) {
+			// Validate total size - must be exact; a short file is a corrupt archive
+			if ((int) $current_size !== (int) $total_size) {
 				@unlink($tmp_file);
 				return new WP_Error('size_mismatch', sprintf('Size mismatch: received %d, expected %d.', $current_size, $total_size));
 			}
@@ -3232,7 +3258,8 @@ class SiteGuard_Backup_Commands {
 
 			// Handle bundle zips - send response BEFORE extraction so the
 			// client doesn't time out waiting (large bundles take minutes).
-			if (strpos($filename, 'sgbackup_bundle_') === 0 && $ext === 'zip') {
+			$admin = SiteGuard_Backup_Admin::instance();
+			if ($ext === 'zip' && (strpos($filename, 'sgbackup_bundle_') === 0 || $admin->zip_contains_backup($final_file))) {
 				$result['bundle'] = true;
 				$result['message'] = 'Bundle uploaded - extracting backup files...';
 
@@ -3240,7 +3267,6 @@ class SiteGuard_Backup_Commands {
 				$sgbackup = SiteGuard_Backup::instance();
 				$sgbackup->close_browser_connection(json_encode(array('success' => true, 'data' => $result)));
 
-				$admin = SiteGuard_Backup_Admin::instance();
 				$extracted = $admin->extract_bundle($final_file, $backup_dir);
 				@unlink($final_file);
 				if (!is_wp_error($extracted)) {
@@ -3265,13 +3291,15 @@ class SiteGuard_Backup_Commands {
 						}
 					}
 
-					$backup_data = array(
-						'nonce' => $nonce,
-						$entity => array($filename),
-						'service' => array('none'),
-						'size' => $result['size'],
-					);
-					SiteGuard_Backup_History::add_backup($timestamp, $backup_data);
+					if ($entity !== 'unknown') {
+						$backup_data = array(
+							'nonce' => $nonce,
+							$entity => array($filename),
+							'service' => array('none'),
+							'size' => $result['size'],
+						);
+						SiteGuard_Backup_History::add_backup($timestamp, $backup_data);
+					}
 				}
 
 				$audit = SiteGuard_Backup_Audit_Log::instance();

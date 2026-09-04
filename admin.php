@@ -536,6 +536,7 @@ class SiteGuard_Backup_Admin {
 			if (!empty($backup[$entity])) {
 				$entity_files = is_array($backup[$entity]) ? $backup[$entity] : array($backup[$entity]);
 				foreach ($entity_files as $f) {
+					if (!is_string($f) || $f === '' || basename($f) !== $f) continue; // never follow a path
 					$fpath = $backup_dir . $f;
 					clearstatcache(true, $fpath);
 					if (file_exists($fpath)) {
@@ -845,10 +846,11 @@ class SiteGuard_Backup_Admin {
 			if (is_array($raw)) {
 				$clean = array();
 				foreach ($raw as $entry) {
+					if (!is_array($entry)) continue;
 					$clean[] = array(
-						'source_blog_id' => intval($entry['source_blog_id']),
-						'source_domain'  => sanitize_text_field($entry['source_domain']),
-						'action'         => in_array($entry['action'], array('overwrite', 'create', 'skip')) ? $entry['action'] : 'skip',
+						'source_blog_id' => isset($entry['source_blog_id']) ? intval($entry['source_blog_id']) : 0,
+						'source_domain'  => isset($entry['source_domain']) && is_string($entry['source_domain']) ? sanitize_text_field($entry['source_domain']) : '',
+						'action'         => isset($entry['action']) && in_array($entry['action'], array('overwrite', 'create', 'skip'), true) ? $entry['action'] : 'skip',
 						'target_blog_id' => isset($entry['target_blog_id']) ? intval($entry['target_blog_id']) : 0,
 						'target_domain'  => isset($entry['target_domain']) ? sanitize_text_field($entry['target_domain']) : '',
 					);
@@ -883,6 +885,23 @@ class SiteGuard_Backup_Admin {
 		));
 
 		require_once SGBACKUP_DIR . 'restorer.php';
+		// Continuation of a checkpointed restore ("resume=1"): the client only
+		// re-posts the timestamp. Rebuilding options from that POST made every
+		// entity false, so the DB phase (and its search-replace resume) was skipped
+		// and the stream ended with "Restore complete!" on a half-migrated DB.
+		// Reuse the options the original request saved with its progress.
+		if (!empty($_POST['resume'])) {
+			$resume_progress = SiteGuard_Backup_Options::instance()->get_transient('sgbackup_restore_progress');
+			if (is_array($resume_progress) && !empty($resume_progress['options']) && is_array($resume_progress['options'])
+				&& (int) (isset($resume_progress['timestamp']) ? $resume_progress['timestamp'] : 0) === (int) $timestamp) {
+				$resumed = $resume_progress['options'];
+				// The passphrase is not persisted with progress; keep the one just posted, if any.
+				if (!empty($restore_options['encryption_key'])) $resumed['encryption_key'] = $restore_options['encryption_key'];
+				$restore_options = $resumed;
+				echo 'RINFO:' . wp_json_encode(array('type' => 'progress', 'message' => 'Resuming restore with the original options')) . "\n";
+			}
+		}
+
 		$restorer = new SiteGuard_Backup_Restorer($backup_set, $restore_options);
 		$result = $restorer->perform_restore();
 
@@ -997,13 +1016,17 @@ class SiteGuard_Backup_Admin {
 				}
 			}
 
-			$backup_data = array(
-				'nonce' => $nonce,
-				$entity => array($filename),
-				'service' => array('none'),
-				'size' => filesize($dest),
-			);
-			SiteGuard_Backup_History::add_backup($timestamp, $backup_data);
+			// An entity we cannot classify would create a history row that no
+			// consumer reads (orphan row, file left behind on delete) - skip it.
+			if ($entity !== 'unknown') {
+				$backup_data = array(
+					'nonce' => $nonce,
+					$entity => array($filename),
+					'service' => array('none'),
+					'size' => filesize($dest),
+				);
+				SiteGuard_Backup_History::add_backup($timestamp, $backup_data);
+			}
 		}
 
 		// Audit log
@@ -1250,6 +1273,19 @@ class SiteGuard_Backup_Admin {
 			return false;
 		}
 
+		// Same perimeter as ajax_handler(): the IP allowlist and the settings
+		// lock must also cover restore, upload, and download - otherwise a
+		// locked UI still allowed a full restore with the generic page nonce.
+		require_once SGBACKUP_DIR . 'includes/class-security.php';
+		if (!SiteGuard_Backup_Security::check_ip_allowlist()) {
+			wp_send_json_error(array('message' => 'Access denied: your IP is not in the allowlist.'));
+			return false;
+		}
+		if ($this->is_settings_locked()) {
+			wp_send_json_error(array('message' => 'Settings are locked. Please unlock first.'));
+			return false;
+		}
+
 		$nonce_key = ($method === 'GET') ? '_wpnonce' : 'nonce';
 		$nonce_source = ($method === 'GET') ? $_GET : $_POST;
 		$nonce = isset($nonce_source[$nonce_key]) ? sanitize_text_field($nonce_source[$nonce_key]) : '';
@@ -1337,8 +1373,33 @@ class SiteGuard_Backup_Admin {
 
 		// Register in backup history using the bundle control file's metadata.
 		$registered = false;
-		if ($manifest && !empty($manifest['timestamp']) && !empty($manifest['backup'])) {
-			$backup_data = $manifest['backup'];
+		if (is_array($manifest) && !empty($manifest['timestamp']) && !empty($manifest['backup']) && is_array($manifest['backup'])) {
+			// The manifest is attacker-controllable (it came out of an uploaded zip).
+			// Keep its scalar metadata, but every file reference must be a bare
+			// filename that we actually extracted - otherwise a crafted manifest
+			// could point history at ../../wp-config.php or another tenant's dir,
+			// which download/delete would then happily follow.
+			$backup_data = array();
+			$file_keys = array('db', 'plugins', 'themes', 'uploads', 'others', 'wpcore', 'manifest');
+			foreach ($manifest['backup'] as $k => $v) {
+				if (!is_string($k)) continue;
+				$is_file_key = in_array($k, $file_keys, true) || strpos($k, 'extradir_') === 0;
+				if ($is_file_key) {
+					$list = is_array($v) ? $v : array($v);
+					$clean = array();
+					foreach ($list as $fname) {
+						if (!is_string($fname) || $fname === '' || basename($fname) !== $fname) continue;
+						if (!in_array($fname, $extracted, true)) continue;
+						$clean[] = $fname;
+					}
+					if (!empty($clean)) $backup_data[$k] = array_values(array_unique($clean));
+				} elseif (is_scalar($v) || is_array($v)) {
+					$backup_data[$k] = $v;
+				}
+			}
+			if (isset($backup_data['nonce'])) {
+				$backup_data['nonce'] = is_string($backup_data['nonce']) ? preg_replace('/[^a-zA-Z0-9]/', '', $backup_data['nonce']) : '';
+			}
 			$total_size = 0;
 			foreach ($extracted as $f) {
 				$p = $backup_dir . $f;
@@ -1347,8 +1408,14 @@ class SiteGuard_Backup_Admin {
 			}
 			$backup_data['size'] = $total_size;
 			$backup_data['service'] = array('none');
-			SiteGuard_Backup_History::add_backup(intval($manifest['timestamp']), $backup_data);
-			$registered = true;
+			$has_files = false;
+			foreach ($backup_data as $k => $v) {
+				if ((in_array($k, $file_keys, true) || strpos($k, 'extradir_') === 0) && !empty($v)) { $has_files = true; break; }
+			}
+			if ($has_files) {
+				SiteGuard_Backup_History::add_backup(intval($manifest['timestamp']), $backup_data);
+				$registered = true;
+			}
 		}
 
 		// Fallback: no (or invalid) _sgbackup_bundle.json - e.g. someone re-zipped the
@@ -1367,7 +1434,7 @@ class SiteGuard_Backup_Admin {
 	 * (_sgbackup_bundle.json) OR any backup_* entity file at the root - regardless of the
 	 * archive's own name. Lets renamed bundles / hand-zipped backup sets import correctly.
 	 */
-	private function zip_contains_backup($zip_path) {
+	public function zip_contains_backup($zip_path) {
 		if (!class_exists('ZipArchive')) return false;
 		$zip = new ZipArchive();
 		if (true !== $zip->open($zip_path)) return false;
