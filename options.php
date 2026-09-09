@@ -138,25 +138,124 @@ class SiteGuard_Backup_Options {
 	}
 
 	/**
+	 * Is $path inside a tree the webserver serves?
+	 *
+	 * Checks ABSPATH, the real path of WP_CONTENT_DIR, and its parent (the document
+	 * root on most layouts, including Azure App Service where the served docroot
+	 * symlinks wp-content back into /home/site/wwwroot).
+	 */
+	public function is_web_served_path($path) {
+		$real = realpath($path);
+		if (!$real) {
+			$real = $path; // may not exist yet
+		}
+		$real = untrailingslashit($real);
+
+		$trees = array();
+		if (defined('ABSPATH')) {
+			$a = realpath(ABSPATH);
+			if ($a) {
+				$trees[] = untrailingslashit($a);
+			}
+		}
+		$c = realpath(WP_CONTENT_DIR);
+		if ($c) {
+			$trees[] = untrailingslashit($c);
+			$trees[] = untrailingslashit(dirname($c)); // the web root itself
+		}
+
+		foreach ($trees as $t) {
+			if ('' === $t || '/' === $t) {
+				continue;
+			}
+			if ($real === $t || 0 === strpos($real . '/', $t . '/')) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	/**
+	 * Candidate roots for backup storage, best (least exposed) first.
+	 *
+	 * Backups are archives of the whole site and its database; they must not live
+	 * where the webserver can serve them. .htaccess does nothing on nginx, so
+	 * "protected" in-webroot storage is not protection at all.
+	 */
+	private function candidate_backup_roots() {
+		$roots = array();
+
+		// 1. Explicit host override, e.g. define('SGBACKUP_DIR', '/home/site/sgbackup');
+		if (defined('SGBACKUP_DIR') && SGBACKUP_DIR) {
+			$roots[] = untrailingslashit(SGBACKUP_DIR);
+		}
+
+		// 2. One level above the web root. /var/www/html/wp-content -> /var/www/sgbackup
+		//    Azure App Service: /home/site/wwwroot/wp-content -> /home/site/sgbackup
+		$content = realpath(WP_CONTENT_DIR);
+		if ($content) {
+			$webroot = dirname($content);
+			$above   = dirname($webroot);
+			if ($above && $above !== $webroot && '/' !== $above && '.' !== $above) {
+				$roots[] = untrailingslashit($above) . '/sgbackup';
+			}
+		}
+
+		return $roots;
+	}
+
+	/**
+	 * Pick a writable backup root that the webserver cannot serve.
+	 * Falls back to the legacy in-webroot path only as a last resort, and records
+	 * that fact so the exposure is visible rather than silent.
+	 */
+	private function default_backup_root() {
+		foreach ($this->candidate_backup_roots() as $candidate) {
+			if ($this->is_web_served_path($candidate)) {
+				continue;
+			}
+			if (!file_exists($candidate) && !wp_mkdir_p($candidate)) {
+				continue;
+			}
+			if (is_dir($candidate) && wp_is_writable($candidate)) {
+				return $candidate;
+			}
+		}
+
+		error_log('SiteGuard Backup: no writable directory outside the web root; falling back to ' . WP_CONTENT_DIR . '/sgbackup (archives may be publicly downloadable)');
+		return WP_CONTENT_DIR . '/sgbackup';
+	}
+
+	/**
 	 * Get the backup directory path.
 	 */
 	public function get_backup_dir() {
 		$dir = $this->get_option('sgbackup_dir', '');
 
-		// Validate custom dir is within WordPress installation
+		// A custom directory OUTSIDE the WordPress install is the desired case, so it
+		// is allowed. Only reject paths that are unusable or obviously unsafe.
 		if (!empty($dir)) {
-			$real_dir = realpath(dirname($dir));
-			$real_content = realpath(WP_CONTENT_DIR);
-			$real_abspath = realpath(ABSPATH);
-			if ($real_dir && $real_content && strpos($real_dir, $real_content) !== 0 && strpos($real_dir, $real_abspath) !== 0) {
-				error_log('SiteGuard Backup: Custom backup directory is outside WordPress installation, using default');
+			$dir = untrailingslashit($dir);
+			if (0 !== strpos($dir, '/') || false !== strpos($dir, '../')) {
+				error_log('SiteGuard Backup: custom backup directory must be an absolute path without traversal; using default');
+				$dir = '';
+			} elseif (!file_exists($dir) && !wp_mkdir_p($dir)) {
+				error_log('SiteGuard Backup: custom backup directory could not be created; using default');
+				$dir = '';
+			} elseif (!wp_is_writable($dir)) {
+				error_log('SiteGuard Backup: custom backup directory is not writable; using default');
 				$dir = '';
 			}
 		}
 
 		if (empty($dir)) {
-			$dir = WP_CONTENT_DIR . '/sgbackup';
+			$dir = $this->default_backup_root();
 		}
+
+		/**
+		 * Filter the backup root before the per-site subdirectory is appended.
+		 */
+		$dir = untrailingslashit(apply_filters('sgbackup_backup_dir', $dir));
 
 		// Per-site subdirectory for subsites (blog_id > 1)
 		if (is_multisite() && get_current_blog_id() > 1) {
@@ -164,26 +263,11 @@ class SiteGuard_Backup_Options {
 		}
 
 		if (!file_exists($dir)) {
-			$result = wp_mkdir_p($dir);
-			if ($result) {
-				// Protect directory
+			if (wp_mkdir_p($dir)) {
 				$this->protect_backup_dir($dir);
 			}
-		}
-
-		// Re-validate resolved path after directory exists (catches symlink attacks)
-		$real_resolved = realpath($dir);
-		$real_content = realpath(WP_CONTENT_DIR);
-		$real_abspath = realpath(ABSPATH);
-		if ($real_resolved && $real_content && $real_abspath
-			&& strpos($real_resolved, $real_content) !== 0
-			&& strpos($real_resolved, $real_abspath) !== 0) {
-			error_log('SiteGuard Backup: Resolved backup directory is outside WordPress installation, using default');
-			$dir = WP_CONTENT_DIR . '/sgbackup';
-			if (!file_exists($dir)) {
-				wp_mkdir_p($dir);
-				$this->protect_backup_dir($dir);
-			}
+		} else {
+			$this->protect_backup_dir($dir);
 		}
 
 		return trailingslashit($dir);
@@ -248,6 +332,34 @@ class SiteGuard_Backup_Options {
 			if (false === $result) {
 				error_log('SiteGuard Backup: Failed to write .nginx-deny to ' . $dir);
 			}
+		}
+
+		// None of the files above actually protect anything on nginx: .htaccess is
+		// Apache-only, and nginx has no per-directory config, so .nginx-deny is inert
+		// unless an admin includes it in the server block by hand. If the directory is
+		// web-served on such a server, every archive is publicly downloadable. Record
+		// it loudly instead of failing silently.
+		$this->flag_dir_exposure($dir);
+	}
+
+	/**
+	 * Record whether the backup directory is actually reachable by the webserver.
+	 *
+	 * Stores sgbackup_dir_exposed (1/0) so the admin UI can surface it, and logs on
+	 * transition. .user.ini keeps PHP from EXECUTING there, but static archives
+	 * (.zip/.gz) are still served, so this is a data-disclosure risk, not RCE.
+	 */
+	private function flag_dir_exposure($dir) {
+		$server      = isset($_SERVER['SERVER_SOFTWARE']) ? strtolower((string) $_SERVER['SERVER_SOFTWARE']) : '';
+		$apache_like = (false !== strpos($server, 'apache') || false !== strpos($server, 'litespeed'));
+		$exposed     = $this->is_web_served_path($dir) && !$apache_like;
+
+		$previous = (int) $this->get_option('sgbackup_dir_exposed', 0);
+		if ($exposed && !$previous) {
+			error_log('SiteGuard Backup: SECURITY - backup directory ' . $dir . ' is inside the web root on a non-Apache server (' . ($server ? $server : 'unknown') . '); .htaccess is ignored there and archives may be publicly downloadable. Move backups outside the web root, e.g. define(\'SGBACKUP_DIR\', \'/path/outside/webroot\').');
+		}
+		if ((int) $exposed !== $previous) {
+			$this->update_option('sgbackup_dir_exposed', $exposed ? 1 : 0);
 		}
 	}
 
