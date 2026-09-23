@@ -13,10 +13,13 @@ class SiteGuard_Backup_Options {
 
 	/**
 	 * Keys that must remain network-wide (shared across all sites).
-	 * Migration RSA keys = one identity per install.
+	 * Migration RSA keys = one identity per install; the resolved backup root is
+	 * shared because subsites live in per-site subdirectories beneath it.
 	 */
 	private static $network_wide_keys = array(
 		'sgbackup_migrator_localkeys',
+		'sgbackup_resolved_root',
+		'sgbackup_legacy_leftovers',
 	);
 
 	public static function instance() {
@@ -138,38 +141,87 @@ class SiteGuard_Backup_Options {
 	}
 
 	/**
-	 * Is $path inside a tree the webserver serves?
+	 * Trees the webserver may serve, as absolute paths without trailing slash.
 	 *
-	 * Checks ABSPATH, the real path of WP_CONTENT_DIR, and its parent (the document
-	 * root on most layouts, including Azure App Service where the served docroot
-	 * symlinks wp-content back into /home/site/wwwroot).
+	 * Both the configured and the resolved form of ABSPATH / WP_CONTENT_DIR / the
+	 * uploads dir are included, plus DOCUMENT_ROOT. On Azure App Service the docroot
+	 * is switched from /home/site/wwwroot to /var/www/wordpress a few minutes after
+	 * boot, so a path that is not served right now may be served after the next
+	 * restart; every docroot the install can be reached through counts.
+	 */
+	private function web_served_trees() {
+		$trees = array_merge($this->web_roots(), $this->resolved_forms(array(WP_CONTENT_DIR)));
+		if (!empty($_SERVER['DOCUMENT_ROOT'])) {
+			$trees = array_merge($trees, $this->resolved_forms(array((string) $_SERVER['DOCUMENT_ROOT'])));
+		}
+		return array_values(array_unique($trees));
+	}
+
+	/**
+	 * Every directory that may be the web root: ABSPATH, the parent of wp-content and
+	 * the grandparent of the uploads dir, each both as configured and after resolving
+	 * symlinks (a symlinked wp-content points back at the persistent tree).
+	 */
+	private function web_roots() {
+		$paths = array(dirname(WP_CONTENT_DIR));
+		$content = realpath(WP_CONTENT_DIR);
+		if ($content) {
+			$paths[] = dirname($content);
+		}
+		if (defined('ABSPATH')) {
+			$paths[] = ABSPATH;
+		}
+		$uploads = $this->uploads_basedir();
+		if ($uploads) {
+			$paths[] = dirname(dirname($uploads)); // <webroot>/wp-content/uploads -> <webroot>
+			$real_uploads = realpath($uploads);
+			if ($real_uploads) {
+				$paths[] = dirname(dirname($real_uploads));
+			}
+		}
+		return $this->resolved_forms($paths);
+	}
+
+	/**
+	 * Normalised configured + realpath() forms of $paths, deduplicated, never "/".
+	 */
+	private function resolved_forms($paths) {
+		$out = array();
+		foreach ($paths as $p) {
+			foreach (array($p, realpath($p)) as $t) {
+				if (!$t) continue;
+				$t = untrailingslashit(wp_normalize_path($t));
+				if ('' === $t || '/' === $t || '.' === $t) continue;
+				$out[$t] = true;
+			}
+		}
+		return array_keys($out);
+	}
+
+	/**
+	 * Uploads base directory without creating it (wp_upload_dir() would mkdir).
+	 */
+	private function uploads_basedir() {
+		if (!function_exists('wp_upload_dir')) return '';
+		$u = wp_upload_dir(null, false);
+		return (is_array($u) && !empty($u['basedir'])) ? untrailingslashit($u['basedir']) : '';
+	}
+
+	/**
+	 * Is $path inside a tree the webserver serves?
 	 */
 	public function is_web_served_path($path) {
+		$candidates = array(untrailingslashit(wp_normalize_path($path)));
 		$real = realpath($path);
-		if (!$real) {
-			$real = $path; // may not exist yet
-		}
-		$real = untrailingslashit($real);
-
-		$trees = array();
-		if (defined('ABSPATH')) {
-			$a = realpath(ABSPATH);
-			if ($a) {
-				$trees[] = untrailingslashit($a);
-			}
-		}
-		$c = realpath(WP_CONTENT_DIR);
-		if ($c) {
-			$trees[] = untrailingslashit($c);
-			$trees[] = untrailingslashit(dirname($c)); // the web root itself
+		if ($real) {
+			$candidates[] = untrailingslashit(wp_normalize_path($real));
 		}
 
-		foreach ($trees as $t) {
-			if ('' === $t || '/' === $t) {
-				continue;
-			}
-			if ($real === $t || 0 === strpos($real . '/', $t . '/')) {
-				return true;
+		foreach ($this->web_served_trees() as $t) {
+			foreach ($candidates as $c) {
+				if ($c === $t || 0 === strpos($c . '/', $t . '/')) {
+					return true;
+				}
 			}
 		}
 		return false;
@@ -179,51 +231,76 @@ class SiteGuard_Backup_Options {
 	 * Candidate roots for backup storage, best (least exposed) first.
 	 *
 	 * Backups are archives of the whole site and its database; they must not live
-	 * where the webserver can serve them. .htaccess does nothing on nginx, so
-	 * "protected" in-webroot storage is not protection at all.
+	 * where the webserver can serve them. Nothing written into a directory protects
+	 * it on nginx, so the only real protection is keeping archives outside the web
+	 * root (downloads go through the capability-checked sgbackup_download endpoint).
+	 *
+	 * Several independent anchors are used so a single mis-derived path (e.g. a
+	 * docroot that changes at runtime) does not leave nowhere to go.
 	 */
 	private function candidate_backup_roots() {
 		$roots = array();
 
-		// 1. Explicit host override, e.g. define('SGBACKUP_DIR', '/home/site/sgbackup');
-		if (defined('SGBACKUP_DIR') && SGBACKUP_DIR) {
-			$roots[] = untrailingslashit(SGBACKUP_DIR);
+		// 1. Explicit host override in wp-config.php:
+		//    define('SGBACKUP_BACKUP_DIR', '/home/site/sgbackup');
+		//    (SGBACKUP_DIR is the plugin's own install directory, not a destination.)
+		if (defined('SGBACKUP_BACKUP_DIR') && SGBACKUP_BACKUP_DIR) {
+			$roots[] = (string) SGBACKUP_BACKUP_DIR;
 		}
 
-		// 2. One level above the web root. /var/www/html/wp-content -> /var/www/sgbackup
+		// 2. One level above each web root the install can be reached through.
+		//    /var/www/html/wp-content -> /var/www/sgbackup
 		//    Azure App Service: /home/site/wwwroot/wp-content -> /home/site/sgbackup
-		$content = realpath(WP_CONTENT_DIR);
-		if ($content) {
-			$webroot = dirname($content);
-			$above   = dirname($webroot);
-			if ($above && $above !== $webroot && '/' !== $above && '.' !== $above) {
-				$roots[] = untrailingslashit($above) . '/sgbackup';
+		foreach ($this->web_roots() as $w) {
+			$above = dirname($w);
+			if ($above && $above !== $w && '/' !== $above && '.' !== $above) {
+				$roots[] = $above . '/sgbackup';
 			}
 		}
 
-		return $roots;
+		$clean = array();
+		foreach ($roots as $r) {
+			$r = untrailingslashit(wp_normalize_path($r));
+			if ('' === $r || 0 !== strpos($r, '/') || false !== strpos($r, '../')) continue;
+			$clean[$r] = true;
+		}
+		return array_keys($clean);
+	}
+
+	/**
+	 * Is $dir usable as a backup root (outside the web root, exists or can be created, writable)?
+	 */
+	private function is_usable_backup_root($dir) {
+		if ($this->is_web_served_path($dir)) return false;
+		if (!file_exists($dir) && !wp_mkdir_p($dir)) return false;
+		return is_dir($dir) && wp_is_writable($dir);
 	}
 
 	/**
 	 * Pick a writable backup root that the webserver cannot serve.
-	 * Falls back to the legacy in-webroot path only as a last resort, and records
-	 * that fact so the exposure is visible rather than silent.
+	 *
+	 * SGBACKUP_BACKUP_DIR always wins. Otherwise the first root found is remembered
+	 * network-wide, so a later change in how the web root is derived (Azure's post-boot docroot switch) cannot silently move
+	 * backups. The in-webroot legacy path is used only when nothing else works, and
+	 * get_backup_dir() then reports it loudly.
 	 */
 	private function default_backup_root() {
+		$explicit   = (defined('SGBACKUP_BACKUP_DIR') && SGBACKUP_BACKUP_DIR);
+		$remembered = $this->get_option('sgbackup_resolved_root', '');
+		if (!$explicit && is_string($remembered) && '' !== $remembered && $this->is_usable_backup_root($remembered)) {
+			return $remembered;
+		}
+
 		foreach ($this->candidate_backup_roots() as $candidate) {
-			if ($this->is_web_served_path($candidate)) {
-				continue;
-			}
-			if (!file_exists($candidate) && !wp_mkdir_p($candidate)) {
-				continue;
-			}
-			if (is_dir($candidate) && wp_is_writable($candidate)) {
+			if ($this->is_usable_backup_root($candidate)) {
+				if ($candidate !== $remembered) {
+					$this->update_option('sgbackup_resolved_root', $candidate);
+				}
 				return $candidate;
 			}
 		}
 
-		error_log('SiteGuard Backup: no writable directory outside the web root; falling back to ' . WP_CONTENT_DIR . '/sgbackup (archives may be publicly downloadable)');
-		return WP_CONTENT_DIR . '/sgbackup';
+		return untrailingslashit(WP_CONTENT_DIR) . '/sgbackup';
 	}
 
 	/**
@@ -254,6 +331,8 @@ class SiteGuard_Backup_Options {
 
 		/**
 		 * Filter the backup root before the per-site subdirectory is appended.
+		 * Return an absolute path outside the web root to pin the location, e.g. from
+		 * an mu-plugin: add_filter('sgbackup_backup_dir', fn() => '/home/site/sgbackup');
 		 */
 		$dir = untrailingslashit(apply_filters('sgbackup_backup_dir', $dir));
 
@@ -263,104 +342,188 @@ class SiteGuard_Backup_Options {
 		}
 
 		if (!file_exists($dir)) {
-			if (wp_mkdir_p($dir)) {
-				$this->protect_backup_dir($dir);
-			}
-		} else {
+			wp_mkdir_p($dir);
+		}
+
+		$exposed = $this->flag_dir_exposure($dir);
+		if ($this->is_web_served_path($dir)) {
+			// Only meaningful on Apache/IIS; see protect_backup_dir().
 			$this->protect_backup_dir($dir);
+		} else {
+			$this->remove_protection_stubs($dir);
+		}
+		if (!$exposed) {
+			$this->maybe_cleanup_legacy_dirs($dir);
 		}
 
 		return trailingslashit($dir);
 	}
 
 	/**
-	 * Add .htaccess, .user.ini, index.php, index.html, and web.config to protect backup directory.
+	 * Stub files dropped into an in-webroot backup directory, name => exact content.
+	 *
+	 * These help on Apache (.htaccess) and IIS (web.config), and index.* only answer a
+	 * request for the directory itself. On nginx none of them stop a request for a
+	 * named archive, which nginx serves straight off disk; there is no in-directory
+	 * fix there, so an nginx snippet file is deliberately not shipped.
+	 */
+	private function protection_stubs() {
+		return array(
+			'.htaccess'  => "<IfModule mod_authz_core.c>\nRequire all denied\n</IfModule>\n<IfModule !mod_authz_core.c>\nOrder deny,allow\nDeny from all\n</IfModule>\n",
+			'.user.ini'  => "auto_prepend_file = none\nengine = off\n",
+			'index.php'  => "<?php\n// Silence is golden.\ndie('Access denied.');\n",
+			'index.html' => "<html><body><p>Forbidden</p></body></html>\n",
+			'web.config' => "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<configuration>\n<system.webServer>\n<authorization>\n<deny users=\"*\" />\n</authorization>\n</system.webServer>\n</configuration>\n",
+		);
+	}
+
+	/**
+	 * Stub files earlier versions wrote that are no longer written anywhere.
+	 */
+	private function retired_stubs() {
+		return array(
+			'.nginx-deny' => "# Include this file in your Nginx server block for backup directory protection\n# location ~ /sgbackup { deny all; return 404; }\n",
+		);
+	}
+
+	/**
+	 * Write the Apache/IIS protection stubs into an in-webroot backup directory.
 	 */
 	private function protect_backup_dir($dir) {
-		// .htaccess
-		$htaccess = $dir . '/.htaccess';
-		if (!file_exists($htaccess)) {
-			$result = file_put_contents($htaccess, "<IfModule mod_authz_core.c>\nRequire all denied\n</IfModule>\n<IfModule !mod_authz_core.c>\nOrder deny,allow\nDeny from all\n</IfModule>\n");
-			if (false === $result) {
-				error_log('SiteGuard Backup: Failed to write .htaccess to ' . $dir);
+		foreach ($this->protection_stubs() as $name => $content) {
+			$path = $dir . '/' . $name;
+			if (!file_exists($path)) {
+				if (false === @file_put_contents($path, $content)) {
+					error_log('SiteGuard Backup: Failed to write ' . $name . ' to ' . $dir);
+					continue;
+				}
+			}
+			if ('index.php' !== $name && 'index.html' !== $name) {
+				@chmod($path, 0600);
 			}
 		}
-		@chmod($htaccess, 0600);
+		$this->remove_stub_files($dir, $this->retired_stubs());
+	}
 
-		// .user.ini - disable PHP execution (CGI/FastCGI environments)
-		$userini = $dir . '/.user.ini';
-		if (!file_exists($userini)) {
-			$result = file_put_contents($userini, "auto_prepend_file = none\nengine = off\n");
-			if (false === $result) {
-				error_log('SiteGuard Backup: Failed to write .user.ini to ' . $dir);
+	/**
+	 * Outside the web root the stubs protect nothing; remove any we wrote earlier.
+	 */
+	private function remove_protection_stubs($dir) {
+		$this->remove_stub_files($dir, array_merge($this->protection_stubs(), $this->retired_stubs()));
+	}
+
+	/**
+	 * Delete stub files whose content is byte-identical to what this plugin wrote,
+	 * so a hand-made file with the same name is never touched.
+	 */
+	private function remove_stub_files($dir, $stubs) {
+		foreach ($stubs as $name => $content) {
+			$path = $dir . '/' . $name;
+			if (is_file($path) && !is_link($path) && filesize($path) === strlen($content) && @file_get_contents($path) === $content) {
+				@unlink($path);
 			}
 		}
-		@chmod($userini, 0600);
+	}
 
-		// index.php - block direct PHP access with die()
-		$index_php = $dir . '/index.php';
-		if (!file_exists($index_php)) {
-			$result = file_put_contents($index_php, "<?php\n// Silence is golden.\ndie('Access denied.');\n");
-			if (false === $result) {
-				error_log('SiteGuard Backup: Failed to write index.php to ' . $dir);
+	/**
+	 * Remove the stub-only directories older versions left in the web root
+	 * (<wp-content>/sgbackup and its site-N children) once backups live elsewhere.
+	 *
+	 * Only directories that are empty after stub removal are deleted. Anything else
+	 * (in particular real archives) is left in place and recorded in
+	 * sgbackup_legacy_leftovers so the admin notice can point at it: those files are
+	 * publicly downloadable and moving them is the admin's call.
+	 */
+	private function maybe_cleanup_legacy_dirs($current_dir) {
+		if (get_site_transient('sgbackup_legacy_cleanup')) return;
+		set_site_transient('sgbackup_legacy_cleanup', 1, HOUR_IN_SECONDS);
+
+		$current = untrailingslashit(wp_normalize_path($current_dir));
+		$legacy = array();
+		foreach (array(WP_CONTENT_DIR, realpath(WP_CONTENT_DIR)) as $c) {
+			if (!$c) continue;
+			$legacy[untrailingslashit(wp_normalize_path($c)) . '/sgbackup'] = true;
+		}
+
+		$leftovers = array();
+		foreach (array_keys($legacy) as $root) {
+			if (!is_dir($root) || is_link($root)) continue;
+			// Never clean the directory currently in use (e.g. a filter pointing there).
+			if ($root === $current || 0 === strpos($current . '/', $root . '/')) continue;
+
+			$subdirs = glob($root . '/site-*', GLOB_ONLYDIR);
+			foreach (array_merge(is_array($subdirs) ? $subdirs : array(), array($root)) as $d) {
+				if (is_link($d)) continue;
+				$this->remove_protection_stubs($d);
+				$remaining = array_diff((array) @scandir($d), array('.', '..'));
+				if (empty($remaining)) {
+					@rmdir($d);
+				} else {
+					$files = array_filter($remaining, function ($f) use ($d) { return is_file($d . '/' . $f); });
+					if (!empty($files)) {
+						$leftovers[$d] = count($files);
+					}
+				}
 			}
 		}
 
-		// index.html
-		$index = $dir . '/index.html';
-		if (!file_exists($index)) {
-			$result = file_put_contents($index, "<html><body><p>Forbidden</p></body></html>\n");
-			if (false === $result) {
-				error_log('SiteGuard Backup: Failed to write index.html to ' . $dir);
-			}
+		if ($leftovers != $this->get_option('sgbackup_legacy_leftovers', array())) {
+			$this->update_option('sgbackup_legacy_leftovers', $leftovers);
 		}
-
-		// web.config for IIS
-		$webconfig = $dir . '/web.config';
-		if (!file_exists($webconfig)) {
-			$result = file_put_contents($webconfig, "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<configuration>\n<system.webServer>\n<authorization>\n<deny users=\"*\" />\n</authorization>\n</system.webServer>\n</configuration>\n");
-			if (false === $result) {
-				error_log('SiteGuard Backup: Failed to write web.config to ' . $dir);
-			}
-		}
-		@chmod($webconfig, 0600);
-
-		// .nginx-deny - Nginx protection snippet
-		$nginx_deny = $dir . '/.nginx-deny';
-		if (!file_exists($nginx_deny)) {
-			$result = file_put_contents($nginx_deny, "# Include this file in your Nginx server block for backup directory protection\n# location ~ /sgbackup { deny all; return 404; }\n");
-			if (false === $result) {
-				error_log('SiteGuard Backup: Failed to write .nginx-deny to ' . $dir);
-			}
-		}
-
-		// None of the files above actually protect anything on nginx: .htaccess is
-		// Apache-only, and nginx has no per-directory config, so .nginx-deny is inert
-		// unless an admin includes it in the server block by hand. If the directory is
-		// web-served on such a server, every archive is publicly downloadable. Record
-		// it loudly instead of failing silently.
-		$this->flag_dir_exposure($dir);
 	}
 
 	/**
 	 * Record whether the backup directory is actually reachable by the webserver.
 	 *
-	 * Stores sgbackup_dir_exposed (1/0) so the admin UI can surface it, and logs on
-	 * transition. .user.ini keeps PHP from EXECUTING there, but static archives
-	 * (.zip/.gz) are still served, so this is a data-disclosure risk, not RCE.
+	 * Stores sgbackup_dir_exposed (1/0) and sgbackup_dir_exposure details so the admin
+	 * notice fires on the next admin page load, not only when a backup runs. The
+	 * record lives in the database and the audit log because error_log() may go to a
+	 * container's stdout and be lost. .user.ini keeps PHP from EXECUTING there, but
+	 * static archives (.zip/.gz) are still served: a data-disclosure risk, not RCE.
+	 *
+	 * @return bool True if the directory is exposed.
 	 */
 	private function flag_dir_exposure($dir) {
-		$server      = isset($_SERVER['SERVER_SOFTWARE']) ? strtolower((string) $_SERVER['SERVER_SOFTWARE']) : '';
+		$server = isset($_SERVER['SERVER_SOFTWARE']) ? strtolower((string) $_SERVER['SERVER_SOFTWARE']) : '';
+		if ('' !== $server) {
+			if ($server !== get_site_option('sgbackup_server_software', '')) {
+				update_site_option('sgbackup_server_software', $server);
+			}
+		} else {
+			// Cron/CLI: judge by the server last seen serving a web request.
+			$server = (string) get_site_option('sgbackup_server_software', '');
+		}
 		$apache_like = (false !== strpos($server, 'apache') || false !== strpos($server, 'litespeed'));
 		$exposed     = $this->is_web_served_path($dir) && !$apache_like;
 
 		$previous = (int) $this->get_option('sgbackup_dir_exposed', 0);
 		if ($exposed && !$previous) {
-			error_log('SiteGuard Backup: SECURITY - backup directory ' . $dir . ' is inside the web root on a non-Apache server (' . ($server ? $server : 'unknown') . '); .htaccess is ignored there and archives may be publicly downloadable. Move backups outside the web root, e.g. define(\'SGBACKUP_DIR\', \'/path/outside/webroot\').');
+			$msg = 'SECURITY - backup directory ' . $dir . ' is inside the web root on a non-Apache server (' . ($server ? $server : 'unknown') . '); archives there may be publicly downloadable. Tried: ' . implode(', ', $this->candidate_backup_roots()) . '. Set define(\'SGBACKUP_BACKUP_DIR\', \'/path/outside/webroot\') in wp-config.php or use the sgbackup_backup_dir filter.';
+			error_log('SiteGuard Backup: ' . $msg);
+			if (class_exists('SiteGuard_Backup_Audit_Log')) {
+				SiteGuard_Backup_Audit_Log::instance()->log('backup_dir_exposed', $msg);
+			}
 		}
 		if ((int) $exposed !== $previous) {
 			$this->update_option('sgbackup_dir_exposed', $exposed ? 1 : 0);
 		}
+		if ($exposed) {
+			$info = array(
+				'dir'    => $dir,
+				'server' => $server,
+				'tried'  => $this->candidate_backup_roots(),
+			);
+			$stored = $this->get_option('sgbackup_dir_exposure', array());
+			$unchanged = is_array($stored) && isset($stored['dir'], $stored['server'], $stored['tried'])
+				&& $stored['dir'] === $info['dir'] && $stored['server'] === $info['server'] && $stored['tried'] === $info['tried'];
+			if (!$unchanged) {
+				$info['time'] = time();
+				$this->update_option('sgbackup_dir_exposure', $info);
+			}
+		} elseif ($previous) {
+			$this->delete_option('sgbackup_dir_exposure');
+		}
+		return $exposed;
 	}
 
 	/**

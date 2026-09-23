@@ -41,6 +41,8 @@ class SiteGuard_Backup_Admin {
 		add_action('admin_head', array($this, 'maybe_send_csp_headers'));
 		add_action('wp_head', array($this, 'admin_bar_css'));
 		add_action('wp_dashboard_setup', array($this, 'dashboard_widget_setup'));
+		add_action('admin_notices', array($this, 'backup_dir_notice'));
+		add_action('network_admin_notices', array($this, 'backup_dir_notice'));
 		if (is_multisite()) {
 			add_action('wp_network_dashboard_setup', array($this, 'dashboard_widget_setup'));
 		}
@@ -1322,7 +1324,7 @@ class SiteGuard_Backup_Admin {
 		// In-zip extension allowlist and explicit protection-file denylist so a crafted
 		// bundle cannot drop .php/.htaccess/.user.ini/etc into the backup dir.
 		$allowed_ext = array('zip', 'gz', 'sql', 'crypt', 'json');
-		$protected_names = array('.htaccess', '.user.ini', 'index.php', 'web.config', '.nginx-deny');
+		$protected_names = array('.htaccess', '.user.ini', 'index.php', 'index.html', 'web.config', '.nginx-deny');
 
 		$extracted = array();
 		for ($i = 0; $i < $zip->numFiles; $i++) {
@@ -1523,6 +1525,45 @@ class SiteGuard_Backup_Admin {
 	/**
 	 * Check if current user can manage backups.
 	 */
+	/**
+	 * Warn when backups are (or were) stored where the webserver can serve them.
+	 *
+	 * Resolving the backup directory here means the check runs on every admin page
+	 * load, so a fallback into the web root surfaces immediately rather than only
+	 * after the next backup.
+	 */
+	public function backup_dir_notice() {
+		if (!$this->user_can_manage()) return;
+
+		$opts = SiteGuard_Backup_Options::instance();
+		$opts->get_backup_dir();
+
+		if ((int) $opts->get_option('sgbackup_dir_exposed', 0)) {
+			$info = $opts->get_option('sgbackup_dir_exposure', array());
+			$dir  = (is_array($info) && !empty($info['dir'])) ? $info['dir'] : '';
+			echo '<div class="notice notice-error"><p><strong>SiteGuard Backup: backups are stored inside the web root.</strong> ';
+			echo 'Files in <code>' . esc_html($dir) . '</code> can be downloaded by anyone who guesses their name: this server ';
+			echo '(' . esc_html(!empty($info['server']) ? $info['server'] : 'unknown') . ') ignores .htaccess, and no file placed in that directory can block access.</p>';
+			if (!empty($info['tried'])) {
+				echo '<p>No writable directory outside the web root was found. Tried: <code>' . esc_html(implode('</code>, <code>', (array) $info['tried'])) . '</code></p>';
+			}
+			echo '<p>Fix: create a directory outside the web root that PHP can write to, then add <code>define(\'SGBACKUP_BACKUP_DIR\', \'/path/outside/webroot\');</code> to wp-config.php ';
+			echo '(or return that path from the <code>sgbackup_backup_dir</code> filter in an mu-plugin). Then move or delete any existing archives in the old directory.</p></div>';
+		}
+
+		// The legacy scan covers every subsite's directory; only network-level admins see it.
+		$network_admin = is_multisite() ? current_user_can('manage_network_options') : current_user_can('manage_options');
+		$leftovers = $network_admin ? $opts->get_option('sgbackup_legacy_leftovers', array()) : array();
+		if (is_array($leftovers) && !empty($leftovers)) {
+			echo '<div class="notice notice-warning"><p><strong>SiteGuard Backup:</strong> files remain in old backup directories inside the web root and may be publicly downloadable. Move them into the current backup directory (';
+			echo '<code>' . esc_html($opts->get_backup_dir()) . '</code>) or delete them:</p><ul>';
+			foreach ($leftovers as $d => $count) {
+				echo '<li><code>' . esc_html($d) . '</code>: ' . (int) $count . ' file(s)</li>';
+			}
+			echo '</ul></div>';
+		}
+	}
+
 	private function user_can_manage() {
 		if (is_multisite()) {
 			if (current_user_can('manage_network_options')) return true;

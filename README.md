@@ -93,6 +93,20 @@ wp siteguardbackup sysinfo      # shows memory_limit, system_memory, and whether
 
 Finished backups can be downloaded as one streamed zip bundle (no temp file, constant memory) or pushed to another WordPress site in 1-2 MB encrypted chunks.
 
+## Backup Storage Location
+
+Backups hold the whole site and its database, so they are stored **outside the web root**. By default the plugin uses a `sgbackup` directory one level above the web root (for example `/var/www/sgbackup`, or `/home/site/sgbackup` on Azure App Service). It remembers the first directory that works, so a docroot that changes at runtime cannot move backups back into the web root.
+
+To pin the location, add this to `wp-config.php`:
+
+```php
+define('SGBACKUP_BACKUP_DIR', '/path/outside/webroot');
+```
+
+You can also return a path from the `sgbackup_backup_dir` filter in an mu-plugin. Subsites use `site-<id>` subdirectories under the root.
+
+If no writable directory outside the web root exists, backups fall back to `wp-content/sgbackup` and every SiteGuard admin sees an error notice. On nginx, **nothing placed in that directory protects it**: `.htaccess` is Apache-only, and nginx serves named files straight off disk. Fix the location instead of relying on stub files. Downloads from the admin always go through a capability-checked PHP endpoint.
+
 ## Requirements
 
 - WordPress 5.6+
