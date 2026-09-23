@@ -287,11 +287,17 @@ class SiteGuard_Backup_Options {
 	private function default_backup_root() {
 		$explicit   = (defined('SGBACKUP_BACKUP_DIR') && SGBACKUP_BACKUP_DIR);
 		$remembered = $this->get_option('sgbackup_resolved_root', '');
-		if (!$explicit && is_string($remembered) && '' !== $remembered && $this->is_usable_backup_root($remembered)) {
+		if (!$explicit && is_string($remembered) && '' !== $remembered
+			&& null === $this->backup_root_unsafe_reason($remembered) && $this->is_usable_backup_root($remembered)) {
 			return $remembered;
 		}
 
 		foreach ($this->candidate_backup_roots() as $candidate) {
+			$unsafe = $this->backup_root_unsafe_reason($candidate);
+			if (null !== $unsafe) {
+				error_log("SiteGuard Backup: SECURITY: backup root candidate '{$candidate}' skipped ({$unsafe})");
+				continue;
+			}
 			if ($this->is_usable_backup_root($candidate)) {
 				if ($candidate !== $remembered) {
 					$this->update_option('sgbackup_resolved_root', $candidate);
@@ -301,6 +307,75 @@ class SiteGuard_Backup_Options {
 		}
 
 		return untrailingslashit(WP_CONTENT_DIR) . '/sgbackup';
+	}
+
+	/**
+	 * Why $dir cannot be the backup root, or null if it can.
+	 *
+	 * Judged BEFORE anything is created: the nearest existing ancestor is resolved
+	 * and the missing segments appended, so a bad value never leaves directories
+	 * behind in system paths. Only a safe path is then created and re-checked.
+	 */
+	private function backup_root_unsafe_reason($dir) {
+		if (!is_string($dir) || !SiteGuard_Backup_Filesystem::is_absolute_path($dir)) {
+			return 'empty or not absolute';
+		}
+		$dir = SiteGuard_Backup_Filesystem::normalize_path($dir);
+		$missing = array();
+		$probe = $dir;
+		while (!file_exists($probe)) {
+			$parent = dirname($probe);
+			if ($parent === $probe) break;
+			array_unshift($missing, basename($probe));
+			$probe = $parent;
+		}
+		foreach ($missing as $seg) {
+			if ('.' === $seg || '..' === $seg) return 'contains . or .. segments';
+		}
+		$real = realpath($probe);
+		if (false === $real) {
+			return 'no existing ancestor';
+		}
+		$resolved = SiteGuard_Backup_Filesystem::normalize_path($real);
+		if ($missing) {
+			$resolved = rtrim($resolved, '/') . '/' . implode('/', $missing);
+		}
+		$reason = $this->root_reason_for_resolved($resolved);
+		if (null !== $reason) return $reason;
+
+		if (!file_exists($dir) && !wp_mkdir_p($dir)) {
+			return 'could not be created';
+		}
+		$real = realpath($dir);
+		if (false === $real) {
+			return 'does not exist';
+		}
+		// Re-check: a symlink may have appeared along the way.
+		return $this->root_reason_for_resolved(SiteGuard_Backup_Filesystem::normalize_path($real));
+	}
+
+	/**
+	 * The deletion-root rules plus: never a web root, wp-content or uploads itself.
+	 * (A dedicated subdirectory such as wp-content/sgbackup is allowed; it is the
+	 * loud last-resort fallback.)
+	 */
+	private function root_reason_for_resolved($resolved) {
+		$reason = SiteGuard_Backup_Filesystem::unsafe_root_reason($resolved);
+		if (null !== $reason) return $reason;
+		foreach ($this->web_served_trees() as $t) {
+			if (SiteGuard_Backup_Filesystem::normalize_path($t) === $resolved) {
+				return 'is a web root, wp-content or uploads directory itself';
+			}
+		}
+		$uploads = $this->uploads_basedir();
+		if ($uploads) {
+			foreach (array($uploads, realpath($uploads)) as $u) {
+				if ($u && SiteGuard_Backup_Filesystem::normalize_path($u) === $resolved) {
+					return 'is the uploads directory itself';
+				}
+			}
+		}
+		return null;
 	}
 
 	/**
@@ -315,6 +390,9 @@ class SiteGuard_Backup_Options {
 			$dir = untrailingslashit($dir);
 			if (0 !== strpos($dir, '/') || false !== strpos($dir, '../')) {
 				error_log('SiteGuard Backup: custom backup directory must be an absolute path without traversal; using default');
+				$dir = '';
+			} elseif (null !== ($unsafe = $this->backup_root_unsafe_reason($dir))) {
+				error_log("SiteGuard Backup: SECURITY: custom backup directory '{$dir}' rejected ({$unsafe}); using default");
 				$dir = '';
 			} elseif (!file_exists($dir) && !wp_mkdir_p($dir)) {
 				error_log('SiteGuard Backup: custom backup directory could not be created; using default');
@@ -335,6 +413,21 @@ class SiteGuard_Backup_Options {
 		 * an mu-plugin: add_filter('sgbackup_backup_dir', fn() => '/home/site/sgbackup');
 		 */
 		$dir = untrailingslashit(apply_filters('sgbackup_backup_dir', $dir));
+
+		// Retention, temp cleanup and restore all delete inside this directory, so
+		// it must never be '', '/', a system directory, or an ancestor of WordPress.
+		// ('' would become '/' through trailingslashit() below.)
+		$reason = $this->backup_root_unsafe_reason($dir);
+		if (null !== $reason) {
+			error_log("SiteGuard Backup: SECURITY: backup directory '{$dir}' rejected ({$reason}); using default");
+			$dir = untrailingslashit($this->default_backup_root());
+			$reason = $this->backup_root_unsafe_reason($dir);
+			if (null !== $reason) {
+				// Nothing better exists. Keep going so the site does not fatal: the delete
+				// guard independently refuses to delete under an unsafe root.
+				error_log("SiteGuard Backup: SECURITY: default backup directory '{$dir}' is also unsafe ({$reason}); deletions there will be refused");
+			}
+		}
 
 		// Per-site subdirectory for subsites (blog_id > 1)
 		if (is_multisite() && get_current_blog_id() > 1) {

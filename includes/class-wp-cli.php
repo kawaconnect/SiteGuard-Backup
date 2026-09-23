@@ -1640,7 +1640,11 @@ class SiteGuard_Backup_CLI_Command extends WP_CLI_Command {
                 if ($dry_run) {
                     WP_CLI::log("  Would delete orphan temp dir: {$f}");
                 } else {
-                    SiteGuard_Backup_Filesystem::rmdir_recursive($path);
+                    $deleted = SiteGuard_Backup_Filesystem::rmdir_recursive($path);
+                    if (is_wp_error($deleted)) {
+                        WP_CLI::warning("  Could not delete orphan temp dir {$f}: " . $deleted->get_error_message());
+                        continue;
+                    }
                     WP_CLI::log("  Deleted orphan temp dir: {$f}");
                 }
                 $cleaned++;

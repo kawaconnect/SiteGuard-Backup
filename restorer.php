@@ -2038,7 +2038,7 @@ class SiteGuard_Backup_Restorer {
 		if (!empty($uploads_base)) {
 			$elementor_dir = rtrim($uploads_base, '/') . '/sites/' . intval($target_id) . '/elementor/css/';
 			if (is_dir($elementor_dir)) {
-				$this->remove_dir_recursive($elementor_dir);
+				$this->remove_dir_recursive($elementor_dir, $uploads_base);
 				$this->sgbackup->log("Cleared Elementor CSS cache at {$elementor_dir}");
 			}
 		}
@@ -2340,7 +2340,7 @@ class SiteGuard_Backup_Restorer {
 		foreach ($candidates as $i => $c) {
 			if ($i < $keep_recent) continue;
 			if (($now - $c['mtime']) < 3600) continue;
-			$this->remove_dir_recursive($c['path']);
+			$this->remove_dir_recursive($c['path'], $backup_dir);
 			$pruned++;
 		}
 		if ($pruned > 0) {
@@ -2878,7 +2878,7 @@ class SiteGuard_Backup_Restorer {
 						$zip_file, size_format($needed), size_format($free)
 					), 'error');
 					$this->progress("Uploads restore skipped: insufficient disk space for {$zip_file}");
-					$this->remove_dir_recursive($temp_extract);
+					$this->remove_dir_recursive($temp_extract, $backup_dir);
 					continue;
 				}
 			}
@@ -2886,7 +2886,7 @@ class SiteGuard_Backup_Restorer {
 			$extract_ok = $this->unzip($zip_path, $temp_extract);
 			if (!$extract_ok) {
 				$this->sgbackup->log("Failed to extract uploads zip: {$zip_file}", 'error');
-				$this->remove_dir_recursive($temp_extract);
+				$this->remove_dir_recursive($temp_extract, $backup_dir);
 				$uploads_ok = false;
 				continue;
 			}
@@ -2905,7 +2905,7 @@ class SiteGuard_Backup_Restorer {
 				$this->copy_dir_recursive_exclude($temp_extract, $target_dir, array('sites'));
 			}
 
-			$this->remove_dir_recursive($temp_extract);
+			$this->remove_dir_recursive($temp_extract, $backup_dir);
 			$this->sgbackup->log("Restored uploads from {$zip_file} to /sites/{$target_id}/");
 		}
 
@@ -2996,16 +2996,15 @@ class SiteGuard_Backup_Restorer {
 	/**
 	 * Recursively remove a directory.
 	 */
-	private function remove_dir_recursive($dir) {
-		if (!is_dir($dir)) return;
-		$files = new RecursiveIteratorIterator(
-			new RecursiveDirectoryIterator($dir, FilesystemIterator::SKIP_DOTS),
-			RecursiveIteratorIterator::CHILD_FIRST
-		);
-		foreach ($files as $file) {
-			($file->isDir() || is_dir($file->getPathname())) ? @rmdir($file->getPathname()) : @unlink($file->getPathname());
+	private function remove_dir_recursive($dir, $root = null) {
+		if (null === $root) {
+			$root = SiteGuard_Backup_Options::instance()->get_backup_dir();
 		}
-		@rmdir($dir);
+		$r = SiteGuard_Backup_Filesystem::delete_tree($dir, $root);
+		if (is_wp_error($r)) {
+			$this->sgbackup->log("Could not remove directory {$dir}: " . $r->get_error_message(), 'error');
+		}
+		return $r;
 	}
 
 	/**
@@ -4517,24 +4516,13 @@ class SiteGuard_Backup_Restorer {
 	 * (remove_temp_dir() is bounded to the backup dir and refuses these paths.)
 	 */
 	private function remove_plugin_dir($dir, $plugins_dir) {
-		$real_dir = realpath($dir);
-		$real_plugins = realpath($plugins_dir);
-		if (false === $real_dir || false === $real_plugins) return false;
-		$real_plugins = rtrim($real_plugins, DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR;
-		if (strpos($real_dir, $real_plugins) !== 0 || $real_dir === rtrim($real_plugins, DIRECTORY_SEPARATOR)) return false;
-		if (!is_dir($real_dir) || is_link($dir)) return false;
-		$iterator = new RecursiveIteratorIterator(
-			new RecursiveDirectoryIterator($real_dir, FilesystemIterator::SKIP_DOTS),
-			RecursiveIteratorIterator::CHILD_FIRST
-		);
-		foreach ($iterator as $item) {
-			if ($item->isDir() && !$item->isLink()) {
-				@rmdir($item->getPathname());
-			} else {
-				@unlink($item->getPathname());
-			}
+		if (is_link(rtrim($dir, '/'))) return false;
+		$r = SiteGuard_Backup_Filesystem::delete_tree($dir, $plugins_dir);
+		if (is_wp_error($r)) {
+			$this->sgbackup->log("Could not remove plugin directory {$dir}: " . $r->get_error_message(), 'error');
+			return false;
 		}
-		return @rmdir($real_dir);
+		return true;
 	}
 
 	/**
@@ -4789,30 +4777,8 @@ class SiteGuard_Backup_Restorer {
 	 * Remove a temporary directory.
 	 */
 	private function remove_temp_dir($dir) {
-		if (!is_dir($dir)) return;
-
-		// Boundary check: only allow removal within the backup directory
-		$backup_dir = SiteGuard_Backup_Options::instance()->get_backup_dir();
-		$real_dir = realpath($dir);
-		$real_backup = realpath($backup_dir);
-		if (false === $real_dir || false === $real_backup
-			|| strpos($real_dir, rtrim($real_backup, DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR) !== 0) {
-			$this->sgbackup->log("SECURITY: Refusing to remove directory outside backup path: {$dir}", 'error');
-			return;
-		}
-
-		$iterator = new RecursiveIteratorIterator(
-			new RecursiveDirectoryIterator($dir, FilesystemIterator::SKIP_DOTS),
-			RecursiveIteratorIterator::CHILD_FIRST
-		);
-		foreach ($iterator as $item) {
-			if ($item->isDir() || is_dir($item->getPathname())) {
-				@rmdir($item->getPathname());
-			} else {
-				@unlink($item->getPathname());
-			}
-		}
-		@rmdir($dir);
+		// Bounded to the backup directory; delete_tree() refuses anything else.
+		$this->remove_dir_recursive($dir, SiteGuard_Backup_Options::instance()->get_backup_dir());
 	}
 
 	// ==========================================

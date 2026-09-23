@@ -987,21 +987,10 @@ class SiteGuard_Backup_Engine {
 	}
 
 	private function recursive_rmdir($dir) {
-		if (!is_dir($dir)) return;
-		// Ensure directory is within backup_dir to prevent accidental deletion
-		$real_dir = realpath($dir);
-		$real_backup = realpath($this->backup_dir);
-		if (!$real_dir || !$real_backup || strpos($real_dir, $real_backup) !== 0) {
-			return;
+		$r = SiteGuard_Backup_Filesystem::delete_tree($dir, $this->backup_dir);
+		if (is_wp_error($r)) {
+			$this->sgbackup->log("Could not remove directory {$dir}: " . $r->get_error_message(), 'warning');
 		}
-		$items = new RecursiveIteratorIterator(
-			new RecursiveDirectoryIterator($dir, FilesystemIterator::SKIP_DOTS),
-			RecursiveIteratorIterator::CHILD_FIRST
-		);
-		foreach ($items as $item) {
-			($item->isDir() || is_dir($item->getPathname())) ? @rmdir($item->getPathname()) : @unlink($item->getPathname());
-		}
-		@rmdir($dir);
 	}
 
 	public function __destruct() {
@@ -1781,25 +1770,10 @@ class SiteGuard_Backup_Engine {
 	 * Remove a directory and all its contents.
 	 */
 	private function remove_dir($dir) {
-		if (!is_dir($dir)) return;
-		// Validate directory is within backup directory to prevent accidental deletion
-		$real_dir = realpath($dir);
-		$real_backup = realpath($this->backup_dir);
-		if (!$real_dir || !$real_backup || strpos($real_dir, $real_backup) !== 0) {
-			return;
+		$r = SiteGuard_Backup_Filesystem::delete_tree($dir, $this->backup_dir);
+		if (is_wp_error($r)) {
+			$this->sgbackup->log("Could not remove directory {$dir}: " . $r->get_error_message(), 'warning');
 		}
-		$iterator = new RecursiveIteratorIterator(
-			new RecursiveDirectoryIterator($dir, FilesystemIterator::SKIP_DOTS),
-			RecursiveIteratorIterator::CHILD_FIRST
-		);
-		foreach ($iterator as $item) {
-			if ($item->isDir() || is_dir($item->getPathname())) {
-				@rmdir($item->getPathname());
-			} else {
-				@unlink($item->getPathname());
-			}
-		}
-		@rmdir($dir);
 	}
 }
 
