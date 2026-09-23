@@ -130,6 +130,7 @@ class SiteGuard_Backup_Foreign_Importer {
 		}
 
 		// For pure SQL files, use the db entity (x.tar.gz reports ext 'gz' - it's a files archive)
+		$filename = basename($filepath);
 		$is_targz = (strlen($filename) > 7 && substr(strtolower($filename), -7) === '.tar.gz');
 		if (in_array($ext, array('sql', 'gz'), true) && !$is_targz) {
 			$entity = 'db';

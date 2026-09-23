@@ -47,5 +47,22 @@ sudo tests/run-sandboxed.sh          # read-only /, tmpfs /tmp, runs as nobody
 php tests/test-delete-guard.php      # or directly, as an unprivileged user
 ```
 
+## Integration tests (real WordPress)
+
+`tests/integration/run.sh` drives SiteGuard through WP-CLI in disposable
+single-site and multisite instances created with WPMultisiteDocker's
+`scripts/instance.sh`. Plugin code runs only inside the instance containers
+as www-data. Each destructive test fingerprints every file outside the backup
+directory before and after, and fails on any change.
+
+```sh
+# on a disposable Docker host, never on a machine holding unique state
+WPD=/srv/sgtest/wpdocker
+$WPD/scripts/instance.sh create sgt-single --mode single
+$WPD/scripts/instance.sh create sgt-multi  --mode multisite
+# install the plugin into both, then:
+tests/integration/run.sh $WPD/scripts/instance.sh sgt-single sgt-multi
+```
+
 The PHP tests refuse to run as root or from a web request. `tests/` is excluded
 from the release zip.

@@ -886,7 +886,7 @@ class SiteGuard_Backup_Restorer {
 		// Fresh import: discard any search-replace checkpoint/cursor from an earlier
 		// run of this backup, otherwise a later restore "resumes" with a stale cursor
 		// and skips tables that were just re-imported.
-		$opts->delete_option($this->sr_state_option);
+		SiteGuard_Backup_Options::instance()->delete_option($this->sr_state_option);
 		delete_option('sgbackup_sr_progress');
 
 		// Detect whether custom/mirror mode has __skip__ entries - if so we must

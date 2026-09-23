@@ -2236,7 +2236,7 @@ class SiteGuard_Backup {
 			foreach ($history as $timestamp => $backup) {
 				if ($type === 'db' && !empty($backup['db'])) {
 					$type_backups[$timestamp] = $backup;
-				} elseif ($type === 'files' && (!empty($backup['plugins']) || !empty($backup['themes']) || !empty($backup['uploads']) || !empty($backup['others']) || !empty($backup['wpcore']))) {
+				} elseif ($type === 'files' && SiteGuard_Backup_History::file_entity_keys($backup)) {
 					$type_backups[$timestamp] = $backup;
 				}
 			}
@@ -2271,14 +2271,18 @@ class SiteGuard_Backup {
 					}
 				}
 
-				// Delete marked backups
+				// Delete only this rule's type from each marked set. Deleting the whole
+				// set let a db rule destroy file archives (and vice versa), locally and
+				// remotely; History::prune() already works this way.
 				foreach ($to_delete as $timestamp => $backup) {
-					$this->log("Retention rule pruning: removing backup at " . gmdate('Y-m-d H:i:s', $timestamp));
-					SiteGuard_Backup_History::delete_backup_set($timestamp, true);
-					// Also remove from history so subsequent rules see updated state
-					unset($history[$timestamp]);
+					$entity_keys = ($type === 'db') ? array('db') : SiteGuard_Backup_History::file_entity_keys($backup);
+					$this->log("Retention rule pruning: removing {$type} of backup at " . gmdate('Y-m-d H:i:s', $timestamp));
+					SiteGuard_Backup_History::delete_backup_entities($timestamp, $entity_keys, true);
 					unset($type_backups[$timestamp]);
 				}
+				// Later rules and the other type must see what is actually left.
+				$history = SiteGuard_Backup_History::get_history();
+				krsort($history);
 			}
 		}
 	}
