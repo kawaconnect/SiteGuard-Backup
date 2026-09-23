@@ -194,6 +194,8 @@ class SiteGuard_Backup_Method_Webdav extends SiteGuard_Backup_Module {
     }
 
     public function delete($files) {
+        $files = $this->safe_remote_names($files);
+        if (!$files) return true;
         if (!is_array($files)) $files = array($files);
         $errors = array();
 

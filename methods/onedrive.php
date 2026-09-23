@@ -296,6 +296,8 @@ class SiteGuard_Backup_Method_Onedrive extends SiteGuard_Backup_Module {
     }
 
     public function delete($files) {
+        $files = $this->safe_remote_names($files);
+        if (!$files) return true;
         $token = $this->get_access_token();
         if (is_wp_error($token)) return $token;
 

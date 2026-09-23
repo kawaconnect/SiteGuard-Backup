@@ -2684,14 +2684,19 @@ class SiteGuard_Backup_CLI_Command extends WP_CLI_Command {
             WP_CLI::error($result->get_error_message());
         }
 
+        $failed = 0;
         foreach ($result['results'] as $svc => $info) {
             if ($info['success']) {
                 WP_CLI::log("  {$svc}: {$info['uploaded']} file(s) uploaded.");
             } else {
+                $failed++;
                 WP_CLI::warning("  {$svc}: " . implode('; ', $info['errors']));
             }
         }
 
+        if ($failed) {
+            WP_CLI::error("Upload failed for {$failed} of " . count($result['results']) . ' service(s).');
+        }
         WP_CLI::success('Upload complete.');
     }
 
@@ -2845,10 +2850,11 @@ class SiteGuard_Backup_CLI_Command extends WP_CLI_Command {
 
         $jobdata = $sgbackup->jobdata_getarray($nonce);
         $status = isset($jobdata['jobstatus']) ? $jobdata['jobstatus'] : '';
-        if (self::backup_status_succeeded($status)) {
+        // 'warning' also covers "every upload failed"; the upload is the whole job here.
+        if (self::backup_status_succeeded($status) && !empty($jobdata['remote_upload_succeeded'])) {
             WP_CLI::success('Migration send complete.');
         } else {
-            WP_CLI::error('Migration send did not complete (status: ' . $status . '). Check logs.');
+            WP_CLI::error('Migration send failed (status: ' . $status . ', upload ' . (empty($jobdata['remote_upload_succeeded']) ? 'failed' : 'ok') . '). Check logs.');
         }
     }
 
@@ -2913,10 +2919,10 @@ class SiteGuard_Backup_CLI_Command extends WP_CLI_Command {
 
         $jobdata = $sgbackup->jobdata_getarray($nonce);
         $status = isset($jobdata['jobstatus']) ? $jobdata['jobstatus'] : '';
-        if (self::backup_status_succeeded($status)) {
+        if (self::backup_status_succeeded($status) && !empty($jobdata['remote_upload_succeeded'])) {
             WP_CLI::success('Clone complete.');
         } else {
-            WP_CLI::error('Clone did not complete (status: ' . $status . '). Check logs.');
+            WP_CLI::error('Clone failed (status: ' . $status . ', upload ' . (empty($jobdata['remote_upload_succeeded']) ? 'failed' : 'ok') . '). Check logs.');
         }
     }
 
@@ -3420,7 +3426,7 @@ class SiteGuard_Backup_CLI_Command extends WP_CLI_Command {
     public function resume_restore($args, $assoc_args) {
         require_once SGBACKUP_DIR . 'includes/class-commands.php';
         $commands = new SiteGuard_Backup_Commands();
-        $result = $commands->resume_restore(array());
+        $result = $commands->resume_restore(array('execute' => true));
 
         if (is_wp_error($result)) {
             WP_CLI::error($result->get_error_message());

@@ -509,6 +509,23 @@ class SiteGuard_Backup_Filesystem {
 	}
 
 	/**
+	 * Largest backup file PHP will accept in one request.
+	 *
+	 * wp_max_upload_size() is the MEDIA limit: on multisite it is capped by the
+	 * network's "Max upload file size" (1-1.5 MB by default), which made backup
+	 * uploads fail outright and forced sub-1 MB chunks. Backup archives are not
+	 * media; only PHP's own limits apply.
+	 */
+	public static function max_backup_upload_size() {
+		$limits = array();
+		foreach (array('upload_max_filesize', 'post_max_size') as $ini) {
+			$v = function_exists('wp_convert_hr_to_bytes') ? wp_convert_hr_to_bytes((string) ini_get($ini)) : (int) ini_get($ini);
+			if ($v > 0) $limits[] = $v;
+		}
+		return $limits ? min($limits) : wp_max_upload_size();
+	}
+
+	/**
 	 * Get a safe temporary filename in the backup dir.
 	 */
 	public static function temp_file($backup_dir, $prefix = 'sgbackup_', $ext = '.tmp') {

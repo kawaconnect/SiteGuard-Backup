@@ -64,5 +64,19 @@ $WPD/scripts/instance.sh create sgt-multi  --mode multisite
 tests/integration/run.sh $WPD/scripts/instance.sh sgt-single sgt-multi
 ```
 
+Further suites, same rules (disposable host, instances from `instance.sh`):
+
+| Script | What it proves |
+|---|---|
+| `integration/browser-flow.sh` | The everyday workflow over HTTP as a logged-in admin: Backup Now, download the set as a zip bundle (and each file), upload it, restore, verify. Same-site recovery, move to another site, chunked upload, and a multisite network. |
+| `integration/transfer.sh` | Site transfers in every direction: single to single, single to a new or existing subsite, subsite to single, main site to single, subsite to a new subsite, network to network. Each over file import and over SiteGuard's own remote send. |
+| `integration/storage.sh` | Remote storage against local emulators (MinIO for S3, Azurite for Azure over TLS): small and multipart uploads, byte-identical downloads, listing, delete, and the unsafe-name delete guard. |
+
+```sh
+tests/integration/browser-flow.sh $WPD/scripts/instance.sh /path/to/siteguardbackup
+tests/integration/transfer.sh     $WPD/scripts/instance.sh /path/to/siteguardbackup --keep-failed
+tests/integration/storage.sh      $WPD/scripts/instance.sh <instance-with-plugin>
+```
+
 The PHP tests refuse to run as root or from a web request. `tests/` is excluded
 from the release zip.

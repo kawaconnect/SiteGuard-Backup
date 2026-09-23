@@ -78,12 +78,31 @@ class SiteGuard_Backup_Method_Remotesend extends SiteGuard_Backup_Module {
 		$status = $rpc->send_message($site, 'get_file_status', array('file' => $filename));
 		$start_offset = 0;
 		if (!is_wp_error($status) && isset($status['size'])) {
-			$start_offset = intval($status['size']);
-			if ($start_offset > 0 && $start_offset < $filesize) {
+			$remote_size = intval($status['size']);
+			if (isset($status['status']) && 1 == $status['status']) {
+				// "Complete" on the destination only counts if it is THIS file:
+				// same size, and same content when the receiver reports a hash.
+				$same = ($remote_size === (int) $filesize)
+					&& (empty($status['md5']) || hash_equals((string) $status['md5'], (string) md5_file($file)));
+				if ($same) {
+					$sgbackup->log("File already fully uploaded to remote site");
+					return true;
+				}
+				return new WP_Error('remote_exists', "The destination already has a different file named {$filename}; not overwritten.");
+			}
+			if ($remote_size > $filesize) {
+				// A partial upload larger than the file cannot belong to it; never
+				// finalize over it.
+				return new WP_Error('remote_partial_mismatch', "The destination holds a partial {$filename} larger than this file ({$remote_size} > {$filesize} bytes); remove it on the destination and retry.");
+			}
+			$start_offset = $remote_size;
+			if ($start_offset === (int) $filesize && $filesize > 0) {
+				// Fully received but never finalized: resend the last chunk so the
+				// destination checks and finalizes it (same bytes, same offsets).
+				$start_offset = max(0, (int) $filesize - $this->chunk_size);
+			}
+			if ($start_offset > 0) {
 				$sgbackup->log("Resuming from offset " . SiteGuard_Backup_Filesystem::format_bytes($start_offset));
-			} elseif (isset($status['status']) && $status['status'] == 1) {
-				$sgbackup->log("File already fully uploaded to remote site");
-				return true;
 			}
 		}
 
@@ -222,6 +241,8 @@ class SiteGuard_Backup_Method_Remotesend extends SiteGuard_Backup_Module {
 	}
 
 	public function delete($files) {
+		$files = $this->safe_remote_names($files);
+		if (!$files) return true;
 		// Remote sites manage their own files
 		return true;
 	}

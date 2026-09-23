@@ -21,7 +21,7 @@ class SiteGuard_Backup_Security {
 	private static $sensitive_fields = array(
 		's3'         => array('secret_key'),
 		's3generic'  => array('secret_key'),
-		'azure'      => array('account_key'),
+		'azure'      => array('account_key', 'sas_token'),
 		'googledrive' => array('client_secret', 'token', 'access_token', 'refresh_token'),
 		'dropbox'    => array('app_secret', 'token', 'access_token', 'refresh_token'),
 		'onedrive'   => array('client_secret', 'token', 'access_token', 'refresh_token'),
@@ -163,6 +163,32 @@ class SiteGuard_Backup_Security {
 	 */
 	public static function is_encrypted($value) {
 		return is_string($value) && strpos($value, self::ENCRYPTED_PREFIX) === 0;
+	}
+
+	/**
+	 * Placeholder sent to the browser instead of a stored secret. Saving it back
+	 * means "keep the stored value"; the secret itself never reaches the page.
+	 */
+	const SECRET_UNCHANGED = '__sgbackup_secret_unchanged__';
+
+	/**
+	 * What to put in a password field's value attribute for a stored secret.
+	 */
+	public static function mask_secret($value) {
+		return (is_string($value) && '' !== $value) ? self::SECRET_UNCHANGED : '';
+	}
+
+	/**
+	 * Replace SECRET_UNCHANGED placeholders in $new with the matching values of $previous.
+	 */
+	public static function keep_unchanged_secrets($new, $previous) {
+		if (!is_array($new)) return $new;
+		foreach ($new as $k => $v) {
+			if (self::SECRET_UNCHANGED === $v) {
+				$new[$k] = (is_array($previous) && isset($previous[$k])) ? $previous[$k] : '';
+			}
+		}
+		return $new;
 	}
 
 	/**

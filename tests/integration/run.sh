@@ -217,8 +217,64 @@ t_multisite_scoping() {
 	URL=(--url="$sub"); reset_state; URL=()
 }
 
+# Upgrading from in-webroot backups: stubs must stay while archives remain.
+t_legacy_cleanup() {
+	local L=/var/www/html/wp-content/sgbackup-legacytest
+	# Use a scratch legacy root by pointing WP_CONTENT_DIR's sgbackup at a copy is not
+	# possible, so exercise the real one with the backup dir moved elsewhere.
+	PHP 'wp_mkdir_p(WP_CONTENT_DIR . "/mu-plugins");
+		file_put_contents(WP_CONTENT_DIR . "/mu-plugins/sg-test-dir.php", "<?php add_filter(\"sgbackup_backup_dir\", function () { return \"/tmp/sg-moved\"; });");' >/dev/null
+	local legacy; legacy="$(PHP 'echo WP_CONTENT_DIR;')/sgbackup"
+	# Seed: plugin stubs + a real archive in the legacy dir.
+	PHP 'delete_site_transient("sgbackup_legacy_cleanup"); SiteGuard_Backup_Options::instance()->get_backup_dir();' >/dev/null
+	SH "mkdir -p '$legacy' && echo data > '$legacy/backup_legacy-db.gz'" >/dev/null
+	PHP '$o = SiteGuard_Backup_Options::instance(); $m = new ReflectionMethod($o, "protect_backup_dir"); $m->setAccessible(true); $m->invoke($o, WP_CONTENT_DIR . "/sgbackup");' >/dev/null
+	PHP 'delete_site_transient("sgbackup_legacy_cleanup"); echo SiteGuard_Backup_Options::instance()->get_backup_dir();' >/dev/null
+	check "legacy archive left in place"            SH "test -f '$legacy/backup_legacy-db.gz'"
+	check "legacy .htaccess kept while archive remains" SH "test -f '$legacy/.htaccess'"
+	check "legacy web.config kept while archive remains" SH "test -f '$legacy/web.config'"
+	check "leftover recorded for the admin notice"  test "$(PHP 'echo count((array) SiteGuard_Backup_Options::instance()->get_option("sgbackup_legacy_leftovers", array()));')" -ge 1
+	# Leave only the plugin's stubs (earlier tests' logs live here too on a reused instance).
+	SH "cd '$legacy' && for f in \$(ls -A); do case \"\$f\" in .htaccess|.user.ini|index.php|index.html|web.config) ;; *) rm -rf -- \"\$f\" ;; esac; done" >/dev/null
+	PHP 'delete_site_transient("sgbackup_legacy_cleanup"); SiteGuard_Backup_Options::instance()->get_backup_dir();' >/dev/null
+	check "stub-only legacy dir removed once empty" SH "test ! -e '$legacy'"
+	SH 'rm -f wp-content/mu-plugins/sg-test-dir.php' >/dev/null
+	PHP 'SiteGuard_Backup_Options::instance()->get_backup_dir();' >/dev/null
+}
+
+t_pre_restore_backup() {
+	make_backup
+	local ts; ts="$(history_ts)"; ts="${ts##* }"
+	local before; before="$(set_count)"
+	W siteguardbackup restore "$ts" --entities=db --pre-restore-backup --yes >/dev/null 2>&1
+	check "pre-restore safety backup added" test "$(set_count)" -eq $((before + 1))
+	check "safety backup is always-keep and labelled" test "$(PHP '$n = 0; foreach (SiteGuard_Backup_History::get_history_raw() as $b) { if (!empty($b["always_keep"]) && "Pre-restore" === ($b["label"] ?? "")) $n++; } echo $n;')" -ge 1
+	check "SiteGuard still active after restore" W eval 'exit(class_exists("SiteGuard_Backup") ? 0 : 1);'
+}
+
+# A history entry that names another backup's archive must not be able to delete it.
+t_delete_shared_file_protected() {
+	make_backup; make_backup
+	local all; all="$(history_ts)"; set -- $all
+	local a="$1" b="$2"
+	# Poison entry A with one of B's archives.
+	PHP "\$h = SiteGuard_Backup_History::get_history_raw(); \$h[$a]['plugins'][] = \$h[$b]['plugins'][0]; SiteGuard_Backup_History::save_history(\$h);" >/dev/null
+	local shared; shared="$(PHP "echo SiteGuard_Backup_History::get_history_raw()[$b]['plugins'][0];")"
+	local dir; dir="$(backup_dir)"
+	W siteguardbackup delete "$a" --yes >/dev/null
+	check "archive still used by another backup survives" SH "test -f '$dir$shared'"
+	check "that backup still verifies" W siteguardbackup verify "$b"
+}
+
+# Remote delete must refuse names that would address the whole backup folder.
+t_remote_delete_names() {
+	check "unsafe remote names are filtered" test "$(PHP 'require_once SGBACKUP_DIR . "methods/backup-module.php"; require_once SGBACKUP_DIR . "methods/ftp.php";
+		$m = new SiteGuard_Backup_Method_Ftp(); $r = new ReflectionMethod($m, "safe_remote_names"); $r->setAccessible(true);
+		echo json_encode($r->invoke($m, array("", ".", "..", "a/b.zip", "..\\x", "ok.zip", null, "x\0y")));')" = '["ok.zip"]'
+}
+
 # -----------------------------------------------------------------------------
-TESTS=(t_backup_verify t_delete_scoped t_retention_count t_retention_extrarule_db t_cleanup_symlink t_hostile_backup_dir t_restore_db t_multisite_scoping)
+TESTS=(t_legacy_cleanup t_backup_verify t_delete_scoped t_retention_count t_retention_extrarule_db t_cleanup_symlink t_hostile_backup_dir t_restore_db t_pre_restore_backup t_delete_shared_file_protected t_remote_delete_names t_multisite_scoping)
 
 command -v jq >/dev/null || { echo "jq is required" >&2; exit 2; }
 

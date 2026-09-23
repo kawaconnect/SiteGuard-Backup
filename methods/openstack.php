@@ -587,6 +587,8 @@ class SiteGuard_Backup_Method_Openstack extends SiteGuard_Backup_Module {
 	 * @return bool|WP_Error
 	 */
 	public function delete($files) {
+		$files = $this->safe_remote_names($files);
+		if (!$files) return true;
 		$auth = $this->authenticate();
 		if (is_wp_error($auth)) return $auth;
 

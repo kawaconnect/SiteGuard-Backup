@@ -295,6 +295,23 @@ class SiteGuard_Backup_Job_Scheduler {
 			}
 		}
 
+		// A scheduled resumption only means "running" if the job itself is still
+		// running. A finished job can be left with a pending resumption event
+		// (seen after "Backup Now": done in seconds, event due minutes later),
+		// which reported a phantom running job and refused the next backup.
+		if (!empty($jobs)) {
+			$sgbackup = SiteGuard_Backup::instance();
+			$terminal = array('complete', 'finished', 'error', 'aborted', 'failed', 'warning');
+			foreach (array_keys($jobs) as $nonce) {
+				$jobdata = $sgbackup->jobdata_getarray($nonce);
+				$status = isset($jobdata['jobstatus']) ? $jobdata['jobstatus'] : '';
+				if (empty($jobdata) || !empty($jobdata['finalized']) || in_array($status, $terminal, true)) {
+					self::clear_scheduled_events($nonce);
+					unset($jobs[$nonce]);
+				}
+			}
+		}
+
 		// Fallback: during the direct-chain execution, cron events are briefly
 		// cleared and rescheduled between resumptions. If the poll reads the cron
 		// during that window, it finds nothing. Check the active job marker set

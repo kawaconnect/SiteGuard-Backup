@@ -755,6 +755,9 @@ class SiteGuard_Backup_Commands {
 						$instance_id = sanitize_text_field($instance_id);
 						if (!is_array($instance_settings)) continue;
 						array_walk($instance_settings, $sanitize_method_value);
+						require_once SGBACKUP_DIR . 'includes/class-security.php';
+						$previous = isset($stored['settings'][$instance_id]) ? SiteGuard_Backup_Security::decrypt_method_options($method, $stored['settings'][$instance_id]) : array();
+						$instance_settings = SiteGuard_Backup_Security::keep_unchanged_secrets($instance_settings, $previous);
 						// Encrypt credentials at rest if enabled
 						if ($opts->get_option('sgbackup_encrypt_credentials', false)) {
 							require_once SGBACKUP_DIR . 'includes/class-security.php';
@@ -766,6 +769,9 @@ class SiteGuard_Backup_Commands {
 				} else {
 					// Legacy flat format
 					array_walk($method_data, $sanitize_method_value);
+					require_once SGBACKUP_DIR . 'includes/class-security.php';
+					$method_data = SiteGuard_Backup_Security::keep_unchanged_secrets($method_data,
+						SiteGuard_Backup_Security::decrypt_method_options($method, (array) $opts->get_option('sgbackup_' . $method, array())));
 					if ($opts->get_option('sgbackup_encrypt_credentials', false)) {
 						require_once SGBACKUP_DIR . 'includes/class-security.php';
 						$method_data = SiteGuard_Backup_Security::encrypt_method_options($method, $method_data);
@@ -803,9 +809,21 @@ class SiteGuard_Backup_Commands {
 
 		// Save external databases
 		if (isset($params['extradbs']) && is_array($params['extradbs'])) {
+			require_once SGBACKUP_DIR . 'includes/class-security.php';
+			$previous_extradbs = (array) $opts->get_option('sgbackup_extradbs', array());
 			$sanitized_extradbs = array();
 			foreach ($params['extradbs'] as $extdb) {
 				if (!is_array($extdb)) continue;
+				if (isset($extdb['pass']) && SiteGuard_Backup_Security::SECRET_UNCHANGED === $extdb['pass']) {
+					// Keep the stored password of the same database (host/user/name).
+					$extdb['pass'] = '';
+					foreach ($previous_extradbs as $prev) {
+						if (is_array($prev) && ($prev['host'] ?? '') === ($extdb['host'] ?? '') && ($prev['user'] ?? '') === ($extdb['user'] ?? '') && ($prev['name'] ?? '') === ($extdb['name'] ?? '')) {
+							$extdb['pass'] = isset($prev['pass']) ? $prev['pass'] : '';
+							break;
+						}
+					}
+				}
 				$sanitized_extradbs[] = array(
 					'host'   => isset($extdb['host']) ? sanitize_text_field($extdb['host']) : '',
 					'port'   => isset($extdb['port']) ? intval($extdb['port']) : 3306,
@@ -1757,8 +1775,10 @@ class SiteGuard_Backup_Commands {
 		$prefix_escaped = preg_quote($prefix, '/');
 
 		foreach ($tables as $table) {
-			// Match tables like wp_2_options, wp_3_posts, etc.
-			if (preg_match('/^' . $prefix_escaped . '(\d+)_(.+)$/', $table, $m)) {
+			// Match tables like wp_2_options, wp_3_posts, etc. (only for blogs that
+			// exist: main-site plugin tables such as wp_404_to_301 match the pattern too)
+			if (preg_match('/^' . $prefix_escaped . '(\d+)_(.+)$/', $table, $m)
+				&& function_exists('get_blog_details') && is_multisite() && get_blog_details((int) $m[1], false)) {
 				$blog_id = intval($m[1]);
 				if (!isset($grouped[$blog_id])) {
 					$blog_label = 'Blog #' . $blog_id;
@@ -1903,6 +1923,17 @@ class SiteGuard_Backup_Commands {
 		$backup_set = SiteGuard_Backup_History::get_history($timestamp);
 		if (empty($backup_set)) {
 			return new WP_Error('not_found', 'Backup not found');
+		}
+
+		// The admin UI only asks whether it can resume, then re-attaches to the
+		// progress stream (sgbackup_restore with resume=1), which does the work
+		// and skips completed phases. Running the restore here as well ran it
+		// twice, the first time inside a request the browser gives up on after 20s.
+		if (empty($params['execute'])) {
+			$lock = new SiteGuard_Backup_Semaphore('restore', 3600);
+			$running = !$lock->lock();
+			if (!$running) $lock->unlock();
+			return array('status' => $running ? 'running' : 'resumable', 'timestamp' => (int) $timestamp);
 		}
 
 		require_once SGBACKUP_DIR . 'restorer.php';
@@ -3141,7 +3172,7 @@ class SiteGuard_Backup_Commands {
 		}
 
 		// Cap chunk size server-side
-		$max_chunk = min(2 * 1024 * 1024, intval(0.9 * wp_max_upload_size()));
+		$max_chunk = min(2 * 1024 * 1024, intval(0.9 * SiteGuard_Backup_Filesystem::max_backup_upload_size()));
 		if (strlen($chunk_data) > $max_chunk) {
 			return new WP_Error('chunk_too_large', 'Chunk exceeds maximum size.');
 		}
@@ -3243,7 +3274,16 @@ class SiteGuard_Backup_Commands {
 			}
 
 			if (file_exists($final_file)) {
-				@unlink($final_file);
+				// Never overwrite a backup file already on disk with an upload.
+				$same = (filesize($final_file) === filesize($tmp_file)) && (md5_file($final_file) === md5_file($tmp_file));
+				@unlink($tmp_file);
+				if (!$same) {
+					return new WP_Error('file_exists', sprintf('A different file named %s already exists in the backup directory; it was not overwritten.', $filename));
+				}
+				$result['status'] = 1;
+				$result['size'] = filesize($final_file);
+				$result['message'] = 'This file is already on the server; nothing to do.';
+				return $result;
 			}
 			// Rename with copy+unlink fallback for CIFS
 			if (!@rename($tmp_file, $final_file)) {
@@ -3268,13 +3308,16 @@ class SiteGuard_Backup_Commands {
 				$sgbackup->close_browser_connection(json_encode(array('success' => true, 'data' => $result)));
 
 				$extracted = $admin->extract_bundle($final_file, $backup_dir);
-				@unlink($final_file);
+				$audit = SiteGuard_Backup_Audit_Log::instance();
 				if (!is_wp_error($extracted)) {
-					$audit = SiteGuard_Backup_Audit_Log::instance();
+					SiteGuard_Backup_Filesystem::delete_file($final_file, $backup_dir);
 					$audit->log('upload_bundle', 'Chunked upload and extracted bundle: ' . $filename, array(
 						'files' => count($extracted),
 						'size' => $total_size,
 					));
+				} else {
+					// Keep the bundle: it may be the only complete copy.
+					$audit->log('upload_bundle_failed', 'Bundle ' . $filename . ' was not imported (kept on disk): ' . $extracted->get_error_message());
 				}
 				die; // Response already sent
 			} else {

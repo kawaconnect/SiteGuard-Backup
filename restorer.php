@@ -107,6 +107,18 @@ class SiteGuard_Backup_Restorer {
 	/** @var array Destination wp_blogs entries saved before import (for filtered import with skips) */
 	private $pre_import_blogs = array();
 
+	/** @var array blog id => that subsite's own SiteGuard option rows before a network import. */
+	private $pre_import_subsite_sg = array();
+
+	/** @var bool A whole-network database import ran (every subsite's tables came from the source). */
+	private $network_import = false;
+
+	/** @var array Blog domains as imported from the source (before identity fixes). */
+	private $source_blog_domains = array();
+
+	/** @var bool The filtered (skip-map) import ran, so skipped blog ids hold DESTINATION tables. */
+	private $filtered_import_used = false;
+
 	/** @var array Destination sgbackup_* options saved before DB import */
 	private $pre_import_sgbackup_options = array();
 
@@ -140,11 +152,32 @@ class SiteGuard_Backup_Restorer {
 	/** @var bool Whether source user tables were actually skipped during DB import */
 	private $user_tables_skipped = false;
 
+	/** @var array entity => top-level names moved in from the backup (see move_files()). */
+	private $restored_top_items = array();
+
+	/** @var bool Uploads come from a subsite's sites/N/ tree and go to the uploads root. */
+	private $subsite_to_single_uploads = false;
+
+	/** @var array|null Source plugins not yet on disk when a subsite import set active_plugins. */
+	private $subsite_plugin_intent = null;
+
+	/** @var array How this plugin was activated before the restore (restored afterwards). */
+	private $self_activation = array();
+
 	/**
 	 * @param array $backup_set     Backup set from history.
 	 * @param array $restore_options What to restore: ['db' => bool, 'plugins' => bool, etc.]
 	 */
 	public function __construct($backup_set, $restore_options = array()) {
+		if (!function_exists('is_plugin_active_for_network')) {
+			require_once ABSPATH . 'wp-admin/includes/plugin.php';
+		}
+		$self = plugin_basename(SGBACKUP_DIR . 'siteguardbackup.php');
+		$this->self_activation = array(
+			'basename' => $self,
+			'network'  => is_multisite() && is_plugin_active_for_network($self),
+			'site'     => in_array($self, (array) get_option('active_plugins', array()), true),
+		);
 		$this->sgbackup = SiteGuard_Backup::instance();
 		$this->backup_set = $backup_set;
 		$this->restore_options = $restore_options;
@@ -274,10 +307,25 @@ class SiteGuard_Backup_Restorer {
 			$this->sgbackup->log("[Restore] Resume detected; skipping completed phases: " . implode(', ', $completed_phases));
 		}
 
-		// Phase 0: Create pre-restore backup if requested
+		// Phase 0: Create pre-restore backup if requested. It is the rollback point,
+		// so it must be complete: if it fails, nothing is restored. On a resume the
+		// first run already made it; a second one would snapshot the half-restored
+		// site as another "always keep" set.
 		if (!empty($this->restore_options['pre_restore_backup'])) {
-			$this->progress("Creating pre-restore backup");
-			$this->create_pre_restore_backup();
+			if (!empty($completed_phases)) {
+				$this->progress("Pre-restore backup was taken by the interrupted run - not repeating it");
+			} else {
+				$this->progress("Creating pre-restore backup");
+				$pre = $this->create_pre_restore_backup();
+				if (true !== $pre) {
+					$msg = 'Pre-restore backup failed (' . (is_wp_error($pre) ? $pre->get_error_message() : 'unknown error') . '); nothing was restored.';
+					$this->progress($msg);
+					$result['success'] = false;
+					$result['errors'][] = $msg;
+					$this->end_restore(); $this->sgbackup->logfile_close();
+					return $result;
+				}
+			}
 		}
 
 		// Phase 1: Verify all required files are present and validate integrity
@@ -309,7 +357,7 @@ class SiteGuard_Backup_Restorer {
 
 		// Pre-scan SQL to detect subsite backup when metadata is missing.
 		// Must run before the guard below to catch subsite backups early.
-		if (!$this->is_subsite_backup && is_multisite() && !empty($this->backup_set['db'])) {
+		if (!$this->is_subsite_backup && !empty($this->backup_set['db'])) {
 			$db_files = $this->backup_set['db'];
 			if (is_string($db_files)) $db_files = array($db_files);
 			$first_file = $backup_dir . $db_files[0];
@@ -347,6 +395,24 @@ class SiteGuard_Backup_Restorer {
 			$result['errors'][] = "This is a per-subsite backup from {$src_domain}. To restore it, use 'Import as subsite' mode and provide a target domain. Standard migrate/overwrite modes cannot handle subsite-only backups.";
 			$this->end_restore(); $this->sgbackup->logfile_close();
 			return $result;
+		}
+
+		// A multisite subsite's backup restored onto a SINGLE site: convert it into
+		// that site (wp_N_* -> wp_*). The standard path refuses the prefix mismatch.
+		if ($this->is_subsite_backup && !is_multisite()) {
+			$this->progress("Restoring a multisite subsite backup into this single site");
+			$conv = $this->restore_subsite_into_single($backup_dir);
+			$result['messages'] = array_merge($result['messages'], $conv['messages']);
+			if (!$conv['success']) {
+				$result['errors'] = array_merge($result['errors'], $conv['errors']);
+				$result['success'] = false;
+				$this->end_restore(); $this->sgbackup->logfile_close();
+				return $result;
+			}
+			// Database handled; files follow through the standard entity loop, with
+			// uploads taken from the subsite's sites/N/ tree into the uploads root.
+			$this->restore_options['db'] = false;
+			$this->subsite_to_single_uploads = true;
 		}
 
 		// Subsite import mode: use dedicated restore path (works for both
@@ -407,6 +473,7 @@ class SiteGuard_Backup_Restorer {
 			}
 			$this->move_in_mode  = $original_mode;
 			$this->is_migration  = $original_migration;
+			$this->activate_extracted_subsite_plugins();
 
 			// wpcore in subsite mode is always refused.
 			if (!empty($this->restore_options['wpcore']) && !empty($this->backup_set['wpcore'])) {
@@ -456,6 +523,13 @@ class SiteGuard_Backup_Restorer {
 			if (!$db_result['success']) {
 				$result['errors'] = array_merge($result['errors'], $db_result['errors']);
 				$result['success'] = false;
+				// Do not go on to overwrite files for a database that was not restored:
+				// that left a half-restored site that reported success.
+				if ($this->db_restore_mode !== self::DB_RESTORE_SKIP_DB) {
+					$this->progress("Database restore failed; files were not touched.");
+					$this->end_restore(); $this->sgbackup->logfile_close();
+					return $result;
+				}
 			}
 			if ($this->db_restore_mode === self::DB_RESTORE_SKIP_DB) {
 				$result['messages'][] = "Database: skipped (user selected skip-db mode)";
@@ -505,7 +579,11 @@ class SiteGuard_Backup_Restorer {
 
 			@set_time_limit(SGBACKUP_SET_TIME_LIMIT);
 			$this->progress("Restoring {$entity}");
-			$entity_result = $this->restore_file_entity($entity, $backup_dir);
+			if ('uploads' === $entity && $this->subsite_to_single_uploads) {
+				$entity_result = $this->restore_subsite_uploads($backup_dir, (int) $this->source_blog_id, 1);
+			} else {
+				$entity_result = $this->restore_file_entity($entity, $backup_dir);
+			}
 			if (!$entity_result) {
 				$result['errors'][] = "Failed to restore {$entity}";
 				$result['success'] = false;
@@ -880,6 +958,16 @@ class SiteGuard_Backup_Restorer {
 		// Save destination's sgbackup_* options before DB import.
 		// After import these get overwritten with source values; we restore them in post_restore_cleanup().
 		$this->save_plugin_options_before_import();
+		// Subsites keep their own SiteGuard state too (history, settings, scheduled
+		// events); save_plugin_options_before_import() only covers the main site.
+		if (is_multisite()) {
+			global $wpdb;
+			$this->network_import = true;
+			foreach ((array) get_sites(array('fields' => 'ids', 'number' => 0)) as $bid) {
+				if ((int) $bid === 1) continue;
+				$this->pre_import_subsite_sg[(int) $bid] = $this->read_plugin_option_rows($wpdb->get_blog_prefix($bid) . 'options');
+			}
+		}
 
 		// Save progress for resume support
 		$this->save_restore_progress('db', 'started');
@@ -1039,6 +1127,7 @@ class SiteGuard_Backup_Restorer {
 						}
 					);
 				} else {
+					$this->filtered_import_used = true;
 					$this->sgbackup->log("Filtered import: {$skipped_count} tables excluded for skipped subsites, importing " . count($tables_to_import) . " tables");
 					$this->progress("Importing " . count($tables_to_import) . " tables (skipping {$skipped_count} subsite tables)");
 					$import_result = SiteGuard_Backup_Database_Utility::execute_sql_file_filtered(
@@ -1087,6 +1176,18 @@ class SiteGuard_Backup_Restorer {
 		// Flush WordPress object cache - the atomic RENAME TABLE makes all
 		// cached option values stale (they still hold the pre-import data).
 		wp_cache_flush();
+
+		// The SOURCE's blog domains, before the safety net below rewrites blog 1 to
+		// the destination's domain. The mirror search-replace used to read them
+		// afterwards, took the destination's own domain for a source "independent
+		// domain" and remapped it onto itself (dst.test -> dst.dst.dst.test).
+		if (is_multisite()) {
+			global $wpdb;
+			$bt = $wpdb->base_prefix . 'blogs';
+			if ($wpdb->get_var($wpdb->prepare('SHOW TABLES LIKE %s', $wpdb->esc_like($bt))) === $bt) {
+				$this->source_blog_domains = array_values(array_unique((array) $wpdb->get_col("SELECT domain FROM `{$bt}`")));
+			}
+		}
 
 		// Capture imported siteurl/home BEFORE overwriting - needed for migration
 		// detection below. After the safety-net write, get_option returns destination.
@@ -1241,6 +1342,7 @@ class SiteGuard_Backup_Restorer {
 			$target_blog = get_blog_details(array('domain' => $target_domain), false);
 		}
 		$target_id = null;
+		$preserved_sg_options = array();
 
 		if ($target_blog) {
 			$target_id = (int) $target_blog->blog_id;
@@ -1250,6 +1352,7 @@ class SiteGuard_Backup_Restorer {
 
 			// Drop existing subsite tables so we can import fresh
 			$target_prefix = $wpdb->base_prefix . $target_id . '_';
+			$preserved_sg_options = $this->read_plugin_option_rows($target_prefix . 'options');
 			$existing_tables = SiteGuard_Backup_Database_Utility::get_tables($target_prefix);
 			if (!empty($existing_tables)) {
 				$wpdb->query('SET FOREIGN_KEY_CHECKS = 0');
@@ -1323,7 +1426,11 @@ class SiteGuard_Backup_Restorer {
 					$prefix_pattern = '/^' . preg_quote($wpdb->base_prefix, '/') . '(\d+)_/';
 					$detected_ids = array();
 					foreach ($all_tables as $table) {
-						if (preg_match($prefix_pattern, $table, $m)) {
+						// A number is a blog id only if that blog has its own options
+						// table; plugin tables like wp_404_to_301 on a single site
+						// otherwise made the whole import use prefix wp_404_.
+						if (preg_match($prefix_pattern, $table, $m)
+							&& in_array($wpdb->base_prefix . $m[1] . '_options', $all_tables, true)) {
 							$detected_ids[intval($m[1])] = true;
 						}
 					}
@@ -1336,7 +1443,7 @@ class SiteGuard_Backup_Restorer {
 						// Multiple blog_ids - pick the most common one
 						$id_counts = array();
 						foreach ($all_tables as $table) {
-							if (preg_match($prefix_pattern, $table, $m)) {
+							if (preg_match($prefix_pattern, $table, $m) && isset($detected_ids[intval($m[1])])) {
 								$id = intval($m[1]);
 								$id_counts[$id] = ($id_counts[$id] ?? 0) + 1;
 							}
@@ -1387,6 +1494,8 @@ class SiteGuard_Backup_Restorer {
 
 			// Step 3: Merge users - match by email
 			$this->merge_subsite_users($source_id, $target_id, $backup_dir, $resolved_db_paths);
+			$this->fix_prefixed_option_names($source_prefix, $target_prefix, $target_id);
+			$this->replace_plugin_option_rows($target_prefix . 'options', $preserved_sg_options, $target_id);
 		}
 
 		// Step 4: Move uploaded files
@@ -1517,6 +1626,21 @@ class SiteGuard_Backup_Restorer {
 			));
 			foreach ($known_tokens as $tok) {
 				$add_pair($tok, '%');
+			}
+
+			// Pair 0.5: single site / main site -> subsite. The source kept uploads at
+			// wp-content/uploads/, the subsite's files were restored to
+			// uploads/sites/{target}/, so the uploads base URL has to change too;
+			// a plain host swap left every image pointing at the main site (404).
+			// Must precede the generic URL pairs.
+			if ((int) $source_id <= 1 && (int) $target_id > 1 && !empty($old_url_base)) {
+				$bare_old_up = preg_replace('#^https?://#i', '', $old_url_base) . '/wp-content/uploads/';
+				$new_up = $target_url_base . '/wp-content/uploads/sites/' . (int) $target_id . '/';
+				foreach (array('https://', 'http://', '//') as $sch) {
+					$to = ('//' === $sch) ? preg_replace('#^https?:#i', '', $new_up) : $new_up;
+					$add_pair($sch . $bare_old_up, $to);
+					$add_pair(str_replace('/', '\/', $sch . $bare_old_up), str_replace('/', '\/', $to));
+				}
 			}
 
 			// Pair 1-2: schemed full URLs. Cover both http:// and https:// because
@@ -1786,6 +1910,32 @@ class SiteGuard_Backup_Restorer {
 	}
 
 	/**
+	 * Activate, on the imported subsite, the source plugins that were not on disk
+	 * when active_plugins was reconciled but have now been extracted from the backup.
+	 */
+	private function activate_extracted_subsite_plugins() {
+		global $wpdb;
+		if (empty($this->subsite_plugin_intent['plugins'])) return;
+		$intent = $this->subsite_plugin_intent;
+		$this->subsite_plugin_intent = null;
+
+		$table = $intent['prefix'] . 'options';
+		$current = @unserialize((string) $wpdb->get_var($wpdb->prepare("SELECT option_value FROM `{$table}` WHERE option_name = %s", 'active_plugins')));
+		if (!is_array($current)) $current = array();
+		$added = array();
+		foreach ($intent['plugins'] as $p) {
+			if (validate_file($p) === 0 && file_exists(WP_PLUGIN_DIR . '/' . $p) && !in_array($p, $current, true)) {
+				$current[] = $p;
+				$added[] = $p;
+			}
+		}
+		if (!$added) return;
+		$wpdb->update($table, array('option_value' => serialize(array_values($current))), array('option_name' => 'active_plugins'));
+		if (function_exists('clean_blog_cache')) clean_blog_cache($intent['blog_id']);
+		$this->sgbackup->log("Activated on blog #{$intent['blog_id']} after extraction: " . implode(', ', $added));
+	}
+
+	/**
 	 * After a per-subsite restore, reconcile active_plugins / active theme with
 	 * what's actually installed on the destination network. Sets the intersection,
 	 * reports the unmet subset as remediation data.
@@ -1849,6 +1999,14 @@ class SiteGuard_Backup_Restorer {
 			}
 		}
 		$out['kept_plugins'] = $to_activate_on_subsite;
+		// Plugins that only arrive with the backup are extracted AFTER this runs
+		// (shared entities go last); remember the intent so they can be activated
+		// once they are on disk (see activate_extracted_subsite_plugins()).
+		$this->subsite_plugin_intent = array(
+			'prefix'  => $target_prefix,
+			'blog_id' => (int) $target_id,
+			'plugins' => $out['unmet_plugins'],
+		);
 
 		// Write the reconstructed active_plugins list to the target subsite.
 		// Do this unconditionally when we have a non-empty set - even if the
@@ -2400,6 +2558,7 @@ class SiteGuard_Backup_Restorer {
 			return $result;
 		}
 
+		$batch_preserved_sg = array(); // target blog id => its own SiteGuard option rows
 		// Step 1: Prepare targets and build prefix map
 		$prefix_map = array();
 		$target_map = array(); // source_blog_id => target_blog_id
@@ -2427,6 +2586,7 @@ class SiteGuard_Backup_Restorer {
 
 				// Drop existing subsite tables
 				$target_prefix = $base_prefix . $target_id . '_';
+				$batch_preserved_sg[$target_id] = $this->read_plugin_option_rows($target_prefix . 'options');
 				$existing_tables = SiteGuard_Backup_Database_Utility::get_tables($target_prefix);
 				if (!empty($existing_tables)) {
 					$wpdb->query('SET FOREIGN_KEY_CHECKS = 0');
@@ -2542,6 +2702,10 @@ class SiteGuard_Backup_Restorer {
 			foreach ($target_map as $source_id => $target_id) {
 				$this->progress("Merging users for subsite #{$source_id} -> #{$target_id}");
 				$this->merge_subsite_users($source_id, $target_id, $backup_dir, $resolved_db_paths);
+				$src_prefix = ((int) $source_id > 1) ? $base_prefix . $source_id . '_' : $base_prefix;
+				$this->fix_prefixed_option_names($src_prefix, $base_prefix . $target_id . '_', $target_id);
+				$this->replace_plugin_option_rows($base_prefix . $target_id . '_options',
+					isset($batch_preserved_sg[$target_id]) ? $batch_preserved_sg[$target_id] : array(), $target_id);
 			}
 
 			// Step 4: Per-subsite search-replace
@@ -2644,6 +2808,260 @@ class SiteGuard_Backup_Restorer {
 	}
 
 	/**
+	 * Restore a multisite subsite's backup into this single site.
+	 *
+	 * Imports the subsite's wp_N_* tables as wp_*, keeps this site's URL, users,
+	 * SiteGuard settings and scheduled events, merges the source's users (by
+	 * email, created when missing, with their subsite roles), rewrites the
+	 * subsite's URLs (including its path and its uploads/sites/N/ base) to this
+	 * site, and keeps the plugins the subsite relied on active.
+	 */
+	private function restore_subsite_into_single($backup_dir) {
+		global $wpdb;
+		$out = array('success' => true, 'errors' => array(), 'messages' => array());
+		$base = $wpdb->base_prefix;
+		$src_id = (int) ($this->source_blog_id ? $this->source_blog_id : (isset($this->backup_set['subsite_blog_id']) ? $this->backup_set['subsite_blog_id'] : 0));
+		if ($src_id < 2) {
+			$out['success'] = false;
+			$out['errors'][] = 'Could not determine which subsite this backup came from.';
+			return $out;
+		}
+		if (empty($this->restore_options['db']) || empty($this->backup_set['db'])) {
+			return $out; // files only
+		}
+		$src_prefix = $base . $src_id . '_';
+		$dst_siteurl = untrailingslashit(get_option('siteurl'));
+		$dst_home = untrailingslashit(get_option('home'));
+		$preserved = $this->read_plugin_option_rows($base . 'options');
+
+		$db_files = (array) $this->backup_set['db'];
+		$predecrypted = $this->predecrypt_db_files($backup_dir);
+		if (is_wp_error($predecrypted)) {
+			$out['success'] = false;
+			$out['errors'][] = $predecrypted->get_error_message();
+			return $out;
+		}
+		$paths = array();
+		foreach ($db_files as $db_file) {
+			$paths[] = isset($predecrypted[$db_file]) ? $predecrypted[$db_file] : $backup_dir . $db_file;
+		}
+
+		$this->progress("Importing database: remapping {$src_prefix}* -> {$base}*");
+		$tables = 0;
+		foreach ($paths as $path) {
+			$r = SiteGuard_Backup_Database_Utility::execute_sql_file_remap_prefix($path, $src_prefix, $base, $base);
+			$tables += (int) $r['tables_restored'];
+			if (!$r['success']) {
+				$out['success'] = false;
+				$out['errors'] = array_merge($out['errors'], (array) $r['errors']);
+			}
+		}
+		if (!$out['success'] || 0 === $tables) {
+			$out['success'] = false;
+			if (0 === $tables) $out['errors'][] = "No {$src_prefix}* tables were found in the backup.";
+			return $out;
+		}
+		$out['messages'][] = "Database: {$tables} tables imported from subsite #{$src_id}";
+		wp_cache_flush();
+
+		// The subsite's options table now holds the SOURCE's URL; remember it first.
+		$old_siteurl = untrailingslashit((string) $wpdb->get_var("SELECT option_value FROM {$base}options WHERE option_name = 'siteurl'"));
+		if (!empty($this->backup_set['subsite_url'])) {
+			$old_siteurl = untrailingslashit($this->backup_set['subsite_url']);
+		}
+
+		$this->merge_subsite_users($src_id, 1, $backup_dir, $paths);
+		$this->fix_prefixed_option_names($src_prefix, $base, 1);
+		$this->replace_plugin_option_rows($base . 'options', $preserved, 1);
+
+		// URL rewrite: most specific first (the subsite's uploads base).
+		$search = array();
+		$replace = array();
+		$add = function ($from, $to) use (&$search, &$replace) {
+			if ('' === $from || $from === $to || in_array($from, $search, true)) return;
+			$search[] = $from;
+			$replace[] = $to;
+		};
+		if ($old_siteurl) {
+			$bare_old = preg_replace('#^https?://#i', '', $old_siteurl);
+			$old_host = parse_url($old_siteurl, PHP_URL_HOST);
+			$network_root = $old_host; // uploads of a subdirectory subsite live under the network root too
+			foreach (array_unique(array($bare_old, $network_root)) as $b) {
+				foreach (array('https://', 'http://') as $sch) {
+					$add($sch . $b . '/wp-content/uploads/sites/' . $src_id . '/', $dst_siteurl . '/wp-content/uploads/');
+					$add(str_replace('/', '\\/', $sch . $b . '/wp-content/uploads/sites/' . $src_id . '/'), str_replace('/', '\\/', $dst_siteurl . '/wp-content/uploads/'));
+				}
+			}
+			$add('/wp-content/uploads/sites/' . $src_id . '/', '/wp-content/uploads/');
+			foreach (array('https://', 'http://') as $sch) {
+				$add($sch . $bare_old, $dst_home);
+				$add(str_replace('/', '\\/', $sch . $bare_old), str_replace('/', '\\/', $dst_home));
+			}
+			$add('//' . $bare_old, preg_replace('#^https?:#i', '', $dst_home));
+			$new_host = parse_url($dst_home, PHP_URL_HOST);
+			if ($old_host && $new_host && $old_host !== $new_host) {
+				$add($old_host, $new_host);
+			}
+		}
+		if ($search) {
+			require_once SGBACKUP_DIR . 'includes/class-search-replace.php';
+			$emails = array();
+			foreach (array('admin_email', 'new_admin_email') as $ek) {
+				$emails[$ek] = get_option($ek);
+			}
+			$sr_tables = array_values(array_diff(SiteGuard_Backup_Database_Utility::get_tables($base), array($base . 'users', $base . 'usermeta')));
+			$sr = new SiteGuard_Backup_Search_Replace();
+			$report = $sr->run($search, $replace, $sr_tables);
+			$out['messages'][] = "Search-replace: {$report['changes']} changes ({$old_siteurl} -> {$dst_home})";
+			$this->sgbackup->log("Subsite-to-single search-replace: " . wp_json_encode($search) . ' -> ' . wp_json_encode($replace) . ": {$report['changes']} changes");
+			foreach ($emails as $ek => $ev) {
+				if (false !== $ev) update_option($ek, $ev);
+			}
+		}
+		// This site keeps its own address whatever the SR did.
+		update_option('siteurl', $dst_siteurl);
+		update_option('home', $dst_home);
+
+		// Plugins the subsite ran: its own list plus what was network-active for it,
+		// and always this plugin (it was network-active on the source, so it is not
+		// in the subsite's own list, and dropping it would disable backups here).
+		$active = (array) get_option('active_plugins', array());
+		if (!empty($this->backup_set['subsite_active_sitewide_plugins']) && is_array($this->backup_set['subsite_active_sitewide_plugins'])) {
+			$active = array_merge($active, $this->backup_set['subsite_active_sitewide_plugins']);
+		}
+		$active[] = plugin_basename(SGBACKUP_DIR . 'siteguardbackup.php');
+		$active = array_values(array_unique(array_filter(array_map('strval', $active), function ($p) {
+			return 0 === validate_file($p);
+		})));
+		update_option('active_plugins', $active);
+
+		$this->is_migration = true;
+		$this->old_siteurl = $old_siteurl;
+		$this->save_restore_progress('db', 'completed');
+		$this->sgbackup->log("Subsite #{$src_id} converted into this single site ({$old_siteurl} -> {$dst_home})");
+		return $out;
+	}
+
+	/**
+	 * This plugin's own option rows (settings, history, job state) in an options table.
+	 */
+	private function read_plugin_option_rows($table) {
+		global $wpdb;
+		if ($wpdb->get_var($wpdb->prepare('SHOW TABLES LIKE %s', $wpdb->esc_like($table))) !== $table) return array();
+		$rows = (array) $wpdb->get_results($wpdb->prepare(
+			"SELECT option_name, option_value, autoload FROM `{$table}` WHERE option_name LIKE %s",
+			$wpdb->esc_like('sgbackup_') . '%'
+		), ARRAY_A);
+		// This site's own scheduled SiteGuard events (kept under a pseudo row).
+		$cron = @unserialize((string) $wpdb->get_var($wpdb->prepare("SELECT option_value FROM `{$table}` WHERE option_name = %s", 'cron')), array('allowed_classes' => false));
+		$rows['__cron'] = is_array($cron) ? $this->plugin_cron_events($cron, true) : array();
+		return $rows;
+	}
+
+	/**
+	 * Keep ($only_plugin) or drop (!$only_plugin) this plugin's hooks in a cron array.
+	 */
+	private function plugin_cron_events($cron, $only_plugin) {
+		$out = array();
+		foreach ($cron as $time => $hooks) {
+			if (!is_array($hooks)) {
+				if (!$only_plugin) $out[$time] = $hooks; // 'version' => 2
+				continue;
+			}
+			foreach ($hooks as $hook => $events) {
+				if ((0 === strpos((string) $hook, 'sgbackup_')) === $only_plugin) {
+					$out[$time][$hook] = $events;
+				}
+			}
+		}
+		return $out;
+	}
+
+	/**
+	 * After importing another site's options table into a subsite, drop the SOURCE's
+	 * SiteGuard rows and put back the target's own (none for a new subsite).
+	 *
+	 * The source's rows carried its in-flight job marker (the dump is taken while
+	 * the backup job runs), so every backup on the imported subsite failed with
+	 * "another job is already running"; they also carried its remote-storage
+	 * credentials and retention settings into a different site.
+	 */
+	private function replace_plugin_option_rows($table, $preserved, $target_id) {
+		global $wpdb;
+		if ($wpdb->get_var($wpdb->prepare('SHOW TABLES LIKE %s', $wpdb->esc_like($table))) !== $table) return;
+		$removed = $wpdb->query($wpdb->prepare(
+			"DELETE FROM `{$table}` WHERE option_name LIKE %s OR option_name LIKE %s OR option_name LIKE %s",
+			$wpdb->esc_like('sgbackup_') . '%',
+			$wpdb->esc_like('_transient_sgbackup_') . '%',
+			$wpdb->esc_like('_transient_timeout_sgbackup_') . '%'
+		));
+		$own_cron = isset($preserved['__cron']) ? $preserved['__cron'] : array();
+		unset($preserved['__cron']);
+		// The imported cron array holds the SOURCE's scheduled SiteGuard events,
+		// including the resumption of the very backup being dumped, which made the
+		// job scheduler report a running job forever. Keep only other hooks, then
+		// add back this site's own SiteGuard events.
+		$cron = @unserialize((string) $wpdb->get_var($wpdb->prepare("SELECT option_value FROM `{$table}` WHERE option_name = %s", 'cron')), array('allowed_classes' => false));
+		if (is_array($cron)) {
+			$cron = $this->plugin_cron_events($cron, false);
+			foreach ($own_cron as $time => $hooks) {
+				foreach ($hooks as $hook => $events) {
+					$cron[$time][$hook] = $events;
+				}
+			}
+			ksort($cron);
+			$wpdb->update($table, array('option_value' => serialize($cron)), array('option_name' => 'cron'));
+		}
+		foreach ((array) $preserved as $row) {
+			$wpdb->insert($table, array(
+				'option_name'  => $row['option_name'],
+				'option_value' => $row['option_value'],
+				'autoload'     => $row['autoload'],
+			));
+		}
+		if (function_exists('clean_blog_cache')) clean_blog_cache((int) $target_id);
+		$this->sgbackup->log("Blog #{$target_id}: replaced {$removed} SiteGuard option row(s) from the source with " . count((array) $preserved) . " of the target's own");
+	}
+
+	/**
+	 * Rename options whose NAME carries the table prefix after a prefix-remapped import.
+	 *
+	 * Table names are remapped (wp_* -> wp_4_*) but option names inside them are
+	 * not, so the imported roles stay under "wp_user_roles" while WordPress reads
+	 * "wp_4_user_roles": the subsite ends up with no roles and nobody can
+	 * administer it. Falls back to the default roles if none came across.
+	 */
+	private function fix_prefixed_option_names($source_prefix, $target_prefix, $target_id) {
+		global $wpdb;
+		if ($source_prefix === $target_prefix) return;
+		$table = $target_prefix . 'options';
+		if ($wpdb->get_var($wpdb->prepare('SHOW TABLES LIKE %s', $wpdb->esc_like($table))) !== $table) return;
+
+		$from = $source_prefix . 'user_roles';
+		$to   = $target_prefix . 'user_roles';
+		$has_from = (int) $wpdb->get_var($wpdb->prepare("SELECT COUNT(*) FROM `{$table}` WHERE option_name = %s", $from));
+		if ($has_from) {
+			$wpdb->query($wpdb->prepare("DELETE FROM `{$table}` WHERE option_name = %s", $to));
+			$wpdb->query($wpdb->prepare("UPDATE `{$table}` SET option_name = %s WHERE option_name = %s", $to, $from));
+			$this->sgbackup->log("Renamed option {$from} -> {$to} in blog #{$target_id}");
+		}
+
+		$has_roles = (int) $wpdb->get_var($wpdb->prepare("SELECT COUNT(*) FROM `{$table}` WHERE option_name = %s", $to));
+		if (!$has_roles) {
+			if (!function_exists('populate_roles')) {
+				require_once ABSPATH . 'wp-admin/includes/schema.php';
+			}
+			if (is_multisite()) switch_to_blog((int) $target_id);
+			populate_roles();
+			if (is_multisite()) restore_current_blog();
+			$this->sgbackup->log("No roles came across for blog #{$target_id}; installed the default roles", 'warning');
+		}
+		if (function_exists('clean_blog_cache')) {
+			clean_blog_cache((int) $target_id);
+		}
+	}
+
+	/**
 	 * Merge users from a subsite backup into the existing multisite user base.
 	 * Matches by email - reuses existing users, inserts new ones.
 	 *
@@ -2686,7 +3104,9 @@ class SiteGuard_Backup_Restorer {
 		$usermeta_table = $base_prefix . 'usermeta';
 		// blog_id 1 and single-site (0) both use wp_capabilities (no numeric prefix)
 		$source_cap_key = ($source_id > 1) ? $base_prefix . $source_id . '_capabilities' : $base_prefix . 'capabilities';
-		$target_cap_key = $base_prefix . $target_id . '_capabilities';
+		// Main site / single site keep the bare prefix (wp_capabilities, wp_posts).
+		$target_prefix = ((int) $target_id > 1) ? $base_prefix . $target_id . '_' : $base_prefix;
+		$target_cap_key = $target_prefix . 'capabilities';
 
 		// Read users and capabilities from the SQL dump.
 		// wp_usermeta is skipped during remap import, so we parse caps directly
@@ -2728,13 +3148,17 @@ class SiteGuard_Backup_Restorer {
 					if (!$line_capped && preg_match_all("/\(\s*'?(\d+)'?\s*,\s*'([^']*)'\s*,\s*'([^']*)'\s*,\s*'([^']*)'\s*,\s*'([^']*)'/", $line, $matches, PREG_SET_ORDER)) {
 						foreach ($matches as $m) {
 							$backup_users[$m[5]] = array(
-								'old_id' => intval($m[1]),
-								'login'  => $m[2],
-								'email'  => $m[5],
+								'old_id'   => intval($m[1]),
+								'login'    => stripslashes($m[2]),
+								'pass'     => stripslashes($m[3]),
+								'nicename' => stripslashes($m[4]),
+								'email'    => stripslashes($m[5]),
 							);
 						}
 					}
-					if (strpos($line, ';') !== false) {
+					// End of statement is a line ending in ");". A bare ';' also occurs
+					// inside values (display names, serialized data).
+					if (preg_match('/\)\s*;\s*$/', $line)) {
 						$in_users_insert = false;
 					}
 				}
@@ -2750,7 +3174,10 @@ class SiteGuard_Backup_Restorer {
 							}
 						}
 					}
-					if (strpos($line, ';') !== false) {
+					// Serialized capabilities always contain ';' (a:1:{s:6:"editor";b:1;}),
+					// so ending the statement at the first ';' dropped every row after
+					// the first capability entry and imported users as subscribers.
+					if (preg_match('/\)\s*;\s*$/', $line)) {
 						$in_usermeta_insert = false;
 					}
 				}
@@ -2771,6 +3198,7 @@ class SiteGuard_Backup_Restorer {
 
 		// Map old user IDs to new (existing or matching) user IDs
 		$id_map = array();
+		$created = array();
 		foreach ($backup_users as $email => $user_data) {
 			$existing = get_user_by('email', $email);
 			if ($existing) {
@@ -2779,27 +3207,61 @@ class SiteGuard_Backup_Restorer {
 				$existing_by_login = get_user_by('login', $user_data['login']);
 				if ($existing_by_login) {
 					$id_map[$user_data['old_id']] = $existing_by_login->ID;
+					continue;
 				}
-				// If no match, user data was imported with the subsite tables;
-				// we leave user references as-is (they may need manual resolution)
+				// Not on the destination at all: create the account (the source's
+				// user tables are never imported, so otherwise every author,
+				// editor and customer of the source site was silently dropped).
+				$new_id = wp_insert_user(array(
+					'user_login'    => $user_data['login'],
+					'user_email'    => $email,
+					'user_nicename' => $user_data['nicename'],
+					'user_pass'     => wp_generate_password(32),
+					'role'          => '',
+				));
+				if (is_wp_error($new_id)) {
+					$this->sgbackup->log("User merge: could not create {$user_data['login']}: " . $new_id->get_error_message(), 'warning');
+					continue;
+				}
+				if ('' !== $user_data['pass']) {
+					// Keep the source password hash so the user's existing password works.
+					$wpdb->update($wpdb->users, array('user_pass' => $user_data['pass']), array('ID' => $new_id));
+					clean_user_cache($new_id);
+				}
+				if (is_multisite()) {
+					// wp_insert_user() adds the user to the current blog; membership is
+					// set from the source capabilities below.
+					delete_user_meta($new_id, $wpdb->get_blog_prefix(get_current_blog_id()) . 'capabilities');
+					delete_user_meta($new_id, $wpdb->get_blog_prefix(get_current_blog_id()) . 'user_level');
+				}
+				$id_map[$user_data['old_id']] = $new_id;
+				$created[$new_id] = true;
+				$this->sgbackup->log("User merge: created {$user_data['login']} (#{$new_id}, was #{$user_data['old_id']})");
 			}
 		}
 
-		// For users that exist, add them to the target subsite with their capabilities
-		$target_prefix = $base_prefix . $target_id . '_';
+		// Give every mapped user their source role on the target. An existing
+		// destination user keeps any role they already have there.
 		foreach ($id_map as $old_id => $new_id) {
-			// Read capabilities from the parsed SQL dump data
-			if (isset($backup_caps[$old_id])) {
-				$caps = maybe_unserialize($backup_caps[$old_id]);
-				if (is_array($caps)) {
-					update_user_meta($new_id, $target_cap_key, $caps);
-				} else {
-					add_user_to_blog($target_id, $new_id, 'subscriber');
-				}
-			} else {
-				// No capability data available - default to subscriber
-				add_user_to_blog($target_id, $new_id, 'subscriber');
+			if (empty($created[$new_id]) && get_user_meta($new_id, $target_cap_key, true)) {
+				continue;
 			}
+			$caps = isset($backup_caps[$old_id]) ? maybe_unserialize($backup_caps[$old_id]) : null;
+			if (!is_array($caps) || !$caps) {
+				$caps = array('subscriber' => true);
+			}
+			update_user_meta($new_id, $target_cap_key, $caps);
+			$level = 0;
+			foreach (array_keys($caps) as $role_name) {
+				$role = get_role($role_name);
+				if ($role) {
+					foreach ($role->capabilities as $cap => $granted) {
+						if ($granted && preg_match('/^level_(\d+)$/', $cap, $lm)) $level = max($level, (int) $lm[1]);
+					}
+				}
+			}
+			update_user_meta($new_id, $target_prefix . 'user_level', $level);
+			clean_user_cache($new_id);
 		}
 
 		// Update user IDs in subsite tables (e.g., post_author, comment_user_id)
@@ -2807,16 +3269,25 @@ class SiteGuard_Backup_Restorer {
 			$target_posts = $target_prefix . 'posts';
 			$target_comments = $target_prefix . 'comments';
 
+			// Two phases through an offset: remapping 2->3 and then 3->2 in place
+			// merged both authors into one.
+			$offset = 1000000000000;
+			$has_posts = (bool) $wpdb->get_var($wpdb->prepare('SHOW TABLES LIKE %s', $target_posts));
+			$has_comments = (bool) $wpdb->get_var($wpdb->prepare('SHOW TABLES LIKE %s', $target_comments));
 			foreach ($id_map as $old_id => $new_id) {
-				if ($old_id === $new_id) continue;
-
-				// Check tables exist before updating
-				if ($wpdb->get_var("SHOW TABLES LIKE '{$target_posts}'")) {
-					$wpdb->update($target_posts, array('post_author' => $new_id), array('post_author' => $old_id));
+				if ((int) $old_id === (int) $new_id) continue;
+				if ($has_posts) {
+					$wpdb->query($wpdb->prepare("UPDATE `{$target_posts}` SET post_author = %d WHERE post_author = %d", $new_id + $offset, $old_id));
 				}
-				if ($wpdb->get_var("SHOW TABLES LIKE '{$target_comments}'")) {
-					$wpdb->update($target_comments, array('user_id' => $new_id), array('user_id' => $old_id));
+				if ($has_comments) {
+					$wpdb->query($wpdb->prepare("UPDATE `{$target_comments}` SET user_id = %d WHERE user_id = %d", $new_id + $offset, $old_id));
 				}
+			}
+			if ($has_posts) {
+				$wpdb->query($wpdb->prepare("UPDATE `{$target_posts}` SET post_author = post_author - %d WHERE post_author >= %d", $offset, $offset));
+			}
+			if ($has_comments) {
+				$wpdb->query($wpdb->prepare("UPDATE `{$target_comments}` SET user_id = user_id - %d WHERE user_id >= %d", $offset, $offset));
 			}
 			$this->sgbackup->log("Subsite user merge: remapped " . count($id_map) . " user IDs in subsite tables");
 		}
@@ -2840,7 +3311,10 @@ class SiteGuard_Backup_Restorer {
 		} else {
 			$uploads_base = SiteGuard_Backup_Filesystem::wp_uploads_dir();
 		}
-		$target_dir = trailingslashit($uploads_base) . 'sites/' . $target_id . '/';
+		// Blog 1 (a single site, or a network's main site) keeps uploads at the root.
+		$target_dir = ((int) $target_id > 1)
+			? trailingslashit($uploads_base) . 'sites/' . $target_id . '/'
+			: trailingslashit($uploads_base);
 
 		if (!file_exists($target_dir)) {
 			wp_mkdir_p($target_dir);
@@ -3120,9 +3594,14 @@ class SiteGuard_Backup_Restorer {
 
 		$this->sgbackup->log("Selective import: importing blog_ids [" . implode(',', $import_blog_ids) . "], skipping blog_ids [" . implode(',', $skip_blog_ids) . "], main site skipped: " . ($main_site_skipped ? 'yes' : 'no'));
 
-		return array_values(array_filter($all_tables, function($table) use ($prefix_pattern, $import_prefixes, $main_site_skipped, $base_prefix, $multisite_infra) {
+		// Only numbers that are real blog ids in the backup mark a subsite table:
+		// main-site plugin tables such as wp_404_to_301 match wp_N_ too, and were
+		// dropped from the import as "blog 404".
+		$known_blog_ids = array_map('intval', array_keys($source_blogs));
+
+		return array_values(array_filter($all_tables, function($table) use ($prefix_pattern, $import_prefixes, $main_site_skipped, $base_prefix, $multisite_infra, $known_blog_ids) {
 			// Check if this is a blog-specific table (wp_N_*)
-			if (preg_match($prefix_pattern, $table, $m)) {
+			if (preg_match($prefix_pattern, $table, $m) && in_array((int) $m[1], $known_blog_ids, true)) {
 				// Only include if this blog_id is in the import whitelist
 				$table_prefix = $GLOBALS['wpdb']->base_prefix . $m[1] . '_';
 				return in_array($table_prefix, $import_prefixes, true);
@@ -3763,9 +4242,14 @@ class SiteGuard_Backup_Restorer {
 		$is_selective_mirror = ($this->subsite_mode === self::SUBSITE_MODE_MIRROR && !empty($this->subsite_map));
 		$has_skip_map = ($is_custom || $is_selective_mirror);
 
-		// Read all blog domains from wp_blogs
+		// The source's blog domains, captured before the destination identity was
+		// written back (see restore_database()); wp_blogs as a fallback.
 		$blogs_table = $wpdb->base_prefix . 'blogs';
-		$blogs = $wpdb->get_col("SELECT DISTINCT domain FROM {$blogs_table}");
+		$blogs = !empty($this->source_blog_domains) ? $this->source_blog_domains : $wpdb->get_col("SELECT DISTINCT domain FROM {$blogs_table}");
+		// Never treat the destination's own domain as a source domain.
+		$blogs = array_values(array_filter((array) $blogs, function ($d) use ($new_domain, $old_domain) {
+			return $d !== $new_domain || $d === $old_domain;
+		}));
 		if (empty($blogs)) return;
 
 		$mode_label = $is_custom ? 'custom-map' : ($is_selective_mirror ? 'selective-mirror' : 'mirror');
@@ -3954,7 +4438,7 @@ class SiteGuard_Backup_Restorer {
 					// Remove the source's skipped blog entry from wp_blogs
 					$wpdb->delete($blogs_table, array('blog_id' => $blog->blog_id), array('%d'));
 
-					if (!empty($this->pre_import_blogs)) {
+					if ($this->filtered_import_used) {
 						// Filtered import was used - tables at this blog_id belong to
 						// the destination, NOT the source. Do NOT drop them.
 						$this->sgbackup->log("  Skipped blog #{$blog->blog_id} ({$blog->domain}): deleted from wp_blogs (destination tables preserved)");
@@ -4166,7 +4650,9 @@ class SiteGuard_Backup_Restorer {
 		global $wpdb;
 		$blogs_table = $wpdb->base_prefix . 'blogs';
 		$removed = 0;
-		$use_filtered_mode = !empty($this->pre_import_blogs);
+		// Decided by the import that actually ran, not by whether the destination
+		// happened to have subsites before it.
+		$use_filtered_mode = $this->filtered_import_used;
 
 		foreach ($this->subsite_map as $domain => $action) {
 			if ($action !== self::SUBSITE_SKIP) continue;
@@ -4287,6 +4773,20 @@ class SiteGuard_Backup_Restorer {
 
 		$dest_dir = $entities_info[$entity]['path'];
 
+		// extradir_N means "the Nth configured extra directory", and that list can
+		// change: restore only into the directory the archive was taken from.
+		if (0 === strpos($entity, 'extradir_')) {
+			$recorded = isset($this->backup_set['extra_dir_sources'][$entity]) ? (string) $this->backup_set['extra_dir_sources'][$entity] : '';
+			$current = realpath($dest_dir);
+			if ('' === $recorded || false === $current || untrailingslashit(wp_normalize_path($current)) !== untrailingslashit(wp_normalize_path((string) (realpath($recorded) ?: $recorded)))) {
+				$msg = "Skipped {$entity}: it was backed up from " . ('' !== $recorded ? $recorded : 'an unrecorded directory')
+					. ", which is not the directory now configured at that position ({$dest_dir}). Extract that archive manually.";
+				$this->sgbackup->log("[Restore] {$msg}", 'warning');
+				$this->progress($msg);
+				return false;
+			}
+		}
+
 		// Save progress for resume support
 		$this->save_restore_progress($entity, 'started');
 
@@ -4360,14 +4860,18 @@ class SiteGuard_Backup_Restorer {
 				$this->progress("Skipped wp-config.php (destination config preserved)");
 			}
 
-			// Exclude our own plugin directory during migration to prevent
-			// overwriting destination's encryption keys, config, and version.
-			if ($entity === 'plugins' && $this->is_migration) {
-				$self_dir = $temp_dir . 'siteguardbackup';
-				if (is_dir($self_dir)) {
-					$this->remove_temp_dir($self_dir);
-					$this->sgbackup->log("Migration: excluded siteguardbackup/ from plugin restore to preserve destination config");
-					$this->progress("Excluded SiteGuard Backup plugin from restore (preserving destination config)");
+			// Never restore over this plugin's own directory: it is the code running
+			// this restore (swapping it mid-request mixes versions, and an older
+			// backup would bring back older, possibly unsafe code), and it holds the
+			// destination's config. Match the real install folder, not a fixed name.
+			if ($entity === 'plugins') {
+				foreach (array_unique(array(basename(untrailingslashit(SGBACKUP_DIR)), 'siteguardbackup')) as $self_name) {
+					$self_dir = $temp_dir . $self_name;
+					if (is_dir($self_dir)) {
+						$this->remove_temp_dir($self_dir);
+						$this->sgbackup->log("Excluded {$self_name}/ (SiteGuard Backup itself) from plugin restore");
+						$this->progress("Excluded SiteGuard Backup plugin from restore (keeping the running version)");
+					}
 				}
 			}
 
@@ -4456,73 +4960,58 @@ class SiteGuard_Backup_Restorer {
 	 * @param string $plugins_dir Path to the wp-content/plugins/ directory.
 	 */
 	private function remove_duplicate_plugins($plugins_dir) {
+		// Nothing is deleted here any more. Matching on the "Plugin Name" header
+		// deleted unrelated directories that happen to share a name (e.g.
+		// elementor-pro/ and elementorpro/), and, with "back up existing" mode,
+		// deleted the freshly restored plugin whenever the renamed safety copy
+		// had a higher version. Two copies only break a site ("Cannot redeclare")
+		// when both are ACTIVE, so that is the only case acted on: the copy that
+		// did not come from the backup is deactivated.
 		$plugins_dir = trailingslashit($plugins_dir);
-		$seen = array(); // Plugin Name => array('dir' => dirname, 'version' => version)
-		$removed = 0;
+		$restored = isset($this->restored_top_items['plugins']) ? $this->restored_top_items['plugins'] : array();
+		$by_name = array(); // Plugin Name => list of "dir/file.php"
 
 		$dirs = @scandir($plugins_dir);
 		if (!is_array($dirs)) return;
-
 		foreach ($dirs as $dir) {
 			if ($dir === '.' || $dir === '..' || !is_dir($plugins_dir . $dir)) continue;
-
-			// Find the main plugin file (contains "Plugin Name:" header)
+			if (false !== strpos($dir, '.sgbackup-old-')) continue; // our own safety copies
 			$plugin_files = glob($plugins_dir . $dir . '/*.php');
 			if (!$plugin_files) continue;
-
 			foreach ($plugin_files as $file) {
 				$header = $this->read_plugin_header($file);
 				if (empty($header['name'])) continue;
-
-				$name = $header['name'];
-				$version = $header['version'] ?: '0.0.0';
-
-				if (isset($seen[$name])) {
-					// Duplicate found - remove the older one
-					$existing = $seen[$name];
-					if (version_compare($version, $existing['version'], '>')) {
-						// New one is newer - remove existing
-						$remove_dir = $plugins_dir . $existing['dir'];
-						$keep_dir = $dir;
-						$seen[$name] = array('dir' => $dir, 'version' => $version);
-					} else {
-						// Existing is newer or same - remove new one
-						$remove_dir = $plugins_dir . $dir;
-						$keep_dir = $existing['dir'];
-					}
-
-					if ($this->remove_plugin_dir($remove_dir, $plugins_dir)) {
-						$removed++;
-						$this->sgbackup->log("Removed duplicate plugin '{$name}': deleted " . basename($remove_dir) . "/ (kept {$keep_dir}/ v" . $seen[$name]['version'] . ")");
-						$this->progress("Removed duplicate plugin: " . basename($remove_dir) . "/ (kept {$keep_dir}/)");
-					} else {
-						$this->sgbackup->log("Could not remove duplicate plugin directory " . basename($remove_dir) . "/ - both copies of '{$name}' remain; deactivate one manually", 'warning');
-					}
-				} else {
-					$seen[$name] = array('dir' => $dir, 'version' => $version);
-				}
-
-				break; // Only check one main file per directory
+				$by_name[$header['name']][] = $dir . '/' . basename($file);
+				break;
 			}
 		}
 
-		if ($removed > 0) {
-			$this->sgbackup->log("Duplicate plugin cleanup: removed {$removed} duplicate(s)");
-		}
-	}
+		$active = (array) get_option('active_plugins', array());
+		$network = is_multisite() ? (array) get_site_option('active_sitewide_plugins', array()) : array();
+		$changed = false;
+		$is_active = function ($p) use ($active, $network) {
+			return in_array($p, $active, true) || isset($network[$p]);
+		};
 
-	/**
-	 * Remove a plugin directory, bounded to the plugins directory.
-	 * (remove_temp_dir() is bounded to the backup dir and refuses these paths.)
-	 */
-	private function remove_plugin_dir($dir, $plugins_dir) {
-		if (is_link(rtrim($dir, '/'))) return false;
-		$r = SiteGuard_Backup_Filesystem::delete_tree($dir, $plugins_dir);
-		if (is_wp_error($r)) {
-			$this->sgbackup->log("Could not remove plugin directory {$dir}: " . $r->get_error_message(), 'error');
-			return false;
+		foreach ($by_name as $name => $copies) {
+			if (count($copies) < 2) continue;
+			$this->sgbackup->log("Plugin '{$name}' is installed more than once: " . implode(', ', $copies), 'warning');
+			$active_copies = array_values(array_filter($copies, $is_active));
+			if (count($active_copies) < 2) continue;
+			foreach ($active_copies as $p) {
+				$dir = strtok($p, '/');
+				if (in_array($dir, $restored, true)) continue; // keep what the backup restored
+				$active = array_values(array_diff($active, array($p)));
+				unset($network[$p]);
+				$changed = true;
+				$this->sgbackup->log("Deactivated duplicate copy {$p} of '{$name}' (both copies were active)", 'warning');
+				$this->progress("Deactivated duplicate plugin copy: {$p}");
+			}
 		}
-		return true;
+		if ($changed) {
+			update_option('active_plugins', $active);
+			if (is_multisite()) update_site_option('active_sitewide_plugins', $network);
+		}
 	}
 
 	/**
@@ -4688,6 +5177,7 @@ class SiteGuard_Backup_Restorer {
 
 		$mode = $this->move_in_mode;
 		$moved_count = 0;
+		$this->restored_top_items[$entity] = array_values(array_diff((array) @scandir($source), array('.', '..')));
 
 		// For MERGE mode at the top-level, we iterate individual items
 		// For SKIP mode at the top-level directory items, check existence
@@ -4748,18 +5238,13 @@ class SiteGuard_Backup_Restorer {
 					continue;
 				}
 
-				// Overwrite existing (modes 0, 1, 3 all overwrite individual files)
-				if (file_exists($target)) {
-					@unlink($target);
-				}
-				// rename() fails silently cross-filesystem; fall back to copy+unlink
-				if (!@rename($item->getPathname(), $target)) {
-					if (!@copy($item->getPathname(), $target)) {
-						$this->last_move_failures++;
-						$this->sgbackup->log("Failed to move file: " . basename($item->getPathname()), 'error');
-					} else {
-						@unlink($item->getPathname());
-					}
+				// Overwrite existing (modes 0, 1, 3 all overwrite individual files).
+				// Never delete the live file before its replacement is complete:
+				// the old code unlinked first, so a failed copy (disk full,
+				// permissions) destroyed the file it was restoring over.
+				if (!$this->place_file($item->getPathname(), $target)) {
+					$this->last_move_failures++;
+					$this->sgbackup->log("Failed to move file: {$relative} (existing file left in place)", 'error');
 				}
 
 				// Refresh the execution-time budget periodically on large trees.
@@ -4771,6 +5256,35 @@ class SiteGuard_Backup_Restorer {
 
 		// Honest result: any file we couldn't place makes this a partial move.
 		return $this->last_move_failures === 0;
+	}
+
+	/**
+	 * Put $src at $target, replacing any existing file only once the new copy is complete.
+	 */
+	private function place_file($src, $target) {
+		// Same filesystem: rename() replaces the target atomically.
+		if (@rename($src, $target)) return true;
+
+		// Cross-filesystem: copy next to the target, verify, then swap in.
+		$tmp = $target . '.sgbackup-tmp-' . wp_generate_password(6, false);
+		if (!@copy($src, $tmp)) {
+			if (file_exists($tmp)) @unlink($tmp);
+			return false;
+		}
+		clearstatcache(true, $tmp);
+		if (@filesize($tmp) !== @filesize($src)) {
+			@unlink($tmp);
+			return false;
+		}
+		if (!@rename($tmp, $target)) {
+			// Some platforms (Windows) refuse to rename over an existing file.
+			if (!file_exists($target) || !@unlink($target) || !@rename($tmp, $target)) {
+				@unlink($tmp);
+				return false;
+			}
+		}
+		@unlink($src);
+		return true;
 	}
 
 	/**
@@ -4788,14 +5302,61 @@ class SiteGuard_Backup_Restorer {
 	/**
 	 * Post-restore cleanup tasks.
 	 */
+	private function ensure_self_active() {
+		$self = isset($this->self_activation['basename']) ? $this->self_activation['basename'] : '';
+		if ('' === $self) return;
+		if (!empty($this->self_activation['network']) && is_multisite()) {
+			$net = (array) get_site_option('active_sitewide_plugins', array());
+			if (!isset($net[$self])) {
+				$net[$self] = time();
+				update_site_option('active_sitewide_plugins', $net);
+				$this->sgbackup->log("Re-activated SiteGuard Backup network-wide after restore");
+			}
+		}
+		if (!empty($this->self_activation['site']) || (empty($this->self_activation['network']))) {
+			$active = (array) get_option('active_plugins', array());
+			$net = is_multisite() ? (array) get_site_option('active_sitewide_plugins', array()) : array();
+			if (!in_array($self, $active, true) && !isset($net[$self])) {
+				$active[] = $self;
+				update_option('active_plugins', array_values($active));
+				$this->sgbackup->log("Re-activated SiteGuard Backup after restore");
+			}
+		}
+	}
+
 	private function post_restore_cleanup() {
 		$this->progress("Running post-restore cleanup");
+
+		// The imported options/sitemeta come from the SOURCE, where this plugin may
+		// have been activated differently (e.g. network-active there, so absent
+		// from the main site's active_plugins). Restoring such a backup switched
+		// SiteGuard itself off. Put its activation back as it was.
+		$this->ensure_self_active();
 
 		// Unlink any plaintext files left by decrypt_file() (confidentiality + disk).
 		$this->cleanup_decrypted_temp_files();
 
-		// Flush rewrite rules
+		// Flush rewrite rules. $wp_rewrite was initialised when this request began,
+		// with the permalink structure the site had BEFORE the restore; flushing
+		// without re-reading it rebuilt the old rules, and every URL in the
+		// restored site's structure (e.g. /%year%/%monthnum%/%postname%/) 404'd.
+		global $wp_rewrite;
+		wp_cache_delete('alloptions', 'options');
+		wp_cache_delete('permalink_structure', 'options');
+		if ($wp_rewrite instanceof WP_Rewrite) {
+			$wp_rewrite->init();
+		}
 		flush_rewrite_rules(true);
+		// Every other blog keeps its own cached rules; drop them so each one is
+		// rebuilt from its (restored) permalink structure on its next request.
+		if (is_multisite()) {
+			global $wpdb;
+			foreach ((array) get_sites(array('fields' => 'ids', 'number' => 0)) as $bid) {
+				if ((int) $bid === (int) get_current_blog_id()) continue;
+				$wpdb->delete($wpdb->get_blog_prefix($bid) . 'options', array('option_name' => 'rewrite_rules'));
+				if (function_exists('clean_blog_cache')) clean_blog_cache((int) $bid);
+			}
+		}
 
 		// Clear all caches
 		if (function_exists('wp_cache_flush')) {
@@ -4863,6 +5424,15 @@ class SiteGuard_Backup_Restorer {
 			// wp_users/wp_usermeta were imported, saying "preserved" is a
 			// dangerous lie - warn the admin their login may have changed instead.
 			$old_host = parse_url($this->old_siteurl, PHP_URL_HOST);
+			if ($this->user_tables_skipped) {
+				// Destination accounts were preserved; bring the source's other users
+				// across too (matched by email, created when missing) so authorship
+				// and logins survive the move.
+				$blog_ids = is_multisite() ? get_sites(array('fields' => 'ids', 'number' => 0)) : array(1);
+				foreach ($blog_ids as $bid) {
+					$this->merge_subsite_users((int) $bid, (int) $bid, SiteGuard_Backup_Options::instance()->get_backup_dir());
+				}
+			}
 			if ($this->user_tables_skipped) {
 				$auth_msg = "Database restored from {$old_host}. Your login credentials have been preserved.";
 				$auth_type = 'info';
@@ -5026,64 +5596,64 @@ class SiteGuard_Backup_Restorer {
 	 */
 	private function cleanup_imported_cron_events() {
 		global $wpdb;
+		$terminal = array('complete', 'finished', 'error', 'aborted', 'failed', 'warning');
+		$blog_ids = is_multisite() ? array_map('intval', (array) get_sites(array('fields' => 'ids', 'number' => 0))) : array(0);
+		$events = 0;
+		$jobs = 0;
 
-		// Remove all sgbackup_backup_resume cron events
-		$crons = _get_cron_array();
-		if (is_array($crons)) {
-			$cleaned = 0;
-			foreach ($crons as $timestamp => $hooks) {
-				if (isset($hooks['sgbackup_backup_resume'])) {
-					foreach ($hooks['sgbackup_backup_resume'] as $key => $event) {
-						wp_unschedule_event($timestamp, 'sgbackup_backup_resume', $event['args']);
-						$cleaned++;
+		foreach ($blog_ids as $bid) {
+			$table = $bid ? $wpdb->get_blog_prefix($bid) . 'options' : $wpdb->options;
+
+			// Subsites of a WHOLE-NETWORK import: put back their own SiteGuard rows and
+			// scheduled events (the main site is handled by restore_plugin_options()).
+			// Never for other restore paths: a single-subsite import leaves every
+			// other subsite's tables alone, and this would wipe their SiteGuard state.
+			if ($bid > 1 && $this->network_import) {
+				$this->replace_plugin_option_rows($table, isset($this->pre_import_subsite_sg[$bid]) ? $this->pre_import_subsite_sg[$bid] : array(), $bid);
+			}
+
+			// Resumptions of the SOURCE's jobs (the dump is taken while one runs):
+			// they made the scheduler report a job that can never finish.
+			$cron = @unserialize((string) $wpdb->get_var($wpdb->prepare("SELECT option_value FROM `{$table}` WHERE option_name = %s", 'cron')), array('allowed_classes' => false));
+			if (is_array($cron)) {
+				$changed = false;
+				foreach ($cron as $ts => $hooks) {
+					if (is_array($hooks) && isset($hooks['sgbackup_backup_resume'])) {
+						$events += count($hooks['sgbackup_backup_resume']);
+						unset($cron[$ts]['sgbackup_backup_resume']);
+						if (empty($cron[$ts])) unset($cron[$ts]);
+						$changed = true;
 					}
 				}
-			}
-			if ($cleaned > 0) {
-				$this->sgbackup->log("Cleaned up {$cleaned} imported sgbackup_backup_resume cron events");
-			}
-		}
-
-		// Mark any imported jobs as complete so they don't try to resume
-		if (is_multisite()) {
-			$job_rows = $wpdb->get_results($wpdb->prepare(
-				"SELECT meta_key, meta_value FROM {$wpdb->sitemeta} WHERE meta_key LIKE %s",
-				$wpdb->esc_like('sgbackup_jobdata_') . '%'
-			));
-			foreach ($job_rows as $row) {
-				if (strpos($row->meta_value, '"running"') !== false) {
-					$wpdb->update(
-						$wpdb->sitemeta,
-						array('meta_value' => str_replace('"running"', '"complete"', $row->meta_value)),
-						array('meta_key' => $row->meta_key),
-						array('%s'),
-						array('%s')
-					);
+				if ($changed) {
+					$wpdb->update($table, array('option_value' => serialize($cron)), array('option_name' => 'cron'));
 				}
 			}
-		} else {
-			$job_rows = $wpdb->get_results($wpdb->prepare(
-				"SELECT option_name, option_value FROM {$wpdb->options} WHERE option_name LIKE %s",
+
+			// Imported jobs still marked as in progress can never resume here.
+			// (The old string replace of "running" corrupted the serialized data and
+			// missed "begun"/"resuming".)
+			$rows = $wpdb->get_results($wpdb->prepare(
+				"SELECT option_name, option_value FROM `{$table}` WHERE option_name LIKE %s",
 				$wpdb->esc_like('sgbackup_jobdata_') . '%'
 			));
-			foreach ($job_rows as $row) {
-				if (strpos($row->option_value, '"running"') !== false) {
-					$wpdb->update(
-						$wpdb->options,
-						array('option_value' => str_replace('"running"', '"complete"', $row->option_value)),
-						array('option_name' => $row->option_name),
-						array('%s'),
-						array('%s')
-					);
-				}
+			foreach ((array) $rows as $row) {
+				$data = @unserialize($row->option_value, array('allowed_classes' => false));
+				if (!is_array($data)) continue;
+				$status = isset($data['jobstatus']) ? $data['jobstatus'] : '';
+				if (!empty($data['finalized']) || in_array($status, $terminal, true)) continue;
+				$data['jobstatus'] = 'aborted';
+				$data['finalized'] = 1;
+				$wpdb->update($table, array('option_value' => serialize($data)), array('option_name' => $row->option_name));
+				$jobs++;
 			}
-		}
 
-		// Remove semaphore locks from the imported DB
-		$wpdb->query($wpdb->prepare(
-			"DELETE FROM {$wpdb->options} WHERE option_name LIKE %s",
-			$wpdb->esc_like('sgbackup_sem_') . '%'
-		));
+			// Semaphore locks from the imported DB.
+			$wpdb->query($wpdb->prepare("DELETE FROM `{$table}` WHERE option_name LIKE %s", $wpdb->esc_like('sgbackup_sem_') . '%'));
+			if ($bid && function_exists('clean_blog_cache')) clean_blog_cache($bid);
+		}
+		wp_cache_delete('cron', 'options');
+		wp_cache_delete('alloptions', 'options');
 
 		// Remove restore progress transients
 		if (is_multisite()) {
@@ -5092,7 +5662,7 @@ class SiteGuard_Backup_Restorer {
 			delete_option('sgbackup_restore_progress');
 		}
 
-		$this->sgbackup->log("Cleaned up imported job state and semaphore locks");
+		$this->sgbackup->log("Cleaned up imported job state: {$events} resumption event(s), {$jobs} unfinished job(s), semaphore locks");
 	}
 
 	/**
@@ -5195,86 +5765,89 @@ class SiteGuard_Backup_Restorer {
 	}
 
 	/**
-	 * Create a backup before restoring (safety net).
+	 * Dump the current database as an always-keep set before restoring over it.
+	 *
+	 * @return true|WP_Error Any table that cannot be dumped is an error: a partial
+	 *                       rollback point is worse than a clear refusal.
 	 */
 	private function create_pre_restore_backup() {
+		require_once SGBACKUP_DIR . 'includes/class-database-utility.php';
+		$sgbackup = SiteGuard_Backup::instance();
+		$backup_dir = $sgbackup->get_backup_dir();
+		global $wpdb;
+
+		$nonce = substr(wp_generate_password(12, false), 0, 12);
+		$timestamp = time();
+		$db_file = "prerestore_{$nonce}-db.sql.gz";
+		$db_path = $backup_dir . $db_file;
+		$temp_dir = $backup_dir . 'dbtemp_prerestore_' . $nonce . '/';
+		$fail = function ($msg) use ($db_path, $temp_dir, $backup_dir) {
+			if (file_exists($db_path)) SiteGuard_Backup_Filesystem::delete_file($db_path, $backup_dir);
+			SiteGuard_Backup_Filesystem::delete_tree($temp_dir, $backup_dir);
+			$this->sgbackup->log("Pre-restore backup failed: {$msg}", 'error');
+			return new WP_Error('prerestore_failed', $msg);
+		};
+
 		try {
 			$this->progress("Creating pre-restore database backup...");
-
-			// Synchronous DB-only backup (async cron backup would be useless before restore)
-			require_once SGBACKUP_DIR . 'includes/class-database-utility.php';
-			$sgbackup = SiteGuard_Backup::instance();
-			$backup_dir = $sgbackup->get_backup_dir();
-
-			$nonce = substr(wp_generate_password(12, false), 0, 12);
-			$timestamp = time();
-			$db_file = "prerestore_{$nonce}-db.sql.gz";
-			$db_path = $backup_dir . $db_file;
-
-			global $wpdb;
 			$tables = SiteGuard_Backup_Database_Utility::get_tables($wpdb->prefix);
+			if (empty($tables)) return $fail('no tables found');
 
-			// Dump all tables directly into a single gz file
 			$fh = @gzopen($db_path, 'wb9');
-			if (!$fh) {
-				$this->progress("Warning: Could not create pre-restore backup file");
-				return;
+			if (!$fh) return $fail('could not create ' . $db_file);
+			$put = function ($data) use ($fh) {
+				return '' === $data || gzwrite($fh, $data) > 0;
+			};
+			if (!$put("-- SiteGuard Backup pre-restore backup\n-- Generated: " . gmdate('Y-m-d H:i:s') . " UTC\nSET FOREIGN_KEY_CHECKS = 0;\n\n")) {
+				gzclose($fh);
+				return $fail('write error (disk full?)');
 			}
-
-			gzwrite($fh, "-- SiteGuard Backup pre-restore backup\n");
-			gzwrite($fh, "-- Generated: " . gmdate('Y-m-d H:i:s') . " UTC\n");
-			gzwrite($fh, "SET FOREIGN_KEY_CHECKS = 0;\n\n");
-
-			$temp_dir = $backup_dir . 'dbtemp_prerestore_' . $nonce . '/';
 			if (!is_dir($temp_dir)) wp_mkdir_p($temp_dir);
 
 			foreach ($tables as $table) {
 				$table_file = $temp_dir . $table . '.sql.gz';
-				$result = SiteGuard_Backup_Database_Utility::php_dump_table($table, $table_file);
+				$ok = SiteGuard_Backup_Database_Utility::php_dump_table($table, $table_file);
 				clearstatcache(true, $table_file);
-				if (!$result || !file_exists($table_file) || filesize($table_file) === 0) {
-					$this->sgbackup->log("Pre-restore backup: skipping table {$table} (dump failed)", 'warning');
-					@unlink($table_file);
-					continue;
+				if (!$ok || !file_exists($table_file) || filesize($table_file) === 0) {
+					gzclose($fh);
+					return $fail("could not dump table {$table}");
 				}
-
 				$tfh = @gzopen($table_file, 'rb');
 				if (!$tfh) {
-					$this->sgbackup->log("Pre-restore backup: could not read dump for {$table}", 'warning');
-					@unlink($table_file);
-					continue;
+					gzclose($fh);
+					return $fail("could not read the dump of {$table}");
 				}
 				while (!gzeof($tfh)) {
 					$chunk = gzread($tfh, 65536);
-					if (false === $chunk || strlen($chunk) === 0) break;
-					gzwrite($fh, $chunk);
+					if (false === $chunk) { gzclose($tfh); gzclose($fh); return $fail("read error on {$table}"); }
+					if ('' === $chunk) break;
+					if (!$put($chunk)) { gzclose($tfh); gzclose($fh); return $fail('write error (disk full?)'); }
 				}
 				gzclose($tfh);
-				@unlink($table_file);
+				SiteGuard_Backup_Filesystem::delete_file($table_file, $backup_dir);
 			}
 
-			gzwrite($fh, "\nSET FOREIGN_KEY_CHECKS = 1;\n");
-			gzclose($fh);
-
-			// Clean up temp dir
-			SiteGuard_Backup_Filesystem::rmdir_recursive($temp_dir);
+			if (!$put("\nSET FOREIGN_KEY_CHECKS = 1;\n") || !gzclose($fh)) {
+				return $fail('write error while finishing the dump');
+			}
+			SiteGuard_Backup_Filesystem::delete_tree($temp_dir, $backup_dir);
 
 			clearstatcache(true, $db_path);
-			if (file_exists($db_path) && filesize($db_path) > 0) {
-				$backup_data = array(
-					'nonce'       => $nonce,
-					'db'          => array($db_file),
-					'service'     => array('none'),
-					'always_keep' => true,
-					'size'        => filesize($db_path),
-				);
-				SiteGuard_Backup_History::add_backup($timestamp, $backup_data);
-				$this->progress("Pre-restore backup saved: {$db_file}");
-			} else {
-				$this->progress("Warning: Pre-restore backup empty - continuing");
+			if (!file_exists($db_path) || filesize($db_path) === 0) {
+				return $fail('the dump is empty');
 			}
+			SiteGuard_Backup_History::add_backup($timestamp, array(
+				'nonce'       => $nonce,
+				'db'          => array($db_file),
+				'service'     => array('none'),
+				'always_keep' => true,
+				'label'       => 'Pre-restore',
+				'size'        => filesize($db_path),
+			));
+			$this->progress("Pre-restore backup saved: {$db_file}");
+			return true;
 		} catch (Exception $e) {
-			$this->progress("Warning: Pre-restore backup failed ({$e->getMessage()}) - continuing");
+			return $fail($e->getMessage());
 		}
 	}
 

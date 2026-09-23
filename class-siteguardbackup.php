@@ -1660,8 +1660,8 @@ class SiteGuard_Backup {
 			$this->send_email_report();
 		}
 
-		// Prune old backups
-		if (!$force_abort) {
+		// Prune old backups (not after merely re-sending an existing set)
+		if (!$force_abort && !$this->is_send_existing_job()) {
 			SiteGuard_Backup_History::prune('full');
 			SiteGuard_Backup_History::prune('db');
 			$this->prune_retained_backups();
@@ -1733,9 +1733,26 @@ class SiteGuard_Backup {
 	}
 
 	/**
+	 * A job that only uploads an EXISTING backup set somewhere (migrate_send,
+	 * "upload to remote") creates no new archives.
+	 */
+	private function is_send_existing_job() {
+		return (bool) $this->jobdata_get('original_backup_timestamp', false)
+			&& 'yes' !== $this->jobdata_get('backup_files')
+			&& 'yes' !== $this->jobdata_get('backup_database');
+	}
+
+	/**
 	 * Save the completed backup to history.
 	 */
 	private function save_to_history() {
+		// Sending an existing set must not register a second copy of it: the
+		// phantom entry had no files of its own but counted toward retention, so
+		// a few sends pushed real backups out.
+		if ($this->is_send_existing_job()) {
+			$this->log('Sent existing backup set ' . (int) $this->jobdata_get('original_backup_timestamp') . '; history unchanged');
+			return;
+		}
 		$backup_array = $this->jobdata_get('backup_files_array', array());
 		$db_files = $this->jobdata_get('db_backup_files', array());
 		$job_type = $this->jobdata_get('job_type', 'backup');
@@ -1761,6 +1778,11 @@ class SiteGuard_Backup {
 				// duplicates (from before the create_zips fix) still lands as a
 				// clean history entry.
 				$backup_data[$entity] = array_values(array_unique($entity_files));
+				// Extra directories are keyed by their position in a list that can
+				// change later; record where each one actually came from.
+				if (0 === strpos($entity, 'extradir_') && is_array($info) && !empty($info['path'])) {
+					$backup_data['extra_dir_sources'][$entity] = untrailingslashit($info['path']);
+				}
 			}
 		}
 

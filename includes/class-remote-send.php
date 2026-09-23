@@ -410,19 +410,24 @@ class SiteGuard_Backup_Remote_Send {
 		// On last chunk, rename to final filename
 		if ($is_last) {
 			if (file_exists($final_file)) {
-				// A peer may replace its own earlier transfer, never a file that
-				// belongs to a backup this site made itself.
-				if (false === $this->file_owned_by_remote_set($final_file)) {
+				// A peer may replace only its own earlier transfer. A file not in
+				// history at all (null) may be a local backup still being written,
+				// so it is protected too; that used to be deleted and replaced.
+				if (true !== $this->file_owned_by_remote_set($final_file)) {
 					@unlink($tmp_file);
 					return new WP_Error('file_exists', 'A local backup file with this name already exists and will not be overwritten.');
 				}
-				@unlink($final_file);
 			}
+			// rename() replaces the old copy atomically; nothing is deleted first.
 			if (!@rename($tmp_file, $final_file)) {
-				// rename fails across mount points (e.g. /tmp to /home on Azure)
-				if (!@copy($tmp_file, $final_file) || !@unlink($tmp_file)) {
+				// rename fails across mount points (e.g. /tmp to /home on Azure):
+				// copy next to the target, then swap it in.
+				$staged = $final_file . '.sgbackup-tmp-' . wp_generate_password(6, false);
+				if (!@copy($tmp_file, $staged) || filesize($staged) !== filesize($tmp_file) || !@rename($staged, $final_file)) {
+					@unlink($staged);
 					return new WP_Error('rename_failed', 'Failed to finalize uploaded file.');
 				}
+				@unlink($tmp_file);
 			}
 
 			$result['status'] = 1; // 1 = complete
@@ -458,7 +463,9 @@ class SiteGuard_Backup_Remote_Send {
 
 		clearstatcache(true, $final_file);
 		if (file_exists($final_file)) {
-			return array('size' => filesize($final_file), 'status' => 1);
+			// md5 lets the sender tell "already sent" from "a different file with
+			// the same name" (older senders ignore it).
+			return array('size' => filesize($final_file), 'status' => 1, 'md5' => md5_file($final_file));
 		}
 
 		clearstatcache(true, $tmp_file);
@@ -496,13 +503,7 @@ class SiteGuard_Backup_Remote_Send {
 		// local history writers (class-backup-history.php) to avoid a lost-update
 		// race. Same acquire/retry pattern as SiteGuard_Backup_History::add_backup().
 		$lock = new SiteGuard_Backup_Semaphore('history');
-		if (!$lock->lock()) {
-			error_log('SiteGuard Backup: Could not acquire history lock in cmd_set_backup_metadata - retrying once');
-			usleep(500000); // 500ms
-			if (!$lock->lock()) {
-				error_log('SiteGuard Backup: History lock failed in cmd_set_backup_metadata, proceeding without lock');
-			}
-		}
+		$lock->lock_wait();
 		try {
 		// Flush cache to ensure fresh data inside the locked section
 		wp_cache_delete('sgbackup_backup_history', 'options');
@@ -649,13 +650,7 @@ class SiteGuard_Backup_Remote_Send {
 		// Serialize against the semaphore-protected local history writers to
 		// avoid a lost-update race. Same pattern as add_backup().
 		$lock = new SiteGuard_Backup_Semaphore('history');
-		if (!$lock->lock()) {
-			error_log('SiteGuard Backup: Could not acquire history lock in register_received_file - retrying once');
-			usleep(500000); // 500ms
-			if (!$lock->lock()) {
-				error_log('SiteGuard Backup: History lock failed in register_received_file, proceeding without lock');
-			}
-		}
+		$lock->lock_wait();
 		try {
 			// Flush cache to ensure fresh data inside the locked section
 			wp_cache_delete('sgbackup_backup_history', 'options');

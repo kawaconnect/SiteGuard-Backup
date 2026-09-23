@@ -151,10 +151,38 @@ class SiteGuard_Backup_Options {
 	 */
 	private function web_served_trees() {
 		$trees = array_merge($this->web_roots(), $this->resolved_forms(array(WP_CONTENT_DIR)));
-		if (!empty($_SERVER['DOCUMENT_ROOT'])) {
-			$trees = array_merge($trees, $this->resolved_forms(array((string) $_SERVER['DOCUMENT_ROOT'])));
-		}
+		// WP-CLI and system cron have no DOCUMENT_ROOT, so a directory served only
+		// through the docroot (WordPress in a subdirectory) looked unserved there:
+		// CLI runs picked and remembered an exposed root and stripped its stubs.
+		// Remember every docroot seen during web requests and use them everywhere.
+		$trees = array_merge($trees, $this->resolved_forms($this->known_docroots()));
 		return array_values(array_unique($trees));
+	}
+
+	/**
+	 * Docroots seen in web requests (persisted), plus the current one.
+	 */
+	private function known_docroots() {
+		$seen = get_site_option('sgbackup_seen_docroots', array());
+		if (!is_array($seen)) $seen = array();
+		if (!empty($_SERVER['DOCUMENT_ROOT'])) {
+			$dr = untrailingslashit(wp_normalize_path((string) $_SERVER['DOCUMENT_ROOT']));
+			if ('' !== $dr && '/' !== $dr && !in_array($dr, $seen, true)) {
+				$seen[] = $dr;
+				$seen = array_slice($seen, -8);
+				update_site_option('sgbackup_seen_docroots', $seen);
+			}
+		}
+		return $seen;
+	}
+
+	/**
+	 * True when this process cannot know every tree the webserver serves: no
+	 * DOCUMENT_ROOT now and none ever recorded. Decisions that would expose
+	 * archives (remembering a root, stripping deny stubs) must wait for a web request.
+	 */
+	private function docroot_unknown() {
+		return empty($_SERVER['DOCUMENT_ROOT']) && !$this->known_docroots();
 	}
 
 	/**
@@ -295,11 +323,15 @@ class SiteGuard_Backup_Options {
 		foreach ($this->candidate_backup_roots() as $candidate) {
 			$unsafe = $this->backup_root_unsafe_reason($candidate);
 			if (null !== $unsafe) {
-				error_log("SiteGuard Backup: SECURITY: backup root candidate '{$candidate}' skipped ({$unsafe})");
+				// A candidate that merely cannot be created is normal (no write access
+				// above the web root); only an unsafe one is worth reporting.
+				if (!in_array($unsafe, array('could not be created', 'does not exist', 'no existing ancestor'), true)) {
+					error_log("SiteGuard Backup: SECURITY: backup root candidate '{$candidate}' skipped ({$unsafe})");
+				}
 				continue;
 			}
 			if ($this->is_usable_backup_root($candidate)) {
-				if ($candidate !== $remembered) {
+				if ($candidate !== $remembered && !$this->docroot_unknown()) {
 					$this->update_option('sgbackup_resolved_root', $candidate);
 				}
 				return $candidate;
@@ -442,7 +474,7 @@ class SiteGuard_Backup_Options {
 		if ($this->is_web_served_path($dir)) {
 			// Only meaningful on Apache/IIS; see protect_backup_dir().
 			$this->protect_backup_dir($dir);
-		} else {
+		} elseif (!$this->docroot_unknown()) {
 			$this->remove_protection_stubs($dir);
 		}
 		if (!$exposed) {
@@ -511,11 +543,37 @@ class SiteGuard_Backup_Options {
 	 */
 	private function remove_stub_files($dir, $stubs) {
 		foreach ($stubs as $name => $content) {
-			$path = $dir . '/' . $name;
-			if (is_file($path) && !is_link($path) && filesize($path) === strlen($content) && @file_get_contents($path) === $content) {
-				@unlink($path);
+			if ($this->is_plugin_stub($dir, $name, $stubs)) {
+				SiteGuard_Backup_Filesystem::delete_file($dir . '/' . $name, $dir);
 			}
 		}
+	}
+
+	/**
+	 * Is $dir/$name a stub file byte-identical to what this plugin wrote?
+	 */
+	private function is_plugin_stub($dir, $name, $stubs = null) {
+		if (null === $stubs) {
+			$stubs = array_merge($this->protection_stubs(), $this->retired_stubs());
+		}
+		if (!isset($stubs[$name])) return false;
+		$path = $dir . '/' . $name;
+		return is_file($path) && !is_link($path) && filesize($path) === strlen($stubs[$name])
+			&& file_get_contents($path) === $stubs[$name];
+	}
+
+	/**
+	 * Entries of $dir other than '.', '..' and the plugin's own stubs.
+	 */
+	private function non_stub_entries($dir) {
+		$entries = @scandir($dir);
+		if (!is_array($entries)) return array('(unreadable)');
+		$out = array();
+		foreach ($entries as $e) {
+			if ('.' === $e || '..' === $e || $this->is_plugin_stub($dir, $e)) continue;
+			$out[] = $e;
+		}
+		return $out;
 	}
 
 	/**
@@ -544,18 +602,26 @@ class SiteGuard_Backup_Options {
 			// Never clean the directory currently in use (e.g. a filter pointing there).
 			if ($root === $current || 0 === strpos($current . '/', $root . '/')) continue;
 
+			// Children first, so the root is only emptied once they are gone. Decide
+			// BEFORE touching anything: stripping the deny stubs from a directory that
+			// still holds archives made them publicly downloadable on Apache/IIS.
 			$subdirs = glob($root . '/site-*', GLOB_ONLYDIR);
 			foreach (array_merge(is_array($subdirs) ? $subdirs : array(), array($root)) as $d) {
 				if (is_link($d)) continue;
-				$this->remove_protection_stubs($d);
-				$remaining = array_diff((array) @scandir($d), array('.', '..'));
-				if (empty($remaining)) {
-					@rmdir($d);
-				} else {
-					$files = array_filter($remaining, function ($f) use ($d) { return is_file($d . '/' . $f); });
-					if (!empty($files)) {
-						$leftovers[$d] = count($files);
+				$content = $this->non_stub_entries($d);
+				if (empty($content)) {
+					$this->remove_protection_stubs($d);
+					if (!@rmdir($d)) {
+						error_log("SiteGuard Backup: could not remove empty legacy directory {$d}");
 					}
+					continue;
+				}
+				// Still holds data (or, for the root, surviving site-N dirs): keep it
+				// protected. Only rewrites stubs that are missing.
+				$this->protect_backup_dir($d);
+				$files = array_filter($content, function ($f) use ($d) { return is_file($d . '/' . $f); });
+				if (!empty($files)) {
+					$leftovers[$d] = count($files);
 				}
 			}
 		}

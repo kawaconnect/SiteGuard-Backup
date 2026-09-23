@@ -1090,9 +1090,20 @@ class SiteGuard_Backup_Database_Utility {
 				$old_tables[] = $old_backup;
 			}
 
-			// Drop any leftover _sgb_old_ tables from previous crashed restores
-			foreach ($old_tables as $old_tbl) {
-				$wpdb->query("DROP TABLE IF EXISTS `{$old_tbl}`");
+			// Leftover _sgb_old_ tables from a previous crashed restore. If that crash
+			// hit between "live -> _sgb_old_" and "temp -> live", the leftover is the
+			// ONLY copy of the live table: put it back instead of dropping it.
+			$old_idx = 0;
+			foreach ($tables_created as $original => $temp) {
+				$original = self::sanitize_table_name($original);
+				$old_tbl = $old_tables[$old_idx++];
+				if (!$wpdb->get_var($wpdb->prepare('SHOW TABLES LIKE %s', $wpdb->esc_like($old_tbl)))) continue;
+				if (!$wpdb->get_var($wpdb->prepare('SHOW TABLES LIKE %s', $wpdb->esc_like($original)))) {
+					$wpdb->query("RENAME TABLE `{$old_tbl}` TO `{$original}`");
+					error_log("SiteGuard Backup: recovered `{$original}` from `{$old_tbl}` left by an interrupted restore");
+				} else {
+					$wpdb->query("DROP TABLE IF EXISTS `{$old_tbl}`");
+				}
 			}
 
 			$rename_parts = array();

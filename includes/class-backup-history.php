@@ -85,13 +85,7 @@ class SiteGuard_Backup_History {
 	 */
 	public static function add_backup($timestamp, $backup_data) {
 		$lock = new SiteGuard_Backup_Semaphore('history');
-		if (!$lock->lock()) {
-			error_log('SiteGuard Backup: Could not acquire history lock - retrying once');
-			usleep(500000); // 500ms
-			if (!$lock->lock()) {
-				error_log('SiteGuard Backup: History lock failed, proceeding without lock');
-			}
-		}
+		$lock->lock_wait();
 		try {
 			// Flush cache to ensure fresh data inside the locked section
 			wp_cache_delete('sgbackup_backup_history', 'options');
@@ -115,12 +109,7 @@ class SiteGuard_Backup_History {
 	 */
 	public static function remove_backup($timestamp) {
 		$lock = new SiteGuard_Backup_Semaphore('history');
-		if (!$lock->lock()) {
-			usleep(500000);
-			if (!$lock->lock()) {
-				error_log('SiteGuard Backup: History lock failed in remove_backup');
-			}
-		}
+		$lock->lock_wait();
 		try {
 			// Flush cache to ensure fresh data inside the locked section
 			wp_cache_delete('sgbackup_backup_history', 'options');
@@ -151,13 +140,13 @@ class SiteGuard_Backup_History {
 		$opts = SiteGuard_Backup_Options::instance();
 		$backup_dir = $opts->get_backup_dir();
 
-		// Collect all files
-		$files = self::get_all_files($backup);
+		// Collect all files, minus any another history entry still uses (a crafted
+		// or corrupt entry must never be able to delete someone else's archives).
+		$files = array_values(array_diff(self::get_all_files($backup), self::files_referenced_elsewhere($timestamp)));
 
 		foreach ($files as $file) {
 			$path = $backup_dir . $file;
-			if (file_exists($path)) {
-				@unlink($path);
+			if (file_exists($path) && true === SiteGuard_Backup_Filesystem::delete_file($path, $backup_dir)) {
 				$deleted[] = $file;
 			}
 		}
@@ -169,7 +158,7 @@ class SiteGuard_Backup_History {
 		if ($nonce) {
 			$logfile = $backup_dir . 'log.' . $nonce . '.txt';
 			if (file_exists($logfile)) {
-				@unlink($logfile);
+				SiteGuard_Backup_Filesystem::delete_file($logfile, $backup_dir);
 			}
 		}
 
@@ -198,6 +187,20 @@ class SiteGuard_Backup_History {
 		}
 
 		return $deleted;
+	}
+
+	/**
+	 * Files referenced by any history entry other than $timestamp.
+	 */
+	public static function files_referenced_elsewhere($timestamp) {
+		$in_use = array();
+		foreach (self::get_history() as $ts => $other) {
+			if ((string) $ts === (string) $timestamp) continue;
+			foreach (self::get_all_files($other) as $f) {
+				$in_use[$f] = true;
+			}
+		}
+		return array_keys($in_use);
 	}
 
 	/**
@@ -276,10 +279,7 @@ class SiteGuard_Backup_History {
 	 */
 	public static function merge_incremental($parent_timestamp, $incremental_data) {
 		$lock = new SiteGuard_Backup_Semaphore('history');
-		if (!$lock->lock()) {
-			usleep(500000);
-			$lock->lock();
-		}
+		$lock->lock_wait();
 		try {
 			$history = self::get_history_raw();
 			if (!isset($history[$parent_timestamp])) return false;
@@ -380,13 +380,12 @@ class SiteGuard_Backup_History {
 				if (is_string($f) && $f !== '' && basename($f) === $f) $files[] = $f;
 			}
 		}
-		$files = array_values(array_unique($files));
+		$files = array_values(array_diff(array_unique($files), self::files_referenced_elsewhere($timestamp)));
 
 		$deleted = array();
 		foreach ($files as $file) {
 			$path = $backup_dir . $file;
-			if (file_exists($path)) {
-				@unlink($path);
+			if (file_exists($path) && true === SiteGuard_Backup_Filesystem::delete_file($path, $backup_dir)) {
 				$deleted[] = $file;
 			}
 		}
@@ -403,7 +402,7 @@ class SiteGuard_Backup_History {
 		}
 
 		$lock = new SiteGuard_Backup_Semaphore('history');
-		if (!$lock->lock()) { usleep(500000); $lock->lock(); }
+		$lock->lock_wait();
 		try {
 			$history = self::get_history_raw();
 			if (isset($history[$timestamp])) {

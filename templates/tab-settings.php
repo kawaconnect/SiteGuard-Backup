@@ -1,4 +1,5 @@
 <?php if (!defined('ABSPATH')) die('No direct access.');
+require_once SGBACKUP_DIR . 'includes/class-security.php';
 $opts = SiteGuard_Backup_Options::instance();
 $settings = $opts->get_all_settings();
 $schedules = array(
@@ -374,7 +375,7 @@ $period_labels = array(
 					</tr>
 					<tr>
 						<th><?php esc_html_e('Password', 'siteguardbackup'); ?></th>
-						<td><input type="password" class="sgbackup-extradb-field regular-text" data-key="pass" value="<?php echo esc_attr($edb['pass'] ?? ''); ?>" autocomplete="off" /></td>
+						<td><input type="password" class="sgbackup-extradb-field regular-text" data-key="pass" value="<?php echo esc_attr(SiteGuard_Backup_Security::mask_secret($edb['pass'] ?? '')); ?>" autocomplete="off" /></td>
 					</tr>
 					<tr>
 						<th><?php esc_html_e('Database Name', 'siteguardbackup'); ?></th>
@@ -499,7 +500,7 @@ $period_labels = array(
 					</tr>
 					<tr>
 						<th><?php esc_html_e('Secret Key', 'siteguardbackup'); ?></th>
-						<td><input type="password" class="sgbackup-instance-field regular-text" data-key="secret_key" data-method="s3" data-instance="<?php echo esc_attr($iid); ?>" value="<?php echo esc_attr($iopts['secret_key'] ?? ''); ?>" autocomplete="off" /></td>
+						<td><input type="password" class="sgbackup-instance-field regular-text" data-key="secret_key" data-method="s3" data-instance="<?php echo esc_attr($iid); ?>" value="<?php echo esc_attr(SiteGuard_Backup_Security::mask_secret($iopts['secret_key'] ?? '')); ?>" autocomplete="off" /></td>
 					</tr>
 					<tr>
 						<th><?php esc_html_e('Bucket', 'siteguardbackup'); ?></th>
@@ -518,6 +519,7 @@ $period_labels = array(
 						<td>
 							<input type="url" class="sgbackup-instance-field regular-text" data-key="endpoint" data-method="s3" data-instance="<?php echo esc_attr($iid); ?>" value="<?php echo esc_attr($iopts['endpoint'] ?? ''); ?>" placeholder="https://..." />
 							<p class="description"><?php esc_html_e('Only for S3-compatible services (Spaces, MinIO, B2). Leave empty for AWS.', 'siteguardbackup'); ?></p>
+							<label><input type="checkbox" class="sgbackup-instance-field" data-key="allow_insecure" data-method="s3" data-instance="<?php echo esc_attr($iid); ?>" value="1" <?php checked(!empty($iopts['allow_insecure'])); ?> /> <?php esc_html_e('Allow an unencrypted http:// endpoint (private networks only)', 'siteguardbackup'); ?></label>
 						</td>
 					</tr>
 					<tr>
@@ -600,7 +602,7 @@ $period_labels = array(
 					</tr>
 					<tr>
 						<th><?php esc_html_e('Secret Key', 'siteguardbackup'); ?></th>
-						<td><input type="password" class="sgbackup-instance-field regular-text" data-key="secret_key" data-method="s3generic" data-instance="<?php echo esc_attr($iid); ?>" value="<?php echo esc_attr($iopts['secret_key'] ?? ''); ?>" autocomplete="off" /></td>
+						<td><input type="password" class="sgbackup-instance-field regular-text" data-key="secret_key" data-method="s3generic" data-instance="<?php echo esc_attr($iid); ?>" value="<?php echo esc_attr(SiteGuard_Backup_Security::mask_secret($iopts['secret_key'] ?? '')); ?>" autocomplete="off" /></td>
 					</tr>
 					<tr>
 						<th><?php esc_html_e('Bucket', 'siteguardbackup'); ?></th>
@@ -677,7 +679,7 @@ $period_labels = array(
 					</tr>
 					<tr>
 						<th><?php esc_html_e('Application Key', 'siteguardbackup'); ?></th>
-						<td><input type="password" class="sgbackup-instance-field regular-text" data-key="secret_key" data-method="b2" data-instance="<?php echo esc_attr($iid); ?>" value="<?php echo esc_attr($iopts['secret_key'] ?? ''); ?>" autocomplete="off" /></td>
+						<td><input type="password" class="sgbackup-instance-field regular-text" data-key="secret_key" data-method="b2" data-instance="<?php echo esc_attr($iid); ?>" value="<?php echo esc_attr(SiteGuard_Backup_Security::mask_secret($iopts['secret_key'] ?? '')); ?>" autocomplete="off" /></td>
 					</tr>
 					<tr>
 						<th><?php esc_html_e('Bucket', 'siteguardbackup'); ?></th>
@@ -750,7 +752,7 @@ $period_labels = array(
 					</tr>
 					<tr>
 						<th><?php esc_html_e('Client Secret', 'siteguardbackup'); ?></th>
-						<td><input type="password" class="sgbackup-instance-field regular-text" data-key="client_secret" data-method="googledrive" data-instance="<?php echo esc_attr($iid); ?>" value="<?php echo esc_attr($iopts['client_secret'] ?? ''); ?>" autocomplete="off" /></td>
+						<td><input type="password" class="sgbackup-instance-field regular-text" data-key="client_secret" data-method="googledrive" data-instance="<?php echo esc_attr($iid); ?>" value="<?php echo esc_attr(SiteGuard_Backup_Security::mask_secret($iopts['client_secret'] ?? '')); ?>" autocomplete="off" /></td>
 					</tr>
 					<tr>
 						<th><?php esc_html_e('Folder Name', 'siteguardbackup'); ?></th>
@@ -808,7 +810,7 @@ $period_labels = array(
 					</tr>
 					<tr>
 						<th><?php esc_html_e('App Secret', 'siteguardbackup'); ?></th>
-						<td><input type="password" class="sgbackup-instance-field regular-text" data-key="app_secret" data-method="dropbox" data-instance="<?php echo esc_attr($iid); ?>" value="<?php echo esc_attr($iopts['app_secret'] ?? ''); ?>" autocomplete="off" /></td>
+						<td><input type="password" class="sgbackup-instance-field regular-text" data-key="app_secret" data-method="dropbox" data-instance="<?php echo esc_attr($iid); ?>" value="<?php echo esc_attr(SiteGuard_Backup_Security::mask_secret($iopts['app_secret'] ?? '')); ?>" autocomplete="off" /></td>
 					</tr>
 					<tr>
 						<th><?php esc_html_e('Folder', 'siteguardbackup'); ?></th>
@@ -870,7 +872,7 @@ $period_labels = array(
 					</tr>
 					<tr>
 						<th><?php esc_html_e('Password', 'siteguardbackup'); ?></th>
-						<td><input type="password" class="sgbackup-instance-field regular-text" data-key="pass" data-method="ftp" data-instance="<?php echo esc_attr($iid); ?>" value="<?php echo esc_attr($iopts['pass'] ?? ''); ?>" autocomplete="off" /></td>
+						<td><input type="password" class="sgbackup-instance-field regular-text" data-key="pass" data-method="ftp" data-instance="<?php echo esc_attr($iid); ?>" value="<?php echo esc_attr(SiteGuard_Backup_Security::mask_secret($iopts['pass'] ?? '')); ?>" autocomplete="off" /></td>
 					</tr>
 					<tr>
 						<th><?php esc_html_e('Remote Path', 'siteguardbackup'); ?></th>
@@ -947,12 +949,12 @@ $period_labels = array(
 					</tr>
 					<tr>
 						<th><?php esc_html_e('Password', 'siteguardbackup'); ?></th>
-						<td><input type="password" class="sgbackup-instance-field regular-text" data-key="pass" data-method="sftp" data-instance="<?php echo esc_attr($iid); ?>" value="<?php echo esc_attr($iopts['pass'] ?? ''); ?>" autocomplete="off" /></td>
+						<td><input type="password" class="sgbackup-instance-field regular-text" data-key="pass" data-method="sftp" data-instance="<?php echo esc_attr($iid); ?>" value="<?php echo esc_attr(SiteGuard_Backup_Security::mask_secret($iopts['pass'] ?? '')); ?>" autocomplete="off" /></td>
 					</tr>
 					<tr>
 						<th><?php esc_html_e('SSH Key (optional)', 'siteguardbackup'); ?></th>
 						<td>
-							<textarea class="sgbackup-instance-field regular-text" data-key="key" data-method="sftp" data-instance="<?php echo esc_attr($iid); ?>" rows="3" style="font-family:monospace;"><?php echo esc_textarea($iopts['key'] ?? ''); ?></textarea>
+							<textarea class="sgbackup-instance-field regular-text" data-key="key" data-method="sftp" data-instance="<?php echo esc_attr($iid); ?>" rows="3" style="font-family:monospace;"><?php echo esc_textarea(SiteGuard_Backup_Security::mask_secret($iopts['key'] ?? '')); ?></textarea>
 							<p class="description"><?php esc_html_e('Paste private key contents. Leave empty to use password auth.', 'siteguardbackup'); ?></p>
 						</td>
 					</tr>
@@ -1021,7 +1023,14 @@ $period_labels = array(
 					</tr>
 					<tr>
 						<th><?php esc_html_e('Account Key', 'siteguardbackup'); ?></th>
-						<td><input type="password" class="sgbackup-instance-field regular-text" data-key="account_key" data-method="azure" data-instance="<?php echo esc_attr($iid); ?>" value="<?php echo esc_attr($iopts['account_key'] ?? ''); ?>" autocomplete="off" /></td>
+						<td><input type="password" class="sgbackup-instance-field regular-text" data-key="account_key" data-method="azure" data-instance="<?php echo esc_attr($iid); ?>" value="<?php echo esc_attr(SiteGuard_Backup_Security::mask_secret($iopts['account_key'] ?? '')); ?>" autocomplete="off" /></td>
+					</tr>
+					<tr>
+						<th><?php esc_html_e('SAS Token (optional)', 'siteguardbackup'); ?></th>
+						<td>
+							<input type="password" class="sgbackup-instance-field regular-text" data-key="sas_token" data-method="azure" data-instance="<?php echo esc_attr($iid); ?>" value="<?php echo esc_attr(SiteGuard_Backup_Security::mask_secret($iopts['sas_token'] ?? '')); ?>" autocomplete="off" />
+							<p class="description"><?php esc_html_e('Used instead of the account key when set (for storage accounts with Shared Key access disabled).', 'siteguardbackup'); ?></p>
+						</td>
 					</tr>
 					<tr>
 						<th><?php esc_html_e('Container', 'siteguardbackup'); ?></th>
@@ -1093,7 +1102,7 @@ $period_labels = array(
 					</tr>
 					<tr>
 						<th><?php esc_html_e('HMAC Secret Key', 'siteguardbackup'); ?></th>
-						<td><input type="password" class="sgbackup-instance-field regular-text" data-key="secret_key" data-method="gcs" data-instance="<?php echo esc_attr($iid); ?>" value="<?php echo esc_attr($iopts['secret_key'] ?? ''); ?>" autocomplete="off" /></td>
+						<td><input type="password" class="sgbackup-instance-field regular-text" data-key="secret_key" data-method="gcs" data-instance="<?php echo esc_attr($iid); ?>" value="<?php echo esc_attr(SiteGuard_Backup_Security::mask_secret($iopts['secret_key'] ?? '')); ?>" autocomplete="off" /></td>
 					</tr>
 					<tr>
 						<th><?php esc_html_e('Bucket', 'siteguardbackup'); ?></th>
@@ -1169,7 +1178,7 @@ $period_labels = array(
 					<tr>
 						<th><?php esc_html_e('Access Token', 'siteguardbackup'); ?></th>
 						<td>
-							<input type="password" class="sgbackup-instance-field regular-text" data-key="access_token" data-method="pcloud" data-instance="<?php echo esc_attr($iid); ?>" value="<?php echo esc_attr($iopts['access_token'] ?? ''); ?>" autocomplete="off" />
+							<input type="password" class="sgbackup-instance-field regular-text" data-key="access_token" data-method="pcloud" data-instance="<?php echo esc_attr($iid); ?>" value="<?php echo esc_attr(SiteGuard_Backup_Security::mask_secret($iopts['access_token'] ?? '')); ?>" autocomplete="off" />
 							<p class="description"><?php esc_html_e('OAuth 2.0 access token from pCloud. Generate at my.pcloud.com.', 'siteguardbackup'); ?></p>
 						</td>
 					</tr>
@@ -1250,14 +1259,14 @@ $period_labels = array(
 					<tr>
 						<th><?php esc_html_e('Password', 'siteguardbackup'); ?></th>
 						<td>
-							<input type="password" class="sgbackup-instance-field regular-text" data-key="password" data-method="openstack" data-instance="<?php echo esc_attr($iid); ?>" value="<?php echo esc_attr($iopts['password'] ?? ''); ?>" autocomplete="off" />
+							<input type="password" class="sgbackup-instance-field regular-text" data-key="password" data-method="openstack" data-instance="<?php echo esc_attr($iid); ?>" value="<?php echo esc_attr(SiteGuard_Backup_Security::mask_secret($iopts['password'] ?? '')); ?>" autocomplete="off" />
 							<p class="description"><?php esc_html_e('Keystone password. Leave empty if using API key (Rackspace).', 'siteguardbackup'); ?></p>
 						</td>
 					</tr>
 					<tr>
 						<th><?php esc_html_e('API Key (Rackspace)', 'siteguardbackup'); ?></th>
 						<td>
-							<input type="password" class="sgbackup-instance-field regular-text" data-key="api_key" data-method="openstack" data-instance="<?php echo esc_attr($iid); ?>" value="<?php echo esc_attr($iopts['api_key'] ?? ''); ?>" autocomplete="off" />
+							<input type="password" class="sgbackup-instance-field regular-text" data-key="api_key" data-method="openstack" data-instance="<?php echo esc_attr($iid); ?>" value="<?php echo esc_attr(SiteGuard_Backup_Security::mask_secret($iopts['api_key'] ?? '')); ?>" autocomplete="off" />
 							<p class="description"><?php esc_html_e('Rackspace API key. Used instead of password for Rackspace Cloud Files.', 'siteguardbackup'); ?></p>
 						</td>
 					</tr>

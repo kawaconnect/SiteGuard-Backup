@@ -105,6 +105,26 @@ class SiteGuard_Backup_Semaphore {
 	}
 
 	/**
+	 * Try to acquire the lock for up to $max_seconds.
+	 *
+	 * The history lock is held only for a read-modify-write, so waiting a little
+	 * is always better than writing without it (which silently lost entries).
+	 *
+	 * @return bool True if acquired. On false, callers log and continue as before.
+	 */
+	public function lock_wait($max_seconds = 15) {
+		$deadline = microtime(true) + $max_seconds;
+		while (!$this->lock()) {
+			if (microtime(true) >= $deadline) {
+				error_log("SiteGuard Backup: lock '{$this->lock_name}' still busy after {$max_seconds}s; continuing without it");
+				return false;
+			}
+			usleep(250000);
+		}
+		return true;
+	}
+
+	/**
 	 * Release the lock.
 	 *
 	 * @return bool

@@ -169,6 +169,62 @@ abstract class SiteGuard_Backup_Module {
 	 */
 	abstract public function delete($files);
 
+	/**
+	 * Local path a download of remote file $name is streamed to.
+	 */
+	protected function local_download_path($dest_dir, $name) {
+		return trailingslashit($dest_dir) . basename((string) $name);
+	}
+
+	/**
+	 * Confirm a streamed download is complete. A transport error or proxy can end
+	 * the stream early and leave a truncated archive that would later fail to
+	 * restore; the partial file is removed.
+	 *
+	 * @param string   $path     Local file.
+	 * @param int|null $expected Content-Length announced by the server, if any.
+	 * @param string   $label    Provider name for messages.
+	 * @return true|WP_Error
+	 */
+	protected function verify_download($path, $expected, $label) {
+		clearstatcache(true, $path);
+		$size = file_exists($path) ? filesize($path) : false;
+		if (false === $size || 0 === $size) {
+			if (file_exists($path)) @unlink($path);
+			return new WP_Error('download_empty', "{$label} download produced no data");
+		}
+		if (null !== $expected && (int) $size !== (int) $expected) {
+			@unlink($path);
+			return new WP_Error('download_truncated', sprintf('%s download incomplete: got %d of %d bytes', $label, $size, $expected));
+		}
+		return true;
+	}
+
+	/**
+	 * Only plain file names are ever deleted remotely.
+	 *
+	 * An empty name (or "." / "..") turns "<folder>/<name>" into the backup folder
+	 * itself, and several providers delete folders recursively (OneDrive,
+	 * Dropbox, WebDAV collections): one bad name would wipe every remote backup.
+	 *
+	 * @param mixed $files
+	 * @return string[]
+	 */
+	protected function safe_remote_names($files) {
+		$out = array();
+		foreach ((array) $files as $f) {
+			if (!is_string($f)) continue;
+			$f = trim($f);
+			if ('' === $f || '.' === $f || '..' === $f || basename($f) !== $f
+				|| preg_match('/[\x00-\x1f\\\\]/', $f)) {
+				error_log('SiteGuard Backup: refusing remote delete of unsafe name: ' . json_encode($f));
+				continue;
+			}
+			$out[] = $f;
+		}
+		return $out;
+	}
+
 	// ===== Optional methods =====
 
 	/**

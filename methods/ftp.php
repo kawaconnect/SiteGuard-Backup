@@ -44,7 +44,12 @@ class SiteGuard_Backup_Method_Ftp extends SiteGuard_Backup_Module {
 			);
 		}
 
-		if ($ftps_mode === 'explicit' && function_exists('ftp_ssl_connect')) {
+		if ($ftps_mode === 'explicit') {
+			if (!function_exists('ftp_ssl_connect')) {
+				// Never fall back to plaintext when encryption was asked for: that
+				// sent the password in the clear.
+				return new WP_Error('ftps_unavailable', 'FTPS was selected but this PHP build has no ftp_ssl_connect(); refusing to connect without encryption.');
+			}
 			$conn = ftp_ssl_connect($options['host'], $port, 30);
 		} else {
 			$conn = ftp_connect($options['host'], $port, 30);
@@ -105,6 +110,8 @@ class SiteGuard_Backup_Method_Ftp extends SiteGuard_Backup_Module {
 	}
 
 	public function delete($files) {
+		$files = $this->safe_remote_names($files);
+		if (!$files) return true;
 		$conn = $this->connect();
 		if (is_wp_error($conn)) return $conn;
 

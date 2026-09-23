@@ -71,6 +71,8 @@ class SiteGuard_Backup_Method_Email extends SiteGuard_Backup_Module {
 	}
 
 	public function delete($files) {
+		$files = $this->safe_remote_names($files);
+		if (!$files) return true;
 		// Email attachments cannot be deleted
 		return true;
 	}

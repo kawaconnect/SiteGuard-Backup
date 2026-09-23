@@ -42,16 +42,8 @@ class SiteGuard_Backup_Method_Sftp extends SiteGuard_Backup_Module {
 			return new WP_Error('sftp_no_lib', 'Neither ssh2 extension nor phpseclib available.');
 		}
 
-		if (is_wp_error($conn)) {
-			return $conn;
-		}
-
-		// Gap 9: Host fingerprint verification
-		$fingerprint_result = $this->verify_fingerprint($conn, $options);
-		if (is_wp_error($fingerprint_result)) {
-			return $fingerprint_result;
-		}
-
+		// The host key is verified inside connect_ssh2()/connect_phpseclib(),
+		// before authentication.
 		return $conn;
 	}
 
@@ -92,9 +84,9 @@ class SiteGuard_Backup_Method_Sftp extends SiteGuard_Backup_Module {
 		}
 
 		if (empty($server_fingerprint)) {
-			$sgbackup = SiteGuard_Backup::instance();
-			$sgbackup->log("SFTP: could not determine server host key fingerprint. Fingerprint verification skipped.", 'warning');
-			return true;
+			// Fail closed: without the host key we cannot tell the real server from
+			// an impostor, and the next step would hand it our credentials.
+			return new WP_Error('sftp_no_fingerprint', 'SFTP: could not read the server host key; refusing to send credentials to an unverified server.');
 		}
 
 		$stored_fingerprint = isset($options['fingerprint']) ? strtolower(trim($options['fingerprint'])) : '';
@@ -126,6 +118,13 @@ class SiteGuard_Backup_Method_Sftp extends SiteGuard_Backup_Module {
 		$conn = @ssh2_connect($options['host'], $port);
 		if (!$conn) {
 			return new WP_Error('sftp_connect_failed', "Could not connect to SFTP: {$options['host']}:{$port}");
+		}
+
+		// Verify the host key BEFORE authenticating: checking afterwards had already
+		// sent the password or key to whoever answered.
+		$verified = $this->verify_fingerprint(array('type' => 'ssh2', 'conn' => $conn), $options);
+		if (is_wp_error($verified)) {
+			return $verified;
 		}
 
 		// Key auth
@@ -168,6 +167,13 @@ class SiteGuard_Backup_Method_Sftp extends SiteGuard_Backup_Module {
 			$sftp = new \phpseclib\Net\SFTP($options['host'], $port);
 		} else {
 			$sftp = new Net_SFTP($options['host'], $port);
+		}
+
+		// Key exchange happens here (getServerPublicHostKey connects); verify the
+		// host key before login() sends any credentials.
+		$verified = $this->verify_fingerprint(array('type' => 'phpseclib', 'sftp' => $sftp), $options);
+		if (is_wp_error($verified)) {
+			return $verified;
 		}
 
 		$auth = false;
@@ -333,6 +339,8 @@ class SiteGuard_Backup_Method_Sftp extends SiteGuard_Backup_Module {
 	}
 
 	public function delete($files) {
+		$files = $this->safe_remote_names($files);
+		if (!$files) return true;
 		$conn = $this->connect();
 		if (is_wp_error($conn)) return $conn;
 

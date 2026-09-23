@@ -20,7 +20,10 @@ class SiteGuard_Backup_Method_Azure extends SiteGuard_Backup_Module {
 			'account_key'     => '',
 			'container'       => '',
 			'path'            => '',
-			'endpoint_suffix' => 'blob.core.windows.net', // Global, Germany: blob.core.cloudapi.de, China: blob.core.chinacloudapi.cn, US Gov: blob.core.usgovcloudapi.net
+			'endpoint_suffix' => 'blob.core.windows.net', // Global; China: blob.core.chinacloudapi.cn; US Gov: blob.core.usgovcloudapi.net
+			// Optional account/container SAS token (sv=...&sig=...). When set it is used
+			// instead of the account key, for accounts where Shared Key access is disabled.
+			'sas_token'       => '',
 		);
 	}
 
@@ -72,12 +75,17 @@ class SiteGuard_Backup_Method_Azure extends SiteGuard_Backup_Module {
 	 * @param string $content_type   Content-Type header value.
 	 * @return array Signed headers including Authorization.
 	 */
-	private function sign_request($method, $uri, $headers, $query = '', $content_length = 0, $content_type = '') {
+	private function sign_request($method, $uri, $headers, $query = '', $content_length = 0, $content_type = '', $content_md5 = '') {
 		$options = $this->get_options();
 		$now = gmdate('D, d M Y H:i:s T');
 
 		$headers['x-ms-date'] = $now;
 		$headers['x-ms-version'] = $this->api_version;
+
+		// With a SAS token the signature travels in the query string instead.
+		if ($this->get_sas_token() !== '') {
+			return $headers;
+		}
 
 		// Build canonicalized headers (lowercase, sorted, newline-separated)
 		$canonical_headers = '';
@@ -116,7 +124,7 @@ class SiteGuard_Backup_Method_Azure extends SiteGuard_Backup_Module {
 			. "\n"                             // Content-Encoding
 			. "\n"                             // Content-Language
 			. $content_length_str . "\n"       // Content-Length
-			. "\n"                             // Content-MD5
+			. $content_md5 . "\n"             // Content-MD5
 			. $content_type . "\n"             // Content-Type
 			. "\n"                             // Date
 			. "\n"                             // If-Modified-Since
@@ -136,6 +144,30 @@ class SiteGuard_Backup_Method_Azure extends SiteGuard_Backup_Module {
 	}
 
 	/**
+	 * The configured SAS token without a leading "?", or ''.
+	 */
+	private function get_sas_token() {
+		$options = $this->get_options();
+		return isset($options['sas_token']) ? ltrim(trim((string) $options['sas_token']), '?') : '';
+	}
+
+	/**
+	 * Full request URL for $uri and $query, with the SAS token appended when used.
+	 */
+	private function build_url($uri, $query = '') {
+		$sas = $this->get_sas_token();
+		$query = implode('&', array_filter(array($query, $sas), 'strlen'));
+		return $this->get_base_url() . $uri . ('' !== $query ? '?' . $query : '');
+	}
+
+	/**
+	 * Whether this host should keep request bodies small (see SiteGuard_Backup::is_low_memory()).
+	 */
+	private function low_memory() {
+		return class_exists('SiteGuard_Backup') && SiteGuard_Backup::instance()->is_low_memory();
+	}
+
+	/**
 	 * Perform an Azure Blob Storage REST API request.
 	 *
 	 * @param string $method  HTTP method.
@@ -148,15 +180,13 @@ class SiteGuard_Backup_Method_Azure extends SiteGuard_Backup_Module {
 	private function request($method, $uri, $body = '', $extra_headers = array(), $query = '') {
 		$content_length = strlen($body);
 		$content_type = isset($extra_headers['Content-Type']) ? $extra_headers['Content-Type'] : '';
+		$content_md5 = isset($extra_headers['Content-MD5']) ? $extra_headers['Content-MD5'] : '';
 
 		$headers = array_merge(array(), $extra_headers);
 
-		$signed_headers = $this->sign_request($method, $uri, $headers, $query, $content_length, $content_type);
+		$signed_headers = $this->sign_request($method, $uri, $headers, $query, $content_length, $content_type, $content_md5);
 
-		$url = $this->get_base_url() . $uri;
-		if (!empty($query)) {
-			$url .= '?' . $query;
-		}
+		$url = $this->build_url($uri, $query);
 
 		$args = array(
 			'method'  => $method,
@@ -181,7 +211,8 @@ class SiteGuard_Backup_Method_Azure extends SiteGuard_Backup_Module {
 	/**
 	 * Upload a backup file to Azure Blob Storage.
 	 *
-	 * Uses Put Blob for files under 50MB, Block Blob (chunked) for larger files.
+	 * Uses Put Blob for small files, Put Block + Put Block List for larger ones, so
+	 * at most one block is held in memory.
 	 *
 	 * @param string $file Full path to the file to upload.
 	 * @return bool|WP_Error
@@ -192,18 +223,44 @@ class SiteGuard_Backup_Method_Azure extends SiteGuard_Backup_Module {
 		$uri = $this->encode_uri_path('/' . $options['container'] . '/' . $blob_name);
 		$filesize = filesize($file);
 
-		// For files under 50MB, use simple Put Blob
-		if ($filesize < 52428800) {
+		// Small files: a single Put Blob (the body is held in memory, so keep it small).
+		if ($filesize <= ($this->low_memory() ? 4194304 : 16777216)) {
 			$body = file_get_contents($file);
-			$result = $this->request('PUT', $uri, $body, array(
-				'Content-Type'    => 'application/octet-stream',
-				'x-ms-blob-type' => 'BlockBlob',
-			));
-			return is_wp_error($result) ? $result : true;
+			if (false === $body || strlen($body) !== $filesize) {
+				return new WP_Error('azure_read_error', 'Failed to read file for upload.');
+			}
+			$result = $this->request_with_retries(function() use ($uri, $body) {
+				return $this->request('PUT', $uri, $body, array(
+					'Content-Type'   => 'application/octet-stream',
+					'Content-MD5'    => base64_encode(md5($body, true)),
+					'x-ms-blob-type' => 'BlockBlob',
+				));
+			}, 'Azure Put Blob');
+			if (is_wp_error($result)) return $result;
+			return $this->verify_blob_size($uri, $filesize);
 		}
 
 		// For larger files, use Block Blob with Put Block + Put Block List
-		return $this->block_blob_upload($file, $uri);
+		$result = $this->block_blob_upload($file, $uri);
+		if (is_wp_error($result)) return $result;
+		return $this->verify_blob_size($uri, $filesize);
+	}
+
+	/**
+	 * Confirm the committed blob has the local file's size.
+	 *
+	 * @return true|WP_Error
+	 */
+	private function verify_blob_size($uri, $expected) {
+		$head = $this->request('HEAD', $uri);
+		if (is_wp_error($head)) {
+			return new WP_Error('azure_verify', 'Uploaded blob could not be confirmed: ' . $head->get_error_message());
+		}
+		$length = wp_remote_retrieve_header($head, 'content-length');
+		if ('' !== $length && null !== $length && (int) $length !== (int) $expected) {
+			return new WP_Error('azure_upload_incomplete', sprintf('Azure blob is %d bytes, expected %d.', (int) $length, $expected));
+		}
+		return true;
 	}
 
 	/**
@@ -214,7 +271,10 @@ class SiteGuard_Backup_Method_Azure extends SiteGuard_Backup_Module {
 	 * @return bool|WP_Error
 	 */
 	private function block_blob_upload($file, $uri) {
-		$chunk_size = 10485760; // 10MB per block
+		$filesize = filesize($file);
+		// Azure allows 50,000 committed blocks per blob; grow blocks for huge files.
+		$chunk_size = $this->low_memory() ? 4194304 : 10485760;
+		$chunk_size = max($chunk_size, (int) ceil($filesize / 49000));
 		$fh = fopen($file, 'rb');
 		if (!$fh) {
 			return new WP_Error('azure_read_error', 'Failed to open file for reading.');
@@ -225,9 +285,13 @@ class SiteGuard_Backup_Method_Azure extends SiteGuard_Backup_Module {
 		$offset = 0;
 		$sgbackup = SiteGuard_Backup::instance();
 
-		while (!feof($fh)) {
+		while ($offset < $filesize) {
 			$chunk = fread($fh, $chunk_size);
-			if (false === $chunk || strlen($chunk) === 0) break;
+			if (false === $chunk || strlen($chunk) === 0) {
+				// Committing the blocks read so far would store a truncated blob.
+				fclose($fh);
+				return new WP_Error('azure_read_error', sprintf('Read failed after %d of %d bytes.', $offset, $filesize));
+			}
 
 			// Block ID must be base64-encoded, same length for all blocks
 			$block_id = base64_encode(str_pad((string) $block_index, 6, '0', STR_PAD_LEFT));
@@ -237,6 +301,7 @@ class SiteGuard_Backup_Method_Azure extends SiteGuard_Backup_Module {
 			$result = $this->request_with_retries(function() use ($uri, $chunk, $query) {
 				return $this->request('PUT', $uri, $chunk, array(
 					'Content-Type' => 'application/octet-stream',
+					'Content-MD5'  => base64_encode(md5($chunk, true)), // the service rejects a corrupted block
 				), $query);
 			}, 'Azure Put Block');
 
@@ -260,9 +325,11 @@ class SiteGuard_Backup_Method_Azure extends SiteGuard_Backup_Module {
 		}
 		$block_list_xml .= '</BlockList>';
 
-		$result = $this->request('PUT', $uri, $block_list_xml, array(
-			'Content-Type' => 'application/xml',
-		), 'comp=blocklist');
+		$result = $this->request_with_retries(function() use ($uri, $block_list_xml) {
+			return $this->request('PUT', $uri, $block_list_xml, array(
+				'Content-Type' => 'application/xml',
+			), 'comp=blocklist');
+		}, 'Azure Put Block List');
 
 		return is_wp_error($result) ? $result : true;
 	}
@@ -276,14 +343,15 @@ class SiteGuard_Backup_Method_Azure extends SiteGuard_Backup_Module {
 	 */
 	public function download($file, $dest_dir) {
 		$options = $this->get_options();
+		$file = basename($file);
 		$blob_name = $this->get_blob_path($file);
 		$uri = $this->encode_uri_path('/' . $options['container'] . '/' . $blob_name);
-		$local_path = trailingslashit($dest_dir) . basename($file);
+		$local_path = $this->local_download_path($dest_dir, $file);
 
 		$headers = array();
 		$signed_headers = $this->sign_request('GET', $uri, $headers);
 
-		$url = $this->get_base_url() . $uri;
+		$url = $this->build_url($uri);
 
 		$response = wp_remote_get($url, array(
 			'headers'  => $signed_headers,
@@ -303,7 +371,8 @@ class SiteGuard_Backup_Method_Azure extends SiteGuard_Backup_Module {
 			return new WP_Error('azure_download', "Azure download failed (HTTP {$code})");
 		}
 
-		return true;
+		$length = wp_remote_retrieve_header($response, 'content-length');
+		return $this->verify_download($local_path, ('' === $length || null === $length) ? null : (int) $length, 'Azure');
 	}
 
 	/**
@@ -313,13 +382,15 @@ class SiteGuard_Backup_Method_Azure extends SiteGuard_Backup_Module {
 	 * @return bool|WP_Error
 	 */
 	public function delete($files) {
+		$files = $this->safe_remote_names($files);
+		if (!$files) return true;
 		if (!is_array($files)) $files = array($files);
 
 		$options = $this->get_options();
 		$errors = array();
 
 		foreach ($files as $file) {
-			$blob_name = $this->get_blob_path($file);
+			$blob_name = $this->get_blob_path(basename($file));
 			$uri = $this->encode_uri_path('/' . $options['container'] . '/' . $blob_name);
 			$result = $this->request('DELETE', $uri);
 			if (is_wp_error($result)) {
@@ -393,8 +464,8 @@ class SiteGuard_Backup_Method_Azure extends SiteGuard_Backup_Module {
 	 */
 	public function credentials_test() {
 		$options = $this->get_options();
-		if (empty($options['account_name']) || empty($options['account_key']) || empty($options['container'])) {
-			return new WP_Error('azure_config', 'Account name, account key, and container are required.');
+		if (empty($options['account_name']) || empty($options['container']) || (empty($options['account_key']) && $this->get_sas_token() === '')) {
+			return new WP_Error('azure_config', 'Account name, container, and an account key or SAS token are required.');
 		}
 
 		$uri = $this->encode_uri_path('/' . $options['container']);

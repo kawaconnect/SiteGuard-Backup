@@ -140,8 +140,8 @@ class SiteGuard_Backup_Admin {
 				'get_health_status'        => wp_create_nonce('sgbackup-get_health_status'),
 				'regenerate_health_api_key' => wp_create_nonce('sgbackup-regenerate_health_api_key'),
 			),
-			'max_upload_size' => wp_max_upload_size(),
-			'chunk_size' => min(2 * 1024 * 1024, intval(0.9 * wp_max_upload_size())),
+			'max_upload_size' => SiteGuard_Backup_Filesystem::max_backup_upload_size(),
+			'chunk_size' => min(2 * 1024 * 1024, intval(0.9 * SiteGuard_Backup_Filesystem::max_backup_upload_size())),
 			'is_multisite' => is_multisite(),
 			'current_blog_id' => get_current_blog_id(),
 			'is_single_site_mode' => function_exists('sgbackup_is_single_site_mode') ? sgbackup_is_single_site_mode() : false,
@@ -318,6 +318,21 @@ class SiteGuard_Backup_Admin {
 		$generic_nonce_valid = wp_verify_nonce($nonce, 'sgbackup-ajax');
 		if (!$action_nonce_valid && !$generic_nonce_valid) {
 			wp_send_json_error(array('message' => 'Invalid security token. Please reload the page.'));
+		}
+
+		// On multisite these reach beyond the current subsite (network-wide tables,
+		// options, migration receive keys, audit trail, arbitrary DB hosts), so a
+		// subsite administrator must not run them; network administrators can.
+		// Subsite admins restore their own site through ajax_restore, which scopes
+		// the restore to their blog (restrict_restore_scope()).
+		$network_admin_only = array(
+			'restore_alldownloaded', 'searchreplace', 'wipe_settings', 'import_settings',
+			'migrate_key_create', 'get_migrator_keys', 'delete_migrator_key',
+			'failover_prefailover', 'failover_postfailover', 'clear_audit_log', 'toggle_audit_log',
+			'regenerate_health_api_key', 'test_extdb',
+		);
+		if (is_multisite() && !current_user_can('manage_network_options') && in_array($subaction, $network_admin_only, true)) {
+			wp_send_json_error(array('message' => __('Only a network administrator can do this.', 'siteguardbackup')));
 		}
 
 		// Rate limiting on sensitive destructive/mutating endpoints
@@ -904,6 +919,13 @@ class SiteGuard_Backup_Admin {
 			}
 		}
 
+		$denied = $this->restrict_restore_scope($backup_set, $restore_options);
+		if (null !== $denied) {
+			echo 'RINFO:' . wp_json_encode(array('type' => 'error', 'message' => $denied)) . "\n";
+			echo 'RINFO:' . wp_json_encode(array('type' => 'complete', 'success' => false, 'errors' => array($denied))) . "\n";
+			exit;
+		}
+
 		$restorer = new SiteGuard_Backup_Restorer($backup_set, $restore_options);
 		$result = $restorer->perform_restore();
 
@@ -967,12 +989,20 @@ class SiteGuard_Backup_Admin {
 		}
 
 		// Server-side file size check
-		$max_upload = wp_max_upload_size();
+		$max_upload = SiteGuard_Backup_Filesystem::max_backup_upload_size();
 		if ($file['size'] > $max_upload) {
 			wp_send_json_error(array('message' => 'File exceeds maximum upload size (' . size_format($max_upload) . ')'));
 		}
 
 		$dest = $backup_dir . $filename;
+		if (file_exists($dest)) {
+			// Never overwrite a backup file already on disk with an upload.
+			if (filesize($dest) === (int) $file['size'] && md5_file($dest) === md5_file($file['tmp_name'])) {
+				@unlink($file['tmp_name']);
+				wp_send_json_success(array('filename' => $filename, 'message' => 'This file is already on the server; nothing to do.'));
+			}
+			wp_send_json_error(array('message' => sprintf('A different file named %s already exists in the backup directory; it was not overwritten.', $filename)));
+		}
 		if (!move_uploaded_file($file['tmp_name'], $dest)) {
 			wp_send_json_error(array('message' => 'Failed to save uploaded file'));
 		}
@@ -985,10 +1015,11 @@ class SiteGuard_Backup_Admin {
 		if (strtolower($ext) === 'zip'
 			&& (strpos($filename, 'sgbackup_bundle_') === 0 || $this->zip_contains_backup($dest))) {
 			$extracted_files = $this->extract_bundle($dest, $backup_dir);
-			@unlink($dest); // Remove the bundle zip after extraction
 			if (is_wp_error($extracted_files)) {
-				wp_send_json_error(array('message' => $extracted_files->get_error_message()));
+				// Keep the uploaded bundle: it may be the only complete copy.
+				wp_send_json_error(array('message' => $extracted_files->get_error_message() . ' The uploaded bundle was kept as ' . basename($dest) . '.'));
 			}
+			SiteGuard_Backup_Filesystem::delete_file($dest, $backup_dir); // extracted: bundle no longer needed
 
 			$audit = SiteGuard_Backup_Audit_Log::instance();
 			$audit->log('upload_bundle', 'Uploaded and extracted backup bundle: ' . $filename, array(
@@ -1327,6 +1358,7 @@ class SiteGuard_Backup_Admin {
 		$protected_names = array('.htaccess', '.user.ini', 'index.php', 'index.html', 'web.config', '.nginx-deny');
 
 		$extracted = array();
+		$errors = array();
 		for ($i = 0; $i < $zip->numFiles; $i++) {
 			$entry = $zip->getNameIndex($i);
 			if ($entry === '_sgbackup_bundle.json') continue;
@@ -1346,32 +1378,58 @@ class SiteGuard_Backup_Admin {
 			// then move it to the sanitized target. This prevents the archive from creating
 			// (even briefly) a file with an attacker-chosen name in the backup directory.
 			$stream = $zip->getStream($entry);
-			if (!$stream) continue;
+			if (!$stream) { $errors[] = "{$safe_name}: cannot read from bundle"; continue; }
 			$tmp_path = $backup_dir . 'sgbundle_tmp_' . wp_generate_password(16, false) . '.part';
 			$out = @fopen($tmp_path, 'wb');
-			if (!$out) { @fclose($stream); continue; }
+			if (!$out) { @fclose($stream); $errors[] = "{$safe_name}: cannot write temp file"; continue; }
+			// Every read and write is checked and the result must match the entry's
+			// size: a full disk used to produce a silently truncated archive that
+			// was then registered as restorable.
+			$stream_ok = true;
 			while (!feof($stream)) {
 				$buf = fread($stream, 65536);
-				if ($buf === false) break;
-				fwrite($out, $buf);
+				if (false === $buf) { $stream_ok = false; break; }
+				if ('' !== $buf && fwrite($out, $buf) !== strlen($buf)) { $stream_ok = false; break; }
 			}
 			fclose($out);
 			fclose($stream);
 			clearstatcache(true, $tmp_path);
+			$stat = $zip->statIndex($i);
+			if (!$stream_ok || !is_array($stat) || filesize($tmp_path) !== (int) $stat['size']) {
+				@unlink($tmp_path);
+				$errors[] = "{$safe_name}: extraction incomplete (disk full?)";
+				continue;
+			}
 
 			$target = $backup_dir . $safe_name;
+			// Never replace an existing backup file: a byte-identical copy is reused,
+			// anything else is refused rather than overwriting a good archive.
+			if (file_exists($target)) {
+				$same = (filesize($target) === filesize($tmp_path)) && (md5_file($target) === md5_file($tmp_path));
+				@unlink($tmp_path);
+				if ($same) {
+					$extracted[] = $safe_name;
+				} else {
+					$errors[] = "{$safe_name}: a different file with this name already exists; not overwritten";
+				}
+				continue;
+			}
 			// Move temp into place (rename; copy+unlink fallback for CIFS).
 			if (!@rename($tmp_path, $target)) {
-				if (@copy($tmp_path, $target)) {
-					@unlink($tmp_path);
-				} else {
-					@unlink($tmp_path);
+				$copied = @copy($tmp_path, $target);
+				@unlink($tmp_path);
+				if (!$copied) {
+					$errors[] = "{$safe_name}: could not move into place";
 					continue;
 				}
 			}
 			$extracted[] = $safe_name;
 		}
 		$zip->close();
+
+		if (!empty($errors)) {
+			return new WP_Error('bundle_incomplete', 'Bundle not imported: ' . implode('; ', $errors));
+		}
 
 		// Register in backup history using the bundle control file's metadata.
 		$registered = false;
@@ -1395,6 +1453,22 @@ class SiteGuard_Backup_Admin {
 						$clean[] = $fname;
 					}
 					if (!empty($clean)) $backup_data[$k] = array_values(array_unique($clean));
+				} elseif ('incremental_sets' === $k) {
+					// Merged into the entry's file lists by get_history(), so delete and
+					// restore act on them: keep only files that came out of THIS bundle.
+					if (!is_array($v)) continue;
+					$sets = array();
+					foreach ($v as $set_ts => $set) {
+						if (!is_array($set)) continue;
+						foreach ($set as $ek => $ev) {
+							$names = is_array($ev) ? $ev : array($ev);
+							$names = array_values(array_filter($names, function ($n) use ($extracted) {
+								return is_string($n) && basename($n) === $n && in_array($n, $extracted, true);
+							}));
+							if ($names) $sets[(int) $set_ts][$ek] = $names;
+						}
+					}
+					if ($sets) $backup_data[$k] = $sets;
 				} elseif (is_scalar($v) || is_array($v)) {
 					$backup_data[$k] = $v;
 				}
@@ -1523,9 +1597,6 @@ class SiteGuard_Backup_Admin {
 	}
 
 	/**
-	 * Check if current user can manage backups.
-	 */
-	/**
 	 * Warn when backups are (or were) stored where the webserver can serve them.
 	 *
 	 * Resolving the backup directory here means the check runs on every admin page
@@ -1564,6 +1635,53 @@ class SiteGuard_Backup_Admin {
 		}
 	}
 
+	/**
+	 * On multisite, a subsite administrator (not a super admin) may only restore a
+	 * per-subsite backup into their OWN subsite, and only its database and uploads.
+	 *
+	 * Without this, target_subsite_id / batch maps let them drop and replace any
+	 * other subsite's tables, a network backup replaced the whole network, and
+	 * plugins/themes/core/others (shared by every site) let them plant PHP that
+	 * runs network-wide.
+	 *
+	 * @return string|null Error message, or null when allowed. Normalises $options.
+	 */
+	private function restrict_restore_scope($backup_set, &$options) {
+		if (!is_multisite() || current_user_can('manage_network_options')) {
+			return null;
+		}
+		$blog_id = (int) get_current_blog_id();
+		if (empty($backup_set['is_subsite_backup'])) {
+			return __('Only a network administrator can restore a network-wide backup.', 'siteguardbackup');
+		}
+		foreach (array('plugins', 'themes', 'others', 'wpcore') as $shared) {
+			if (!empty($options[$shared])) {
+				return sprintf(__('Only a network administrator can restore %s: they are shared by every site in the network.', 'siteguardbackup'), $shared);
+			}
+		}
+		if (!empty($options['batch_subsite_map']) || !empty($options['subsite_map']) || !empty($options['include_unspecified_tables'])) {
+			return __('Only a network administrator can restore into other subsites.', 'siteguardbackup');
+		}
+		if (!empty($options['target_subsite_id']) && (int) $options['target_subsite_id'] !== $blog_id) {
+			return __('You can only restore into your own site.', 'siteguardbackup');
+		}
+		if (!empty($options['target_subsite_domain'])) {
+			$details = get_blog_details($blog_id);
+			$own = $details ? untrailingslashit($details->domain . $details->path) : '';
+			if (untrailingslashit($options['target_subsite_domain']) !== $own) {
+				return __('You can only restore into your own site.', 'siteguardbackup');
+			}
+		}
+		// Always import into the current blog, whatever blog the backup came from.
+		$options['subsite_mode'] = SiteGuard_Backup_Restorer::SUBSITE_MODE_IMPORT_AS;
+		$options['target_subsite_id'] = $blog_id;
+		unset($options['target_subsite_domain']);
+		return null;
+	}
+
+	/**
+	 * Check if current user can manage backups.
+	 */
 	private function user_can_manage() {
 		if (is_multisite()) {
 			if (current_user_can('manage_network_options')) return true;
