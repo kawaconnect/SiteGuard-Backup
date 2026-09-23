@@ -17,8 +17,8 @@ if (!defined('ABSPATH') || !class_exists('SiteGuard_Backup')) {
 
 $method_id = isset($args[0]) ? $args[0] : '';
 $opts = isset($args[1]) ? json_decode($args[1], true) : null;
-if (!in_array($method_id, array('s3', 'azure', 's3generic', 'b2'), true) || !is_array($opts)) {
-	fwrite(STDERR, "usage: <s3|azure|s3generic|b2> '<json options>'\n");
+if (!in_array($method_id, array('s3', 'azure', 's3generic', 'b2', 'webdav'), true) || !is_array($opts)) {
+	fwrite(STDERR, "usage: <s3|azure|s3generic|b2|webdav> '<json options>'\n");
 	exit(2);
 }
 
@@ -69,6 +69,9 @@ wp_mkdir_p($work . '/down');
 
 $r = $m->credentials_test();
 $check("{$method_id}: credentials test", true === $r || (is_array($r) && !empty($r['success'])), $err($r));
+if (isset($opts['url']) && 0 === stripos($opts['url'], 'http://')) {
+	$check("{$method_id}: plain-http endpoint is flagged", is_array($r) && false !== stripos((string) ($r['message'] ?? ''), 'cleartext'));
+}
 
 $files = array(
 	'backup_2026-01-01-0000_sgtest_small000000-db.gz' => 200 * 1024,

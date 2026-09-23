@@ -45,7 +45,11 @@ These rules are not optional.
 ```sh
 sudo tests/run-sandboxed.sh          # read-only /, tmpfs /tmp, runs as nobody
 php tests/test-delete-guard.php      # or directly, as an unprivileged user
+php tests/test-encryption.php        # archive encryption: round trips, wrong key, truncation, tampering
 ```
+
+`.github/workflows/tests.yml` lints every PHP file and runs these on each push
+and pull request, on a disposable hosted runner as a non-root user.
 
 ## Integration tests (real WordPress)
 

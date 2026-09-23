@@ -1467,6 +1467,11 @@ class SiteGuard_Backup_Database_Utility {
 	 * @return bool True if the statement should be blocked.
 	 */
 	private static function is_dangerous_sql($query) {
+		// Any statement aimed at a table in ANOTHER database (`db`.`table` or
+		// db.table) is refused first, before the data/DDL shortcuts below.
+		if (preg_match('/^\s*(?:(?:INSERT|REPLACE)(?:\s+(?:LOW_PRIORITY|DELAYED|IGNORE))*\s+(?:INTO\s+)?|CREATE\s+(?:TEMPORARY\s+)?TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?|ALTER\s+TABLE\s+|DROP\s+TABLE\s+(?:IF\s+EXISTS\s+)?|TRUNCATE\s+(?:TABLE\s+)?|RENAME\s+TABLE\s+|DELETE\s+FROM\s+|UPDATE\s+|LOCK\s+TABLES\s+)(?:`[^`]+`|\w+)\s*\.\s*(?:`[^`]+`|\w+)/i', $query)) {
+			return true;
+		}
 		// Data statements (INSERT/REPLACE) can never be a privilege or file
 		// operation - OUTFILE/LOAD DATA/GRANT are not valid inside them - so the
 		// patterns below must NOT be matched against their row data. Several
@@ -1504,6 +1509,11 @@ class SiteGuard_Backup_Database_Utility {
 			'/\bSET\s+(?:@@)?(?:GLOBAL|PERSIST(?:_ONLY)?)\b/i',
 			'/^\s*CALL\s/i',
 			'/^\s*EXECUTE\s/i',
+			// Never leave the site's own database: `mysqldump --databases` emits
+			// CREATE DATABASE / USE, and a "USE other_db; DROP TABLE ..." dump would
+			// destroy a different site sharing the MySQL user.
+			'/^\s*USE\s/i',
+			'/^\s*(?:CREATE|DROP|ALTER)\s+(?:DATABASE|SCHEMA)\b/i',
 		);
 
 		foreach ($dangerous_patterns as $pattern) {

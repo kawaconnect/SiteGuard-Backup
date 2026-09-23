@@ -1173,6 +1173,14 @@ class SiteGuard_Backup_Restorer {
 			}
 		}
 
+		// A failed import (wrong passphrase, SQL error, ...) must not be checkpointed
+		// as done: the next attempt then took itself for a resume, skipped the
+		// database and reported success with nothing restored.
+		if (!$result['success']) {
+			$this->save_restore_progress('db', 'failed');
+			return $result;
+		}
+
 		// Flush WordPress object cache - the atomic RENAME TABLE makes all
 		// cached option values stale (they still hold the pre-import data).
 		wp_cache_flush();
@@ -1277,8 +1285,8 @@ class SiteGuard_Backup_Restorer {
 			}
 		}
 
-		// Save progress for resume support
-		$this->save_restore_progress('db', 'completed');
+		// Save progress for resume support (only a successful import is "done")
+		$this->save_restore_progress('db', $result['success'] ? 'completed' : 'failed');
 
 		return $result;
 	}

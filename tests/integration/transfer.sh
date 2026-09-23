@@ -85,6 +85,9 @@ seed() { # instance url label
 	wp "$i" "${U[@]}" theme activate twentytwentyfour >/dev/null
 	wp "$i" "${U[@]}" plugin activate sgx-marker >/dev/null
 	wp "$i" "${U[@]}" option update sgx_marker "$label" >/dev/null
+	# URLs inside serialized data and escaped JSON (page builders store both).
+	wp "$i" "${U[@]}" eval "update_option('sgx_ser', array('link' => '${u%/}/deep/page/', 'n' => array('img' => '${u%/}/x.png', 'txt' => 'héllo 🐍 100%')));
+		update_option('sgx_json', json_encode(array('link' => '${u%/}/deep/page/')));" >/dev/null
 	# An editor (multisite logins: lowercase letters and digits only) who authors the marker post.
 	wp "$i" "${U[@]}" user create "sgx$label" "sgx$label@example.test" --role=editor --porcelain >/dev/null
 	local author; author="$(wp "$i" user get "sgx$label" --field=ID)"
@@ -142,6 +145,8 @@ verify_target() {
 	check "siteurl stays $tu"                eq "$(wp "$d" "${U[@]}" option get siteurl)" "$tu"
 	check "home stays $tu"                   eq "$(wp "$d" "${U[@]}" option get home)" "$tu"
 	check "marker option = $label"           eq "$(wp "$d" "${U[@]}" option get sgx_marker)" "$label"
+	check "serialized URLs rewritten and still valid" eq "$(wp "$d" "${U[@]}" eval '$v = get_option("sgx_ser"); echo is_array($v) ? $v["link"] . "|" . $v["n"]["img"] . "|" . $v["n"]["txt"] : "BROKEN";')" "$tu/deep/page/|$tu/x.png|héllo 🐍 100%"
+	check "escaped JSON URL rewritten"         eq "$(wp "$d" "${U[@]}" eval '$v = json_decode(get_option("sgx_json"), true); echo is_array($v) ? $v["link"] : "BROKEN";')" "$tu/deep/page/"
 	local pid; pid="$(wp "$d" "${U[@]}" post list --name="sgx-$label" --field=ID --post_type=post)"
 	check "marker post present"              test -n "$pid"
 	local content; content="$(wp "$d" "${U[@]}" post get "${pid:-0}" --field=post_content 2>/dev/null)"

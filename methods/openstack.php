@@ -52,6 +52,7 @@ class SiteGuard_Backup_Method_Openstack extends SiteGuard_Backup_Module {
 	private function get_auth_url() {
 		$options = $this->get_options();
 		$url = rtrim($options['auth_url'], '/');
+		$this->cleartext_warning($url, 'OpenStack Swift');
 
 		// For Rackspace, ensure we use the identity endpoint
 		if ($this->is_rackspace() && false === strpos($url, '/v2.0')) {
@@ -727,7 +728,9 @@ class SiteGuard_Backup_Method_Openstack extends SiteGuard_Backup_Module {
 		$object_count = wp_remote_retrieve_header($response, 'x-container-object-count');
 		$bytes_used = wp_remote_retrieve_header($response, 'x-container-bytes-used');
 
-		return true;
+		$warn = $this->cleartext_warning($options['auth_url'], 'OpenStack Swift');
+		if ('' === $warn) $warn = $this->cleartext_warning($auth['storage_url'], 'OpenStack Swift');
+		return '' === $warn ? true : array('success' => true, 'message' => 'Connected. Warning: ' . $warn);
 	}
 
 	/**

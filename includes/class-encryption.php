@@ -178,10 +178,12 @@ class SiteGuard_Backup_Encryption {
 		// Encrypt in chunks with counter-based IVs
 		$buffer_size = 65536; // 64KB
 		$chunk_index = 0;
+		$bytes_in = 0;
 
 		while (!feof($in)) {
 			$plaintext = fread($in, $buffer_size);
 			if (false === $plaintext || strlen($plaintext) === 0) break;
+			$bytes_in += strlen($plaintext);
 
 			$chunk_iv = self::chunk_iv($base_iv, $chunk_index);
 			$tag = '';
@@ -219,6 +221,17 @@ class SiteGuard_Backup_Encryption {
 			hash_update($hmac_ctx, $encrypted);
 
 			$chunk_index++;
+		}
+
+		// A read error ends the loop early and would yield a VALID encryption of a
+		// partial archive, after which the caller deletes the plaintext. Require
+		// that exactly the whole file was read.
+		if (false === $src_size || $bytes_in !== (int) $src_size || !feof($in)) {
+			fclose($in);
+			fclose($out);
+			@unlink($encrypted_file);
+			SiteGuard_Backup::instance()->log("Encryption failed: read {$bytes_in} of " . (int) $src_size . " bytes of {$file} - keeping plaintext original", 'error');
+			return false;
 		}
 
 		// Write HMAC trailer
@@ -352,7 +365,7 @@ class SiteGuard_Backup_Encryption {
 			fclose($in);
 			fclose($out);
 			@unlink($tmp_file);
-			SiteGuard_Backup::instance()->log("HMAC verification failed - file may be tampered", 'error');
+			SiteGuard_Backup::instance()->log("Decryption refused: wrong passphrase, or the file is incomplete or corrupted (authentication check failed)", 'error');
 			return false;
 		}
 
@@ -400,6 +413,15 @@ class SiteGuard_Backup_Encryption {
 				return false;
 			}
 			$chunk_index++;
+		}
+
+		if (ftell($in) !== $data_end) {
+			// Malformed framing: never hand back a partial archive as a success.
+			fclose($in);
+			fclose($out);
+			@unlink($tmp_file);
+			SiteGuard_Backup::instance()->log("Decryption failed: chunk structure ended early at chunk {$chunk_index}", 'error');
+			return false;
 		}
 
 		if (false === fflush($out)) {

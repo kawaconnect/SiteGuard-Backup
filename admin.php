@@ -501,6 +501,13 @@ class SiteGuard_Backup_Admin {
 		// Only allow downloading actual backup files (not .htaccess, index.php, etc.)
 		if (!preg_match('/\.(zip|gz|sql|crypt|json|txt)$/', $file)) wp_die('Invalid file type');
 
+		// A file belonging to a network-wide backup is for network administrators only.
+		foreach (SiteGuard_Backup_History::get_history() as $entry) {
+			if (in_array($file, SiteGuard_Backup_History::get_all_files($entry), true) && !$this->may_download_backup($entry)) {
+				wp_die(esc_html__('Only a network administrator can download a network-wide backup.', 'siteguardbackup'), 403);
+			}
+		}
+
 		// Audit log
 		$audit = SiteGuard_Backup_Audit_Log::instance();
 		$audit->log('download_backup', 'Downloaded backup file: ' . $file, array(
@@ -544,6 +551,7 @@ class SiteGuard_Backup_Admin {
 		if (!isset($history[$timestamp])) wp_die('Backup not found');
 
 		$backup = $history[$timestamp];
+		if (!$this->may_download_backup($backup)) wp_die(esc_html__('Only a network administrator can download a network-wide backup.', 'siteguardbackup'), 403);
 		$opts = SiteGuard_Backup_Options::instance();
 		$backup_dir = $opts->get_backup_dir();
 
@@ -1677,6 +1685,16 @@ class SiteGuard_Backup_Admin {
 		$options['target_subsite_id'] = $blog_id;
 		unset($options['target_subsite_domain']);
 		return null;
+	}
+
+	/**
+	 * On multisite, a network-wide backup holds every subsite's database: only a
+	 * network administrator may download it. (A main-site administrator who is
+	 * not one sees those backups in the main site's history.)
+	 */
+	private function may_download_backup($entry) {
+		if (!is_multisite() || current_user_can('manage_network_options')) return true;
+		return !empty($entry['is_subsite_backup']) && (int) ($entry['subsite_blog_id'] ?? 0) === (int) get_current_blog_id();
 	}
 
 	/**

@@ -16,6 +16,13 @@
 #                    damage main site and sub1, upload, restore, verify both
 #   chunked-upload   as move-single, but the zip is uploaded in 1 MB chunks
 #                    (the path the admin UI uses for large files)
+#   recover-encrypted  recover-single with backup encryption on: the bundle holds
+#                    only .crypt archives, a wrong passphrase is refused without
+#                    touching the site, the right one restores it
+#   subsite-admin-limits  a subsite (and main-site) administrator who is not a
+#                    network admin cannot download or restore network backups or
+#                    run network-wide actions, but can back up and download
+#                    their own subsite
 #
 # Uses admin-ajax.php over HTTP with a real login cookie and the page's own
 # nonces. Instances are disposable (WPMultisiteDocker scripts/instance.sh).
@@ -27,7 +34,7 @@ PLUGIN="${2:?plugin directory required}"
 shift 2
 KEEP_FAILED=0; FLOWS=()
 for a in "$@"; do case "$a" in --keep-failed) KEEP_FAILED=1 ;; *) FLOWS+=("$a") ;; esac; done
-[ ${#FLOWS[@]} -gt 0 ] || FLOWS=(recover-single move-single recover-network chunked-upload)
+[ ${#FLOWS[@]} -gt 0 ] || FLOWS=(recover-single move-single recover-network chunked-upload recover-encrypted subsite-admin-limits)
 command -v jq >/dev/null || { echo "jq required" >&2; exit 2; }
 
 exec 9>/tmp/siteguard-browserflow.lock
@@ -258,6 +265,77 @@ flow_recover_network() {
 	finish "$N"
 }
 
+flow_recover_encrypted() {
+	local S=bf-rec-enc; create "$S" single || { bad "create"; return; }
+	seed "$S" "http://$S.test" enc
+	local key="enc-$(openssl rand -hex 8)"
+	wp "$S" eval "\$o = SiteGuard_Backup_Options::instance(); \$o->update_option('sgbackup_encryption_enabled', true); \$o->update_option('sgbackup_encryption_key', '$key');" >/dev/null
+	login "$S" || { bad "login"; return; }
+	local st; st="$(settings "$S")"
+	local ts; ts="$(backup_now "$S" "$st")"; check "Backup Now finished (encrypted)" test -n "$ts"
+	check "every archive is encrypted" test "$(wp "$S" eval "echo count(array_filter(SiteGuard_Backup_History::get_all_files(SiteGuard_Backup_History::get_history_raw()[$ts]), function (\$f) { return substr(\$f, -6) !== '.crypt' && substr(\$f, -5) !== '.json'; }));")" -eq 0
+	download_bundle "$S" "$st" "$ts" "$WORK/enc.zip"
+	bundle_checks "$S" "$st" "$ts" "$WORK/enc.zip"
+	check "no plaintext database dump inside the bundle" bash -c "! unzip -l '$WORK/enc.zip' | grep -E -- '-db\\.gz\$'"
+	wp "$S" siteguardbackup delete "$ts" --yes >/dev/null
+	damage "$S" "http://$S.test" enc
+	local up; up="$(upload_zip "$S" "$st" "$WORK/enc.zip")"
+	check "bundle upload accepted" jq -e '.success == true' <<<"$up" || echo "      server said: ${up:0:400}"
+	local nts; nts="$(history_ts "$S")"; check "bundle registered" test -n "$nts"
+	local bad_out; bad_out="$(restore "$S" "$st" "$nts" -F "encryption_key=not-the-key")"
+	check "restore with the wrong passphrase is refused" bash -c '! grep RINFO: <<<"$1" | sed "s/^.*RINFO://" | jq -s -e "map(select(.type == \"complete\")) | last | .success == true" >/dev/null' _ "$bad_out"
+	check "wrong passphrase changed nothing" eq "$(wp "$S" option get sgx_marker)" DAMAGED
+	local out; out="$(restore "$S" "$st" "$nts" -F "encryption_key=$key")"
+	check "restore with the passphrase succeeds" restore_ok "$out"
+	verify "$S" "http://$S.test" enc
+	common_after "$S"
+	finish "$S"
+}
+
+# A subsite administrator (not a network admin) must stay inside their subsite.
+flow_subsite_admin_limits() {
+	local N=bf-perm-net; create "$N" multisite || { bad "create"; return; }
+	seed "$N" "http://$N.test/sub2" victim
+	wp "$N" siteguardbackup backup >/dev/null                       # a network-wide backup (main site history)
+	local net_ts; net_ts="$(history_ts "$N")"
+	local pw; pw="$(openssl rand -hex 12)"
+	wp "$N" user create subadmin subadmin@example.test --user_pass="$pw" >/dev/null
+	wp "$N" --url="http://$N.test/sub1/" user set-role subadmin administrator >/dev/null
+	wp "$N" --url="http://$N.test/" user set-role subadmin administrator >/dev/null  # also admin of the MAIN site, still not a network admin
+	# log in as the subsite admin
+	local jar="$WORK/$N.jar"; rm -f "$jar"
+	curl -s -o /dev/null -c "$jar" -b "wordpress_test_cookie=WP%20Cookie%20check" -H "Host: $N.test" \
+		--data-urlencode "log=subadmin" --data-urlencode "pwd=$pw" --data "testcookie=1&redirect_to=/sub1/wp-admin/" "$(base "$N")/wp-login.php"
+	check "subsite admin can log in" grep -q wordpress_logged_in "$jar"
+	local main; main="$(curl -s -b "$jar" -H "Host: $N.test" "$(base "$N")/wp-admin/admin.php?page=siteguardbackup" | grep -oE 'var sgbackup_settings = \{.*\};' | head -1 | sed -E 's/^var sgbackup_settings = //; s/;$//')"
+	check "main-site SiteGuard page reachable for a main-site admin" test -n "$main"
+	local code; code="$(curl -s -o "$WORK/net-dl.zip" -w '%{http_code}' -b "$jar" -H "Host: $N.test" \
+		"$(base "$N")/wp-admin/admin-ajax.php?action=sgbackup_download_bundle&timestamp=$net_ts&_wpnonce=$(jq -r '.nonces.download' <<<"$main")")"
+	check "cannot download the network-wide backup (HTTP $code)" test "$code" = 403
+	local r; r="$(curl -s -b "$jar" -H "Host: $N.test" "$(base "$N")/wp-admin/admin-ajax.php" \
+		--data-urlencode action=sgbackup_ajax --data-urlencode subaction=searchreplace --data-urlencode "nonce=$(jq -r '.nonces.searchreplace' <<<"$main")" \
+		--data-urlencode 'data={"search":"victim","replace":"pwned","dry_run":0}')"
+	check "network-wide search-replace refused" jq -e '.success == false' <<<"$r"
+	check "sub2 content untouched" eq "$(wp "$N" --url="http://$N.test/sub2/" option get sgx_marker)" victim
+	local out; out="$(curl -s -N -b "$jar" -H "Host: $N.test" "$(base "$N")/wp-admin/admin-ajax.php" \
+		-F action=sgbackup_restore -F "nonce=$(jq -r '.nonce' <<<"$main")" -F "timestamp=$net_ts" -F sgbackup_restore_db=1 -F db_restore_mode=0)"
+	check "restoring the network backup refused" bash -c '! grep RINFO: <<<"$1" | sed "s/^.*RINFO://" | jq -s -e "map(select(.type == \"complete\")) | last | .success == true" >/dev/null' _ "$out"
+	# Their own subsite: back up and download is allowed.
+	local sub; sub="$(curl -s -b "$jar" -H "Host: $N.test" "$(base "$N")/sub1/wp-admin/admin.php?page=siteguardbackup" | grep -oE 'var sgbackup_settings = \{.*\};' | head -1 | sed -E 's/^var sgbackup_settings = //; s/;$//')"
+	r="$(curl -s -b "$jar" -H "Host: $N.test" "$(base "$N")/sub1/wp-admin/admin-ajax.php" --data-urlencode action=sgbackup_ajax \
+		--data-urlencode subaction=backupnow --data-urlencode "nonce=$(jq -r '.nonces.backupnow' <<<"$sub")" --data-urlencode 'data={}')"
+	check "subsite admin can back up their own site" jq -e '.success == true' <<<"$r"
+	local sts=""
+	for _ in $(seq 1 40); do
+		sts="$(wp "$N" --url="http://$N.test/sub1/" eval '$h = SiteGuard_Backup_History::get_history_raw(); krsort($h); foreach ($h as $t => $b) { if (!empty($b["is_subsite_backup"])) { echo $t; break; } }')"
+		[ -n "$sts" ] && break; wp "$N" --url="http://$N.test/sub1/" cron event run --due-now >/dev/null 2>&1; sleep 2
+	done
+	code="$(curl -s -o "$WORK/own.zip" -w '%{http_code}' -b "$jar" -H "Host: $N.test" \
+		"$(base "$N")/sub1/wp-admin/admin-ajax.php?action=sgbackup_download_bundle&timestamp=$sts&_wpnonce=$(jq -r '.nonces.download' <<<"$sub")")"
+	check "subsite admin can download their own backup (HTTP $code)" test "$code" = 200 -a -s "$WORK/own.zip"
+	finish "$N"
+}
+
 for f in "${FLOWS[@]}"; do
 	CTX="$f"; FAIL_BEFORE=$FAIL
 	echo "== $f"
@@ -266,6 +344,8 @@ for f in "${FLOWS[@]}"; do
 		move-single)     flow_move_single ;;
 		recover-network) flow_recover_network ;;
 		chunked-upload)  flow_move_single chunked ;;
+		recover-encrypted) flow_recover_encrypted ;;
+		subsite-admin-limits) flow_subsite_admin_limits ;;
 		*) bad "unknown flow" ;;
 	esac
 done

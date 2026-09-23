@@ -22,6 +22,7 @@ class SiteGuard_Backup_Method_Webdav extends SiteGuard_Backup_Module {
     private function get_base_url() {
         $options = $this->get_options();
         $url = rtrim($options['url'], '/');
+        $this->cleartext_warning($url, 'WebDAV');
         $path = trim($options['path'], '/');
         if (!empty($path)) {
             $url .= '/' . $path;
@@ -250,7 +251,10 @@ class SiteGuard_Backup_Method_Webdav extends SiteGuard_Backup_Module {
         if (is_wp_error($response)) return $response;
 
         $code = wp_remote_retrieve_response_code($response);
-        if ($code === 207 || $code === 200) return true;
+        if ($code === 207 || $code === 200) {
+            $warn = $this->cleartext_warning($this->get_options()['url'], 'WebDAV');
+            return '' === $warn ? true : array('success' => true, 'message' => 'Connected. Warning: ' . $warn);
+        }
         if ($code === 401) return new WP_Error('webdav_auth', 'Authentication failed.');
 
         return new WP_Error('webdav_test', "WebDAV test failed (HTTP {$code})");

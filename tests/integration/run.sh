@@ -273,8 +273,39 @@ t_remote_delete_names() {
 		echo json_encode($r->invoke($m, array("", ".", "..", "a/b.zip", "..\\x", "ok.zip", null, "x\0y")));')" = '["ok.zip"]'
 }
 
+# Every byte of awkward content must survive dump + restore unchanged.
+t_data_fidelity() {
+	local seed='
+		$v = array(
+			"sgx_json"    => "{\"url\":\"http:\\/\\/example.org\\/a\",\"pct\":\"100%\",\"q\":\"it\x27s\"}",
+			"sgx_ser"     => array("url" => "http://example.org/x", "nested" => array("é" => "中文 🐍", 7 => true, "f" => 1.5), "pct" => "%s %d %%"),
+			"sgx_unicode" => "héllo - 🐍 中文 עברית \u{1F600}",
+			"sgx_quotes"  => "single \x27 double \" backslash \\ tab\t newline\n cr\r end",
+			"sgx_pct"     => "100% LIKE \x27%a_b%\x27 {43ded7db8220f9320535a3aa7ca010fd0da6724531b8493a05e5c6388a06739f}",
+			"sgx_big"     => str_repeat("0123456789abcdef", 65536),
+		);
+		foreach ($v as $k => $x) update_option($k, $x, false);
+		$pid = wp_insert_post(array("post_title" => "SGX fidelity", "post_status" => "publish", "post_content" => $v["sgx_quotes"] . $v["sgx_unicode"]));
+		update_post_meta($pid, "sgx_bin", base64_encode(random_bytes(3000)));
+		update_option("sgx_fid_pid", $pid, false);'
+	PHP "$seed" >/dev/null
+	local fp='$o = array(); foreach (array("sgx_json","sgx_ser","sgx_unicode","sgx_quotes","sgx_pct","sgx_big") as $k) $o[$k] = get_option($k);
+		$pid = (int) get_option("sgx_fid_pid"); $o["content"] = get_post_field("post_content", $pid); $o["bin"] = get_post_meta($pid, "sgx_bin", true);
+		echo md5(serialize($o));'
+	local before; before="$(PHP "$fp")"
+	make_backup
+	local ts; ts="$(history_ts)"; ts="${ts##* }"
+	# Scramble everything, then restore.
+	PHP 'foreach (array("sgx_json","sgx_ser","sgx_unicode","sgx_quotes","sgx_pct","sgx_big") as $k) update_option($k, "changed", false);
+		$pid = (int) get_option("sgx_fid_pid"); wp_update_post(array("ID" => $pid, "post_content" => "changed")); update_post_meta($pid, "sgx_bin", "changed");' >/dev/null
+	check "content scrambled before restore" test "$(PHP "$fp")" != "$before"
+	W siteguardbackup restore "$ts" --entities=db --yes >/dev/null 2>&1
+	check "every byte restored (serialized, JSON, unicode, quotes, %, 1 MB value, binary meta)" test "$(PHP "$fp")" = "$before"
+	check "serialized option still an array" test "$(PHP 'echo is_array(get_option("sgx_ser")) ? "y" : "n";')" = y
+}
+
 # -----------------------------------------------------------------------------
-TESTS=(t_legacy_cleanup t_backup_verify t_delete_scoped t_retention_count t_retention_extrarule_db t_cleanup_symlink t_hostile_backup_dir t_restore_db t_pre_restore_backup t_delete_shared_file_protected t_remote_delete_names t_multisite_scoping)
+TESTS=(t_legacy_cleanup t_backup_verify t_delete_scoped t_retention_count t_retention_extrarule_db t_cleanup_symlink t_hostile_backup_dir t_restore_db t_data_fidelity t_pre_restore_backup t_delete_shared_file_protected t_remote_delete_names t_multisite_scoping)
 
 command -v jq >/dev/null || { echo "jq is required" >&2; exit 2; }
 

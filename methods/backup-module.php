@@ -169,6 +169,27 @@ abstract class SiteGuard_Backup_Module {
 	 */
 	abstract public function delete($files);
 
+	/** @var array Endpoints already warned about in this request. */
+	private $cleartext_warned = array();
+
+	/**
+	 * Warn (once per request) when credentials and archives go over plain http.
+	 * Not refused: a NAS on a private LAN is a legitimate setup, and silently
+	 * failing existing backups would be worse.
+	 *
+	 * @return string Warning text, or '' when the endpoint is encrypted.
+	 */
+	protected function cleartext_warning($url, $label) {
+		if (0 !== stripos((string) $url, 'http://')) return '';
+		$host = (string) parse_url($url, PHP_URL_HOST);
+		$msg = "{$label}: {$host} is reached over unencrypted http://, so the login and the backups travel in cleartext. Use https:// unless this is a private network.";
+		if (empty($this->cleartext_warned[$host])) {
+			$this->cleartext_warned[$host] = true;
+			if (class_exists('SiteGuard_Backup')) SiteGuard_Backup::instance()->log($msg, 'warning');
+		}
+		return $msg;
+	}
+
 	/**
 	 * Local path a download of remote file $name is streamed to.
 	 */
