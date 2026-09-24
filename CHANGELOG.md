@@ -1,5 +1,37 @@
 # Changelog
 
+## 1.5.1
+
+Released 2026-09-24. Build and release tooling only; the plugin code is
+unchanged from 1.5.0.
+
+### Build and release on GitLab
+- GitHub Actions is disabled for this project, so testing, packaging and
+  releasing now run as a GitLab CI pipeline (`.gitlab-ci.yml`), started by
+  pushing a `v<version>` tag or by hand from the GitLab web UI or API.
+- Test: every PHP file outside `vendor/` is linted on PHP 8.3, then the
+  standalone unit tests (delete guard, encryption) run as an unprivileged
+  user (`ci/test.sh`). A lint failure names the file and shows the error.
+- Package: `ci/build-zip.sh` builds the same `siteguardbackup/` zip as the old
+  GitHub workflow, leaving out tests, docs and CI files. A tagged build stops
+  unless the plugin header, `SGBACKUP_VERSION` and a CHANGELOG section all
+  match the tag. Files in the zip are always 0644 and folders 0755, whatever
+  the runner's umask, and the build fails if anything is group- or
+  world-writable.
+- Release: `ci/release.sh` uploads the zip to the project's Generic Package
+  Registry and creates or updates the GitLab release, using this version's
+  CHANGELOG section as the notes. Running it again updates the release in
+  place and never deletes release links or packages.
+- Job images are pinned (`php:8.3-cli-bookworm`, Alpine 3.22).
+
+### Documentation
+- README: how to cut a release on GitLab (push a tag whose version matches the
+  plugin header, `SGBACKUP_VERSION` and CHANGELOG.md), where the zip ends up,
+  and how this differs from the old GitHub workflow: pushes to master no longer
+  release automatically, and a tag pushed with `ci.skip` never releases.
+- tests/README.md points to the GitLab test job instead of the disabled GitHub
+  workflow; local test runs still go through the sandbox.
+
 ## 1.5.0
 
 A safety, correctness and migration release. Everything below was verified on
