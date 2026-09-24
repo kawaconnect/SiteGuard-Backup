@@ -1,0 +1,93 @@
+# GitLab CI for SiteGuard Backup (WordPress plugin).
+#
+# Ports .github/workflows/tests.yml and release.yml (GitHub Actions is
+# disabled for this repo; those files are kept but no longer run):
+#   test     -> php -l on every PHP file + the standalone unit tests, on
+#               PHP 8.3 as an unprivileged user (ci/test.sh)
+#   build    -> the installable siteguardbackup-<version>.zip (ci/build-zip.sh)
+#   release  -> zip to the Generic Package Registry + GitLab release with the
+#               CHANGELOG.md section as notes (ci/release.sh)
+#
+# Runs on v* tags and when started from the web UI / API, never on plain
+# pushes or merge requests. Set RELEASE_VERSION=v1.2.3 on a manual run of the
+# tag v1.2.3 to (re)publish that release. The integration suites under
+# tests/integration/ need disposable Docker WordPress instances and are not
+# run here; see tests/README.md.
+
+stages: [test, build, release]
+
+workflow:
+  rules:
+    - if: $CI_COMMIT_TAG =~ /^v/
+    - if: $CI_PIPELINE_SOURCE == "web"
+    - if: $CI_PIPELINE_SOURCE == "api"
+
+variables:
+  GIT_DEPTH: "1"
+
+.linux:
+  tags: [linux]
+  interruptible: true
+
+.version: &version
+  # v1.2.3 -> 1.2.3; untagged runs build the version in the plugin header.
+  - |
+    if [ -n "$RELEASE_VERSION" ]; then VERSION="${RELEASE_VERSION#v}"; elif [ -n "$CI_COMMIT_TAG" ]; then VERSION="${CI_COMMIT_TAG#v}"; else VERSION=""; fi
+    echo "Release version: ${VERSION:-none (untagged build)}"
+
+# ───────────────────────────── tests (gate) ─────────────────────────────
+
+# Same PHP minor as the GitHub workflow (8.3). The official image already has
+# openssl, hash and posix, which is all the unit tests use.
+test:
+  extends: .linux
+  stage: test
+  image: php:8.3-cli
+  script:
+    - *version
+    # A manual RELEASE_VERSION run must be started on that tag; refuse before
+    # building (the release job re-checks the tag's commit before publishing).
+    - |
+      if [ -n "$RELEASE_VERSION" ] && [ "$CI_COMMIT_TAG" != "v${RELEASE_VERSION#v}" ]; then
+        echo "RELEASE_VERSION=$RELEASE_VERSION but this pipeline runs on '${CI_COMMIT_TAG:-$CI_COMMIT_REF_NAME}'. Run it on the tag v${RELEASE_VERSION#v}."; exit 1
+      fi
+    - |
+      PHP_MINOR=$(php -r 'echo PHP_MAJOR_VERSION, ".", PHP_MINOR_VERSION;')
+      [ "$PHP_MINOR" = "8.3" ] || { echo "expected PHP 8.3, got $(php -r 'echo PHP_VERSION;')"; exit 1; }
+    # Lints, then runs tests/test-*.php as nobody (they refuse root).
+    - bash ci/test.sh
+
+# ───────────────────────────── plugin zip ─────────────────────────────
+
+build-zip:
+  extends: .linux
+  stage: build
+  image: alpine:3.20
+  needs: [test]
+  script:
+    - apk add --no-cache bash rsync zip unzip >/dev/null
+    - *version
+    # With a version, also checks the plugin header, SGBACKUP_VERSION and the
+    # CHANGELOG.md section all match it.
+    - bash ci/build-zip.sh "$VERSION" out
+    - ls -la out/
+  artifacts:
+    name: siteguardbackup-$CI_COMMIT_SHORT_SHA
+    paths: [out/*.zip]
+    expire_in: 30 days
+
+# ───────────────────────────── release ─────────────────────────────
+
+release:
+  extends: .linux
+  stage: release
+  image: alpine:3.20
+  needs: [build-zip]
+  rules:
+    - if: $CI_COMMIT_TAG =~ /^v/
+    - if: $RELEASE_VERSION
+  # Never auto-cancel a half-finished publish.
+  interruptible: false
+  script:
+    - apk add --no-cache curl jq >/dev/null
+    - sh ci/release.sh
