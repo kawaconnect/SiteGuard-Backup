@@ -44,7 +44,7 @@ fi
 
 stage=$(mktemp -d)
 mkdir "$stage/siteguardbackup"
-rsync -a \
+rsync -a --chmod=D755,F644 \
 	--exclude='.git/' \
 	--exclude='.github/' \
 	--exclude='.gitlab-ci.yml' \
@@ -66,4 +66,7 @@ zip_path="$(cd "$out" && pwd)/siteguardbackup-$version.zip"
 test ! -e "$zip_path" || { echo "$zip_path already exists; not overwriting it" >&2; exit 1; }
 (cd "$stage" && zip -q -r -X "$zip_path" siteguardbackup)
 unzip -tq "$zip_path"
+# Installed plugin files must not be group/world-writable (the runner checks out with umask 0000).
+bad_modes=$(unzip -Z "$zip_path" | awk '$1 ~ /^[-d]/ && (substr($1,6,1) == "w" || substr($1,9,1) == "w") {print $NF}')
+[ -z "$bad_modes" ] || { echo "group- or world-writable entries in the package:" >&2; echo "$bad_modes" >&2; exit 1; }
 echo "built $zip_path ($(du -h "$zip_path" | cut -f1), $(unzip -Z1 "$zip_path" | wc -l) entries)"

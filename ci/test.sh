@@ -33,7 +33,7 @@ if [ "$(id -u)" -eq 0 ]; then
 	nobody_uid=$(id -u nobody)
 	nobody_gid=$(id -g nobody)
 	run_unprivileged() { setpriv --reuid="$nobody_uid" --regid="$nobody_gid" --clear-groups --no-new-privs -- "$@"; }
-	run_unprivileged test -r includes/class-filesystem-functions.php ||
+	run_unprivileged test -r "$PWD/includes/class-filesystem-functions.php" ||
 		{ echo "nobody cannot read the checkout at $PWD; the tests cannot run unprivileged" >&2; exit 1; }
 	echo "running the unit tests as nobody"
 else
