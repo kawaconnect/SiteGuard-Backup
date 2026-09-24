@@ -15,11 +15,10 @@ API="$CI_API_V4_URL/projects/$CI_PROJECT_ID"
 H="JOB-TOKEN: $CI_JOB_TOKEN"
 PKG="$API/packages/generic/siteguardbackup/$VERSION"
 
-TAG_JSON=$(curl -fsS -H "$H" "$API/repository/tags/$TAG") || { echo "Tag $TAG does not exist in this project"; exit 1; }
-# A manual RELEASE_VERSION run must be started on the tag itself, or it would
-# publish some other commit's zip under this tag.
-TAG_SHA=$(printf '%s' "$TAG_JSON" | jq -r '.commit.id')
-[ "$TAG_SHA" = "$CI_COMMIT_SHA" ] || { echo "Tag $TAG points at $TAG_SHA but this pipeline built $CI_COMMIT_SHA. Run the pipeline on the tag ref $TAG."; exit 1; }
+# Publish only from a pipeline on the tag itself, so the zip is the tag's
+# commit. Checked locally, so the job token is only used for the Packages and
+# Releases APIs.
+[ "${CI_COMMIT_TAG:-}" = "$TAG" ] || { echo "This pipeline runs on '${CI_COMMIT_TAG:-$CI_COMMIT_REF_NAME}'. Run the pipeline on the tag ref $TAG."; exit 1; }
 
 # Legacy GitHub-style tags (v1.5.0-9ffc7c1) carry the plugin version before the suffix.
 PLUGIN_VERSION=$(printf '%s' "$VERSION" | sed 's/-[0-9a-f]\{7\}$//')
@@ -31,7 +30,7 @@ echo "uploading $name ($(du -h "$ZIP" | cut -f1))"
 curl -fsS -H "$H" --upload-file "$ZIP" "$PKG/$name" >/dev/null
 LINK=$(jq -cn --arg n "$name" --arg u "$PKG/$name" '{name:$n, url:$u, link_type:"package"}')
 
-NOTES=$(awk -v v="## $PLUGIN_VERSION" '$0 == v {on=1; next} /^## / && on {exit} on' CHANGELOG.md)
+NOTES=$(awk -v v="## $PLUGIN_VERSION" '$0 == v {on=1; next} /^## / && on {exit} on && !seen && /^[ \t]*$/ {next} on {seen=1; print}' CHANGELOG.md)
 [ -n "$NOTES" ] || NOTES="Version $PLUGIN_VERSION"
 NOTES=$(printf '%s\n\nInstall: WordPress > Plugins > Add New > Upload Plugin, then choose %s.\n\nCommit %s, built on GitLab CI.' "$NOTES" "$name" "$CI_COMMIT_SHA")
 
