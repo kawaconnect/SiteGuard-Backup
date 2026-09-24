@@ -41,9 +41,14 @@ jobs:
       - name: Create GitHub Release
         run: |
           COMMIT_MSG=$(git log -1 --pretty=%s)
+          VER="${{ steps.version.outputs.version }}"
+          # Use this version's CHANGELOG.md section as the notes when there is one.
+          NOTES=$(awk -v v="## $VER" '$0 == v {on=1; next} /^## / && on {exit} on' CHANGELOG.md 2>/dev/null || true)
+          if [ -z "$NOTES" ]; then NOTES="Version $VER"; fi
+          printf '%s\n\n%s\n' "$NOTES" "Commit ${{ github.sha }}" > release-notes.md
           gh release create "${{ steps.version.outputs.tag }}" \
             --title "$COMMIT_MSG" \
-            --notes "Version ${{ steps.version.outputs.version }} - ${{ github.sha }}" \
+            --notes-file release-notes.md \
             --target "${{ github.sha }}" \
             "siteguardbackup-${{ steps.version.outputs.version }}.zip"
         env:

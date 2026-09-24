@@ -26,8 +26,23 @@ Key multisite capabilities:
 - Handle cross-protocol replacements (HTTP/HTTPS) per subsite
 - Directly fix `wp_sitemeta`, `wp_site`, and `wp_blogs` via SQL to avoid search-replace artifacts
 - Preserve `site_admins` and user accounts during migration
-- Detect and remove duplicate plugins when restoring across sites with different installed versions
+- Detect duplicate plugin copies after a restore and deactivate the non-restored copy when both are active (nothing is deleted)
 - Dispatch scheduled backup cron events for subsites that don't receive regular traffic
+
+## Moving Sites
+
+Every direction is supported, either by downloading a backup zip and uploading it on the other site, or by sending it directly (below):
+
+| From | To | How to restore |
+|---|---|---|
+| Single site | Single site | Standard restore (migrate mode) |
+| Single site | Multisite, new or existing subsite | *Import as subsite* |
+| Multisite subsite | Single site | Standard restore (the subsite is converted) |
+| Multisite main site | Single site | Network backup, subsite mode *main only* |
+| Multisite subsite | Multisite subsite | *Import as subsite* |
+| Multisite network | Multisite network | Standard restore (domains remapped) |
+
+URLs are rewritten everywhere, including inside serialized data and escaped JSON, and the uploads path follows the site (`uploads/` <-> `uploads/sites/<id>/`). The destination keeps its own address, admin login and SiteGuard settings; the source's other users are added (matched by email, with their roles and passwords) and authorship is kept.
 
 ## Site-to-Site Migration
 
@@ -106,6 +121,15 @@ define('SGBACKUP_BACKUP_DIR', '/path/outside/webroot');
 You can also return a path from the `sgbackup_backup_dir` filter in an mu-plugin. Subsites use `site-<id>` subdirectories under the root.
 
 If no writable directory outside the web root exists, backups fall back to `wp-content/sgbackup` and every SiteGuard admin sees an error notice. On nginx, **nothing placed in that directory protects it**: `.htaccess` is Apache-only, and nginx serves named files straight off disk. Fix the location instead of relying on stub files. Downloads from the admin always go through a capability-checked PHP endpoint.
+
+## Safety
+
+- Every file or directory SiteGuard deletes must resolve inside an explicit, sane root (never `/`, a system directory, or a parent of WordPress); symlinks are never followed and failures are reported, not suppressed.
+- Restores that fail (wrong passphrase, SQL error) change nothing and are never mistaken for finished on retry. The optional pre-restore backup is complete or the restore does not start.
+- Imported SQL cannot touch other databases on the same server or run privilege/file operations.
+- On multisite, subsite administrators can only back up, download and restore their own subsite.
+
+Tests live in `tests/` and must only run on disposable hosts; see `tests/README.md`.
 
 ## Requirements
 
