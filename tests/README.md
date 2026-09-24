@@ -48,8 +48,9 @@ php tests/test-delete-guard.php      # or directly, as an unprivileged user
 php tests/test-encryption.php        # archive encryption: round trips, wrong key, truncation, tampering
 ```
 
-`.github/workflows/tests.yml` lints every PHP file and runs these on each push
-and pull request, on a disposable hosted runner as a non-root user.
+The GitLab pipeline's `test` job (`ci/test.sh`, see `.gitlab-ci.yml`) lints
+every PHP file and runs these in a throwaway PHP 8.3 container, as `nobody`, on
+each `v*` tag and on manual pipelines.
 
 ## Integration tests (real WordPress)
 

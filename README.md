@@ -131,6 +131,24 @@ If no writable directory outside the web root exists, backups fall back to `wp-c
 
 Tests live in `tests/` and must only run on disposable hosts; see `tests/README.md`.
 
+## Building / Releases (GitLab CI)
+
+The plugin is built and released by `.gitlab-ci.yml` on the GitLab runners (GitHub Actions is disabled; the old `.github/workflows/` files are kept but no longer run). Pipelines start only on a `v*` tag or when run from the GitLab UI / API, never on plain pushes or merge requests.
+
+| Job | Runs on | What it does |
+|---|---|---|
+| `test` | `php:8.3-cli` on the Linux (Kubernetes) runner | `ci/test.sh`: `php -l` on every PHP file outside `vendor/`, then `tests/test-*.php` (delete guard, encryption) as `nobody`, since those tests refuse root |
+| `build-zip` | `alpine:3.20` | `ci/build-zip.sh`: builds `siteguardbackup-<version>.zip` (one `siteguardbackup/` folder, without `docs/`, `tests/`, git and CI files), kept 30 days as a job artifact |
+| `release` | `alpine:3.20`, tags / `RELEASE_VERSION` only | `ci/release.sh`: uploads the zip to the project's Generic Package Registry (`siteguardbackup/<version>`) and creates or updates the GitLab release for the tag, with this version's `CHANGELOG.md` section as the notes |
+
+To cut a release:
+
+1. Bump the version in both places in `siteguardbackup.php` (the `Version:` header and `SGBACKUP_VERSION`) and add a `## <version>` section to `CHANGELOG.md`.
+2. Tag the commit `v<version>` (e.g. `v1.5.1`) and push the tag. The build fails if the tag, the header, `SGBACKUP_VERSION` and the CHANGELOG section do not all match.
+3. To publish again for an existing tag, run a pipeline on that tag from the UI with `RELEASE_VERSION=v<version>`. Re-running updates the release notes and the zip link in place; nothing is removed.
+
+Only the unit tests run in CI, on PHP 8.3 (as the GitHub workflow did); the plugin itself supports PHP 7.4+. The integration suites in `tests/integration/` need disposable Docker WordPress instances and are run by hand; see `tests/README.md`. To run the CI checks locally: `ci/test.sh` (as an unprivileged user, ideally in a throwaway container) and `ci/build-zip.sh [version] [out-dir]`.
+
 ## Requirements
 
 - WordPress 5.6+
