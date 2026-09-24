@@ -144,8 +144,10 @@ The plugin is built and released by `.gitlab-ci.yml` on the GitLab runners (GitH
 To cut a release:
 
 1. Bump the version in both places in `siteguardbackup.php` (the `Version:` header and `SGBACKUP_VERSION`) and add a `## <version>` section to `CHANGELOG.md`.
-2. Tag the commit `v<version>` (e.g. `v1.5.1`) and push the tag. The build fails if the tag, the header, `SGBACKUP_VERSION` and the CHANGELOG section do not all match.
+2. Tag the commit `v<version>` (e.g. `v1.5.1`) and push the tag (without `-o ci.skip`, which would skip the release pipeline). The build fails if the tag, the header, `SGBACKUP_VERSION` and the CHANGELOG section do not all match.
 3. To publish again for an existing tag, run a pipeline on that tag from the UI with `RELEASE_VERSION=v<version>`. Re-running updates the release notes and the zip link in place; nothing is removed.
+
+Differences from the old GitHub workflow: pushes to `master` no longer publish an automatic `v<version>-<sha7>` release (releases come only from `v*` tags), and the release is titled `SiteGuard Backup <version>` rather than the commit subject. Zip entries are normalised to 0644 files / 0755 folders whatever the checkout's umask, and the build fails if any entry is group- or world-writable.
 
 Only the unit tests run in CI, on PHP 8.3 (as the GitHub workflow did); the plugin itself supports PHP 7.4+. The integration suites in `tests/integration/` need disposable Docker WordPress instances and are run by hand; see `tests/README.md`. Because the unit tests call real delete functions, run them locally with `sudo tests/run-sandboxed.sh` (read-only `/`, private `/tmp`, tests as `nobody`). `ci/test.sh` is the CI entry point and has no sandbox of its own; use it only in CI or a throwaway container. Build the zip locally with `ci/build-zip.sh [version] [out-dir]`.
 
