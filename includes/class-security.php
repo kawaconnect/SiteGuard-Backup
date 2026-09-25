@@ -294,11 +294,11 @@ class SiteGuard_Backup_Security {
 		$remote = !empty($_SERVER['REMOTE_ADDR']) ? sanitize_text_field($_SERVER['REMOTE_ADDR']) : '';
 
 		// CF-Connecting-IP is only meaningful when the TCP peer actually is a
-		// proxy we trust (a Cloudflare edge, or a local reverse proxy on a
-		// loopback/private address). Honouring it unconditionally let any client
-		// pick its own "IP" and walk straight past the allowlist and the rate
-		// limiters. When the peer is a public non-Cloudflare address, the header
-		// is attacker-supplied and is ignored.
+		// proxy we trust: a Cloudflare edge, loopback, or a proxy named in
+		// SGBACKUP_TRUSTED_PROXIES. Honouring it from any other peer let a client
+		// pick its own "IP" and walk past the allowlist and the rate limiters (a
+		// LAN or container neighbour could even lock out another client's IP).
+		// X-Forwarded-For is never used.
 		if (!empty($_SERVER['HTTP_CF_CONNECTING_IP']) && $remote !== '' && self::is_trusted_proxy($remote)) {
 			$cf = sanitize_text_field($_SERVER['HTTP_CF_CONNECTING_IP']);
 			if (filter_var($cf, FILTER_VALIDATE_IP)) {
@@ -312,32 +312,86 @@ class SiteGuard_Backup_Security {
 	/**
 	 * Is $ip a proxy whose forwarded-client headers we accept?
 	 *
-	 * Cloudflare's published ranges plus loopback/RFC1918/link-local (a reverse
-	 * proxy or container gateway in front of PHP). Extend via the
-	 * sgbackup_trusted_proxy_cidrs filter.
+	 * By default only Cloudflare's published ranges and loopback. Private and
+	 * link-local ranges are NOT trusted: on a shared LAN or Docker network any
+	 * neighbour could otherwise forge CF-Connecting-IP. A site whose PHP sees a
+	 * local reverse proxy or tunnel (cloudflared, nginx in another container)
+	 * as REMOTE_ADDR lists that proxy in wp-config.php:
+	 *
+	 *   define('SGBACKUP_TRUSTED_PROXIES', '172.18.0.0/16');   // comma-separated IPs/CIDRs
+	 *
+	 * Developers can also extend the list via the sgbackup_trusted_proxy_cidrs filter.
 	 */
 	public static function is_trusted_proxy($ip) {
-		static $cidrs = null;
-		if (null === $cidrs) {
-			$cidrs = array(
-				// Loopback / private / link-local: a local reverse proxy
-				'127.0.0.0/8', '10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16', '169.254.0.0/16',
-				'::1/128', 'fc00::/7', 'fe80::/10',
-				// Cloudflare IPv4 (https://www.cloudflare.com/ips-v4)
-				'173.245.48.0/20', '103.21.244.0/22', '103.22.200.0/22', '103.31.4.0/22',
-				'141.101.64.0/18', '108.162.192.0/18', '190.93.240.0/20', '188.114.96.0/20',
-				'197.234.240.0/22', '198.41.128.0/17', '162.158.0.0/15', '104.16.0.0/13',
-				'104.24.0.0/14', '172.64.0.0/13', '131.0.72.0/22',
-				// Cloudflare IPv6 (https://www.cloudflare.com/ips-v6)
-				'2400:cb00::/32', '2606:4700::/32', '2803:f800::/32', '2405:b500::/32',
-				'2405:8100::/32', '2a06:98c0::/29', '2c0f:f248::/32',
-			);
-			$cidrs = (array) apply_filters('sgbackup_trusted_proxy_cidrs', $cidrs);
-		}
-		foreach ($cidrs as $cidr) {
+		$ip = self::unmap_ipv4($ip);
+		foreach (self::trusted_proxy_cidrs() as $cidr) {
 			if (self::ip_in_cidr($ip, $cidr)) return true;
 		}
 		return false;
+	}
+
+	/**
+	 * The CIDRs whose CF-Connecting-IP header is honoured: loopback, Cloudflare,
+	 * and valid entries of SGBACKUP_TRUSTED_PROXIES, then the filter.
+	 *
+	 * @return array
+	 */
+	public static function trusted_proxy_cidrs() {
+		$cidrs = array(
+			// Loopback: a reverse proxy on the same host
+			'127.0.0.0/8', '::1/128',
+			// Cloudflare IPv4 (https://www.cloudflare.com/ips-v4)
+			'173.245.48.0/20', '103.21.244.0/22', '103.22.200.0/22', '103.31.4.0/22',
+			'141.101.64.0/18', '108.162.192.0/18', '190.93.240.0/20', '188.114.96.0/20',
+			'197.234.240.0/22', '198.41.128.0/17', '162.158.0.0/15', '104.16.0.0/13',
+			'104.24.0.0/14', '172.64.0.0/13', '131.0.72.0/22',
+			// Cloudflare IPv6 (https://www.cloudflare.com/ips-v6)
+			'2400:cb00::/32', '2606:4700::/32', '2803:f800::/32', '2405:b500::/32',
+			'2405:8100::/32', '2a06:98c0::/29', '2c0f:f248::/32',
+		);
+		if (defined('SGBACKUP_TRUSTED_PROXIES')) {
+			$cidrs = array_merge($cidrs, self::parse_proxy_list(SGBACKUP_TRUSTED_PROXIES));
+		}
+		return (array) apply_filters('sgbackup_trusted_proxy_cidrs', $cidrs);
+	}
+
+	/**
+	 * Parse a comma/space-separated list of IPs and CIDRs (SGBACKUP_TRUSTED_PROXIES).
+	 * A bare IP becomes a /32 or /128; malformed entries are dropped.
+	 *
+	 * @param mixed $raw String, or an array of entries.
+	 * @return array Valid CIDRs.
+	 */
+	public static function parse_proxy_list($raw) {
+		$entries = is_array($raw) ? $raw : preg_split('/[\s,]+/', (string) $raw, -1, PREG_SPLIT_NO_EMPTY);
+		$out = array();
+		foreach ($entries as $entry) {
+			$entry = trim((string) $entry);
+			$parts = explode('/', $entry, 2);
+			if (!filter_var($parts[0], FILTER_VALIDATE_IP)) continue;
+			$max = (false !== strpos($parts[0], ':')) ? 128 : 32;
+			if (1 === count($parts)) {
+				$out[] = $parts[0] . '/' . $max;
+			} elseif (ctype_digit($parts[1]) && (int) $parts[1] <= $max) {
+				$out[] = $parts[0] . '/' . (int) $parts[1];
+			}
+		}
+		return $out;
+	}
+
+	/**
+	 * An IPv4-mapped IPv6 address (::ffff:192.0.2.1, what a dual-stack socket
+	 * reports for an IPv4 client) as plain IPv4; anything else unchanged.
+	 */
+	public static function unmap_ipv4($ip) {
+		$ip = (string) $ip;
+		if (false !== strpos($ip, ':') && filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV6)) {
+			$bin = inet_pton($ip);
+			if (false !== $bin && 0 === strpos($bin, str_repeat("\0", 10) . "\xff\xff")) {
+				return inet_ntop(substr($bin, 12));
+			}
+		}
+		return $ip;
 	}
 
 	/**

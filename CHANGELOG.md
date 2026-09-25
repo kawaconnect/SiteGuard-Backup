@@ -1,5 +1,29 @@
 # Changelog
 
+## Unreleased
+
+### Security fixes from a review
+- Client IP: `CF-Connecting-IP` is honoured only when the connection comes
+  from a Cloudflare edge or loopback. Up to 1.5.3 any private or link-local
+  peer (10/8, 172.16/12, 192.168/16, 169.254/16, fc00::/7, fe80::/10) was
+  trusted too, so a host on the same LAN or Docker network could pick its own
+  IP, dodge the health API rate limiter or lock out the bot's IP. Proxies in
+  front of PHP (cloudflared, an nginx container) are listed with the new
+  `SGBACKUP_TRUSTED_PROXIES` constant in `wp-config.php` (comma-separated IPs
+  or CIDRs). **Sites behind a local proxy or tunnel must set it**, or every
+  visitor shares the proxy's IP for the IP allowlist, rate limits and audit
+  log. Sites reached straight from Cloudflare or directly are unchanged.
+  `X-Forwarded-For` is still never used.
+- Health REST API: every response of `/health*`, errors included, sends
+  `Cache-Control: no-store, private, max-age=0` and `Vary: Authorization`.
+- Health REST API: the key check ran twice per request (WordPress checks
+  permissions again for the `Allow` header), doubling the bcrypt work and
+  counting each failed attempt twice, so the limiter answered 429 after 10
+  bad keys instead of 20. It runs once per request now. IPv6 clients are
+  rate-limited per /64.
+- Uptime Kuma push: redirects are no longer followed (was up to 2), so a
+  push URL cannot bounce the heartbeat and its token to another host.
+
 ## 1.5.3
 
 ### Uptime Kuma push for the health monitor

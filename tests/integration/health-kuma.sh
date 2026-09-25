@@ -91,6 +91,7 @@ SECRET="$(openssl rand -hex 10)"
 GOOD="https://kuma.test/api/push/good$SECRET"
 PAUSED="https://kuma.test/api/push/paused$SECRET"
 SLOW="https://kuma.test/api/push/slow$SECRET"
+REDIR="https://kuma.test/api/push/redir$SECRET"
 NODNS="https://nokuma.invalid/api/push/good$SECRET"
 
 setup_instance() {
@@ -237,6 +238,19 @@ t_push_failures() {
 	no_secret "debug.log never contains the token" "$log"
 }
 
+# A push answered with a redirect is not followed (the token would go wherever
+# the Location points) and counts as a failed push.
+t_push_redirect() {
+	W siteguardbackup health_kuma --push-url="$REDIR" >/dev/null
+	kuma_reset
+	local out; out="$(WE siteguardbackup health_check)"
+	check "redirect: exactly one request, to the push path (no follow)" test "$(kuma_count) $(kuma_last path)" = "1 /api/push/redir$SECRET"
+	check "redirect: recorded as failed with HTTP 302" test "$(PHP '$l = SiteGuard_Backup_Health_Kuma::get_last(); echo json_encode(array($l["ok"], $l["code"]));')" = "[false,302]"
+	check "redirect: health_check reports the failed push" grep -q "last push FAILED (status=up, HTTP 302" <<<"$out"
+	no_secret "redirect: output masks the token" "$out"
+	W siteguardbackup health_kuma --push-url="$GOOD" >/dev/null
+}
+
 t_run_error() {
 	W siteguardbackup health_kuma --push-url="$GOOD" >/dev/null
 	kuma_reset
@@ -347,7 +361,7 @@ t_restore_keeps_url() {
 	no_secret "restore log" "$(PHP '$d = SiteGuard_Backup_Options::instance()->get_backup_dir(); $l = glob($d . "/log.*.txt"); rsort($l); echo $l ? file_get_contents($l[0]) : "";')"
 }
 
-TESTS=(t_cli_set t_push_up t_push_down t_push_failures t_run_error t_cron t_cli_test_clear t_no_leaks t_admin_page t_multisite_network t_restore_keeps_url)
+TESTS=(t_cli_set t_push_up t_push_down t_push_failures t_push_redirect t_run_error t_cron t_cli_test_clear t_no_leaks t_admin_page t_multisite_network t_restore_keeps_url)
 
 for INST in "$SINGLE" "$MULTI"; do
 	echo "== instance $INST"

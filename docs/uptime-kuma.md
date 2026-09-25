@@ -72,7 +72,9 @@ The URL must be `https://` and its path must end in `/api/push/<token>`
 (sub-paths in front are fine for Kuma behind a reverse proxy). The query
 string is dropped. The Kuma host must accept requests from the WordPress
 server; for a Kuma on a LAN, that means publishing it over HTTPS somewhere
-the server can reach.
+the server can reach. Redirects are not followed: use the final URL (for
+example the `https://` one a reverse proxy redirects to, with the right
+host). A push that is answered with a redirect fails as `HTTP 301`/`302`.
 
 ## WP-Cron must run on time
 

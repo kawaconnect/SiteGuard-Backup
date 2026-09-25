@@ -427,9 +427,13 @@ class SiteGuard_Backup_Health_Kuma {
 			'msg'    => $msg,
 			'ping'   => max(0, intval($ping_ms)),
 		);
+		// No redirects: a push URL answers directly, and following one would send
+		// the heartbeat (and the token in its path) wherever the server points.
+		// Not wp_safe_remote_get(): self-hosted Kuma usually sits on a private
+		// address and port 3001, both of which it refuses.
 		$response = wp_remote_get(self::build_push_url($url, $status, $msg, $ping_ms), array(
 			'timeout'             => self::TIMEOUT,
-			'redirection'         => 2,
+			'redirection'         => 0,
 			'limit_response_size' => 8192,
 			'user-agent'          => 'SiteGuard-Health-Monitor/' . (defined('SGBACKUP_VERSION') ? SGBACKUP_VERSION : ''),
 		));

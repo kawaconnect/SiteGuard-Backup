@@ -9,6 +9,7 @@
  *   /api/push/good...   200 {"ok":true}
  *   /api/push/paused... 404 {"ok":false,"msg":"Monitor not found or not active."}
  *   /api/push/slow...   waits 20 s, then 200 (the plugin gives up after 10 s)
+ *   /api/push/redir<x>  302 to /api/push/good<x> (the plugin must not follow)
  *   anything else       404
  *   everything          503 while /tmp/kuma-down holds "1" (Kuma itself down)
  * Runs as a throwaway container on the instance mesh; test use only.
@@ -53,6 +54,7 @@ while (true) {
 
 	$code = 404;
 	$body = '{"ok":false,"msg":"Not found"}';
+	$extra = '';
 	if ('1' === trim((string) @file_get_contents('/tmp/kuma-down'))) {
 		$code = 503; $body = 'Service Unavailable';
 	} elseif (preg_match('#^/api/push/good#', $path)) {
@@ -62,7 +64,10 @@ while (true) {
 	} elseif (preg_match('#^/api/push/slow#', $path)) {
 		sleep(20);
 		$code = 200; $body = '{"ok":true}';
+	} elseif (preg_match('#^/api/push/redir(.*)$#', $path, $m)) {
+		$code = 302; $body = '{"ok":true}';
+		$extra = 'Location: https://kuma.test/api/push/good' . $m[1] . '?' . (string) parse_url($target, PHP_URL_QUERY) . "\r\n";
 	}
-	@fwrite($conn, "HTTP/1.1 $code X\r\nContent-Type: application/json\r\nContent-Length: " . strlen($body) . "\r\nConnection: close\r\n\r\n" . $body);
+	@fwrite($conn, "HTTP/1.1 $code X\r\n" . $extra . "Content-Type: application/json\r\nContent-Length: " . strlen($body) . "\r\nConnection: close\r\n\r\n" . $body);
 	@fclose($conn);
 }

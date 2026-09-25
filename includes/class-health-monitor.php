@@ -964,15 +964,33 @@ class SiteGuard_Backup_Health_Monitor {
 	}
 
 	public function is_rate_limited($ip) {
-		$key = 'sgbackup_health_rl_' . md5($ip);
+		$key = 'sgbackup_health_rl_' . md5(self::rate_limit_bucket($ip));
 		$attempts = (int) get_transient($key);
 		return $attempts >= self::$AUTH_RATE_LIMIT;
 	}
 
 	public function record_failed_auth($ip) {
-		$key = 'sgbackup_health_rl_' . md5($ip);
+		$key = 'sgbackup_health_rl_' . md5(self::rate_limit_bucket($ip));
 		$attempts = (int) get_transient($key);
 		set_transient($key, $attempts + 1, self::$AUTH_RATE_WINDOW);
+	}
+
+	/**
+	 * What the failed-auth limiter counts against: the IPv4 address itself, or
+	 * the /64 of an IPv6 address (one host usually holds a whole /64, so counting
+	 * per address would give it 2^64 fresh buckets). IPv4-mapped IPv6 counts as
+	 * the IPv4 address.
+	 */
+	public static function rate_limit_bucket($ip) {
+		$ip = (string) $ip;
+		if (false === strpos($ip, ':') || !filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV6)) {
+			return $ip;
+		}
+		$bin = inet_pton($ip);
+		if (0 === strpos($bin, str_repeat("\0", 10) . "\xff\xff")) {
+			return inet_ntop(substr($bin, 12));
+		}
+		return inet_ntop(substr($bin, 0, 8) . str_repeat("\0", 8)) . '/64';
 	}
 
 	public static function get_client_ip() {

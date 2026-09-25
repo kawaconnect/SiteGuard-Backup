@@ -20,7 +20,20 @@ Authorization: Bearer <api_key>
 
 Generate the key in **SiteGuard Backup → Health** → "Generate New Key". The plaintext key is shown **once**; only a hash is stored. Losing the key means regenerating. 48-char random string, stored via `wp_hash_password()`.
 
-**Rate limiting.** 20 failed auth attempts per 5-minute window per client IP triggers HTTP 429. The client IP is `REMOTE_ADDR`, or `CF-Connecting-IP` when the connecting peer is a trusted proxy. `X-Forwarded-For` is never used.
+**Rate limiting.** 20 failed auth attempts per 5-minute window per client IP (per /64 for IPv6) trigger HTTP 429. Each request counts at most once, even though WordPress checks permissions twice (the second time for the `Allow` header).
+
+**Client IP.** The client IP is `REMOTE_ADDR`, or `CF-Connecting-IP` when `REMOTE_ADDR` is a trusted proxy: a Cloudflare edge address, loopback (`127.0.0.0/8`, `::1`), or an address listed in `SGBACKUP_TRUSTED_PROXIES`. `X-Forwarded-For` is never used. The same IP is used for the admin IP allowlist, the audit log and the remote-send rate limit. Private and link-local addresses are not trusted by default (up to 1.5.3 they were), because any other host on the same LAN or Docker network could then send a forged `CF-Connecting-IP`, dodge the limiter or lock out the bot's IP.
+
+When PHP sees a local reverse proxy or tunnel as `REMOTE_ADDR` (cloudflared, or nginx, in another container; a standby in Docker is the usual case), list it in `wp-config.php`. Otherwise every client that comes through it shares one rate-limit bucket, and 20 bad requests from anyone lock out the bot too:
+
+```php
+// comma-separated IPs or CIDRs of the proxies in front of PHP, e.g. the Docker network cloudflared connects from
+define('SGBACKUP_TRUSTED_PROXIES', '172.19.0.0/16');
+```
+
+Only list networks on which every host is a proxy you run: whoever can connect from a listed address can set their own client IP. The nginx access log (`$remote_addr`) shows which address PHP sees. Malformed entries are ignored. If nginx itself rewrites `$remote_addr` with `real_ip_header CF-Connecting-IP`, PHP already sees the client IP and nothing needs to be set.
+
+**Caching.** Every response of `/health`, `/health/ping` and `/health/check`, errors included, carries `Cache-Control: no-store, private, max-age=0` and `Vary: Authorization`, so no browser, proxy or CDN stores one caller's answer.
 
 **Disabled state.** If the health monitor is disabled in admin, all endpoints return `404 {"code":"disabled"}`. `define('SGBACKUP_HEALTH_ENABLED', true);` in `wp-config.php` overrides the setting on the main site. Use a real boolean (`true`/`false`, or `wp config set SGBACKUP_HEALTH_ENABLED true --raw`); a value that is not a boolean is ignored and the Health tab warns.
 
@@ -218,6 +231,8 @@ For the second case, give the standby's main site production's key in one of the
    wp config set SGBACKUP_HEALTH_ENABLED true --raw --type=constant
    ```
 
+   A standby in Docker behind a cloudflared tunnel or an nginx container also needs `SGBACKUP_TRUSTED_PROXIES` (see [Client IP](#authentication)), or the bot shares one rate-limit bucket with every other visitor.
+
    **Docker Compose (`WORDPRESS_CONFIG_EXTRA`, `.env`):** Compose reads every `$` in those values as the start of a variable. `$wp` and `$abc…` become empty and `$2y` is an error, so the hash arrives broken. Write every `$` as `$$` there, or use `wp config set` / a mounted `wp-config.php` instead. The Health tab and `wp siteguardbackup health_api_key` report a mangled hash as a malformed `SGBACKUP_HEALTH_API_KEY_HASH` entry, and it is ignored; check that line after setting the pin.
 2. **Set the same key on both.** `printf %s "$KEY" | wp siteguardbackup health_api_key --set` stores the key the bot already has (read from STDIN, or prompted for with hidden input; at least 32 letters and digits). This replaces the standby's own key.
 3. **Let restores bring production's key.** Set the standby's Settings → "Default Health Monitor Key on Restore" to "Use the key from the backup". This covers restores through SiteGuard only, and replaces the standby's own key on every restore.
@@ -237,7 +252,9 @@ A downgrade to 1.5.1 keeps the stored key working. The `wp-config.php` pin, the 
 
 ## Changelog
 
-- **Unreleased** - `/health/ping` adds `key` (`fp`, `source`). The monitor key survives restores and failover: health key policy, key fingerprints, "Switch to the backup's key", `wp-config.php` pin (`SGBACKUP_HEALTH_API_KEY_HASH`, `SGBACKUP_HEALTH_ENABLED`), `health_api_key --set/--print-hash/--adopt-restored/--format`.
+- **Unreleased** - every response sends `Cache-Control: no-store, private, max-age=0` and `Vary: Authorization`; a failed attempt counts once (429 after 20, not 10); IPv6 is rate-limited per /64; `CF-Connecting-IP` is trusted only from Cloudflare, loopback and `SGBACKUP_TRUSTED_PROXIES`.
+- **1.5.3** - no API change (the Uptime Kuma push is separate and not part of any REST payload).
+- **1.5.2** - `/health/ping` adds `key` (`fp`, `source`). The monitor key survives restores and failover: health key policy, key fingerprints, "Switch to the backup's key", `wp-config.php` pin (`SGBACKUP_HEALTH_API_KEY_HASH`, `SGBACKUP_HEALTH_ENABLED`), `health_api_key --set/--print-hash/--adopt-restored/--format`.
 
 - **1.4.9** - Added `summary`, `alerts`, `ssl_checked_at`, `ssl_warn_days`, `/health/ping`, `POST /health/check`. Bumped `api_version` to 2. Per-site SSL fields (`ssl_ok`, `ssl_error`, `ssl_stale`, `ssl_last_success`, `ssl_checked_at`) exposed in the `sites` array.
 - **1.4.4** - `ssl_error` messages now include the domain prefix ("SSL probe failed for {domain}: ...").

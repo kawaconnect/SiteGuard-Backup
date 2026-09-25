@@ -465,6 +465,25 @@ function sgbackup_register_health_api() {
 add_action('rest_api_init', 'sgbackup_register_health_api');
 
 /**
+ * Health responses carry site status and are keyed on the bearer token: no
+ * cache (browser, proxy, CDN) may store them or serve one caller's answer to
+ * another. Applies to every response of the health routes, errors included.
+ */
+function sgbackup_health_api_no_store($result, $server, $request) {
+	$route = strtolower((string) $request->get_route());
+	if ('/sgbackup/v1/health' !== $route && 0 !== strpos($route, '/sgbackup/v1/health/')) {
+		return $result;
+	}
+	if ($result instanceof WP_HTTP_Response) {
+		$result->header('Cache-Control', 'no-store, private, max-age=0');
+		// WordPress adds its own "Vary: Origin" (CORS) later, as a separate header.
+		$result->header('Vary', 'Authorization');
+	}
+	return $result;
+}
+add_filter('rest_post_dispatch', 'sgbackup_health_api_no_store', 10, 3);
+
+/**
  * Bot-facing auth smoke test. Returns 200 + small body so clients can verify
  * the API key without pulling the full site list (and without triggering a
  * health run).
@@ -513,7 +532,28 @@ function sgbackup_health_api_check_callback(WP_REST_Request $request) {
 	return sgbackup_health_api_callback($request);
 }
 
+/**
+ * permission_callback of the health routes.
+ *
+ * WordPress calls it twice per request: to dispatch, and again from
+ * rest_send_allow_header() to build the Allow header. The result is kept for the
+ * request (same request object and Authorization header), so a bad key costs
+ * one bcrypt check and counts as one failed attempt, not two.
+ */
 function sgbackup_health_api_auth(WP_REST_Request $request) {
+	static $memo = null;
+	// Holding the request object (not its id) means a later request can never be
+	// mistaken for this one, even in a long-running process that reuses ids.
+	$auth = hash('sha256', (string) $request->get_header('Authorization'));
+	if (null !== $memo && $memo['request'] === $request && $memo['auth'] === $auth) {
+		return $memo['result'];
+	}
+	$result = sgbackup_health_api_check_auth($request);
+	$memo = array('request' => $request, 'auth' => $auth, 'result' => $result);
+	return $result;
+}
+
+function sgbackup_health_api_check_auth(WP_REST_Request $request) {
 	sgbackup_load_classes();
 	require_once SGBACKUP_DIR . 'includes/class-health-monitor.php';
 	$monitor = SiteGuard_Backup_Health_Monitor::instance();

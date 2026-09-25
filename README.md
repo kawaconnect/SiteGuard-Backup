@@ -144,6 +144,8 @@ If no writable directory outside the web root exists, backups fall back to `wp-c
 - Imported SQL cannot touch other databases on the same server or run privilege/file operations.
 - On multisite, subsite administrators can only back up, download and restore their own subsite.
 
+- The client IP (IP allowlist, rate limits, audit log) is `REMOTE_ADDR`; `CF-Connecting-IP` is used only when the connection comes from Cloudflare or loopback. `X-Forwarded-For` is never used. Behind a local proxy or tunnel in another container (cloudflared, nginx), for example a standby in Docker, list that proxy in `wp-config.php`, or all visitors share its IP: `define('SGBACKUP_TRUSTED_PROXIES', '172.19.0.0/16');` (comma-separated IPs or CIDRs). See [docs/health-api.md](docs/health-api.md#authentication).
+
 Tests live in `tests/` and must only run on disposable hosts; see `tests/README.md`.
 
 ## Building / Releases (GitLab CI)
