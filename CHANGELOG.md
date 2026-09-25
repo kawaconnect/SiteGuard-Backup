@@ -58,6 +58,9 @@
   overwriting the hash.
 - A subsite restored into a single site without a key keeps the subsite's key
   (it used to be dropped).
+- On a network whose main site keeps its monitor settings in `wp_sitemeta`, a
+  backup's per-site setting row (for example `enabled=0`) no longer hides this
+  site's setting: the kept key answered `404 disabled`.
 - The scheduled health check is set to the restored interval (or removed when
   the monitor is off) at the end of a restore, and cached rate-limit counters
   are cleared.

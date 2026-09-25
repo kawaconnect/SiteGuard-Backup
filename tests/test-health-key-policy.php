@@ -126,10 +126,12 @@ foreach (array('keep', 'backup') as $policy) {
 				check("$t: enabled from the backup", effective_value($final, $EN) === effective_value($brows, $EN));
 				check("$t: interval from the backup", effective_value($final, $IV) === effective_value($brows, $IV));
 			} else {
-				// This site's setting rows, over any the backup alone has.
-				$merged = array_merge($brows, $drows);
-				check("$t: enabled kept", effective_value($final, $EN) === effective_value($merged, $EN));
-				check("$t: interval kept", effective_value($final, $IV) === effective_value($merged, $IV));
+				// This site's settings, else any the backup alone has.
+				foreach (array('enabled' => $EN, 'interval' => $IV) as $label => $name) {
+					$want = effective_value($drows, $name);
+					if (null === $want) $want = effective_value($brows, $name);
+					check("$t: $label kept", effective_value($final, $name) === $want);
+				}
 			}
 
 			check("$t: declined hash only when the backup's key was not applied",
@@ -161,6 +163,19 @@ foreach (array('keep', 'backup') as $policy) {
 $plan = $P::resolve('keep', $dests['sitemeta-only'][0], $backups['hash'][0], $ctx);
 check('sitemeta-only destination key is not hidden by the backup\'s per-site row',
 	!isset($plan['final']["options:$H"]) && $plan['final']["sitemeta:$H"] === $HA && in_array("options:$H", $plan['delete'], true));
+
+// Settings kept only in wp_sitemeta are not hidden by the backup's per-site rows
+// either: a backup's enabled=0 made the kept key answer 404 "disabled".
+$shadow_dest = array("sitemeta:$H" => $HA, "sitemeta:$EN" => '1', "sitemeta:$IV" => 'every5min');
+$shadow_backup = array("options:$H" => $HB, "options:$EN" => '0', "options:$IV" => 'everyhour', "options:$TO" => '5', "sitemeta:$EN" => '1');
+$plan = $P::resolve('keep', $shadow_dest, $shadow_backup, $ctx);
+check('sitemeta-only settings: this site\'s key kept', 'kept_site' === $plan['outcome'] && $plan['final']["sitemeta:$H"] === $HA);
+check('sitemeta-only settings: the backup\'s per-site enabled=0 is dropped', !isset($plan['final']["options:$EN"]) && in_array("options:$EN", $plan['delete'], true)
+	&& '1' === effective_value($plan['final'], $EN));
+check('sitemeta-only settings: this site\'s interval is not hidden', 'every5min' === effective_value($plan['final'], $IV));
+check('sitemeta-only settings: a setting this site lacks still comes from the backup', '5' === $plan['final']["options:$TO"]);
+$again = $P::resolve('keep', $plan['final'], $plan['final'], $ctx);
+check('sitemeta-only settings: idempotent', 'unchanged' === $again['outcome'] && array() === $again['write'] && array() === $again['delete']);
 
 $plan = $P::resolve('keep', $dests['enabled0'][0], $backups['hash'][0], $ctx);
 check('keyless standby with enabled=0 adopts the backup\'s unit', 'adopted_backup' === $plan['outcome'] && '1' === $plan['final']["options:$EN"]);

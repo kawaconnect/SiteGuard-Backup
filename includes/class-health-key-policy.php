@@ -155,14 +155,17 @@ class SiteGuard_Backup_Health_Key_Policy {
 		// The winning side's rows. Credential rows only the other side has are
 		// never kept (a backup's per-site row would hide this site's sitemeta
 		// key). When this site wins, settings rows only the backup has survive,
-		// as they always have.
+		// as they always have, except a per-site row for a setting this site keeps
+		// in wp_sitemeta: it would hide that setting the same way (a backup's
+		// enabled=0 turned the kept key into 404 "disabled").
 		$final = array();
 		$winner = ('backup' === $source) ? $imported : $dest;
 		$winner_side = ('backup' === $source) ? $b : $d;
 		foreach (self::UNIT as $name) {
 			foreach (self::SCOPES as $scope) {
 				$v = self::row($winner, $scope . $name);
-				if (null === $v && 'destination' === $source && in_array($name, self::SETTINGS, true)) {
+				if (null === $v && 'destination' === $source && in_array($name, self::SETTINGS, true)
+					&& !('options:' === $scope && null !== self::effective($dest, $name))) {
 					$v = self::row($imported, $scope . $name);
 				}
 				if (null !== $v && ('' !== $v || !in_array($name, self::CREDENTIALS, true))) {

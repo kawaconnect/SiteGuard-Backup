@@ -414,7 +414,20 @@ H12() { # multisite main site
 	restore "$M" "$ts" --entities=db --subsite-mode=mirror >/dev/null; clear_rl "$M"
 	expect_auth "sitemeta-only key still works after a keep restore" 200 "$M" "$ks"
 	expect_auth "the backup's blog-1 key does not shadow it" "403 forbidden" "$M" "$k1"
-	E "$M" 'delete_site_option("sgbackup_health_api_key_hash"); echo 1;' >/dev/null
+	# This site's key and switch only in wp_sitemeta; the backup has enabled=0 on
+	# blog 1. The kept key must not turn into 404 disabled (1.5.1 did).
+	local ts0
+	W "$M" option update sgbackup_health_enabled 0 >/dev/null
+	ts0="$(make_backup "$M")"
+	E "$M" "global \$wpdb; foreach (array('sgbackup_health_api_key_hash', 'sgbackup_health_api_key_meta', 'sgbackup_health_enabled') as \$n) \$wpdb->delete(\$wpdb->options, array('option_name' => \$n));
+		update_site_option('sgbackup_health_api_key_hash', wp_hash_password('$ks')); update_site_option('sgbackup_health_enabled', 1); wp_cache_flush(); echo 1;" >/dev/null
+	clear_rl "$M"
+	expect_auth "sitemeta-only settings: key works before" 200 "$M" "$ks"
+	restore "$M" "$ts0" --entities=db --subsite-mode=mirror >/dev/null; clear_rl "$M"
+	expect_auth "sitemeta-only settings: the backup's blog-1 enabled=0 does not disable it" 200 "$M" "$ks"
+	check "sitemeta-only settings: no blog-1 enabled row left" no_row "$M" sgbackup_health_enabled
+	E "$M" 'delete_site_option("sgbackup_health_api_key_hash"); delete_site_option("sgbackup_health_enabled"); echo 1;' >/dev/null
+	W "$M" siteguardbackup health_config enable >/dev/null
 	# Import a subsite backup as a subsite with --health-key=backup: the main site is untouched.
 	if [ -n "$sub" ]; then
 		local k3 subts sid main_before
