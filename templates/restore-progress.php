@@ -73,6 +73,15 @@
 				</select>
 			</label>
 		</p>
+		<p id="sgbackup-health-key-row">
+			<label><?php esc_html_e('Health monitor API key:', 'siteguardbackup'); ?>
+				<select name="sgbackup_health_key_policy">
+					<option value="keep"><?php esc_html_e("Keep this site's health monitor API key (default)", 'siteguardbackup'); ?></option>
+					<option value="backup"><?php esc_html_e('Use the API key from the backup (e.g. restoring production onto a failover server)', 'siteguardbackup'); ?></option>
+				</select>
+			</label>
+			<br /><span class="description"><?php esc_html_e("Only applies when the database is restored. If this site has no key, the backup's key is used either way. Keys are stored as hashes; nothing secret is shown.", 'siteguardbackup'); ?></span>
+		</p>
 		<p id="sgbackup-subsite-mode-row" style="display:none;">
 			<label><?php esc_html_e('Multisite subsite handling:', 'siteguardbackup'); ?>
 				<select name="sgbackup_subsite_mode">

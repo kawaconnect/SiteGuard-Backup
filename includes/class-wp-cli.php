@@ -333,12 +333,19 @@ class SiteGuard_Backup_CLI_Command extends WP_CLI_Command {
      * [--restore-themes=<items>]
      * : Comma-separated theme directories to restore (selective).
      *
+     * [--health-key=<policy>]
+     * : Health monitor API key after a database restore: keep (this site's key)
+     *   or backup (the backup's key, e.g. production restored onto a failover
+     *   server). Overrides a preset; falls back to the site default, then keep.
+     *   If this site has no key, the backup's key is used either way.
+     *
      * [--yes]
      * : Skip the confirmation prompt (for scripted/non-interactive use).
      *
      * ## EXAMPLES
      *
      *     wp siteguardbackup restore 1709283600
+     *     wp siteguardbackup restore 1709283600 --entities=db --health-key=backup
      *     wp siteguardbackup restore 1709283600 --entities=db,plugins
      *     wp siteguardbackup restore 1709283600 --preset="migration-standard"
      *     wp siteguardbackup restore 1709283600 --db-restore-mode=migrate
@@ -412,6 +419,11 @@ class SiteGuard_Backup_CLI_Command extends WP_CLI_Command {
                 WP_CLI::error("Invalid --db-restore-mode. Valid values: migrate, overwrite, tables-only, skip-db");
             }
             $restore_options['db_restore_mode'] = $db_mode_map[$db_mode];
+        }
+
+        // Health monitor key policy (an enum, not a flag: overrides a preset)
+        if (isset($assoc_args['health-key'])) {
+            $restore_options['health_key_policy'] = $this->health_key_arg($assoc_args['health-key']);
         }
 
         // File move-in mode
@@ -770,6 +782,10 @@ class SiteGuard_Backup_CLI_Command extends WP_CLI_Command {
      * [--entities=<entities>]
      * : When restoring, which entities: db,plugins,themes,uploads,others,wpcore
      *
+     * [--health-key=<policy>]
+     * : When restoring: keep (this site's health monitor key) or backup (the
+     *   backup's key). Falls back to the site default, then keep.
+     *
      * [--delete-source]
      * : Delete source files after successful import.
      *
@@ -777,6 +793,7 @@ class SiteGuard_Backup_CLI_Command extends WP_CLI_Command {
      *
      *     wp siteguardbackup import /tmp/azure-backup/
      *     wp siteguardbackup import /tmp/azure-backup/ --restore --entities=db
+     *     wp siteguardbackup import /tmp/azure-backup/ --restore --health-key=backup
      *     wp siteguardbackup import /tmp/backup_2026-03-01-1457_site_abc123-db.gz
      *
      * @subcommand import
@@ -789,6 +806,8 @@ class SiteGuard_Backup_CLI_Command extends WP_CLI_Command {
         $source = $args[0];
         $opts = SiteGuard_Backup_Options::instance();
         $backup_dir = $opts->get_backup_dir();
+        // Checked before anything is copied.
+        $health_key = isset($assoc_args['health-key']) ? $this->health_key_arg($assoc_args['health-key']) : null;
 
         $imported_files = array();
 
@@ -895,6 +914,9 @@ class SiteGuard_Backup_CLI_Command extends WP_CLI_Command {
                         }
                     }
                 }
+                if (null !== $health_key) {
+                    $restore_options['health_key_policy'] = $health_key;
+                }
 
                 WP_CLI::log('Starting restore...');
                 require_once SGBACKUP_DIR . 'restorer.php';
@@ -905,6 +927,12 @@ class SiteGuard_Backup_CLI_Command extends WP_CLI_Command {
                     WP_CLI::success('Restore complete!');
                 } else {
                     WP_CLI::warning('Restore completed with errors.');
+                }
+                // The health monitor key result and its warnings.
+                foreach ($result['messages'] as $msg) {
+                    if (0 === strpos($msg, 'Health monitor key') || 0 === strpos($msg, 'WARNING:')) {
+                        WP_CLI::log("  {$msg}");
+                    }
                 }
                 foreach ($result['errors'] as $err) {
                     WP_CLI::warning("  Error: {$err}");
@@ -4061,41 +4089,146 @@ class SiteGuard_Backup_CLI_Command extends WP_CLI_Command {
     }
 
     /**
-     * Show or regenerate the health monitor API key.
+     * Show, regenerate, set or pin the health monitor API key.
+     *
+     * The key is stored only as a hash. A backup carries that hash; which key a
+     * restored site keeps is chosen per restore (--health-key) or by the site
+     * default (Settings). See docs/health-api.md.
      *
      * ## OPTIONS
      *
      * [--regenerate]
-     * : Generate a new API key.
+     * : Generate a new API key (shown once).
+     *
+     * [--set]
+     * : Set a key you already have (e.g. the one the bot uses for production, on
+     *   a standby). Read from STDIN, or prompted for with hidden input; never
+     *   taken from the command line. At least 32 letters and digits.
+     *
+     * [--print-hash]
+     * : Print the current key's hash as a wp-config.php define, to pin it on
+     *   another install (a standby). Pinned hashes survive restores and raw
+     *   database syncs.
+     *
+     * [--adopt-restored]
+     * : Switch to the backup's key that the last restore did not apply because
+     *   this site's key was kept (within 7 days of that restore).
+     *
+     * [--format=<format>]
+     * : Status output format: table or json. Default: table.
      *
      * ## EXAMPLES
      *
      *     wp siteguardbackup health_api_key
      *     wp siteguardbackup health_api_key --regenerate
+     *     printf %s "$KEY" | wp siteguardbackup health_api_key --set
+     *     wp siteguardbackup health_api_key --print-hash
+     *     wp siteguardbackup health_api_key --adopt-restored
+     *     wp siteguardbackup health_api_key --format=json
      *
      * @subcommand health_api_key
      */
     public function health_api_key($args, $assoc_args) {
         require_once SGBACKUP_DIR . 'includes/class-health-monitor.php';
+        require_once SGBACKUP_DIR . 'includes/class-health-key-policy.php';
         $monitor = SiteGuard_Backup_Health_Monitor::instance();
 
-        if (isset($assoc_args['regenerate'])) {
+        $actions = array_values(array_intersect(array('regenerate', 'set', 'print-hash', 'adopt-restored'), array_keys($assoc_args)));
+        if (count($actions) > 1) {
+            WP_CLI::error('Use only one of --regenerate, --set, --print-hash, --adopt-restored.');
+        }
+        $action = $actions ? $actions[0] : '';
+
+        if ('regenerate' === $action) {
             $key = $monitor->regenerate_api_key();
             WP_CLI::success('New API key generated. Copy it now - it cannot be retrieved later (stored as hash).');
             WP_CLI::log('');
             WP_CLI::log('API Key: ' . $key);
+            WP_CLI::log('Fingerprint: ' . SiteGuard_Backup_Health_Key_Policy::fingerprint($key));
             WP_CLI::log('Endpoint: ' . rest_url('sgbackup/v1/health'));
             WP_CLI::log('');
             WP_CLI::log('Usage: curl -H "Authorization: Bearer ' . $key . '" ' . rest_url('sgbackup/v1/health'));
+        } elseif ('set' === $action) {
+            if (function_exists('posix_isatty') && posix_isatty(STDIN)) {
+                $key = \cli\prompt('Health monitor API key (input hidden)', false, ': ', true);
+            } else {
+                $key = stream_get_contents(STDIN);
+            }
+            $result = $monitor->set_api_key(trim((string) $key));
+            if (is_wp_error($result)) {
+                WP_CLI::error($result->get_error_message());
+            }
+            $info = $monitor->get_key_info();
+            WP_CLI::success("API key set (…{$info['hint']}, {$info['fp']}). A bot already using this key keeps working.");
+        } elseif ('print-hash' === $action) {
+            if (is_multisite() && !is_main_site()) {
+                WP_CLI::error('The pin is honoured on the main site only. Run this with the main site\'s --url.');
+            }
+            $hash = SiteGuard_Backup_Options::instance()->get_option('sgbackup_health_api_key_hash', '');
+            if (!SiteGuard_Backup_Health_Key_Policy::is_valid_hash($hash)) {
+                WP_CLI::error('No stored key hash to print. Run --regenerate or --set first.');
+            }
+            WP_CLI::line("define('SGBACKUP_HEALTH_API_KEY_HASH', '" . $hash . "');");
+        } elseif ('adopt-restored' === $action) {
+            $result = $monitor->adopt_restored_key();
+            if (is_wp_error($result)) {
+                WP_CLI::error($result->get_error_message());
+            }
+            WP_CLI::success("Switched to the backup's key (…{$result['hint']}, {$result['fp']}).");
         } else {
-            if ($monitor->has_api_key()) {
+            $info = $monitor->get_key_info();
+            if (isset($assoc_args['format']) && 'json' === $assoc_args['format']) {
+                WP_CLI::line(wp_json_encode(array(
+                    'enabled'  => SiteGuard_Backup_Health_Monitor::is_enabled(),
+                    'endpoint' => rest_url('sgbackup/v1/health'),
+                    'key'      => $info,
+                )));
+                return;
+            }
+            if ($info['has_key']) {
                 WP_CLI::log('API key is configured (stored as hash, not retrievable).');
+                if ('' !== $info['fp']) {
+                    WP_CLI::log("  Key: …{$info['hint']}, {$info['fp']} (source: {$info['source']}" . ('' !== $info['origin'] ? ", origin: {$info['origin']}" : '') . ($info['created'] ? ', created ' . gmdate('Y-m-d H:i', $info['created']) . ' UTC' : '') . ')');
+                } else {
+                    WP_CLI::log('  Key configured before fingerprints were recorded; regenerate or --set to see its fingerprint.');
+                }
                 WP_CLI::log('Use --regenerate to create a new key.');
             } else {
                 WP_CLI::log('No API key generated yet. Use --regenerate to create one.');
             }
+            if ($info['pinned']) {
+                WP_CLI::log("Pinned in wp-config: {$info['pinned']} key hash(es) also accepted.");
+            }
+            if ($info['pin_invalid']) {
+                WP_CLI::warning("SGBACKUP_HEALTH_API_KEY_HASH has {$info['pin_invalid']} malformed entr" . (1 === $info['pin_invalid'] ? 'y' : 'ies') . ', ignored.');
+            }
+            if ($info['enabled_pinned']) {
+                WP_CLI::log('Enabled state pinned in wp-config (SGBACKUP_HEALTH_ENABLED).');
+            }
+            if ($info['wp_hash_unsupported']) {
+                WP_CLI::warning('A key hash was made by WordPress 6.8 or later and cannot be checked on this WordPress version.');
+            }
+            if (!empty($info['last_restore'])) {
+                $lr = $info['last_restore'];
+                WP_CLI::log('Last restore: ' . gmdate('Y-m-d H:i', (int) $lr['at']) . ' UTC, ' . (isset($lr['outcome']) ? $lr['outcome'] : '?') . ' (policy: ' . (isset($lr['policy']) ? $lr['policy'] : '?') . ')');
+                if ($info['has_declined']) {
+                    WP_CLI::log("  The backup's key (…{$lr['backup_hint']}" . (!empty($lr['backup_origin']) ? ", from {$lr['backup_origin']}" : '') . ') was not applied. Use --adopt-restored to switch to it.');
+                }
+            }
             WP_CLI::log('Endpoint: ' . rest_url('sgbackup/v1/health'));
         }
+    }
+
+    /**
+     * Validate a --health-key value (keep or backup) or exit with an error.
+     */
+    private function health_key_arg($value) {
+        require_once SGBACKUP_DIR . 'includes/class-health-key-policy.php';
+        $policy = SiteGuard_Backup_Health_Key_Policy::sanitize($value);
+        if (null === $policy) {
+            WP_CLI::error('Invalid --health-key. Valid values: keep, backup');
+        }
+        return $policy;
     }
 
     /**
@@ -4107,7 +4240,7 @@ class SiteGuard_Backup_CLI_Command extends WP_CLI_Command {
      * : enable or disable
      *
      * [--interval=<interval>]
-     * : Check interval: everyhour, every2hours, every4hours, every8hours, twicedaily, daily. Default: every4hours.
+     * : Check interval: every5min, every10min, every15min, every30min, everyhour, every2hours, every4hours, every8hours, twicedaily, daily. Default: every10min.
      *
      * [--timeout=<seconds>]
      * : HTTP timeout in seconds. Default: 10.

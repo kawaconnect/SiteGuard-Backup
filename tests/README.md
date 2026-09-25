@@ -46,6 +46,7 @@ These rules are not optional.
 sudo tests/run-sandboxed.sh          # read-only /, tmpfs /tmp, runs as nobody
 php tests/test-delete-guard.php      # or directly, as an unprivileged user
 php tests/test-encryption.php        # archive encryption: round trips, wrong key, truncation, tampering
+php tests/test-health-key-policy.php # whose health monitor key a restore keeps (pure, no files)
 ```
 
 The GitLab pipeline's `test` job (`ci/test.sh`, see `.gitlab-ci.yml`) lints
@@ -77,11 +78,13 @@ Further suites, same rules (disposable host, instances from `instance.sh`):
 | `integration/transfer.sh` | Site transfers in every direction: single to single, single to a new or existing subsite, subsite to single, main site to single, subsite to a new subsite, network to network. Each over file import and over SiteGuard's own remote send. |
 | `integration/upgrade.sh` | Release check: fresh install from the release zip through WordPress's installer (admin page renders, uninstall is clean), and upgrade from the previous release's zip on a single site and a network, with the old backups still verifying and restoring. |
 | `integration/storage.sh` | Remote storage against local emulators (MinIO for S3, Azurite for Azure over TLS): small and multipart uploads, byte-identical downloads, listing, delete, and the unsafe-name delete guard. |
+| `integration/health-key.sh` | The health monitor key across restores between two single sites and a multisite: keep/backup policy, keyless standby, legacy keys, not-applicable modes, interrupted and resumed restores, stale progress, cron, WP-CLI plumbing, the wp-config pin, and a secrets grep. Reuses existing instances; never creates or destroys any. |
 
 ```sh
 tests/integration/browser-flow.sh $WPD/scripts/instance.sh /path/to/siteguardbackup
 tests/integration/transfer.sh     $WPD/scripts/instance.sh /path/to/siteguardbackup --keep-failed
 tests/integration/storage.sh      $WPD/scripts/instance.sh <instance-with-plugin>
+tests/integration/health-key.sh   $WPD/scripts/instance.sh <src-single> <dst-single> <multisite> [scenario...]
 tests/integration/upgrade.sh      $WPD/scripts/instance.sh old-release.zip new-release.zip
 ```
 

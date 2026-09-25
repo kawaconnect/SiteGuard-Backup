@@ -27,6 +27,45 @@
   search-replace with no URLs.
 - A resumed network migration keeps each subsite's own SiteGuard rows.
 
+### Health monitor key survives restores and failover
+- Why the bot lost access: backups always held the monitor key's hash, but
+  every restore wrote this site's SiteGuard settings back over the backup's,
+  the health key and switch included. A standby that had ever saved its Health
+  tab without a key ended up disabled (`404 disabled`), and one with its own
+  key refused production's (`403`).
+- The monitor key and its settings (enabled, interval, timeout, SSL warning
+  days) are now decided as one unit, right after the import: **keep** this
+  site's key (default) or use the **backup**'s. If this site has no key, the
+  backup's is used either way, and the monitor is enabled if it was in the
+  backup. A backup without a key never leaves the site keyless. Every other
+  SiteGuard setting keeps this site's value, as before.
+- The choice is offered in the restore dialog, as `--health-key=keep|backup`
+  on `wp siteguardbackup restore` and `import --restore`, in restore presets
+  and in the generic restore command, with a site default under Settings
+  ("Default Health Monitor Key on Restore"). Resumed restores keep the
+  decision made at import time.
+- A plaintext key from before 1.3.13 in an old backup no longer replaces this
+  site's key; a stale plaintext row next to a hash is dropped instead of
+  overwriting the hash.
+- A subsite restored into a single site without a key keeps the subsite's key
+  (it used to be dropped).
+- The scheduled health check is set to the restored interval (or removed when
+  the monitor is off) at the end of a restore, and cached rate-limit counters
+  are cleared.
+- Keys carry a fingerprint (`sgk-` + 12 hex digits of SHA-256, computable
+  locally) and hint; the Health tab and `wp siteguardbackup health_api_key`
+  show them, where the key came from, and the last restore's result.
+  `/health/ping` reports the fingerprint of the key that authenticated.
+- "Switch to the backup's key" (Health tab, network admins, within 7 days) and
+  `health_api_key --adopt-restored` use the backup's key a restore did not
+  apply.
+- One key for production and a standby: `SGBACKUP_HEALTH_API_KEY_HASH` (and
+  `SGBACKUP_HEALTH_ENABLED`) in `wp-config.php` are honoured on the main site
+  whatever a restore or raw database sync does; `health_api_key --print-hash`
+  prints the define, `--set` stores a key read from STDIN.
+- Docs: "Keys, backups, restores and failover" in `docs/health-api.md`, and the
+  client IP note corrected (`CF-Connecting-IP` only from a trusted proxy).
+
 ## 1.5.1
 
 Released 2026-09-24. Build and release tooling only; the plugin code is

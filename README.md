@@ -44,6 +44,8 @@ Every direction is supported, either by downloading a backup zip and uploading i
 
 URLs are rewritten everywhere, including inside serialized data and escaped JSON, and the uploads path follows the site (`uploads/` <-> `uploads/sites/<id>/`). The destination keeps its own address, admin login and SiteGuard settings; the source's other users are added (matched by email, with their roles and passwords) and authorship is kept.
 
+The health monitor API key is the one setting you choose per restore: keep this site's key (default) or use the backup's (for a failover server that must answer the bot with production's key). A site without a key takes the backup's either way. See [docs/health-api.md](docs/health-api.md#keys-backups-restores-and-failover), which also covers pinning one key on production and a standby in `wp-config.php`.
+
 ## Site-to-Site Migration
 
 Pull backups directly from another WordPress site without manually downloading or uploading files:
@@ -66,8 +68,16 @@ wp siteguardbackup delete <timestamp> [--delete-remote] [--yes]
 wp siteguardbackup inspect <timestamp> [--format=table|json]
 
 # Restore
-wp siteguardbackup restore <timestamp> [--entities=<list>] [--db-restore-mode=<mode>]
+wp siteguardbackup restore <timestamp> [--entities=<list>] [--db-restore-mode=<mode>] [--health-key=keep|backup]
+wp siteguardbackup import <dir> --restore [--entities=<list>] [--health-key=keep|backup]
 wp siteguardbackup resume_restore
+
+# Health monitor API key (for the Discord bot); never shows a key or hash except --print-hash
+wp siteguardbackup health_api_key [--format=table|json]   # fingerprint, wp-config pin, last restore
+wp siteguardbackup health_api_key --regenerate
+printf %s "$KEY" | wp siteguardbackup health_api_key --set   # use a key you already have (STDIN or hidden prompt)
+wp siteguardbackup health_api_key --print-hash                # define() line to pin this key on a standby
+wp siteguardbackup health_api_key --adopt-restored            # switch to the key the last restore did not apply
 
 # Settings
 wp siteguardbackup settings get [--key=<key>] [--format=table|json]

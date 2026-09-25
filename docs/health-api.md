@@ -18,9 +18,11 @@ Authorization: Bearer <api_key>
 
 Generate the key in **SiteGuard Backup → Health** → "Generate New Key". The plaintext key is shown **once**; only a hash is stored. Losing the key means regenerating. 48-char random string, stored via `wp_hash_password()`.
 
-**Rate limiting.** 20 failed auth attempts per 5-minute window per client IP triggers HTTP 429. Client IP is taken from `CF-Connecting-IP` → `X-Forwarded-For` → `REMOTE_ADDR` in that order.
+**Rate limiting.** 20 failed auth attempts per 5-minute window per client IP triggers HTTP 429. The client IP is `REMOTE_ADDR`, or `CF-Connecting-IP` when the connecting peer is a trusted proxy. `X-Forwarded-For` is never used.
 
-**Disabled state.** If the health monitor is disabled in admin, all endpoints return `404 {"code":"disabled"}`.
+**Disabled state.** If the health monitor is disabled in admin, all endpoints return `404 {"code":"disabled"}`. `define('SGBACKUP_HEALTH_ENABLED', true);` in `wp-config.php` overrides the setting on the main site.
+
+Restores and failover are covered in [Keys, backups, restores and failover](#keys-backups-restores-and-failover).
 
 ## Endpoints
 
@@ -98,9 +100,12 @@ Minimal auth smoke-test endpoint. Returns 200 + tiny body without triggering a h
   "site_url": "https://example.com",
   "version": "1.4.9",
   "api_version": 2,
-  "time": 1775892820
+  "time": 1775892820,
+  "key": { "fp": "sgk-3f9c01ab22d0", "source": "db" }
 }
 ```
+
+`key` names the key that authenticated this request: its fingerprint, and `source` `db` (the key stored on the site) or `pin` (a hash pinned in `wp-config.php`). It is additive; bots that ignore it keep working. Compare `fp` with your key's own fingerprint: `printf %s "$KEY" | sha256sum | cut -c1-12` gives the 12 hex digits after `sgk-`.
 
 ### `POST /health/check`
 
@@ -129,6 +134,84 @@ Alerts are only emitted on **fresh** data. If the cert data is carried forward f
 - **Handle 404 disabled**: if the operator disabled the health monitor, the bot should show "monitoring disabled" rather than "API down".
 - **Handle 429 cooldown** on `POST /health/check`: fall back to `GET /health`.
 
+## Keys, backups, restores and failover
+
+### What a backup holds
+
+A database backup contains all of `wp_options`, so it holds the monitor key's **hash** (`sgbackup_health_api_key_hash`), its metadata (`sgbackup_health_api_key_meta`: last 4 characters, fingerprint, origin, creation time) and the monitor settings. It never holds the plaintext key: only the bot has that. On WordPress 6.8 or later the hash (`$wp$2y$…`) does not depend on the site's salts, so it validates on any install running 6.8+. A 6.8+ hash cannot be checked on WordPress 6.7 or older; the Health tab and the restore output warn about that.
+
+### What a restore does with it
+
+The monitor key and its settings (enabled, interval, timeout, SSL warning days) are one unit. A database restore decides the unit once, right after the import, by the **health key policy**:
+
+| This site | The backup | `keep` (default) | `backup` |
+|---|---|---|---|
+| has a key | has the same key | unchanged | unchanged |
+| has a key | has another key | **this site's key** (the backup's can still be switched to, see below) | **the backup's key and settings** |
+| has a key | has no key | this site's key | this site's key |
+| has no key (fresh install, or the Health tab saved once without a key) | has a key | **the backup's key and settings**, monitor enabled if the backup's was | the backup's key and settings |
+| has no key | has no key | nothing changes | nothing changes |
+
+A plaintext key from before 1.3.13 in an old backup never replaces this site's key; when the backup's unit is used, the plaintext is hashed during the restore and not stored. Every other SiteGuard setting (storage credentials, migration keys, history, failover role, schedules) keeps this site's value, as before.
+
+The policy applies to database restores of a single site and of a network's main site (migrate, overwrite, tables-only, selected tables) and to a subsite restored into a single site. It does not apply to skip-database or files-only restores, to importing a subsite into a network, or to batch subsite imports: the main site is not touched, and the restore says so.
+
+The restore prints one line with the result, for example:
+
+```
+Health monitor key: kept this site's key (…a1b2, sgk-3f9c01ab22d0). The backup's key (…9f3c, from prod.example.com) was not applied. Health tab → "Switch to the backup's key" to use it.
+Health monitor key: this site had no key; using the backup's key (…9f3c). Monitor enabled from the backup (this site had no key).
+Health monitor key: using the backup's key (…9f3c, sgk-77d0e1c2a9b4) (policy: backup).
+Health monitor key: backup has no monitor key; kept this site's.
+```
+
+The scheduled check is set to match the restored settings at the end of the restore.
+
+### Choosing the policy
+
+- **Per restore, browser:** the restore dialog's "Health monitor API key" choice (shown when the database is restored). The verification step shows what will happen, and warns when a backup of this same site would bring back a key that was rotated since.
+- **Per restore, WP-CLI:** `wp siteguardbackup restore <ts> --health-key=backup` (or `keep`); `wp siteguardbackup import <dir> --restore --health-key=backup`. Any other value is an error.
+- **Presets:** a restore preset saved from the dialog remembers the choice. Presets saved before this setting existed follow the site default.
+- **Site default:** Settings → "Default Health Monitor Key on Restore". On a standby/failover server choose "Use the key from the backup".
+
+### Interrupted and resumed restores
+
+The decision is made in the request that imports the database and saved with the restore's state. A restore that is interrupted and resumed, or continued by the browser after a search-replace checkpoint, keeps that decision and never makes it again against an already-imported database.
+
+### After a restore: see it, and change your mind
+
+The Health tab shows the key's hint and fingerprint, where it came from, and the last restore's result. When the last restore kept this site's key although the backup had another one, **"Switch to the backup's key"** makes the backup's key the site's key (for 7 days after that restore; network administrators only). From WP-CLI:
+
+```sh
+wp siteguardbackup health_api_key                    # status: fingerprint, pin, last restore
+wp siteguardbackup health_api_key --adopt-restored   # switch to the backup's key
+wp siteguardbackup health_api_key --format=json
+```
+
+Neither shows a key or a hash.
+
+### Production and a standby with one key
+
+The bot keeps one URL (the main site's `rest_url('sgbackup/v1/health')`, which follows the domain through a DNS failover) and one key. Pick one of these for the standby:
+
+1. **Pin production's key hash in the standby's `wp-config.php`.** It works whatever a restore or a raw database sync does, because `wp-config.php` is never restored:
+
+   ```sh
+   # on production
+   wp siteguardbackup health_api_key --print-hash
+   # prints: define('SGBACKUP_HEALTH_API_KEY_HASH', '$wp$2y$10$…');
+   ```
+
+   Add that line to the standby's `wp-config.php` (or its `WORDPRESS_CONFIG_EXTRA`), with `define('SGBACKUP_HEALTH_ENABLED', true);`. The pinned hash is accepted in addition to the standby's own key; the constant can also be an array of hashes. The Health tab shows "Pinned in wp-config". Main site only.
+2. **Set the same key on both.** `printf %s "$KEY" | wp siteguardbackup health_api_key --set` stores the key the bot already has (read from STDIN, or prompted for with hidden input; at least 32 letters and digits).
+3. **Let restores bring production's key.** Set the standby's Settings → "Default Health Monitor Key on Restore" to "Use the key from the backup". This covers restores through SiteGuard only.
+
+After a raw database sync (for example `mysqldump | mysql`) or a DNS failover, run `wp siteguardbackup postfailover --flush-only` on the standby so a persistent object cache (Redis) does not serve old option values.
+
+### Downgrading
+
+A downgrade to 1.5.1 keeps the stored key working. The `wp-config.php` pin, the key metadata and the last-restore record are ignored by 1.5.1 (the rows are harmless), so do not rely on the pin until you have confirmed the version.
+
 ## Backward compatibility
 
 - `api_version: 1` - original shape, no `summary`, no `alerts`, no `ssl_checked_at`, fewer SSL per-site fields.
@@ -137,6 +220,8 @@ Alerts are only emitted on **fresh** data. If the cert data is carried forward f
 `sites[*]` retains all v1 fields. Bots on v1 keep working; migrate when convenient.
 
 ## Changelog
+
+- **Unreleased** - `/health/ping` adds `key` (`fp`, `source`). The monitor key survives restores and failover: health key policy, key fingerprints, "Switch to the backup's key", `wp-config.php` pin (`SGBACKUP_HEALTH_API_KEY_HASH`, `SGBACKUP_HEALTH_ENABLED`), `health_api_key --set/--print-hash/--adopt-restored/--format`.
 
 - **1.4.9** - Added `summary`, `alerts`, `ssl_checked_at`, `ssl_warn_days`, `/health/ping`, `POST /health/check`. Bumped `api_version` to 2. Per-site SSL fields (`ssl_ok`, `ssl_error`, `ssl_stale`, `ssl_last_success`, `ssl_checked_at`) exposed in the `sites` array.
 - **1.4.4** - `ssl_error` messages now include the domain prefix ("SSL probe failed for {domain}: ...").

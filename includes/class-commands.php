@@ -423,6 +423,7 @@ class SiteGuard_Backup_Commands {
 			'default_db_restore_mode',
 			'default_subsite_mode',
 			'default_keep_protocol',
+			'default_health_key_policy',
 			'extra_dirs', 'max_incrementals_before_full',
 			'ssl_disableverify', 'ssl_useservercerts',
 			'auto_update',
@@ -638,6 +639,8 @@ class SiteGuard_Backup_Commands {
 					$value = in_array($value, $valid_intervals, true) ? $value : 'every10min';
 				} elseif ($key === 'low_memory_mode') {
 					$value = in_array($value, array('auto', 'on', 'off'), true) ? $value : 'auto';
+				} elseif ($key === 'default_health_key_policy') {
+					$value = in_array($value, array('keep', 'backup'), true) ? $value : 'keep';
 				} elseif (in_array($key, array('retain', 'retain_db', 'split_every', 'max_split', 'delete_local', 'debug_mode', 'encryption_enabled', 'syslog_enabled', 'lock_admin', 'lock_admin_session_length', 'backupdb_nonwp', 'db_anonymise', 'max_incrementals_before_full', 'ssl_disableverify', 'ssl_useservercerts', 'auto_update', 'encrypt_credentials', 'failover_enabled', 'default_db_restore_mode', 'default_subsite_mode', 'default_keep_protocol', 'health_enabled', 'health_timeout', 'health_ssl_warn_days'))) {
 					$value = intval($value);
 				} elseif ($key === 'email') {
@@ -993,6 +996,15 @@ class SiteGuard_Backup_Commands {
 		}
 		if (!empty($params['keep_protocol'])) {
 			$restore_options['keep_protocol'] = true;
+		}
+		// Health monitor key policy: only when valid, so the restorer falls back to
+		// the site default otherwise.
+		if (isset($params['health_key_policy'])) {
+			require_once SGBACKUP_DIR . 'includes/class-health-key-policy.php';
+			$health_key_policy = SiteGuard_Backup_Health_Key_Policy::sanitize($params['health_key_policy']);
+			if (null !== $health_key_policy) {
+				$restore_options['health_key_policy'] = $health_key_policy;
+			}
 		}
 
 		// Gap 25: Include-unspecified options
@@ -1490,6 +1502,12 @@ class SiteGuard_Backup_Commands {
 		$result['timestamp'] = $timestamp;
 		$result['current_siteurl'] = get_option('siteurl');
 		$result['old_siteurl'] = '';
+		// Health monitor key in the backup's main options table (presence, hint and
+		// fingerprint only) and this site's, for the verification step.
+		$result['health_key'] = array('present' => false, 'hint' => '', 'fp' => '');
+		require_once SGBACKUP_DIR . 'includes/class-health-monitor.php';
+		$current_key = SiteGuard_Backup_Health_Monitor::instance()->get_key_info();
+		$result['current_health_key'] = array('present' => $current_key['has_key'], 'hint' => $current_key['hint'], 'fp' => $current_key['fp']);
 
 		// Include subsite backup metadata
 		if (!empty($backup_set['is_subsite_backup'])) {
@@ -1596,6 +1614,16 @@ class SiteGuard_Backup_Commands {
 							if ($current_options_blog_id > 1 && !isset($subsite_urls[$current_options_blog_id])) {
 								$subsite_urls[$current_options_blog_id] = $url_m[1];
 							}
+						}
+					}
+
+					if ($in_main_options && false !== strpos($trimmed, "'sgbackup_health_api_key")) {
+						if (preg_match("/'sgbackup_health_api_key(_hash)?'\\s*,\\s*'[^']/", $trimmed)) {
+							$result['health_key']['present'] = true;
+						}
+						if (false !== strpos($trimmed, "'sgbackup_health_api_key_meta'")) {
+							if (preg_match('/sgk-[0-9a-f]{12}/', $trimmed, $fp_m)) $result['health_key']['fp'] = $fp_m[0];
+							if (preg_match('/hint\\\\?";s:4:\\\\?"([A-Za-z0-9]{4})/', $trimmed, $hint_m)) $result['health_key']['hint'] = $hint_m[1];
 						}
 					}
 
@@ -2610,6 +2638,7 @@ class SiteGuard_Backup_Commands {
 
 			if (isset($defaults[$key])) {
 				if ($key === 'lock_admin_password') continue;
+				if ($key === 'default_health_key_policy' && !in_array($value, array('keep', 'backup'), true)) continue;
 				// Type-check against default value
 				if (gettype($value) !== gettype($defaults[$key])) continue;
 				// Tighten the type check: an array-typed option previously imported unchecked.
@@ -3042,6 +3071,14 @@ class SiteGuard_Backup_Commands {
 		$restore_options['include_unspecified_tables'] = !empty($params['include_unspecified_tables']);
 		$restore_options['include_unspecified_plugins'] = !empty($params['include_unspecified_plugins']);
 		$restore_options['include_unspecified_themes'] = !empty($params['include_unspecified_themes']);
+		// Stored only when chosen; presets without it follow the site default.
+		if (isset($params['health_key_policy'])) {
+			require_once SGBACKUP_DIR . 'includes/class-health-key-policy.php';
+			$health_key_policy = SiteGuard_Backup_Health_Key_Policy::sanitize($params['health_key_policy']);
+			if (null !== $health_key_policy) {
+				$restore_options['health_key_policy'] = $health_key_policy;
+			}
+		}
 
 		// Auto-increment ID
 		if (!empty($params['preset_id']) && isset($presets[intval($params['preset_id'])])) {
@@ -3450,7 +3487,8 @@ class SiteGuard_Backup_Commands {
 	}
 
 	/**
-	 * Get cached health status. API key is never returned here (hashed at rest).
+	 * Get cached health status. API key is never returned here (hashed at rest);
+	 * key_info carries hints and fingerprints only.
 	 */
 	public function get_health_status($params) {
 		require_once SGBACKUP_DIR . 'includes/class-health-monitor.php';
@@ -3459,6 +3497,7 @@ class SiteGuard_Backup_Commands {
 			'overall'     => $monitor->get_overall_status(),
 			'sites'       => $monitor->get_results(),
 			'has_api_key' => $monitor->has_api_key(),
+			'key_info'    => $monitor->get_key_info(),
 		);
 	}
 
@@ -3469,5 +3508,20 @@ class SiteGuard_Backup_Commands {
 	public function regenerate_health_api_key($params) {
 		require_once SGBACKUP_DIR . 'includes/class-health-monitor.php';
 		return array('api_key' => SiteGuard_Backup_Health_Monitor::instance()->regenerate_api_key());
+	}
+
+	/**
+	 * Switch to the backup's key that the last restore kept out (this site's key
+	 * was kept). Returns its hint and fingerprint, never the key or its hash.
+	 */
+	public function health_adopt_restored_key($params) {
+		require_once SGBACKUP_DIR . 'includes/class-health-monitor.php';
+		$monitor = SiteGuard_Backup_Health_Monitor::instance();
+		$result = $monitor->adopt_restored_key();
+		if (is_wp_error($result)) {
+			return $result;
+		}
+		SiteGuard_Backup_Audit_Log::instance()->log('health_key_adopted', 'Health monitor key switched to the key from the last restored backup (' . $result['fp'] . ').');
+		return array('adopted' => $result, 'key_info' => $monitor->get_key_info());
 	}
 }

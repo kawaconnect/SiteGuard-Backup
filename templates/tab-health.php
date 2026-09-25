@@ -80,6 +80,15 @@ $next_check = wp_next_scheduled('sgbackup_health_check');
 				<button type="button" class="button" id="sgbackup-health-copy-key" style="display:none;"><?php esc_html_e('Copy', 'siteguardbackup'); ?></button>
 				<button type="button" class="button button-secondary" id="sgbackup-health-regen-key"><?php esc_html_e('Generate New Key', 'siteguardbackup'); ?></button>
 				<p class="description"><?php esc_html_e('The API key is shown only once when generated. Copy it immediately. It is stored hashed and cannot be retrieved later.', 'siteguardbackup'); ?></p>
+				<div id="sgbackup-health-key-info" style="margin-top:8px;"></div>
+			</td>
+		</tr>
+		<tr id="sgbackup-health-last-restore-row" style="display:none;">
+			<th scope="row"><?php esc_html_e('Last Restore', 'siteguardbackup'); ?></th>
+			<td>
+				<div id="sgbackup-health-last-restore"></div>
+				<button type="button" class="button" id="sgbackup-health-adopt-key" style="display:none;margin-top:6px;"></button>
+				<p class="description"><?php esc_html_e('Which monitor key the last database restore left in place. To make a failover server always take the backup\'s key, set Settings → "Default Health Monitor Key on Restore".', 'siteguardbackup'); ?></p>
 			</td>
 		</tr>
 	</table>

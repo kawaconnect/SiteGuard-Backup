@@ -139,6 +139,7 @@ class SiteGuard_Backup_Admin {
 				'health_check_now'         => wp_create_nonce('sgbackup-health_check_now'),
 				'get_health_status'        => wp_create_nonce('sgbackup-get_health_status'),
 				'regenerate_health_api_key' => wp_create_nonce('sgbackup-regenerate_health_api_key'),
+				'health_adopt_restored_key' => wp_create_nonce('sgbackup-health_adopt_restored_key'),
 			),
 			'max_upload_size' => SiteGuard_Backup_Filesystem::max_backup_upload_size(),
 			'chunk_size' => min(2 * 1024 * 1024, intval(0.9 * SiteGuard_Backup_Filesystem::max_backup_upload_size())),
@@ -148,6 +149,7 @@ class SiteGuard_Backup_Admin {
 			'default_db_restore_mode' => intval(SiteGuard_Backup_Options::instance()->get_option('sgbackup_default_db_restore_mode', 0)),
 			'default_subsite_mode' => intval(SiteGuard_Backup_Options::instance()->get_option('sgbackup_default_subsite_mode', 0)),
 			'default_keep_protocol' => intval(SiteGuard_Backup_Options::instance()->get_option('sgbackup_default_keep_protocol', 0)),
+			'default_health_key_policy' => ('backup' === SiteGuard_Backup_Options::instance()->get_option('sgbackup_default_health_key_policy', 'keep')) ? 'backup' : 'keep',
 			'configured_methods' => $this->get_configured_methods(),
 			'strings'   => array(
 				'backup_started'   => __('Backup started...', 'siteguardbackup'),
@@ -329,7 +331,7 @@ class SiteGuard_Backup_Admin {
 			'restore_alldownloaded', 'searchreplace', 'wipe_settings', 'import_settings',
 			'migrate_key_create', 'get_migrator_keys', 'delete_migrator_key',
 			'failover_prefailover', 'failover_postfailover', 'clear_audit_log', 'toggle_audit_log',
-			'regenerate_health_api_key', 'test_extdb',
+			'regenerate_health_api_key', 'health_adopt_restored_key', 'test_extdb',
 		);
 		if (is_multisite() && !current_user_can('manage_network_options') && in_array($subaction, $network_admin_only, true)) {
 			wp_send_json_error(array('message' => __('Only a network administrator can do this.', 'siteguardbackup')));
@@ -350,6 +352,7 @@ class SiteGuard_Backup_Admin {
 			'delete_restore_preset'  => array('limit' => 10, 'window' => 60),   // 10 per minute
 			'save_remotesend_schedule' => array('limit' => 5, 'window' => 60),  // 5 per minute
 			'health_check_now'         => array('limit' => 3, 'window' => 60),  // 3 per minute
+			'health_adopt_restored_key' => array('limit' => 5, 'window' => 60), // 5 per minute
 		);
 		if (isset($rate_limits[$subaction])) {
 			$rl = $rate_limits[$subaction];
@@ -434,6 +437,7 @@ class SiteGuard_Backup_Admin {
 			'health_check_now',
 			'get_health_status',
 			'regenerate_health_api_key',
+			'health_adopt_restored_key',
 		);
 
 		if (!in_array($subaction, $allowed_commands, true)) {
@@ -845,6 +849,16 @@ class SiteGuard_Backup_Admin {
 		// Remap independent domains to subdomains of the new domain
 		if (isset($_POST['remap_independent_domains'])) {
 			$restore_options['remap_independent_domains'] = !empty($_POST['remap_independent_domains']);
+		}
+
+		// Health monitor key policy - only set if posted and valid, so the restorer
+		// falls back to the site default. Never coerced to 'backup'.
+		if (isset($_POST['health_key_policy']) && is_string($_POST['health_key_policy'])) {
+			require_once SGBACKUP_DIR . 'includes/class-health-key-policy.php';
+			$health_key_policy = SiteGuard_Backup_Health_Key_Policy::sanitize(wp_unslash($_POST['health_key_policy']));
+			if (null !== $health_key_policy) {
+				$restore_options['health_key_policy'] = $health_key_policy;
+			}
 		}
 
 		// Target domain/blog_id for subsite import
@@ -1691,6 +1705,8 @@ class SiteGuard_Backup_Admin {
 			}
 		}
 		// Always import into the current blog, whatever blog the backup came from.
+		// The network's health monitor key is not theirs to replace.
+		$options['health_key_policy'] = 'keep';
 		$options['subsite_mode'] = SiteGuard_Backup_Restorer::SUBSITE_MODE_IMPORT_AS;
 		$options['target_subsite_id'] = $blog_id;
 		unset($options['target_subsite_domain']);

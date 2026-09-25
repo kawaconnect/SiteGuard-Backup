@@ -659,6 +659,10 @@
 				var initDbMode = $('select[name="sgbackup_db_restore_mode"]').val();
 				$('#sgbackup-subsite-mode-row').toggle(sgbackup_settings.is_multisite && (initDbMode === '0' || initDbMode === '1'));
 
+				// Health monitor key policy from the site default
+				$('select[name="sgbackup_health_key_policy"]').val(sgbackup_settings.default_health_key_policy === 'backup' ? 'backup' : 'keep');
+				self.toggleHealthKeyRow();
+
 				$('#sgbackup-restore-modal').dialog({
 					modal: true,
 					width: 600,
@@ -744,6 +748,11 @@
 				}
 			});
 
+			// The health key choice only matters when the main site's database is restored.
+			$(document).on('change', 'input[name="sgbackup_restore_db"], select[name="sgbackup_db_restore_mode"], select[name="sgbackup_subsite_mode"]', function() {
+				self.toggleHealthKeyRow();
+			});
+
 			// Subsite import picker: show/hide "Create new" text input and sync hidden fields
 			$(document).on('change', '#sgbackup-target-subsite-select', function() {
 				var val = $(this).val();
@@ -780,6 +789,18 @@
 					self.loadSubsiteImportPicker();
 				}
 			});
+		},
+
+		/**
+		 * Show the health monitor key choice only when it applies: the database is
+		 * restored (not skip-db) onto the main site (not import-as or batch).
+		 */
+		toggleHealthKeyRow: function() {
+			var dbChecked = $('input[name="sgbackup_restore_db"]').is(':checked');
+			var dbMode = String($('select[name="sgbackup_db_restore_mode"]').val());
+			var subsiteMode = String($('select[name="sgbackup_subsite_mode"]').val());
+			var mainSiteUntouched = sgbackup_settings.is_multisite && (subsiteMode === '4' || subsiteMode === '5');
+			$('#sgbackup-health-key-row').toggle(dbChecked && dbMode !== '3' && !mainSiteUntouched);
 		},
 
 		/**
@@ -1317,6 +1338,7 @@
 					// Force Import-as-subsite mode and hide normal subsite mode row
 					$('select[name="sgbackup_subsite_mode"]').val('4');
 					$('#sgbackup-subsite-mode-row').hide();
+					self.toggleHealthKeyRow();
 				} else {
 					$('#sgbackup-subsite-import').hide();
 				}
@@ -1483,6 +1505,35 @@
 					}
 				}
 
+				// Health monitor key: what this restore will do with it
+				// (The options pane is hidden here, so check the row's own display.)
+				if ($('#sgbackup-health-key-row').css('display') !== 'none' && data.health_key) {
+					var hkPolicy = $('select[name="sgbackup_health_key_policy"]').val() === 'backup' ? 'backup' : 'keep';
+					var hkCur = data.current_health_key || {};
+					var hkBak = data.health_key;
+					var hkLabel = function(k) {
+						if (!k.hint && !k.fp) return 'fingerprint unknown';
+						return (k.hint ? '\u2026' + k.hint : '') + (k.hint && k.fp ? ', ' : '') + (k.fp || '');
+					};
+					var hkLine;
+					if (!hkBak.present) {
+						hkLine = 'The backup has no monitor key; this site\'s key is kept.';
+					} else if (!hkCur.present) {
+						hkLine = 'This site has no key; the backup\'s key (' + hkLabel(hkBak) + ') will be used.';
+					} else if (hkPolicy === 'backup') {
+						hkLine = 'The backup\'s key (' + hkLabel(hkBak) + ') replaces this site\'s (' + hkLabel(hkCur) + ').';
+					} else {
+						hkLine = 'This site\'s key (' + hkLabel(hkCur) + ') is kept; the backup\'s (' + hkLabel(hkBak) + ') is not applied.';
+					}
+					html += '<tr><td><strong>Health monitor key:</strong></td><td>' + SGB.esc(hkLine) + '</td></tr>';
+					var hkOldHost = '', hkCurHost = '';
+					try { hkOldHost = data.old_siteurl ? new URL(data.old_siteurl).host : ''; hkCurHost = data.current_siteurl ? new URL(data.current_siteurl).host : ''; } catch (e) {}
+					if (hkPolicy === 'backup' && hkBak.present && hkCur.present && hkOldHost && hkOldHost === hkCurHost
+						&& hkBak.fp && hkCur.fp && hkBak.fp !== hkCur.fp) {
+						warnings.push('This restores an older monitor key that was rotated (' + hkCur.fp + ' will be replaced by ' + hkBak.fp + '). The bot needs that older key afterwards.');
+					}
+				}
+
 				html += '</tbody></table>';
 
 				// Check for .htaccess warning when restoring wpcore or others
@@ -1571,6 +1622,10 @@
 
 			// Subsite mode (already captured above, before divs were hidden)
 			formData.append('subsite_mode', subsiteMode || '0');
+
+			// Health monitor key policy (the server validates it and ignores it
+			// where it does not apply)
+			formData.append('health_key_policy', $('select[name="sgbackup_health_key_policy"]').val() === 'backup' ? 'backup' : 'keep');
 
 			// Keep original protocol (skip HTTP/HTTPS conversion)
 			if ($('#sgbackup-keep-protocol').is(':checked')) {
@@ -3895,6 +3950,10 @@
 				$('input[name="sgbackup_include_unspecified_tables"]').prop('checked', opts.include_unspecified_tables !== false);
 				$('input[name="sgbackup_include_unspecified_plugins"]').prop('checked', opts.include_unspecified_plugins !== false);
 				$('input[name="sgbackup_include_unspecified_themes"]').prop('checked', opts.include_unspecified_themes !== false);
+				// Presets saved before the health key choice follow the site default.
+				var presetHealthKey = (opts.health_key_policy === 'keep' || opts.health_key_policy === 'backup') ? opts.health_key_policy : sgbackup_settings.default_health_key_policy;
+				$('select[name="sgbackup_health_key_policy"]').val(presetHealthKey === 'backup' ? 'backup' : 'keep');
+				self.toggleHealthKeyRow();
 			});
 
 			// Save preset
@@ -3941,7 +4000,8 @@
 					pre_restore_backup: $('input[name="sgbackup_restore_pre_backup"]').is(':checked'),
 					include_unspecified_tables: $('input[name="sgbackup_include_unspecified_tables"]').is(':checked'),
 					include_unspecified_plugins: $('input[name="sgbackup_include_unspecified_plugins"]').is(':checked'),
-					include_unspecified_themes: $('input[name="sgbackup_include_unspecified_themes"]').is(':checked')
+					include_unspecified_themes: $('input[name="sgbackup_include_unspecified_themes"]').is(':checked'),
+					health_key_policy: $('select[name="sgbackup_health_key_policy"]').val() === 'backup' ? 'backup' : 'keep'
 				};
 
 				self.ajax('save_restore_preset', params, function(data) {
@@ -4177,12 +4237,33 @@
 							'This is the only time it will be shown.'
 						);
 						self.showNotice('New API key generated. Copy it now!', 'success');
+						// Refresh the fingerprint shown next to the key.
+						self.ajax('get_health_status', {}, function(status) {
+							self.renderHealthKeyInfo(status && status.key_info ? status.key_info : null);
+						}, function() {});
 					} else {
 						self._hlog('error', 'Response missing api_key field', data);
 					}
 				}, function(err) {
 					self._hlog('error', 'regenerate_health_api_key FAILED', { error: err });
 					self.showNotice(err || 'Failed to generate key.', 'error');
+				});
+			});
+
+			// ---- Switch to the backup's key (declined by the last restore) ----
+			$(document).on('click', '#sgbackup-health-adopt-key', function() {
+				var msg = 'Switch the monitor to the key from the restored backup? This site\'s current key stops working; the bot must use the backup\'s key.';
+				if ($(this).data('rotated')) {
+					msg += '\n\nThat backup came from this same site: this may bring back an older key that was rotated.';
+				}
+				if (!confirm(msg)) return;
+				self.ajax('health_adopt_restored_key', {}, function(data) {
+					var fp = data && data.adopted ? data.adopted.fp : '';
+					self.showNotice('Monitor key switched to the backup\'s key' + (fp ? ' (' + fp + ')' : '') + '.', 'success');
+					self.loadHealthStatus();
+				}, function(err) {
+					self._hlog('error', 'health_adopt_restored_key FAILED', { error: err });
+					self.showNotice(err || 'Failed to switch the key.', 'error');
 				});
 			});
 
@@ -4241,6 +4322,7 @@
 				} else {
 					$keyStatus.html('<span style="color:#dc3232;font-weight:600;">No key generated</span> - click "Generate New Key" to create one.');
 				}
+				self.renderHealthKeyInfo(data.key_info || null);
 				if (data.sites && data.sites.length > 0) {
 					self._hlog('info', 'Rendering ' + data.sites.length + ' site results');
 					self.renderHealthResults(data.sites);
@@ -4252,6 +4334,58 @@
 				self._hlog('error', 'get_health_status AJAX FAILED', { error: err });
 				$container.html('<p class="notice notice-error" style="padding:10px;">Failed: ' + self.esc(err || 'Unknown error') + '</p>');
 			});
+		},
+
+		/**
+		 * Key fingerprint, wp-config pin and last-restore outcome (hints and
+		 * fingerprints only; the server never sends a key or a hash).
+		 */
+		renderHealthKeyInfo: function(info) {
+			var self = this;
+			var $info = $('#sgbackup-health-key-info');
+			var $row = $('#sgbackup-health-last-restore-row');
+			var $adopt = $('#sgbackup-health-adopt-key');
+			if (!info) { $info.empty(); $row.hide(); return; }
+			var lines = [];
+			var fmtDate = function(ts) { return ts ? new Date(ts * 1000).toLocaleString() : ''; };
+			if (info.has_key && info.fp) {
+				var details = [info.source || '', info.origin ? 'origin ' + info.origin : '', info.created ? 'created ' + fmtDate(info.created) : ''].filter(function(p) { return p; });
+				lines.push('Key: <code>\u2026' + self.esc(info.hint) + '</code>, fingerprint <code>' + self.esc(info.fp) + '</code>' + (details.length ? ' (' + self.esc(details.join(', ')) + ')' : ''));
+			} else if (info.has_key) {
+				lines.push('Key configured (created before fingerprints were recorded; regenerate it, or set it with <code>wp siteguardbackup health_api_key --set</code>, to see its fingerprint).');
+			}
+			if (info.pinned) {
+				lines.push('<strong>Pinned in wp-config</strong>: ' + parseInt(info.pinned, 10) + ' key hash(es) from SGBACKUP_HEALTH_API_KEY_HASH are also accepted, whatever a restore does.');
+			}
+			if (info.pin_invalid) {
+				lines.push('<span style="color:#d63638;">SGBACKUP_HEALTH_API_KEY_HASH has ' + parseInt(info.pin_invalid, 10) + ' malformed entry(ies); they are ignored.</span>');
+			}
+			if (info.enabled_pinned) {
+				lines.push('Enabled state pinned in wp-config (SGBACKUP_HEALTH_ENABLED).');
+			}
+			if (info.wp_hash_unsupported) {
+				lines.push('<span style="color:#d63638;">A key hash was made by WordPress 6.8 or later and cannot be checked on this WordPress version. Update WordPress or generate a new key.</span>');
+			}
+			$info.html(lines.length ? '<p class="description" style="margin:0;">' + lines.join('<br />') + '</p>' : '');
+
+			var lr = info.last_restore;
+			if (!lr || !lr.at) { $row.hide(); return; }
+			var bak = (lr.backup_hint ? '\u2026' + lr.backup_hint : 'fingerprint unknown') + (lr.backup_origin ? ', from ' + lr.backup_origin : '');
+			var outcomes = {
+				kept_site: 'Kept this site\'s key; the backup\'s key (' + bak + ') was not applied.',
+				adopted_backup: 'This site had no key; the backup\'s key (' + bak + ') is used.',
+				took_backup: 'The backup\'s key (' + bak + ') is used (policy: backup).',
+				unchanged: 'The backup had this site\'s key; unchanged.',
+				no_backup_key: 'The backup had no monitor key; this site\'s key was kept.'
+			};
+			$('#sgbackup-health-last-restore').text(fmtDate(lr.at) + ': ' + (outcomes[lr.outcome] || lr.outcome || ''));
+			if (info.has_declined) {
+				$adopt.text('Switch to the backup\'s key (' + (lr.backup_hint ? '\u2026' + lr.backup_hint : 'fingerprint unknown') + ')').show();
+				$adopt.data('rotated', !!(lr.backup_origin && info.site_host && lr.backup_origin === info.site_host));
+			} else {
+				$adopt.hide();
+			}
+			$row.show();
 		},
 
 		renderHealthResults: function(sites) {

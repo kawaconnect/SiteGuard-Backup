@@ -312,6 +312,17 @@ $period_labels = array(
 				<p class="description"><?php esc_html_e('Default mode for WP-CLI restores, remote-receive migrations, and any restore where the mode is not explicitly chosen.', 'siteguardbackup'); ?></p>
 			</td>
 		</tr>
+		<tr>
+			<th><?php esc_html_e('Default Health Monitor Key on Restore', 'siteguardbackup'); ?></th>
+			<td>
+				<?php $default_health_key_policy = (isset($settings['default_health_key_policy']) && 'backup' === $settings['default_health_key_policy']) ? 'backup' : 'keep'; ?>
+				<select name="default_health_key_policy">
+					<option value="keep" <?php selected($default_health_key_policy, 'keep'); ?>><?php esc_html_e("Keep this site's monitor key (default)", 'siteguardbackup'); ?></option>
+					<option value="backup" <?php selected($default_health_key_policy, 'backup'); ?>><?php esc_html_e('Use the key from the backup', 'siteguardbackup'); ?></option>
+				</select>
+				<p class="description"><?php esc_html_e("On a standby/failover server choose 'Use the key from the backup' so the Discord bot keeps working after failover. Applies to database restores that do not choose otherwise; if this site has no key, the backup's key is used either way.", 'siteguardbackup'); ?></p>
+			</td>
+		</tr>
 		<?php if (is_multisite()) : ?>
 		<tr>
 			<th><?php esc_html_e('Default Subsite Migration Mode', 'siteguardbackup'); ?></th>
