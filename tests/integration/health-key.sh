@@ -7,7 +7,7 @@
 # <instance-manager> is WPMultisiteDocker's scripts/instance.sh. The three
 # instances must already exist, be up, and have the plugin active. This script
 # never creates, destroys or stops an instance. <src-single> plays production,
-# <dst-single> the standby. Scenarios: H1 ... H21 (default: all implemented).
+# <dst-single> the standby. Scenarios: H1 ... H22 (default: all implemented).
 #
 # All plugin code runs inside the instances' cli containers as www-data. Keys
 # live only in this script's memory. Takes the shared integration lock (waits
@@ -223,6 +223,8 @@ H2() { # production -> standby, default policy; then adopt
 	clear_rl "$DST"
 	expect_auth "after adopt: KA works" 200 "$DST" "$KA"
 	expect_auth "after adopt: KB refused" "403 forbidden" "$DST" "$KB"
+	check "last restore says the switch was made" test "$(last_restore "$DST" | jq -r '.outcome')" = adopted_after_restore
+	check "no declined key left" test "$(W "$DST" siteguardbackup health_api_key --format=json | jq -r '.key.has_declined')" = false
 	check "adopt cannot run twice" bash -c '! "$0" wp "$1" siteguardbackup health_api_key --adopt-restored >/dev/null 2>&1' "$IM" "$DST"
 }
 
@@ -472,6 +474,15 @@ H13() { # a subsite restored into a single site
 	restore "$DST" "$tsb" --entities=db >/dev/null; clear_rl "$DST"
 	expect_auth "single site with its own key keeps it" 200 "$DST" "$KB"
 	expect_auth "subsite's key refused there" "403 forbidden" "$DST" "$ks"
+	# This site has a key but never enabled the monitor; the subsite backup has
+	# enabled=1. This site's unit wins alone: the monitor stays off, as in 1.5.1.
+	standby
+	E "$DST" 'global $wpdb; foreach (array("sgbackup_health_enabled","sgbackup_health_interval","sgbackup_health_timeout","sgbackup_health_ssl_warn_days") as $n) $wpdb->delete($wpdb->options, array("option_name" => $n)); wp_clear_scheduled_hook("sgbackup_health_check"); wp_cache_flush(); echo 1;' >/dev/null
+	restore "$DST" "$tsb" --entities=db >/dev/null; clear_rl "$DST"
+	check "key kept, no enabled row from the subsite" no_row "$DST" sgbackup_health_enabled
+	check "no interval row from the subsite" no_row "$DST" sgbackup_health_interval
+	expect_auth "monitor stays off" "404 disabled" "$DST" "$KB"
+	check "no health check scheduled" test "$(cron_schedule "$DST")" = none
 	"$IM" wp "$M" --url="$sub" siteguardbackup health_config disable >/dev/null 2>&1
 }
 
@@ -579,6 +590,15 @@ H17() { # wp-config pin
 	# replaced by other values; the pin and SGBACKUP_HEALTH_ENABLED still win.
 	kc="$(genkey "$DST")"; W "$DST" option update sgbackup_health_enabled 0 >/dev/null; clear_rl "$DST"
 	expect_auth "(c) DB key replaced and disabled: KA still works" 200 "$DST" "$KA"
+	# What docker-compose leaves of the define when "$" is not written as "$$":
+	# reported as malformed, never counted as a pin.
+	W "$DST" config set SGBACKUP_HEALTH_API_KEY_HASH '$2y$10' --type=constant >/dev/null
+	check "a truncated pin is reported as malformed" test "$(W "$DST" siteguardbackup health_api_key --format=json | jq -c '[.key.pinned, .key.pin_invalid]')" = '[0,1]'
+	# The string 'false' (wp config set without --raw) must not switch the monitor on.
+	W "$DST" config set SGBACKUP_HEALTH_ENABLED false --type=constant >/dev/null
+	check "SGBACKUP_HEALTH_ENABLED 'false' (string) keeps the monitor off" test "$(E "$DST" 'var_export(SiteGuard_Backup_Health_Monitor::is_enabled());')" = false
+	W "$DST" config set SGBACKUP_HEALTH_ENABLED maybe --type=constant >/dev/null
+	check "a non-boolean SGBACKUP_HEALTH_ENABLED is ignored with a warning" test "$(W "$DST" siteguardbackup health_api_key --format=json | jq -c '[.key.enabled_pinned, .key.enabled_pin_invalid, .enabled]')" = '[false,true,false]'
 	W "$DST" config delete SGBACKUP_HEALTH_API_KEY_HASH >/dev/null
 	W "$DST" config delete SGBACKUP_HEALTH_ENABLED >/dev/null
 	W "$DST" option update sgbackup_health_enabled 1 >/dev/null
@@ -596,14 +616,16 @@ H18() { # secrets never leak (run last: it greps everything the other scenarios 
 		local n="${!where}" dir blob
 		dir="$(E "$n" 'echo SiteGuard_Backup_Options::instance()->get_backup_dir();')"
 		blob="$(SH "$n" "cat '$dir'log.*.txt 2>/dev/null")$(E "$n" 'echo json_encode(array(get_option("sgbackup_audit_log"), get_site_option("sgbackup_audit_log")));')$(E "$n" 'echo json_encode(get_transient("sgbackup_restore_progress"));')$(E "$n" 'require_once SGBACKUP_DIR . "includes/class-commands.php"; echo json_encode((new SiteGuard_Backup_Commands())->get_health_status(array()));')"
+		# The saved restore state holds this site's key hash by design (a database
+		# row, like the key itself); only a plaintext key there is a leak.
 		for k in "$KA" "$KB"; do
-			[ -n "$k" ] && grep -qF -- "$k" <<<"$blob" && { leaks=$((leaks + 1)); echo "    plaintext key found on $n"; }
+			[ -n "$k" ] && grep -qF -- "$k" <<<"$blob$(E "$n" 'echo json_encode(get_option("sgbackup_restore_preserved"));')" && { leaks=$((leaks + 1)); echo "    plaintext key found on $n"; }
 		done
 		if grep -qE '\$wp\$2y\$|\$2y\$[0-9]{2}\$|\$P\$[./A-Za-z0-9]{8}' <<<"$blob"; then leaks=$((leaks + 1)); echo "    hash found on $n"; fi
 	done
 	auth "$DST" "$KA" >/dev/null
 	grep -qE '\$wp\$|\$2y\$|\$P\$' <<<"$LAST_BODY" && leaks=$((leaks + 1))
-	check "no plaintext key or hash in logs, audit log, progress, health status or /ping" test "$leaks" -eq 0
+	check "no plaintext key or hash in logs, audit log, progress, saved restore state, health status or /ping" test "$leaks" -eq 0
 }
 
 H19() { # golden: the same restore under 1.5.1 and this build
@@ -659,8 +681,31 @@ H21() { # a restore lock row that came in with the imported database
 	check "no restore lock left behind" no_row "$SRC" sgbackup_restore
 }
 
+H22() { # this site's own legacy plaintext key: restore state holds only its hash
+	fixture; standby
+	local kl out snap
+	kl="$(E "$DST" 'echo wp_generate_password(48, false, false);')"
+	E "$DST" "global \$wpdb; foreach (array('sgbackup_health_api_key_hash', 'sgbackup_health_api_key_meta') as \$n) \$wpdb->delete(\$wpdb->options, array('option_name' => \$n)); \$wpdb->replace(\$wpdb->options, array('option_name' => 'sgbackup_health_api_key', 'option_value' => '$kl', 'autoload' => 'yes')); wp_cache_flush(); echo 1;" >/dev/null
+	out="$(crash_restore "$DST" "$TS_A_ON_B" plugins:started "array('db' => true, 'plugins' => true, 'restore_plugins_items' => array('akismet'))")"
+	check "crashed after the database" grep_out "$out" "SIMULATED CRASH at plugins:started"
+	snap="$(option_raw "$DST" sgbackup_restore_preserved)"
+	check "saved restore state exists" test -n "$snap"
+	check "saved restore state holds no plaintext key" bash -c '! grep -qF -- "$1" <<<"$0"' "$snap" "$kl"
+	check "saved restore state holds this site's key hash" grep_out "$snap" sgbackup_health_api_key_hash
+	check "plaintext appears nowhere in the options table" test -z "$(E "$DST" "global \$wpdb; echo \$wpdb->get_var(\$wpdb->prepare(\"SELECT COUNT(*) FROM {\$wpdb->options} WHERE option_value LIKE %s\", '%$kl%')) ?: '';")"
+	clear_rl "$DST"
+	expect_auth "before resume: this site's (legacy) key works" 200 "$DST" "$kl"
+	out="$(WE "$DST" siteguardbackup resume_restore)"
+	check "resume finds the backup" bash -c '! grep -q "Backup not found" <<<"$0"' "$out"
+	clear_rl "$DST"
+	expect_auth "after resume: this site's key works" 200 "$DST" "$kl"
+	expect_auth "after resume: KA refused" "403 forbidden" "$DST" "$KA"
+	check "no legacy plaintext row" no_row "$DST" sgbackup_health_api_key
+	check "snapshot row removed" no_row "$DST" sgbackup_restore_preserved
+}
+
 # -----------------------------------------------------------------------------
-SCENARIOS=(H1 H2 H3 H4 H5 H6 H7 H8 H9 H10 H11 H12 H13 H14 H15 H16 H17 H19 H20 H21 H18)
+SCENARIOS=(H1 H2 H3 H4 H5 H6 H7 H8 H9 H10 H11 H12 H13 H14 H15 H16 H17 H19 H20 H21 H22 H18)
 
 for n in "$SRC" "$DST" "$MULTI"; do
 	W "$n" plugin is-active siteguardbackup >/dev/null || W "$n" plugin is-active siteguardbackup --network >/dev/null \
