@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.5.3
 
 ### Uptime Kuma push for the health monitor
 - After every health run (cron, Check Now, `wp siteguardbackup health_check`,
