@@ -355,6 +355,9 @@ H9() { # interrupted after the DB phase, resumed from completed phases
 		check "$p: non-health SiteGuard rows restored" same_rows "$DST" "$before"
 		check "$p: snapshot row removed" no_row "$DST" sgbackup_restore_preserved
 		check "$p: progress cleared" test -z "$(E "$DST" 'echo get_transient("sgbackup_restore_progress") ? "left" : "";')"
+		# The interrupted run's restore lock row is in the saved snapshot; writing it
+		# back would refuse every restore for an hour.
+		check "$p: no restore lock left behind" no_row "$DST" sgbackup_restore
 	done
 }
 
@@ -476,6 +479,7 @@ H14() { # a browser-style restore that checkpoints search-replace, then continue
 	expect_auth "after the continuation: KA works" 200 "$DST" "$KA"
 	expect_auth "after the continuation: KB refused" "403 forbidden" "$DST" "$KB"
 	check "retain sentinel kept" test "$(option_raw "$DST" sgbackup_retain)" = 37
+	check "no restore lock left behind by the first request" no_row "$DST" sgbackup_restore
 	# A bogus per-restore value falls back to the site default.
 	check "bogus policy falls back to keep" test "$(E "$DST" "require_once SGBACKUP_DIR . 'restorer.php'; \$r = new SiteGuard_Backup_Restorer(array('nonce' => 'x', 'timestamp' => 1), array('health_key_policy' => 'BACKUP')); \$p = new ReflectionProperty(\$r, 'health_key_policy'); \$p->setAccessible(true); echo \$p->getValue(\$r);")" = keep
 }

@@ -358,6 +358,7 @@ t_resume_after_db() {
 	check "resume skips the database" grep -q "Database already restored" <<<"$out"
 	check "this site's settings written back (retain 41)" test "$(WQ option get sgbackup_retain)" = 41
 	check "destination snapshot removed" test -z "$(PHP 'echo get_option("sgbackup_restore_preserved") ? "left" : "";')"
+	check "no restore lock left behind" test -z "$(PHP 'global $wpdb; echo $wpdb->get_var("SELECT COUNT(*) FROM {$wpdb->options} WHERE option_name = \"sgbackup_restore\"") ?: "";')"
 }
 
 # -----------------------------------------------------------------------------
