@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.5.4
 
 ### Security fixes from a review
 - Client IP: `CF-Connecting-IP` is honoured only when the connection comes
