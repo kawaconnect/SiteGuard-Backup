@@ -45,6 +45,7 @@ These rules are not optional.
 ```sh
 sudo tests/run-sandboxed.sh          # read-only /, tmpfs /tmp, runs as nobody
 php tests/test-delete-guard.php      # or directly, as an unprivileged user
+php tests/test-health-kuma.php       # Uptime Kuma push: URL validation, masking, up/down message (pure)
 php tests/test-encryption.php        # archive encryption: round trips, wrong key, truncation, tampering
 php tests/test-health-key-policy.php # whose health monitor key a restore keeps (pure, no files)
 ```
@@ -74,6 +75,7 @@ Further suites, same rules (disposable host, instances from `instance.sh`):
 
 | Script | What it proves |
 |---|---|
+| `integration/health-kuma.sh` | Uptime Kuma push against a fake Kuma (HTTPS, throwaway CA) on the instance mesh: up and down heartbeats naming the failing site, push failures (Kuma 404/5xx, DNS, timeout) never breaking the run, a run that throws still pushing, cron and REST runs, WP-CLI set/test/clear, a database restore keeping the site's own URL, and the push token never appearing in output, logs, REST, AJAX, export or the admin page. Reuses existing instances. |
 | `integration/browser-flow.sh` | The everyday workflow over HTTP as a logged-in admin: Backup Now, download the set as a zip bundle (and each file), upload it, restore, verify. Same-site recovery, move to another site, chunked upload, and a multisite network. |
 | `integration/transfer.sh` | Site transfers in every direction: single to single, single to a new or existing subsite, subsite to single, main site to single, subsite to a new subsite, network to network. Each over file import and over SiteGuard's own remote send. |
 | `integration/upgrade.sh` | Release check: fresh install from the release zip through WordPress's installer (admin page renders, uninstall is clean), and upgrade from the previous release's zip on a single site and a network, with the old backups still verifying and restoring. |
@@ -82,6 +84,7 @@ Further suites, same rules (disposable host, instances from `instance.sh`):
 
 ```sh
 tests/integration/browser-flow.sh $WPD/scripts/instance.sh /path/to/siteguardbackup
+tests/integration/health-kuma.sh  $WPD/scripts/instance.sh <single-instance> <multisite-instance> [test...]
 tests/integration/transfer.sh     $WPD/scripts/instance.sh /path/to/siteguardbackup --keep-failed
 tests/integration/storage.sh      $WPD/scripts/instance.sh <instance-with-plugin>
 tests/integration/health-key.sh   $WPD/scripts/instance.sh <src-single> <dst-single> <multisite> [scenario...]

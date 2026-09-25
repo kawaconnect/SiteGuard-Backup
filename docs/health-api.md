@@ -2,6 +2,8 @@
 
 External-facing REST API for Discord bots / monitoring tools. Exposes per-site HTTP reachability and SSL certificate info collected by the plugin's health monitor cron.
 
+For a single up/down heartbeat to Uptime Kuma after every health run (no polling), see [uptime-kuma.md](uptime-kuma.md).
+
 ## Base URL
 
 ```

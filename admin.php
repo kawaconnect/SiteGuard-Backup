@@ -125,6 +125,7 @@ class SiteGuard_Backup_Admin {
 				'migrate_send'      => wp_create_nonce('sgbackup-migrate_send'),
 				'searchreplace'     => wp_create_nonce('sgbackup-searchreplace'),
 				'test_webhook'      => wp_create_nonce('sgbackup-test_webhook'),
+				'health_kuma'       => wp_create_nonce('sgbackup-health_kuma'),
 				'failover_status'   => wp_create_nonce('sgbackup-failover_status'),
 				'failover_prefailover'  => wp_create_nonce('sgbackup-failover_prefailover'),
 				'failover_postfailover' => wp_create_nonce('sgbackup-failover_postfailover'),
@@ -328,7 +329,7 @@ class SiteGuard_Backup_Admin {
 		// Subsite admins restore their own site through ajax_restore, which scopes
 		// the restore to their blog (restrict_restore_scope()).
 		$network_admin_only = array(
-			'restore_alldownloaded', 'searchreplace', 'wipe_settings', 'import_settings',
+			'restore_alldownloaded', 'searchreplace', 'wipe_settings', 'import_settings', 'health_kuma',
 			'migrate_key_create', 'get_migrator_keys', 'delete_migrator_key',
 			'failover_prefailover', 'failover_postfailover', 'clear_audit_log', 'toggle_audit_log',
 			'regenerate_health_api_key', 'health_adopt_restored_key', 'test_extdb',
@@ -341,6 +342,7 @@ class SiteGuard_Backup_Admin {
 		$rate_limits = array(
 			'wipe_settings'          => array('limit' => 2,  'window' => 60),   // 2 per minute
 			'searchreplace'          => array('limit' => 5,  'window' => 60),   // 5 per minute
+			'health_kuma'            => array('limit' => 10, 'window' => 60),   // 10 per minute (test pushes)
 			'delete_backup'          => array('limit' => 15, 'window' => 60),   // 15 per minute
 			'migrate_send'           => array('limit' => 5,  'window' => 60),   // 5 per minute
 			'import_settings'        => array('limit' => 3,  'window' => 60),   // 3 per minute
@@ -423,6 +425,7 @@ class SiteGuard_Backup_Admin {
 			'toggle_audit_log',
 			'clear_audit_log',
 			'test_webhook',
+			'health_kuma',
 			'failover_status',
 			'failover_prefailover',
 			'failover_postfailover',

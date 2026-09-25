@@ -1,5 +1,31 @@
 # Changelog
 
+## Unreleased
+
+### Uptime Kuma push for the health monitor
+- After every health run (cron, Check Now, `wp siteguardbackup health_check`,
+  `POST /health/check`) SiteGuard can send one heartbeat to an Uptime Kuma
+  Push monitor: `status=up|down`, a message of at most 200 characters naming
+  the failing sites with reasons, and the run time as `ping`. Down when any
+  site is down, a certificate expired or expires within 3 days (the REST
+  API's critical alerts); slow sites, SSL probe failures and certificates
+  expiring later stay up and are named in the message. A run that throws
+  still pushes (down), and a failed push never affects the run.
+- Health tab: "Uptime Kuma Push" section with the push URL (masked after
+  saving), Send test push, Remove, the last push result and the Kuma
+  heartbeat interval to use; warns when WP-Cron is not driven by a system
+  cron or the last health run is more than two intervals old. Network
+  administrators only on multisite.
+- WP-CLI: `wp siteguardbackup health_kuma [--push-url=<push url>] [--test] [--clear]`;
+  `health_status`, `health_check` and `health_config` show the masked URL and
+  last push.
+- The push URL is validated (https, path ending in `/api/push/<token>`), never
+  logged or returned in full, and not part of the REST API, webhooks or a
+  settings export. Push failures are logged once per change, with the URL
+  masked.
+- Docs: `docs/uptime-kuma.md` (Kuma monitor settings, message format, cron).
+- Tests: `tests/test-health-kuma.php` (URL validation, masking, message
+  building) and `tests/integration/health-kuma.sh` (against a fake Kuma).
 ## 1.5.2
 
 ### Interrupted restores keep this site's settings

@@ -100,6 +100,10 @@ wp siteguardbackup cron_events [--sgbackup-only]
 
 Run `wp help siteguardbackup` for the full command list.
 
+## Uptime Kuma
+
+The health monitor (HTTP and SSL checks of every site, Health tab) can send one heartbeat per run to an Uptime Kuma **Push** monitor: `up`, or `down` naming the failing sites (`2/12 failing; down: example.com (HTTP 503); ssl_expired: foo.com`). When WordPress, PHP, the database or WP-Cron stops, the heartbeats stop and Kuma alerts too. Set the push URL on the Health tab or with `wp siteguardbackup health_kuma --push-url=<push url>` (`--test`, `--clear`); set the Kuma heartbeat interval to at least two health check intervals (1320 s for the default 10 minutes). Monitor settings, message format and cron notes: [docs/uptime-kuma.md](docs/uptime-kuma.md).
+
 ## Low-Memory Hosts
 
 The backup engine is built to run inside a small PHP memory limit (64-128 MB) on servers with 512 MB of RAM or less:

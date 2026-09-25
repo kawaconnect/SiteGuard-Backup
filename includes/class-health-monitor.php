@@ -33,9 +33,30 @@ class SiteGuard_Backup_Health_Monitor {
 	private function __construct() {}
 
 	/**
-	 * Run health checks on all sites and store results.
+	 * Run health checks on all sites and store results, then push the outcome to
+	 * Uptime Kuma when a push URL is set (also when the checks threw).
 	 */
 	public function run_checks() {
+		$started = microtime(true);
+		$results = null;
+		$error = null;
+		try {
+			$results = $this->run_site_checks();
+		} catch (Throwable $e) {
+			$error = $e;
+		}
+		require_once SGBACKUP_DIR . 'includes/class-health-kuma.php';
+		SiteGuard_Backup_Health_Kuma::after_run($results, $started, $error);
+		if ($error) {
+			throw $error;
+		}
+		return $results;
+	}
+
+	/**
+	 * Check every site and store the results.
+	 */
+	private function run_site_checks() {
 		$opts = SiteGuard_Backup_Options::instance();
 		$timeout = intval($opts->get_option('sgbackup_health_timeout', 10));
 		$ssl_warn = intval($opts->get_option('sgbackup_health_ssl_warn_days', 14));

@@ -2836,6 +2836,41 @@ class SiteGuard_Backup_Commands {
 		return SiteGuard_Backup_Webhook::send_test($url);
 	}
 
+	/**
+	 * Uptime Kuma push for the health monitor: save, clear or test the push URL.
+	 * Returns only the masked URL and the last push result, never the URL.
+	 *
+	 * @param array $params 'op' => 'status'|'save'|'clear'|'test', 'url' for save.
+	 */
+	public function health_kuma($params) {
+		require_once SGBACKUP_DIR . 'includes/class-health-kuma.php';
+		$op = isset($params['op']) && is_string($params['op']) ? $params['op'] : 'status';
+		$test = null;
+
+		if ('save' === $op) {
+			$url = isset($params['url']) && is_string($params['url']) ? trim($params['url']) : '';
+			$masked = SiteGuard_Backup_Health_Kuma::set_url($url);
+			if (is_wp_error($masked)) {
+				return $masked;
+			}
+			SiteGuard_Backup_Audit_Log::instance()->log('health_kuma_set', 'Uptime Kuma push URL set: ' . $masked);
+		} elseif ('clear' === $op) {
+			SiteGuard_Backup_Health_Kuma::clear_url();
+			SiteGuard_Backup_Audit_Log::instance()->log('health_kuma_cleared', 'Uptime Kuma push URL removed.');
+		} elseif ('test' === $op) {
+			$test = SiteGuard_Backup_Health_Kuma::test_push();
+			if (is_wp_error($test)) {
+				return $test;
+			}
+		} elseif ('status' !== $op) {
+			return new WP_Error('invalid_op', 'Unknown operation.');
+		}
+
+		$status = SiteGuard_Backup_Health_Kuma::get_status();
+		$status['test'] = $test;
+		return $status;
+	}
+
 	// ===== Phase 4: Failover Admin AJAX Commands =====
 
 	/**

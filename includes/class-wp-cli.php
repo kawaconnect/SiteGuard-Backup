@@ -4028,6 +4028,84 @@ class SiteGuard_Backup_CLI_Command extends WP_CLI_Command {
         } else {
             WP_CLI::error('Overall status: DOWN', false);
         }
+        require_once SGBACKUP_DIR . 'includes/class-health-kuma.php';
+        if (SiteGuard_Backup_Health_Kuma::is_configured()) {
+            WP_CLI::log('Uptime Kuma: ' . SiteGuard_Backup_Health_Kuma::describe());
+        }
+    }
+
+    /**
+     * Configure the Uptime Kuma push sent after every health run.
+     *
+     * After each health run SiteGuard sends one heartbeat to an Uptime Kuma
+     * "Push" monitor: status=up|down, a short message naming failing sites, and
+     * the run time as ping. The push URL holds the monitor's token: it is only
+     * ever shown masked.
+     *
+     * ## OPTIONS
+     *
+     * [--push-url=<push-url>]
+     * : Set the push URL (https://<kuma>/api/push/<token>; any query is dropped).
+     * (Not --url: that is WP-CLI's global site selector.)
+     *
+     * [--clear]
+     * : Remove the push URL.
+     *
+     * [--test]
+     * : Push once now (from the last health results) and report Kuma's answer.
+     *
+     * ## EXAMPLES
+     *
+     *     wp siteguardbackup health_kuma
+     *     wp siteguardbackup health_kuma --push-url="https://kuma.example.com/api/push/AbC123xyz"
+     *     wp siteguardbackup health_kuma --test
+     *     wp siteguardbackup health_kuma --clear
+     *
+     * @subcommand health_kuma
+     */
+    public function health_kuma($args, $assoc_args) {
+        require_once SGBACKUP_DIR . 'includes/class-health-monitor.php';
+        require_once SGBACKUP_DIR . 'includes/class-health-kuma.php';
+        $kuma = 'SiteGuard_Backup_Health_Kuma';
+
+        if (isset($assoc_args['clear'])) {
+            $kuma::clear_url();
+            WP_CLI::success('Uptime Kuma push URL removed.');
+            return;
+        }
+        if (isset($assoc_args['push-url'])) {
+            $masked = $kuma::set_url((string) $assoc_args['push-url']);
+            if (is_wp_error($masked)) {
+                WP_CLI::error($masked->get_error_message());
+            }
+            WP_CLI::success('Uptime Kuma push URL set: ' . $masked);
+        }
+        if (isset($assoc_args['test'])) {
+            $r = $kuma::test_push();
+            if (is_wp_error($r)) {
+                WP_CLI::error($r->get_error_message());
+            }
+            $line = 'status=' . $r['status'] . ' msg="' . $r['msg'] . '" -> ' . ($r['code'] ? 'HTTP ' . $r['code'] : 'no response') . ($r['error'] ? ' (' . $r['error'] . ')' : '');
+            if ($r['ok']) {
+                WP_CLI::success('Kuma accepted the push: ' . $line);
+            } else {
+                WP_CLI::error('Push failed: ' . $line);
+            }
+            return;
+        }
+        if (isset($assoc_args['push-url'])) {
+            return;
+        }
+
+        WP_CLI::log('Uptime Kuma push: ' . $kuma::describe());
+        if ($kuma::is_configured()) {
+            $opts = SiteGuard_Backup_Options::instance();
+            $interval = SiteGuard_Backup_Health_Monitor::instance()->get_interval_seconds();
+            WP_CLI::log('Kuma monitor: type Push, heartbeat interval >= ' . $kuma::recommended_heartbeat($interval) . 's (health checks every ' . $interval . 's), retries 0-1.');
+            foreach ($kuma::cron_warnings($interval, intval($opts->get_option('sgbackup_health_last_run', 0)), (bool) $opts->get_option('sgbackup_health_enabled', false)) as $w) {
+                WP_CLI::warning($w);
+            }
+        }
     }
 
     /**
@@ -4083,6 +4161,8 @@ class SiteGuard_Backup_CLI_Command extends WP_CLI_Command {
         $overall = $monitor->get_overall_status();
         WP_CLI::log('');
         WP_CLI::log('Overall: ' . strtoupper($overall));
+        require_once SGBACKUP_DIR . 'includes/class-health-kuma.php';
+        WP_CLI::log('Uptime Kuma push: ' . SiteGuard_Backup_Health_Kuma::describe());
         $last_run = SiteGuard_Backup_Options::instance()->get_option('sgbackup_health_last_run', 0);
         if ($last_run) {
             WP_CLI::log('Last checked: ' . date('Y-m-d H:i:s', $last_run) . ' (' . human_time_diff($last_run) . ' ago)');
@@ -4312,6 +4392,8 @@ class SiteGuard_Backup_CLI_Command extends WP_CLI_Command {
             WP_CLI::log('  Interval:      ' . $interval);
             WP_CLI::log('  HTTP Timeout:  ' . $timeout . 's');
             WP_CLI::log('  SSL Warning:   ' . $ssl_warn . ' days');
+            require_once SGBACKUP_DIR . 'includes/class-health-kuma.php';
+            WP_CLI::log('  Uptime Kuma:   ' . SiteGuard_Backup_Health_Kuma::describe());
             if ($next) {
                 WP_CLI::log('  Next check:    ' . date('Y-m-d H:i:s', $next) . ' (' . human_time_diff(time(), $next) . ')');
             }

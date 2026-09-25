@@ -94,6 +94,71 @@ $next_check = wp_next_scheduled('sgbackup_health_check');
 	</table>
 </div>
 
+<?php
+// ---- Uptime Kuma push (network-level; network administrators only on multisite) ----
+if (!is_multisite() || current_user_can('manage_network_options')):
+	require_once SGBACKUP_DIR . 'includes/class-health-monitor.php';
+	require_once SGBACKUP_DIR . 'includes/class-health-kuma.php';
+	$kuma = SiteGuard_Backup_Health_Kuma::get_status();
+	$kuma_interval = SiteGuard_Backup_Health_Monitor::instance()->get_interval_seconds();
+	$kuma_heartbeat = SiteGuard_Backup_Health_Kuma::recommended_heartbeat($kuma_interval);
+	$kuma_warnings = $kuma['configured'] ? SiteGuard_Backup_Health_Kuma::cron_warnings($kuma_interval, intval($opts->get_option('sgbackup_health_last_run', 0)), (bool) $health_enabled) : array();
+?>
+<div class="sgbackup-section" id="sgbackup-kuma-section">
+	<h2><?php esc_html_e('Uptime Kuma Push', 'siteguardbackup'); ?></h2>
+	<p class="description"><?php esc_html_e('After every health run SiteGuard sends one heartbeat to an Uptime Kuma "Push" monitor: up when every site answers, down when any site is down, has an expired certificate or one expiring within 3 days. Warnings (slow sites, certificates expiring later, SSL probe failures) stay up and are named in the message. If heartbeats stop (PHP, database or WP-Cron dead), Kuma alerts too.', 'siteguardbackup'); ?></p>
+	<?php foreach ($kuma_warnings as $kuma_warning): ?>
+	<div class="notice notice-warning inline" style="margin:10px 0;"><p><?php echo esc_html($kuma_warning); ?></p></div>
+	<?php endforeach; ?>
+	<table class="form-table">
+		<tr>
+			<th scope="row"><label for="sgbackup-kuma-url"><?php esc_html_e('Push URL', 'siteguardbackup'); ?></label></th>
+			<td>
+				<div id="sgbackup-kuma-current" style="margin-bottom:6px;<?php echo $kuma['configured'] ? '' : 'display:none;'; ?>">
+					<?php esc_html_e('Current:', 'siteguardbackup'); ?> <code id="sgbackup-kuma-masked"><?php echo esc_html($kuma['masked']); ?></code>
+				</div>
+				<input type="text" id="sgbackup-kuma-url" value="" class="regular-text" autocomplete="off" spellcheck="false" placeholder="https://kuma.example.com/api/push/..." />
+				<button type="button" class="button button-primary" id="sgbackup-kuma-save"><?php esc_html_e('Save', 'siteguardbackup'); ?></button>
+				<button type="button" class="button" id="sgbackup-kuma-test" <?php disabled(!$kuma['configured']); ?>><?php esc_html_e('Send test push', 'siteguardbackup'); ?></button>
+				<button type="button" class="button button-link-delete" id="sgbackup-kuma-clear" <?php disabled(!$kuma['configured']); ?>><?php esc_html_e('Remove', 'siteguardbackup'); ?></button>
+				<p id="sgbackup-kuma-result" style="margin:6px 0 0;"></p>
+				<p class="description"><?php esc_html_e('Paste the Push URL from the Kuma monitor (the "?status=up&msg=OK&ping=" part is dropped). It contains the monitor\'s token, so it is shown masked after saving and never logged.', 'siteguardbackup'); ?></p>
+			</td>
+		</tr>
+		<tr>
+			<th scope="row"><?php esc_html_e('Last Push', 'siteguardbackup'); ?></th>
+			<td id="sgbackup-kuma-last"><?php
+				$kl = $kuma['last'];
+				if (!empty($kl['time'])) {
+					echo esc_html(sprintf(
+						/* translators: 1: OK/FAILED, 2: up/down, 3: HTTP code or error, 4: time ago, 5: message */
+						__('%1$s, status=%2$s (%3$s) %4$s ago: %5$s', 'siteguardbackup'),
+						!empty($kl['ok']) ? 'OK' : 'FAILED',
+						$kl['status'],
+						!empty($kl['error']) ? $kl['error'] : 'HTTP ' . intval($kl['code']),
+						human_time_diff(intval($kl['time'])),
+						$kl['msg']
+					));
+				} else {
+					esc_html_e('None yet.', 'siteguardbackup');
+				}
+			?></td>
+		</tr>
+		<tr>
+			<th scope="row"><?php esc_html_e('Kuma Monitor Settings', 'siteguardbackup'); ?></th>
+			<td><p class="description"><?php
+				echo esc_html(sprintf(
+					/* translators: 1: health check interval in seconds, 2: recommended heartbeat interval in seconds */
+					__('Monitor Type "Push"; Heartbeat Interval %2$d seconds or more (health checks run every %1$d seconds, so this allows one late or missed run); Retries 0 or 1; attach your notification.', 'siteguardbackup'),
+					$kuma_interval,
+					$kuma_heartbeat
+				));
+			?></p></td>
+		</tr>
+	</table>
+</div>
+<?php endif; ?>
+
 <div class="sgbackup-section">
 	<h2>
 		<?php esc_html_e('Current Status', 'siteguardbackup'); ?>

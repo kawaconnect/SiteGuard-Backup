@@ -93,6 +93,7 @@
 			this.bindCronEvents();
 			this.bindExportImportSettings();
 			this.bindWebhook();
+			this.bindHealthKuma();
 			this.bindFailover();
 			this.bindRestorePresets();
 			this.bindRemoteSendSchedule();
@@ -3755,6 +3756,63 @@
 				}, function(msg) {
 					$btn.prop('disabled', false);
 					$result.text('Error: ' + msg).addClass('error').removeClass('success');
+				});
+			});
+		},
+
+		// ===== Health Monitor: Uptime Kuma push =====
+		// The push URL is sent to the server once and never comes back: responses
+		// carry only the masked URL and the last push result.
+		bindHealthKuma: function() {
+			var self = this;
+			if (!$('#sgbackup-kuma-section').length) return;
+
+			var show = function(data, text, ok) {
+				if (data) {
+					$('#sgbackup-kuma-masked').text(data.masked || '');
+					$('#sgbackup-kuma-current').toggle(!!data.configured);
+					$('#sgbackup-kuma-test, #sgbackup-kuma-clear').prop('disabled', !data.configured);
+					var l = data.last || {};
+					if (l.time) {
+						$('#sgbackup-kuma-last').text((l.ok ? 'OK' : 'FAILED') + ', status=' + l.status + ' (' + (l.error ? l.error : 'HTTP ' + l.code) + ') just now: ' + (l.msg || ''));
+					} else if (!data.configured) {
+						$('#sgbackup-kuma-last').text('None yet.');
+					}
+				}
+				$('#sgbackup-kuma-result').text(text || '').css('color', ok === false ? '#d63638' : (ok ? '#00a32a' : ''));
+			};
+			var run = function($btn, params, done) {
+				$btn.prop('disabled', true);
+				show(null, 'Working...');
+				self.ajax('health_kuma', params, function(data) {
+					$btn.prop('disabled', false);
+					done(data);
+				}, function(msg) {
+					$btn.prop('disabled', false);
+					show(null, 'Error: ' + msg, false);
+				});
+			};
+
+			$('#sgbackup-kuma-save').on('click', function() {
+				var url = $.trim($('#sgbackup-kuma-url').val());
+				if (!url) { show(null, 'Paste the Push URL from Uptime Kuma first.', false); return; }
+				run($(this), { op: 'save', url: url }, function(data) {
+					$('#sgbackup-kuma-url').val('');
+					show(data, 'Saved. Use "Send test push" to check that Kuma receives it.', true);
+				});
+			});
+			$('#sgbackup-kuma-test').on('click', function() {
+				run($(this), { op: 'test' }, function(data) {
+					var t = data.test || {};
+					var text = t.ok ? 'Kuma accepted the push (HTTP ' + t.code + ', status=' + t.status + ').'
+						: 'Push failed: ' + (t.error || ('HTTP ' + t.code));
+					show(data, text, !!t.ok);
+				});
+			});
+			$('#sgbackup-kuma-clear').on('click', function() {
+				if (!confirm('Remove the Uptime Kuma push URL? Kuma will then report missed heartbeats.')) return;
+				run($(this), { op: 'clear' }, function(data) {
+					show(data, 'Removed.', true);
 				});
 			});
 		},
