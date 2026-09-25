@@ -659,8 +659,11 @@ function sgbackup_health_api_callback(WP_REST_Request $request) {
 				);
 			}
 			// Fresh data: flag expiry conditions (don't double-alert on stale).
-			if (!$ssl_stale && $ssl_days >= 0) {
-				if ($ssl_days <= 0) {
+			// ssl_ok means this run read the certificate, so a negative day count
+			// is an expiry here, not the -1 "unknown" of an unprobed site.
+			if ($ssl_ok && !$ssl_stale) {
+				$ssl_exp_at = isset($site['ssl_expires_at']) ? intval($site['ssl_expires_at']) : 0;
+				if (SiteGuard_Backup_Health_Monitor::ssl_expired($ssl_exp_at, $ssl_days)) {
 					$summary['ssl_expired']++;
 					$summary['ssl_expiring_soon']++;
 					$alerts[] = array(
@@ -671,7 +674,7 @@ function sgbackup_health_api_callback(WP_REST_Request $request) {
 						'site_id'  => isset($site['site_id']) ? intval($site['site_id']) : 0,
 						'ssl_expiry_days' => $ssl_days,
 					);
-				} elseif ($ssl_days <= $ssl_warn_days) {
+				} elseif ($ssl_days >= 0 && $ssl_days <= $ssl_warn_days) {
 					$summary['ssl_expiring_soon']++;
 					$alerts[] = array(
 						'severity' => ($ssl_days <= 3 ? 'critical' : 'warning'),

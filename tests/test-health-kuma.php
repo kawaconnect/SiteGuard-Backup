@@ -88,6 +88,14 @@ check('cert expiring in 9d: up with a note', 'up' === $m['status'] && '1/2 sites
 $m = $K::build_message(array(site('a.com', array('status' => 'degraded', 'ssl_expiry_days' => 2))));
 check('cert expiring in 2d (critical): down', 'down' === $m['status'] && '1/1 failing; ssl_expiring: a.com (2d)' === $m['msg']);
 
+// Rows as the 1.5.4 monitor writes them around day 0 (days are floored).
+$m = $K::build_message(array(site('a.com', array('status' => 'down', 'ssl_expiry_days' => -1, 'ssl_expires_at' => time() - 3600, 'error' => 'SSL certificate expired'))));
+check('expired 1 h ago (days -1): down as ssl_expired', 'down' === $m['status'] && '1/1 failing; ssl_expired: a.com' === $m['msg']);
+$m = $K::build_message(array(site('a.com', array('status' => 'degraded', 'ssl_expiry_days' => 0, 'ssl_expires_at' => time() + 5 * 3600))));
+check('5 h left (days 0): down as expiring (0d), not expired', 'down' === $m['status'] && '1/1 failing; ssl_expiring: a.com (0d)' === $m['msg']);
+$m = $K::build_message(array(site('a.com', array('ssl_ok' => false, 'ssl_expiry_days' => -1, 'ssl_expires_at' => 0))));
+check('never probed (-1, ssl_ok false, no error): up, nothing flagged', 'up' === $m['status'] && '1/1 sites operational' === $m['msg']);
+
 $m = $K::build_message(array(site('a.com', array('status' => 'degraded', 'ssl_expiry_days' => 2, 'ssl_stale' => true, 'ssl_ok' => false, 'ssl_error' => 'SSL probe failed for a.com: x'))));
 check('stale cert data never pages', 'up' === $m['status'] && '0/1 sites operational; ssl_probe_failed: a.com' === $m['msg']);
 

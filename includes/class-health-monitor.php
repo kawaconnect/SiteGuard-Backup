@@ -83,9 +83,10 @@ class SiteGuard_Backup_Health_Monitor {
 					'http_code'          => 0,
 					'response_time'      => 0,
 					'ssl_expiry_days'    => isset($prev['ssl_expiry_days']) ? intval($prev['ssl_expiry_days']) : -1,
+					'ssl_expires_at'     => isset($prev['ssl_expires_at']) ? intval($prev['ssl_expires_at']) : 0,
 					'ssl_issuer'         => isset($prev['ssl_issuer']) ? (string) $prev['ssl_issuer'] : '',
 					'ssl_ok'             => false,
-					'ssl_error'          => 'skipped: time budget exceeded',
+					'ssl_error'          => 'SSL probe skipped for ' . wp_parse_url($target['url'], PHP_URL_HOST) . ': time budget exceeded',
 					'ssl_stale'          => true,
 					'ssl_last_success'   => isset($prev['ssl_last_success']) ? intval($prev['ssl_last_success']) : 0,
 					'ssl_checked_at'     => isset($prev['ssl_checked_at']) ? intval($prev['ssl_checked_at']) : 0,
@@ -134,6 +135,7 @@ class SiteGuard_Backup_Health_Monitor {
 			'http_code'       => 0,
 			'response_time'   => 0,
 			'ssl_expiry_days' => -1,
+			'ssl_expires_at'  => 0,
 			'ssl_issuer'      => '',
 			'ssl_ok'          => false,
 			'ssl_error'       => '',
@@ -233,18 +235,22 @@ class SiteGuard_Backup_Health_Monitor {
 				$result['ssl_stale']        = false;
 				$result['ssl_error']        = '';
 				$result['ssl_last_success'] = time();
+				$result['ssl_expires_at']   = isset($ssl['expires_at']) ? intval($ssl['expires_at']) : 0;
 
-				// Only escalate status based on fresh cert data
-				if ($ssl['days'] !== -1 && $ssl['days'] <= 0) {
+				// Only escalate status based on fresh cert data. Expiry is decided
+				// from notAfter itself: days are floored, so a certificate that
+				// expired within the last day reads -1 and one with hours left 0.
+				if (self::ssl_expired($result['ssl_expires_at'], $ssl['days'])) {
 					$result['status'] = 'down';
 					$result['error'] = $result['error'] ? $result['error'] . '; SSL expired' : 'SSL certificate expired';
-				} elseif ($ssl['days'] > 0 && $ssl['days'] <= $ssl_warn_days && $result['status'] === 'operational') {
+				} elseif ($ssl['days'] >= 0 && $ssl['days'] <= $ssl_warn_days && $result['status'] === 'operational') {
 					$result['status'] = 'degraded';
 				}
 			} else {
 				// Probe failed: carry forward last-known-good data if we have any
 				if ($prev && isset($prev['ssl_expiry_days']) && intval($prev['ssl_expiry_days']) >= 0) {
 					$result['ssl_expiry_days']  = intval($prev['ssl_expiry_days']);
+					$result['ssl_expires_at']   = isset($prev['ssl_expires_at']) ? intval($prev['ssl_expires_at']) : 0;
 					$result['ssl_issuer']       = isset($prev['ssl_issuer']) ? (string) $prev['ssl_issuer'] : '';
 					$result['ssl_last_success'] = isset($prev['ssl_last_success']) ? intval($prev['ssl_last_success']) : 0;
 				}
@@ -500,6 +506,7 @@ class SiteGuard_Backup_Health_Monitor {
 			$ts = strtotime($expire);
 			if ($ts !== false) {
 				$result['days'] = intval(floor(($ts - time()) / 86400));
+				$result['expires_at'] = intval($ts);
 			}
 		}
 
@@ -509,6 +516,7 @@ class SiteGuard_Backup_Health_Monitor {
 			if (is_array($parsed)) {
 				if (isset($parsed['validTo_time_t'])) {
 					$result['days'] = intval(floor(($parsed['validTo_time_t'] - time()) / 86400));
+					$result['expires_at'] = intval($parsed['validTo_time_t']);
 				}
 				if (isset($parsed['issuer']['O'])) {
 					$result['issuer'] = (string) $parsed['issuer']['O'];
@@ -560,7 +568,8 @@ class SiteGuard_Backup_Health_Monitor {
 			}
 		}
 
-		if ($result['days'] === -1) {
+		// Not days === -1: that is also a certificate that expired within the last day.
+		if (empty($result['expires_at'])) {
 			$result['error'] = 'curl: unable to parse expiry';
 			return $result;
 		}
@@ -633,6 +642,7 @@ class SiteGuard_Backup_Health_Monitor {
 		}
 
 		$result['days'] = intval(floor(($cert['validTo_time_t'] - time()) / 86400));
+		$result['expires_at'] = intval($cert['validTo_time_t']);
 
 		if (isset($cert['issuer']['O'])) {
 			$result['issuer'] = $cert['issuer']['O'];
@@ -643,6 +653,23 @@ class SiteGuard_Backup_Health_Monitor {
 		$result['san'] = $this->extract_cert_names($cert);
 		$result['ok'] = true;
 		return $result;
+	}
+
+	/**
+	 * Has a successfully probed certificate expired? From its notAfter when
+	 * known (ssl_expires_at, 1.5.4+), else from the floored day count, where any
+	 * negative value is an expiry (a successful probe always has a notAfter).
+	 *
+	 * @param int      $expires_at notAfter as a unix timestamp, 0 if unknown.
+	 * @param int      $days       Whole days left (floor).
+	 * @param int|null $now        For tests.
+	 */
+	public static function ssl_expired($expires_at, $days, $now = null) {
+		$expires_at = intval($expires_at);
+		if ($expires_at > 0) {
+			return $expires_at <= (null === $now ? time() : intval($now));
+		}
+		return intval($days) < 0;
 	}
 
 	/**

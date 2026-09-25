@@ -4,7 +4,8 @@
  * once per request although WordPress calls the permission callback twice
  * (dispatch, then the Allow header), a failed attempt counts once so the
  * limiter answers 429 on the 21st bad key, not the 11th, every health response
- * (errors too) is marked no-store.
+ * (errors too) is marked no-store, and SSL expiry is decided from the
+ * certificate's notAfter (no off-by-one around day 0).
  *
  * Standalone: the plugin file is loaded with the few WordPress functions it
  * touches stubbed; options and transients live in memory.
@@ -44,6 +45,9 @@ function get_transient($k) { global $transients; return isset($transients[$k]) ?
 function set_transient($k, $v, $ttl = 0) { global $transients; $transients[$k] = $v; return true; }
 function wp_hash_password($p) { return password_hash($p, PASSWORD_BCRYPT, array('cost' => 4)); }
 function wp_check_password($p, $h) { global $bcrypt_calls; $bcrypt_calls++; return password_verify($p, $h); }
+function wp_get_schedules() { return array('every10min' => array('interval' => 600)); }
+function get_site_url() { return 'https://example.test'; }
+function rest_ensure_response($data) { return $data; }
 
 class WP_Error {
 	private $code; private $data;
@@ -162,6 +166,65 @@ foreach (array('/sgbackup/v1', '/sgbackup/v1/healthz', '/wp/v2/posts', '/other/s
 }
 $err = new WP_Error('x');
 check('non-response result passed through untouched', $err === sgbackup_health_api_no_store($err, null, new WP_REST_Request('/sgbackup/v1/health')));
+
+// --- SSL expiry ------------------------------------------------------------------
+$M = 'SiteGuard_Backup_Health_Monitor';
+$now = time();
+check('ssl_expired: notAfter 1 h ago (days -1) is expired', $M::ssl_expired($now - 3600, -1, $now));
+check('ssl_expired: notAfter in 5 h (days 0) is not expired', !$M::ssl_expired($now + 5 * 3600, 0, $now));
+check('ssl_expired: notAfter now is expired', $M::ssl_expired($now, 0, $now));
+check('ssl_expired: no notAfter (rows from 1.5.3), days -3 is expired', $M::ssl_expired(0, -3, $now));
+check('ssl_expired: no notAfter, days 0 is not expired', !$M::ssl_expired(0, 0, $now));
+
+// The cURL probe: a certificate that expired an hour ago is read, not "unable to parse".
+$parse = new ReflectionMethod($M, 'parse_curl_certinfo');
+$parse->setAccessible(true);
+$probe = function ($expire) use ($parse, $M) {
+	return $parse->invoke($M::instance(), array(array('Expire date' => $expire, 'Subject' => 'CN = a.example')));
+};
+$r = $probe(gmdate('M j H:i:s Y', $now - 3600) . ' GMT');
+check('curl probe: expired 1 h ago is ok, days -1, notAfter recorded', !empty($r['ok']) && -1 === $r['days'] && abs($r['expires_at'] - ($now - 3600)) <= 1);
+$r = $probe(gmdate('M j H:i:s Y', $now + 5 * 3600) . ' GMT');
+check('curl probe: 5 h left is ok, days 0', !empty($r['ok']) && 0 === $r['days'] && $r['expires_at'] > $now);
+$r = $probe('not a date');
+check('curl probe: unparseable expiry still fails', empty($r['ok']) && 'curl: unable to parse expiry' === $r['error']);
+
+// REST summary and alerts from stored rows.
+function ssl_row($id, $domain, $over) {
+	global $now;
+	return array_merge(array(
+		'site_id' => $id, 'url' => 'https://' . $domain . '/', 'domain' => $domain, 'status' => 'operational',
+		'http_code' => 200, 'response_time' => 0.1, 'ssl_expiry_days' => 60, 'ssl_expires_at' => $now + 60 * 86400 + 100,
+		'ssl_issuer' => 'R11', 'ssl_ok' => true, 'ssl_error' => '', 'ssl_stale' => false, 'ssl_last_success' => $now,
+		'ssl_checked_at' => $now, 'last_check' => $now, 'error' => '', 'check_method' => 'external', 'consecutive_failures' => 0,
+	), $over);
+}
+$options['sgbackup_health_results'] = array(
+	ssl_row(1, 'ok.test', array()),
+	ssl_row(2, 'expired1h.test', array('status' => 'down', 'error' => 'SSL certificate expired', 'ssl_expiry_days' => -1, 'ssl_expires_at' => $now - 3600)),
+	ssl_row(3, 'hours5.test', array('status' => 'degraded', 'ssl_expiry_days' => 0, 'ssl_expires_at' => $now + 5 * 3600)),
+	ssl_row(4, 'legacy.test', array('status' => 'down', 'error' => 'SSL certificate expired', 'ssl_expiry_days' => -3, 'ssl_expires_at' => null)),
+	ssl_row(5, 'unknown.test', array('ssl_ok' => false, 'ssl_expiry_days' => -1, 'ssl_expires_at' => 0, 'ssl_last_success' => 0, 'ssl_checked_at' => 0)),
+	ssl_row(6, 'plain.test', array('url' => 'http://plain.test/', 'ssl_ok' => false, 'ssl_expiry_days' => -1, 'ssl_expires_at' => 0)),
+	ssl_row(7, 'stale.test', array('status' => 'degraded', 'ssl_ok' => false, 'ssl_stale' => true, 'ssl_expiry_days' => 2, 'ssl_error' => 'SSL probe failed for stale.test: timeout')),
+	ssl_row(8, 'week.test', array('status' => 'degraded', 'ssl_expiry_days' => 7, 'ssl_expires_at' => $now + 7 * 86400 + 100)),
+);
+unset($options['sgbackup_health_results'][3]['ssl_expires_at']);   // a row stored by 1.5.3
+$payload = sgbackup_health_api_callback(new WP_REST_Request('/sgbackup/v1/health'));
+$by = array();
+foreach ($payload['alerts'] as $a) { $by[$a['domain']][] = $a['type'] . '/' . $a['severity']; }
+$sum = $payload['summary'];
+check('summary.ssl_expired counts both expired certs (1 h ago, legacy -3)', 2 === $sum['ssl_expired']);
+check('summary.ssl_expiring_soon: expired x2 + 5 h + 7 d', 4 === $sum['ssl_expiring_soon']);
+check('expired 1 h ago: ssl_expired alert', in_array('ssl_expired/critical', $by['expired1h.test'], true));
+check('legacy row (no ssl_expires_at), days -3: ssl_expired alert', in_array('ssl_expired/critical', $by['legacy.test'], true));
+check('5 h left: critical ssl_expiring, not expired', array('ssl_expiring/critical') === $by['hours5.test']);
+check('7 d left: warning ssl_expiring', array('ssl_expiring/warning') === $by['week.test']);
+check('never probed (-1, ssl_ok false): no expiry alert', !isset($by['unknown.test']));
+check('http-only: no alert', !isset($by['plain.test']));
+check('stale data: probe-failed alert only, no expiry alert', array('ssl_probe_failed/warning') === $by['stale.test']);
+check('ok site: no alert', !isset($by['ok.test']));
+check('payload still has api_version 2 and the rows as stored', 2 === $payload['api_version'] && 8 === count($payload['sites']) && !array_key_exists('ssl_expires_at', $payload['sites'][3]));
 
 echo "\n$count checks, $failures failed\n";
 exit($failures ? 1 : 0);

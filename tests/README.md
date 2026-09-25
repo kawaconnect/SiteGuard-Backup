@@ -49,7 +49,7 @@ php tests/test-health-kuma.php       # Uptime Kuma push: URL validation, masking
 php tests/test-encryption.php        # archive encryption: round trips, wrong key, truncation, tampering
 php tests/test-health-key-policy.php # whose health monitor key a restore keeps (pure, no files)
 php tests/test-client-ip.php         # client IP: CF-Connecting-IP only from Cloudflare/loopback/SGBACKUP_TRUSTED_PROXIES, IPv6 /64 buckets
-php tests/test-health-api.php        # health REST API: one key check per request, 429 on the 21st bad key, no-store headers
+php tests/test-health-api.php        # health REST API: one key check per request, 429 on the 21st bad key, no-store headers, SSL expiry
 ```
 
 The GitLab pipeline's `test` job (`ci/test.sh`, see `.gitlab-ci.yml`) lints

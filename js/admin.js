@@ -4477,7 +4477,10 @@
 				var sslText;
 				var sslClass = '';
 
-				if (s.ssl_expiry_days >= 0) {
+				if (s.ssl_ok && !sslStale && (s.ssl_expires_at ? s.ssl_expires_at * 1000 <= Date.now() : s.ssl_expiry_days < 0)) {
+					sslText = 'Expired';
+					sslClass = ' style="color:#dc3232;font-weight:600;"';
+				} else if (s.ssl_expiry_days >= 0) {
 					sslText = s.ssl_expiry_days + ' days';
 					if (sslStale && s.ssl_last_success) {
 						sslText += ' (stale, last OK ' + new Date(s.ssl_last_success * 1000).toLocaleDateString() + ')';

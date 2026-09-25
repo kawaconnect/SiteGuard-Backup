@@ -87,7 +87,8 @@ Returns the cached health payload (refreshed by cron on the configured interval,
       "last_check": 1775892820,         // unix ts of HTTP probe
 
       "ssl_ok": true,                   // whether the last SSL probe succeeded
-      "ssl_expiry_days": 75,            // days until expiry, -1 if unknown / never probed / http-only
+      "ssl_expiry_days": 75,            // whole days until expiry (rounded down); negative once expired. -1 is also "unknown" (never probed, http-only): use ssl_ok / ssl_expires_at to tell them apart
+      "ssl_expires_at": 1782392820,     // the certificate's notAfter (unix ts) from the last successful probe, 0 if unknown (1.5.4+)
       "ssl_issuer": "Let's Encrypt",
       "ssl_error": "",                  // "SSL probe failed for <domain>: <reason>" when ssl_ok=false
       "ssl_stale": false,               // true = showing carried-forward data from a previous success
@@ -134,8 +135,10 @@ All alerts carry `severity`, `type`, `domain`, `site_id`, `message`, and optiona
 |---|---|---|---|
 | `site_down` | critical | HTTP probe fails or returns non-2xx/3xx/403-from-localhost | - |
 | `ssl_probe_failed` | warning | SSL probe failed (connect timeout, handshake failure, hostname mismatch, etc.) - the `message` is prefixed with the domain and ends with the underlying reason | `ssl_last_success` (unix ts, 0 if never) |
-| `ssl_expiring` | warning (≤14d) / critical (≤3d) | Fresh probe succeeded and cert expires within `ssl_warn_days` | `ssl_expiry_days` |
-| `ssl_expired` | critical | Fresh probe succeeded and reports `days <= 0` | `ssl_expiry_days` |
+| `ssl_expiring` | warning (≤14d) / critical (≤3d) | Fresh probe succeeded and cert expires within `ssl_warn_days` (0 = less than a day left) | `ssl_expiry_days` |
+| `ssl_expired` | critical | Fresh probe succeeded and the certificate's notAfter has passed | `ssl_expiry_days` |
+
+`domain` is the host only: on a subdirectory multisite several sites share it; use `url` (or `site_id`) to tell them apart.
 
 Alerts are only emitted on **fresh** data. If the cert data is carried forward from a previous successful probe (`ssl_stale: true`), no expiry alert is emitted - a stale "5 days left" reading might be hours or days old and is untrustworthy. The bot can still detect stale state from `summary.ssl_stale` or per-site `ssl_stale`.
 
@@ -252,7 +255,7 @@ A downgrade to 1.5.1 keeps the stored key working. The `wp-config.php` pin, the 
 
 ## Changelog
 
-- **Unreleased** - every response sends `Cache-Control: no-store, private, max-age=0` and `Vary: Authorization`; a failed attempt counts once (429 after 20, not 10); IPv6 is rate-limited per /64; `CF-Connecting-IP` is trusted only from Cloudflare, loopback and `SGBACKUP_TRUSTED_PROXIES`.
+- **Unreleased** - per-site `ssl_expires_at`. `ssl_expired` (and `summary.ssl_expired`) fires for every expired certificate; it used to fire only at exactly 0 days, and a certificate that expired less than a day ago read as -1 ("unknown"). A certificate with hours left is `ssl_expiring` with `ssl_expiry_days: 0`, not expired. The time-budget skip's `ssl_error` names the domain ("SSL probe skipped for <domain>: time budget exceeded"). Every response sends `Cache-Control: no-store, private, max-age=0` and `Vary: Authorization`; a failed attempt counts once (429 after 20, not 10); IPv6 is rate-limited per /64; `CF-Connecting-IP` is trusted only from Cloudflare, loopback and `SGBACKUP_TRUSTED_PROXIES`.
 - **1.5.3** - no API change (the Uptime Kuma push is separate and not part of any REST payload).
 - **1.5.2** - `/health/ping` adds `key` (`fp`, `source`). The monitor key survives restores and failover: health key policy, key fingerprints, "Switch to the backup's key", `wp-config.php` pin (`SGBACKUP_HEALTH_API_KEY_HASH`, `SGBACKUP_HEALTH_ENABLED`), `health_api_key --set/--print-hash/--adopt-restored/--format`.
 

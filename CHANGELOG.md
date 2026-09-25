@@ -24,6 +24,20 @@
 - Uptime Kuma push: redirects are no longer followed (was up to 2), so a
   push URL cannot bounce the heartbeat and its token to another host.
 
+### SSL expiry off by one
+- Days to expiry are rounded down, so a certificate that expired less than a
+  day ago read as -1, the "unknown" value: the site stayed operational. One
+  with hours left read as 0 and was marked expired. The health monitor now
+  records the certificate's notAfter (`ssl_expires_at`, new in the REST API)
+  and decides expiry from it; less than a day left is "expiring" (degraded,
+  critical `ssl_expiring` alert), not expired.
+- REST API: `ssl_expired` alerts and `summary.ssl_expired` only fired at
+  exactly 0 days; they now fire for every expired certificate.
+- The cURL probe treated a certificate that expired within the last day as
+  "unable to parse expiry".
+- The time-budget skip's SSL message names the domain, and the Health tab
+  shows "Expired" instead of "N/A" for an expired certificate.
+
 ## 1.5.3
 
 ### Uptime Kuma push for the health monitor
