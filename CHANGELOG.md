@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.5.5
+
+- CI: pipelines run on merge requests (tests/Linux builds; Windows/macOS manual;
+  nothing published).
+
 ## 1.5.4
 
 ### Security fixes from a review
