@@ -31,6 +31,10 @@ class SiteGuard_Backup_Restorer {
 
 	const SUBSITE_SKIP = '__skip__';   // Sentinel: skip this subsite in custom mapping
 
+	/** Option holding the destination's SiteGuard rows from the import until cleanup,
+	 *  so a resumed or re-run restore writes back the same rows as an uninterrupted one. */
+	const PRESERVED_OPTION = 'sgbackup_restore_preserved';
+
 	/** @var SiteGuard_Backup */
 	private $sgbackup;
 
@@ -183,6 +187,15 @@ class SiteGuard_Backup_Restorer {
 		$this->restore_options = $restore_options;
 		$this->import_table_prefix = $GLOBALS['wpdb']->prefix;
 
+		// History entries are keyed by timestamp and do not carry it. Pin it now,
+		// while history is still this site's: after the DB import the nonce lookup
+		// reads the backup's history, fails, and progress and the search-replace
+		// checkpoint were keyed to 0 (which another backup's restore then reused).
+		if (empty($this->backup_set['timestamp'])) {
+			$ts = $this->restore_timestamp();
+			if ($ts) $this->backup_set['timestamp'] = $ts;
+		}
+
 		// Gap 23: Move-in mode - clamp to valid range [0, 3]
 		if (isset($restore_options['move_in_mode'])) {
 			$this->move_in_mode = min(3, max(0, intval($restore_options['move_in_mode'])));
@@ -305,6 +318,11 @@ class SiteGuard_Backup_Restorer {
 		if (!empty($completed_phases)) {
 			$this->progress("Resuming restore - already completed: " . implode(', ', $completed_phases));
 			$this->sgbackup->log("[Restore] Resume detected; skipping completed phases: " . implode(', ', $completed_phases));
+			// The database was imported by the interrupted run: this site's own
+			// SiteGuard rows now exist only in the snapshot it saved after the import.
+			if (array_intersect(array('db', 'db_import'), $completed_phases) && $this->load_preserved_state()) {
+				$this->sgbackup->log("[Restore] Loaded this site's SiteGuard settings saved by the interrupted run");
+			}
 		}
 
 		// Phase 0: Create pre-restore backup if requested. It is the rollback point,
@@ -652,8 +670,10 @@ class SiteGuard_Backup_Restorer {
 			return array();
 		}
 
+		// A record without a timestamp (written by 1.5.1 when the lookup failed)
+		// cannot be matched to this backup: never let it skip phases here.
 		$this_ts = $this->restore_timestamp();
-		if (!empty($progress['timestamp']) && $this_ts && (string) $progress['timestamp'] !== (string) $this_ts) {
+		if ($this_ts && (empty($progress['timestamp']) || (string) $progress['timestamp'] !== (string) $this_ts)) {
 			return array();
 		}
 
@@ -915,7 +935,21 @@ class SiteGuard_Backup_Restorer {
 		// continue search-replace from its saved table cursor. Detected by the
 		// 'db_import' sub-phase marker being set while 'db' is not yet complete.
 		$completed_phases = $this->get_completed_phases();
+		$sr_resumable = false;
 		if (in_array('db_import', $completed_phases, true) && !in_array('db', $completed_phases, true)) {
+			// Without this backup's checkpoint (the run died between the import and
+			// the first search-replace pass) there is nothing to continue from: a
+			// "resume" rebuilt the pairs from empty URLs and silently replaced
+			// nothing. Import again instead; the destination snapshot is reused.
+			$sr_state = SiteGuard_Backup_Options::instance()->get_option($this->sr_state_option, null);
+			$sr_resumable = is_array($sr_state) && !empty($sr_state['search']) && !empty($sr_state['tables'])
+				&& isset($sr_state['timestamp']) && (string) $sr_state['timestamp'] === (string) $this->restore_timestamp();
+			if (!$sr_resumable) {
+				$this->sgbackup->log("[Restore] No search-replace checkpoint from the interrupted run; importing the database again", 'warning');
+				$this->progress("No search-replace checkpoint found; importing the database again");
+			}
+		}
+		if ($sr_resumable) {
 			$this->sgbackup->log("[Restore] Resuming search-replace (DB import already completed in a prior run)");
 			$this->progress("Resuming search-replace from checkpoint");
 			$sr_status = $this->do_search_replace();
@@ -955,17 +989,31 @@ class SiteGuard_Backup_Restorer {
 			}
 		}
 
-		// Save destination's sgbackup_* options before DB import.
-		// After import these get overwritten with source values; we restore them in post_restore_cleanup().
-		$this->save_plugin_options_before_import();
-		// Subsites keep their own SiteGuard state too (history, settings, scheduled
-		// events); save_plugin_options_before_import() only covers the main site.
-		if (is_multisite()) {
-			global $wpdb;
-			$this->network_import = true;
-			foreach ((array) get_sites(array('fields' => 'ids', 'number' => 0)) as $bid) {
-				if ((int) $bid === 1) continue;
-				$this->pre_import_subsite_sg[(int) $bid] = $this->read_plugin_option_rows($wpdb->get_blog_prefix($bid) . 'options');
+		// An earlier run of this backup died after its import: the SiteGuard rows in
+		// the database now are the backup's, and this site's own are in the snapshot
+		// that run saved. Re-reading them here would write the backup's rows back.
+		$preserved = $this->read_preserved_state();
+		if ($preserved && isset($preserved['status']) && 'in_progress' === $preserved['status']) {
+			$this->load_preserved_state($preserved);
+			$reuse_msg = "Reusing destination settings saved by the interrupted run at " . gmdate('Y-m-d H:i:s', (int) $preserved['saved_at']) . " UTC";
+			$this->sgbackup->log("[Restore] {$reuse_msg}");
+			$this->progress($reuse_msg);
+		} else {
+			// Any other snapshot belongs to a different or abandoned restore.
+			SiteGuard_Backup_Options::instance()->delete_option(self::PRESERVED_OPTION);
+
+			// Save destination's sgbackup_* options before DB import.
+			// After import these get overwritten with source values; we restore them in post_restore_cleanup().
+			$this->save_plugin_options_before_import();
+			// Subsites keep their own SiteGuard state too (history, settings, scheduled
+			// events); save_plugin_options_before_import() only covers the main site.
+			if (is_multisite()) {
+				global $wpdb;
+				$this->network_import = true;
+				foreach ((array) get_sites(array('fields' => 'ids', 'number' => 0)) as $bid) {
+					if ((int) $bid === 1) continue;
+					$this->pre_import_subsite_sg[(int) $bid] = $this->read_plugin_option_rows($wpdb->get_blog_prefix($bid) . 'options');
+				}
 			}
 		}
 
@@ -1184,6 +1232,10 @@ class SiteGuard_Backup_Restorer {
 		// Flush WordPress object cache - the atomic RENAME TABLE makes all
 		// cached option values stale (they still hold the pre-import data).
 		wp_cache_flush();
+
+		// Put this site's backup history back and persist the destination snapshot
+		// now, before anything below can be interrupted.
+		$this->preserve_after_import();
 
 		// The SOURCE's blog domains, before the safety net below rewrites blog 1 to
 		// the destination's domain. The mirror search-replace used to read them
@@ -3651,7 +3703,7 @@ class SiteGuard_Backup_Restorer {
 			foreach ($sitemeta_rows as $row) {
 				if (strpos($row['meta_key'], 'sgbackup_jobdata_') === 0) continue;
 				if (strpos($row['meta_key'], 'sgbackup_sem_') === 0) continue;
-				if (in_array($row['meta_key'], array('sgbackup_restore_sr_state', 'sgbackup_sr_progress'), true)) continue;
+				if (in_array($row['meta_key'], array('sgbackup_restore_sr_state', 'sgbackup_sr_progress', self::PRESERVED_OPTION), true)) continue;
 				$this->pre_import_sgbackup_options['sitemeta:' . $row['meta_key']] = $row['meta_value'];
 				$sitemeta_count++;
 			}
@@ -3665,7 +3717,7 @@ class SiteGuard_Backup_Restorer {
 			foreach ($options_rows as $row) {
 				if (strpos($row['option_name'], 'sgbackup_jobdata_') === 0) continue;
 				if (strpos($row['option_name'], 'sgbackup_sem_') === 0) continue;
-				if (in_array($row['option_name'], array('sgbackup_restore_sr_state', 'sgbackup_sr_progress'), true)) continue;
+				if (in_array($row['option_name'], array('sgbackup_restore_sr_state', 'sgbackup_sr_progress', self::PRESERVED_OPTION), true)) continue;
 				$this->pre_import_sgbackup_options['options:' . $row['option_name']] = array(
 					'value' => $row['option_value'],
 					'autoload' => $row['autoload'],
@@ -3684,7 +3736,7 @@ class SiteGuard_Backup_Restorer {
 			foreach ($rows as $row) {
 				if (strpos($row['option_name'], 'sgbackup_jobdata_') === 0) continue;
 				if (strpos($row['option_name'], 'sgbackup_sem_') === 0) continue;
-				if (in_array($row['option_name'], array('sgbackup_restore_sr_state', 'sgbackup_sr_progress'), true)) continue;
+				if (in_array($row['option_name'], array('sgbackup_restore_sr_state', 'sgbackup_sr_progress', self::PRESERVED_OPTION), true)) continue;
 				$this->pre_import_sgbackup_options[$row['option_name']] = array(
 					'value' => $row['option_value'],
 					'autoload' => $row['autoload'],
@@ -4053,6 +4105,10 @@ class SiteGuard_Backup_Restorer {
 					'user_tables_skipped'         => $this->user_tables_skipped,
 					'old_siteurl'                 => $this->old_siteurl,
 					'old_home'                    => $this->old_home,
+					// A resumed network migration still needs these for the
+					// subsites' own SiteGuard rows (cleanup_imported_cron_events).
+					'network_import'              => $this->network_import,
+					'pre_import_subsite_sg'       => $this->pre_import_subsite_sg,
 				),
 			), false);
 		}
@@ -5076,6 +5132,10 @@ class SiteGuard_Backup_Restorer {
 				'options'   => $this->restore_options,
 				'entities'  => array(),
 				'started_at' => time(),
+				// File lists and metadata only. A resume after the DB import finds
+				// the backup's history in place of this site's, so the set is kept
+				// here for the resume entry points to fall back on.
+				'backup_set' => $this->backup_set,
 			);
 		}
 
@@ -5335,6 +5395,12 @@ class SiteGuard_Backup_Restorer {
 	private function post_restore_cleanup() {
 		$this->progress("Running post-restore cleanup");
 
+		// A run that resumed after the import writes back the snapshot the
+		// importing run saved, not the backup's rows now in the database.
+		if (array_intersect(array('db', 'db_import'), $this->get_completed_phases())) {
+			$this->load_preserved_state();
+		}
+
 		// The imported options/sitemeta come from the SOURCE, where this plugin may
 		// have been activated differently (e.g. network-active there, so absent
 		// from the main site's active_plugins). Restoring such a backup switched
@@ -5495,6 +5561,9 @@ class SiteGuard_Backup_Restorer {
 		$opts = SiteGuard_Backup_Options::instance();
 		$this->archive_processed_backup_files($opts->get_backup_dir());
 
+		// This site's rows are written back: the snapshot has served its purpose.
+		$opts->delete_option(self::PRESERVED_OPTION);
+
 		$this->progress("Post-restore cleanup complete");
 	}
 
@@ -5509,90 +5578,209 @@ class SiteGuard_Backup_Restorer {
 	private function restore_plugin_options() {
 		if (empty($this->pre_import_sgbackup_options)) return;
 
-		global $wpdb;
-		$restored_sitemeta = 0;
-		$restored_options = 0;
+		list($restored_sitemeta, $restored_options) = $this->upsert_preserved_rows($this->pre_import_sgbackup_options);
 
 		if (is_multisite()) {
-			// On multisite, keys are prefixed with 'sitemeta:' or 'options:'
-			// to distinguish which table they came from.
-			foreach ($this->pre_import_sgbackup_options as $prefixed_key => $saved) {
-				if (strpos($prefixed_key, 'sitemeta:') === 0) {
-					$key = substr($prefixed_key, 9); // Remove 'sitemeta:' prefix
-					$exists = $wpdb->get_var($wpdb->prepare(
-						"SELECT COUNT(*) FROM {$wpdb->sitemeta} WHERE meta_key = %s", $key
-					));
-					if ($exists) {
-						$wpdb->update(
-							$wpdb->sitemeta,
-							array('meta_value' => $saved),
-							array('meta_key' => $key),
-							array('%s'),
-							array('%s')
-						);
-					} else {
-						$wpdb->insert(
-							$wpdb->sitemeta,
-							array('site_id' => 1, 'meta_key' => $key, 'meta_value' => $saved),
-							array('%d', '%s', '%s')
-						);
-					}
-					$restored_sitemeta++;
-				} elseif (strpos($prefixed_key, 'options:') === 0) {
-					$key = substr($prefixed_key, 8); // Remove 'options:' prefix
-					$opt_value = $saved['value'];
-					$opt_autoload = $saved['autoload'];
-					$exists = $wpdb->get_var($wpdb->prepare(
-						"SELECT COUNT(*) FROM {$wpdb->options} WHERE option_name = %s", $key
-					));
-					if ($exists) {
-						$wpdb->update(
-							$wpdb->options,
-							array('option_value' => $opt_value, 'autoload' => $opt_autoload),
-							array('option_name' => $key),
-							array('%s', '%s'),
-							array('%s')
-						);
-					} else {
-						$wpdb->insert(
-							$wpdb->options,
-							array('option_name' => $key, 'option_value' => $opt_value, 'autoload' => $opt_autoload),
-							array('%s', '%s', '%s')
-						);
-					}
-					$restored_options++;
-				}
-			}
 			$total = $restored_sitemeta + $restored_options;
 			$this->sgbackup->log("Restored {$total} destination sgbackup_* options ({$restored_sitemeta} sitemeta + {$restored_options} wp_options)");
 			$this->progress("Restored {$total} plugin config options (encryption keys, backup history, etc.)");
 		} else {
-			foreach ($this->pre_import_sgbackup_options as $key => $saved) {
-				$opt_value = $saved['value'];
-				$opt_autoload = $saved['autoload'];
+			$this->sgbackup->log("Restored {$restored_options} destination sgbackup_* options after DB import");
+			$this->progress("Restored {$restored_options} plugin config options (encryption keys, backup history, etc.)");
+		}
+	}
+
+	/**
+	 * Write saved destination rows back with raw UPDATE-or-INSERT, then drop their
+	 * cached copies. Raw values are written as they were read: passing them through
+	 * update_option() would serialize them a second time.
+	 *
+	 * @param array $rows Snapshot rows as save_plugin_options_before_import() keys
+	 *                    them (bare names on a single site, 'sitemeta:'/'options:'
+	 *                    prefixed on multisite).
+	 * @return array [sitemeta rows written, wp_options rows written]
+	 */
+	private function upsert_preserved_rows(array $rows) {
+		global $wpdb;
+		$restored_sitemeta = 0;
+		$restored_options = 0;
+
+		foreach ($rows as $prefixed_key => $saved) {
+			if (is_multisite() && strpos($prefixed_key, 'sitemeta:') === 0) {
+				$key = substr($prefixed_key, 9); // Remove 'sitemeta:' prefix
 				$exists = $wpdb->get_var($wpdb->prepare(
-					"SELECT COUNT(*) FROM {$wpdb->options} WHERE option_name = %s", $key
+					"SELECT COUNT(*) FROM {$wpdb->sitemeta} WHERE meta_key = %s", $key
 				));
 				if ($exists) {
 					$wpdb->update(
-						$wpdb->options,
-						array('option_value' => $opt_value, 'autoload' => $opt_autoload),
-						array('option_name' => $key),
-						array('%s', '%s'),
+						$wpdb->sitemeta,
+						array('meta_value' => $saved),
+						array('meta_key' => $key),
+						array('%s'),
 						array('%s')
 					);
 				} else {
 					$wpdb->insert(
-						$wpdb->options,
-						array('option_name' => $key, 'option_value' => $opt_value, 'autoload' => $opt_autoload),
-						array('%s', '%s', '%s')
+						$wpdb->sitemeta,
+						array('site_id' => 1, 'meta_key' => $key, 'meta_value' => $saved),
+						array('%d', '%s', '%s')
 					);
 				}
-				$restored_options++;
+				$this->invalidate_option_cache($key);
+				$restored_sitemeta++;
+				continue;
 			}
-			$this->sgbackup->log("Restored {$restored_options} destination sgbackup_* options after DB import");
-			$this->progress("Restored {$restored_options} plugin config options (encryption keys, backup history, etc.)");
+			if (is_multisite()) {
+				if (strpos($prefixed_key, 'options:') !== 0) continue;
+				$key = substr($prefixed_key, 8); // Remove 'options:' prefix
+			} else {
+				$key = $prefixed_key;
+			}
+			if (!is_array($saved) || !array_key_exists('value', $saved)) continue;
+			$opt_value = $saved['value'];
+			$opt_autoload = isset($saved['autoload']) ? $saved['autoload'] : 'no';
+			$exists = $wpdb->get_var($wpdb->prepare(
+				"SELECT COUNT(*) FROM {$wpdb->options} WHERE option_name = %s", $key
+			));
+			if ($exists) {
+				$wpdb->update(
+					$wpdb->options,
+					array('option_value' => $opt_value, 'autoload' => $opt_autoload),
+					array('option_name' => $key),
+					array('%s', '%s'),
+					array('%s')
+				);
+			} else {
+				$wpdb->insert(
+					$wpdb->options,
+					array('option_name' => $key, 'option_value' => $opt_value, 'autoload' => $opt_autoload),
+					array('%s', '%s', '%s')
+				);
+			}
+			$this->invalidate_option_cache($key);
+			$restored_options++;
 		}
+
+		return array($restored_sitemeta, $restored_options);
+	}
+
+	/**
+	 * Drop every cached copy of an option after a raw write or delete: its own
+	 * entry, the "does not exist" list, alloptions, and on multisite the network
+	 * option cache. With a persistent object cache (Redis on the standby) a stale
+	 * entry otherwise outlives the request.
+	 */
+	private function invalidate_option_cache($name) {
+		wp_cache_delete($name, 'options');
+		$notoptions = wp_cache_get('notoptions', 'options');
+		if (is_array($notoptions) && isset($notoptions[$name])) {
+			unset($notoptions[$name]);
+			wp_cache_set('notoptions', $notoptions, 'options');
+		}
+		wp_cache_delete('alloptions', 'options');
+		if (is_multisite()) {
+			$network_id = get_current_network_id();
+			wp_cache_delete($network_id . ':' . $name, 'site-options');
+			$notoptions_key = $network_id . ':notoptions';
+			$site_notoptions = wp_cache_get($notoptions_key, 'site-options');
+			if (is_array($site_notoptions) && isset($site_notoptions[$name])) {
+				unset($site_notoptions[$name]);
+				wp_cache_set($notoptions_key, $site_notoptions, 'site-options');
+			}
+		}
+	}
+
+	/**
+	 * Right after a successful import: put this site's backup history back and
+	 * persist the destination snapshot.
+	 *
+	 * The snapshot used to live only in this request's memory. A restore that was
+	 * interrupted after the import (or continued by the browser after a
+	 * search-replace checkpoint) lost it, kept the backup's sgbackup_* rows, and
+	 * its resume failed with "Backup not found" because history was the backup's.
+	 * Everything else still waits for post_restore_cleanup(): decrypt_file() and
+	 * the file phases read settings such as the encryption key after the import.
+	 */
+	private function preserve_after_import() {
+		$history = array();
+		foreach (array('sgbackup_backup_history', 'options:sgbackup_backup_history', 'sitemeta:sgbackup_backup_history') as $key) {
+			if (isset($this->pre_import_sgbackup_options[$key])) {
+				$history[$key] = $this->pre_import_sgbackup_options[$key];
+			}
+		}
+		if (!empty($history)) {
+			$this->upsert_preserved_rows($history);
+			$this->sgbackup->log("[Restore] Put this site's backup history back right after the import");
+		}
+
+		$this->save_preserved_state();
+	}
+
+	/**
+	 * Persist the destination snapshot (sgbackup_restore_preserved) for this restore.
+	 */
+	private function save_preserved_state() {
+		SiteGuard_Backup_Options::instance()->update_option(self::PRESERVED_OPTION, array(
+			'timestamp'             => (string) $this->restore_timestamp(),
+			'saved_at'              => time(),
+			'status'                => 'in_progress',
+			'options'               => $this->pre_import_sgbackup_options,
+			'network_import'        => $this->network_import,
+			'pre_import_subsite_sg' => $this->pre_import_subsite_sg,
+			// What a re-run of the import reads from the database first, which by
+			// then holds the backup's (or the safety net's) values.
+			'pre_import_urls'       => array(
+				'siteurl' => $this->pre_import_siteurl,
+				'home'    => $this->pre_import_home,
+				'content' => $this->pre_import_content_url,
+				'uploads' => $this->pre_import_uploads_url,
+			),
+			'pre_import_blogs'      => $this->pre_import_blogs,
+		), false);
+	}
+
+	/**
+	 * The destination snapshot saved by a run of THIS backup less than a day ago,
+	 * or null. A snapshot is never applied to a different backup's restore.
+	 */
+	private function read_preserved_state() {
+		$row = SiteGuard_Backup_Options::instance()->get_option(self::PRESERVED_OPTION, null);
+		if (!is_array($row) || !isset($row['timestamp'], $row['saved_at'], $row['options']) || !is_array($row['options'])) {
+			return null;
+		}
+		$this_ts = (string) $this->restore_timestamp();
+		if ('' === $this_ts || '0' === $this_ts || (string) $row['timestamp'] !== $this_ts) {
+			return null;
+		}
+		if (time() - (int) $row['saved_at'] > DAY_IN_SECONDS) {
+			return null;
+		}
+		return $row;
+	}
+
+	/**
+	 * Load the destination snapshot into this run. It is the superset of what the
+	 * search-replace checkpoint carries, so it wins over instance_state.
+	 *
+	 * @param array|null $row Row from read_preserved_state(); read when null.
+	 * @return bool Whether a snapshot was loaded.
+	 */
+	private function load_preserved_state($row = null) {
+		if (null === $row) $row = $this->read_preserved_state();
+		if (!$row) return false;
+		$this->pre_import_sgbackup_options = $row['options'];
+		$this->network_import = !empty($row['network_import']);
+		$this->pre_import_subsite_sg = (isset($row['pre_import_subsite_sg']) && is_array($row['pre_import_subsite_sg'])) ? $row['pre_import_subsite_sg'] : array();
+		if (!empty($row['pre_import_urls']['siteurl'])) {
+			$this->pre_import_siteurl = $row['pre_import_urls']['siteurl'];
+			$this->pre_import_home = $row['pre_import_urls']['home'];
+			$this->pre_import_content_url = $row['pre_import_urls']['content'];
+			$this->pre_import_uploads_url = $row['pre_import_urls']['uploads'];
+		}
+		if (isset($row['pre_import_blogs']) && is_array($row['pre_import_blogs'])) {
+			$this->pre_import_blogs = $row['pre_import_blogs'];
+		}
+		return true;
 	}
 
 	/**

@@ -64,7 +64,7 @@ class SiteGuard_Backup_Options {
 	 * Keys holding per-site job/history state (never inherited across sites).
 	 */
 	private static function is_site_scoped_state($key) {
-		if (in_array($key, array('sgbackup_backup_history', 'sgbackup_active_job_nonce', 'sgbackup_restore_sr_state', 'sgbackup_sr_progress', 'sgbackup_migrator_keys_used'), true)) {
+		if (in_array($key, array('sgbackup_backup_history', 'sgbackup_active_job_nonce', 'sgbackup_restore_sr_state', 'sgbackup_sr_progress', 'sgbackup_migrator_keys_used', 'sgbackup_restore_preserved'), true)) {
 			return true;
 		}
 		foreach (array('sgbackup_jobdata_', 'sgbackup_dbtables_', 'sgbackup_sem_', 'sgbackup_rl_') as $prefix) {

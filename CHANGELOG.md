@@ -1,5 +1,32 @@
 # Changelog
 
+## Unreleased
+
+### Interrupted restores keep this site's settings
+- A restore keeps the backup's timestamp from the start. It used to look the
+  timestamp up in history, which after the database import is the backup's:
+  progress and the search-replace checkpoint were then saved under `0`, a
+  resumed migration discarded its own checkpoint ("Discarding stale
+  search-replace checkpoint") and skipped the search-replace.
+- A progress record without a timestamp, or with another backup's, is no longer
+  treated as this restore's. A stale record from an interrupted restore could
+  make a different backup skip its database. An interrupted 1.5.1 restore that
+  is still pending when this version is installed imports its database again
+  instead of resuming.
+- This site's SiteGuard settings (storage credentials, migration keys, history,
+  failover role, health monitor settings) are saved to the database right after
+  the import (`sgbackup_restore_preserved`, removed when the restore finishes,
+  ignored after 24 hours or for another backup). A restore that was interrupted
+  and resumed, or continued by the browser after a search-replace checkpoint,
+  used to lose them and keep the backup's.
+- This site's backup history is put back right after the import, so resuming a
+  restore after its database phase no longer fails with "Backup not found". The
+  progress record also keeps the backup set as a fallback.
+- A resume whose run died between the import and the first search-replace pass
+  imports the database again (reusing the saved settings) instead of running a
+  search-replace with no URLs.
+- A resumed network migration keeps each subsite's own SiteGuard rows.
+
 ## 1.5.1
 
 Released 2026-09-24. Build and release tooling only; the plugin code is

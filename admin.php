@@ -777,10 +777,20 @@ class SiteGuard_Backup_Admin {
 		}
 
 		$backup_set = SiteGuard_Backup_History::get_history($timestamp);
+		// Continuing a restore after its DB import: history is the backup's now,
+		// so the set this restore started from is taken from its progress record.
+		if (empty($backup_set) && !empty($_POST['resume'])) {
+			$resume_progress = SiteGuard_Backup_Options::instance()->get_transient('sgbackup_restore_progress');
+			if (is_array($resume_progress) && !empty($resume_progress['backup_set']) && is_array($resume_progress['backup_set'])
+				&& (int) (isset($resume_progress['timestamp']) ? $resume_progress['timestamp'] : 0) === (int) $timestamp) {
+				$backup_set = $resume_progress['backup_set'];
+			}
+		}
 		if (empty($backup_set)) {
 			echo 'RINFO:' . json_encode(array('type' => 'error', 'message' => 'Backup not found')) . "\n";
 			exit;
 		}
+		$backup_set['timestamp'] = $timestamp;
 
 		$restore_options = array();
 		foreach (array('db', 'plugins', 'themes', 'uploads', 'others', 'wpcore') as $entity) {

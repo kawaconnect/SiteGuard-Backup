@@ -358,6 +358,7 @@ class SiteGuard_Backup_CLI_Command extends WP_CLI_Command {
         if (empty($backup_set)) {
             WP_CLI::error("Backup not found for timestamp: {$timestamp}");
         }
+        $backup_set['timestamp'] = $timestamp;
 
         $restore_options = array();
 
@@ -880,6 +881,7 @@ class SiteGuard_Backup_CLI_Command extends WP_CLI_Command {
         if (isset($assoc_args['restore']) && $registered_ts) {
             $backup_set = SiteGuard_Backup_History::get_history($registered_ts);
             if ($backup_set) {
+                $backup_set['timestamp'] = $registered_ts;
                 $restore_options = array();
                 if (isset($assoc_args['entities'])) {
                     $entities = array_map('trim', explode(',', $assoc_args['entities']));

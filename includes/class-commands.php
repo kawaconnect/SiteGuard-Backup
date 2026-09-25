@@ -954,6 +954,7 @@ class SiteGuard_Backup_Commands {
 		if (empty($backup_set)) {
 			return new WP_Error('not_found', 'Backup not found');
 		}
+		$backup_set['timestamp'] = $timestamp;
 
 		// Parse restore options
 		$restore_options = array();
@@ -1921,9 +1922,15 @@ class SiteGuard_Backup_Commands {
 
 		$timestamp = isset($progress['timestamp']) ? $progress['timestamp'] : 0;
 		$backup_set = SiteGuard_Backup_History::get_history($timestamp);
+		// Interrupted after the DB import: history is the backup's, so use the set
+		// this restore saved with its progress.
+		if (empty($backup_set) && $timestamp && !empty($progress['backup_set']) && is_array($progress['backup_set'])) {
+			$backup_set = $progress['backup_set'];
+		}
 		if (empty($backup_set)) {
 			return new WP_Error('not_found', 'Backup not found');
 		}
+		$backup_set['timestamp'] = $timestamp;
 
 		// The admin UI only asks whether it can resume, then re-attaches to the
 		// progress stream (sgbackup_restore with resume=1), which does the work
