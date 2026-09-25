@@ -126,6 +126,21 @@ class SiteGuard_Backup_Restorer {
 	/** @var array Destination sgbackup_* options saved before DB import */
 	private $pre_import_sgbackup_options = array();
 
+	/** @var string Whose health monitor key the restored site keeps: 'keep' (this
+	 *  site's) or 'backup'. See SiteGuard_Backup_Health_Key_Policy. */
+	private $health_key_policy = 'keep';
+
+	/** @var bool The health key policy was decided for this restore (a DB import
+	 *  reached the main site), in this run or the interrupted one it resumes. */
+	private $health_applied = false;
+
+	/** @var string|null Outcome of that decision (kept_site, took_backup, ...). */
+	private $health_outcome = null;
+
+	/** @var array This site's health rows taken out of the snapshot (snapshot keys),
+	 *  kept so a re-run of the import can decide again. */
+	private $health_dest = array();
+
 	/** @var bool Whether this backup is a per-subsite backup */
 	private $is_subsite_backup = false;
 
@@ -195,6 +210,17 @@ class SiteGuard_Backup_Restorer {
 			$ts = $this->restore_timestamp();
 			if ($ts) $this->backup_set['timestamp'] = $ts;
 		}
+
+		// Health monitor key policy - per restore, else the site default, else keep.
+		// Written back into the options so the progress record carries it and a
+		// resume never re-reads the default from the (imported) database.
+		require_once SGBACKUP_DIR . 'includes/class-health-key-policy.php';
+		$policy = isset($restore_options['health_key_policy']) ? SiteGuard_Backup_Health_Key_Policy::sanitize($restore_options['health_key_policy']) : null;
+		if (null === $policy) {
+			$policy = SiteGuard_Backup_Health_Key_Policy::sanitize(SiteGuard_Backup_Options::instance()->get_option('sgbackup_default_health_key_policy', SiteGuard_Backup_Health_Key_Policy::KEEP));
+		}
+		$this->health_key_policy = $policy ? $policy : SiteGuard_Backup_Health_Key_Policy::KEEP;
+		$this->restore_options['health_key_policy'] = $this->health_key_policy;
 
 		// Gap 23: Move-in mode - clamp to valid range [0, 3]
 		if (isset($restore_options['move_in_mode'])) {
@@ -994,7 +1020,7 @@ class SiteGuard_Backup_Restorer {
 		// that run saved. Re-reading them here would write the backup's rows back.
 		$preserved = $this->read_preserved_state();
 		if ($preserved && isset($preserved['status']) && 'in_progress' === $preserved['status']) {
-			$this->load_preserved_state($preserved);
+			$this->load_preserved_state($preserved, true);
 			$reuse_msg = "Reusing destination settings saved by the interrupted run at " . gmdate('Y-m-d H:i:s', (int) $preserved['saved_at']) . " UTC";
 			$this->sgbackup->log("[Restore] {$reuse_msg}");
 			$this->progress($reuse_msg);
@@ -2932,7 +2958,13 @@ class SiteGuard_Backup_Restorer {
 
 		$this->merge_subsite_users($src_id, 1, $backup_dir, $paths);
 		$this->fix_prefixed_option_names($src_prefix, $base, 1);
+		// The subsite's health unit, read before its SiteGuard rows are replaced by
+		// this site's, then decided like any other restore: onto a site without a
+		// key, the subsite's key is kept instead of always being dropped.
+		$sub_autoload = array();
+		$sub_health = $this->read_health_unit_rows($base . 'options', false, $sub_autoload);
 		$this->replace_plugin_option_rows($base . 'options', $preserved, 1);
+		$this->apply_health_key_policy_rows($base . 'options', $preserved, $sub_health, $sub_autoload, $old_siteurl, $dst_home);
 
 		// URL rewrite: most specific first (the subsite's uploads base).
 		$search = array();
@@ -4109,6 +4141,11 @@ class SiteGuard_Backup_Restorer {
 					// subsites' own SiteGuard rows (cleanup_imported_cron_events).
 					'network_import'              => $this->network_import,
 					'pre_import_subsite_sg'       => $this->pre_import_subsite_sg,
+					// The key decision was made right after the import; a resume
+					// must neither redo nor undo it.
+					'health_applied'              => $this->health_applied,
+					'health_key_policy'           => $this->health_key_policy,
+					'health_outcome'              => $this->health_outcome,
 				),
 			), false);
 		}
@@ -5451,6 +5488,17 @@ class SiteGuard_Backup_Restorer {
 		// repeated DB overwrites or other failures.
 		$this->cleanup_imported_cron_events();
 
+		// The health monitor key was decided right after the import; make the
+		// scheduled check match the settings that came with it.
+		if ($this->health_applied) {
+			$this->reconcile_health_cron();
+			foreach (array_merge(SiteGuard_Backup_Health_Key_Policy::UNIT, array(SiteGuard_Backup_Health_Key_Policy::LAST_RESTORE, 'sgbackup_backup_history')) as $name) {
+				$this->invalidate_option_cache($name);
+			}
+		} else {
+			$this->log_health_not_applicable();
+		}
+
 		// Validate active theme exists
 		$this->validate_theme();
 
@@ -5702,6 +5750,10 @@ class SiteGuard_Backup_Restorer {
 	 * the file phases read settings such as the encryption key after the import.
 	 */
 	private function preserve_after_import() {
+		// Decide the health monitor key now, in the request that imported the
+		// database, so a bot polling with the other key is not refused until cleanup.
+		$this->apply_health_key_policy();
+
 		$history = array();
 		foreach (array('sgbackup_backup_history', 'options:sgbackup_backup_history', 'sitemeta:sgbackup_backup_history') as $key) {
 			if (isset($this->pre_import_sgbackup_options[$key])) {
@@ -5736,6 +5788,12 @@ class SiteGuard_Backup_Restorer {
 				'uploads' => $this->pre_import_uploads_url,
 			),
 			'pre_import_blogs'      => $this->pre_import_blogs,
+			// The health key decision: made once, never re-made on a resume
+			// against an already-imported database.
+			'policy'                => $this->health_key_policy,
+			'health_dest'           => $this->health_dest,
+			'health_applied'        => $this->health_applied,
+			'health_outcome'        => $this->health_outcome,
 		), false);
 	}
 
@@ -5762,13 +5820,24 @@ class SiteGuard_Backup_Restorer {
 	 * Load the destination snapshot into this run. It is the superset of what the
 	 * search-replace checkpoint carries, so it wins over instance_state.
 	 *
-	 * @param array|null $row Row from read_preserved_state(); read when null.
+	 * @param array|null $row   Row from read_preserved_state(); read when null.
+	 * @param bool       $rerun The import is about to run again: put this site's
+	 *                          health rows back so the key is decided afresh.
 	 * @return bool Whether a snapshot was loaded.
 	 */
-	private function load_preserved_state($row = null) {
+	private function load_preserved_state($row = null, $rerun = false) {
 		if (null === $row) $row = $this->read_preserved_state();
 		if (!$row) return false;
 		$this->pre_import_sgbackup_options = $row['options'];
+		$this->health_dest = (isset($row['health_dest']) && is_array($row['health_dest'])) ? $row['health_dest'] : array();
+		if ($rerun) {
+			$this->pre_import_sgbackup_options = array_merge($this->pre_import_sgbackup_options, $this->health_dest);
+			$this->health_applied = false;
+			$this->health_outcome = null;
+		} else {
+			$this->health_applied = !empty($row['health_applied']);
+			$this->health_outcome = isset($row['health_outcome']) ? $row['health_outcome'] : null;
+		}
 		$this->network_import = !empty($row['network_import']);
 		$this->pre_import_subsite_sg = (isset($row['pre_import_subsite_sg']) && is_array($row['pre_import_subsite_sg'])) ? $row['pre_import_subsite_sg'] : array();
 		if (!empty($row['pre_import_urls']['siteurl'])) {
@@ -5781,6 +5850,249 @@ class SiteGuard_Backup_Restorer {
 			$this->pre_import_blogs = $row['pre_import_blogs'];
 		}
 		return true;
+	}
+
+	/**
+	 * Decide whose health monitor key and settings the main site keeps, and write
+	 * them, right after a successful import (see SiteGuard_Backup_Health_Key_Policy).
+	 *
+	 * The unit is taken out of the destination snapshot first, so neither the
+	 * cleanup write-back nor a resumed run can touch it again. That write-back is
+	 * what made every restore put this site's old key over the backup's, which is
+	 * right for storage credentials but broke the monitor on a failover server.
+	 */
+	private function apply_health_key_policy() {
+		global $wpdb;
+		$P = 'SiteGuard_Backup_Health_Key_Policy';
+
+		// This site's rows, out of the snapshot (and its last-restore record, which
+		// this restore replaces).
+		$dest = array();
+		$autoload = array();
+		$this->health_dest = array();
+		foreach (array_merge($P::UNIT, array($P::LAST_RESTORE)) as $name) {
+			$snap_keys = is_multisite() ? array('options:' . $name, 'sitemeta:' . $name) : array($name);
+			foreach ($snap_keys as $snap_key) {
+				if (!array_key_exists($snap_key, $this->pre_import_sgbackup_options)) continue;
+				$saved = $this->pre_import_sgbackup_options[$snap_key];
+				$this->health_dest[$snap_key] = $saved;
+				unset($this->pre_import_sgbackup_options[$snap_key]);
+				if ($P::LAST_RESTORE === $name) continue;
+				if (0 === strpos($snap_key, 'sitemeta:')) {
+					$dest[$snap_key] = (string) $saved;
+				} elseif (is_array($saved) && array_key_exists('value', $saved)) {
+					$dest['options:' . $name] = (string) $saved['value'];
+					$autoload['options:' . $name] = isset($saved['autoload']) ? $saved['autoload'] : 'no';
+				}
+			}
+		}
+
+		$imported_autoload = array();
+		$imported = $this->read_health_unit_rows($wpdb->options, is_multisite(), $imported_autoload);
+		$origin = parse_url((string) $wpdb->get_var($wpdb->prepare("SELECT option_value FROM {$wpdb->options} WHERE option_name = %s", 'siteurl')), PHP_URL_HOST);
+
+		$plan = $P::resolve($this->health_key_policy, $dest, $imported, array(
+			'hasher'      => 'wp_hash_password',
+			'origin'      => $origin ? $origin : '',
+			'site_origin' => (string) parse_url($this->pre_import_siteurl ? $this->pre_import_siteurl : home_url(), PHP_URL_HOST),
+			'backup_ts'   => (int) $this->restore_timestamp(),
+			'now'         => time(),
+		));
+		$row_autoload = ('backup' === $plan['source']) ? $imported_autoload + $autoload : $autoload + $imported_autoload;
+		$this->write_health_unit_rows($wpdb->options, is_multisite(), $plan['final'], $row_autoload);
+		$this->record_health_outcome($plan);
+	}
+
+	/**
+	 * The health key decision for a subsite restored into this single site, after
+	 * replace_plugin_option_rows() put this site's SiteGuard rows back.
+	 *
+	 * @param array $preserved This site's rows from read_plugin_option_rows().
+	 * @param array $imported  The subsite's unit rows (read_health_unit_rows()).
+	 */
+	private function apply_health_key_policy_rows($table, array $preserved, array $imported, array $imported_autoload, $old_siteurl, $site_url) {
+		$P = 'SiteGuard_Backup_Health_Key_Policy';
+		$dest = array();
+		$autoload = array();
+		foreach ($preserved as $row) {
+			if (!is_array($row) || !isset($row['option_name']) || !in_array($row['option_name'], $P::UNIT, true)) continue;
+			$dest['options:' . $row['option_name']] = (string) $row['option_value'];
+			$autoload['options:' . $row['option_name']] = $row['autoload'];
+		}
+		$origin = parse_url((string) $old_siteurl, PHP_URL_HOST);
+		$plan = $P::resolve($this->health_key_policy, $dest, $imported, array(
+			'hasher'      => 'wp_hash_password',
+			'origin'      => $origin ? $origin : '',
+			'site_origin' => (string) parse_url($site_url, PHP_URL_HOST),
+			'backup_ts'   => (int) $this->restore_timestamp(),
+			'now'         => time(),
+		));
+		$row_autoload = ('backup' === $plan['source']) ? $imported_autoload + $autoload : $autoload + $imported_autoload;
+		$this->write_health_unit_rows($table, false, $plan['final'], $row_autoload);
+		$this->record_health_outcome($plan, (string) parse_url($site_url, PHP_URL_HOST));
+	}
+
+	/**
+	 * The health unit rows in an options table (and wp_sitemeta), raw, keyed
+	 * 'options:<name>' / 'sitemeta:<name>'.
+	 */
+	private function read_health_unit_rows($table, $with_sitemeta, &$autoload = array()) {
+		global $wpdb;
+		$names = SiteGuard_Backup_Health_Key_Policy::UNIT;
+		$in = implode(', ', array_fill(0, count($names), '%s'));
+		$rows = array();
+		foreach ((array) $wpdb->get_results($wpdb->prepare("SELECT option_name, option_value, autoload FROM `{$table}` WHERE option_name IN ({$in})", $names), ARRAY_A) as $row) {
+			$rows['options:' . $row['option_name']] = (string) $row['option_value'];
+			$autoload['options:' . $row['option_name']] = $row['autoload'];
+		}
+		if ($with_sitemeta) {
+			// Lowest meta_id last, so it wins, as get_site_option() reads it.
+			foreach ((array) $wpdb->get_results($wpdb->prepare("SELECT meta_key, meta_value FROM {$wpdb->sitemeta} WHERE meta_key IN ({$in}) ORDER BY meta_id DESC", $names), ARRAY_A) as $row) {
+				$rows['sitemeta:' . $row['meta_key']] = (string) $row['meta_value'];
+			}
+		}
+		return $rows;
+	}
+
+	/**
+	 * Make the health unit rows exactly $final: write what it holds, delete the
+	 * rest, keeping each row's autoload. Raw values, then cache invalidation.
+	 */
+	private function write_health_unit_rows($table, $with_sitemeta, array $final, array $autoload) {
+		global $wpdb;
+		foreach (SiteGuard_Backup_Health_Key_Policy::UNIT as $name) {
+			$key = 'options:' . $name;
+			if (isset($final[$key])) {
+				$exists = $wpdb->get_var($wpdb->prepare("SELECT COUNT(*) FROM `{$table}` WHERE option_name = %s", $name));
+				$row_autoload = isset($autoload[$key]) ? $autoload[$key] : 'no';
+				if ($exists) {
+					$wpdb->update($table, array('option_value' => $final[$key], 'autoload' => $row_autoload), array('option_name' => $name), array('%s', '%s'), array('%s'));
+				} else {
+					$wpdb->insert($table, array('option_name' => $name, 'option_value' => $final[$key], 'autoload' => $row_autoload), array('%s', '%s', '%s'));
+				}
+			} else {
+				$wpdb->delete($table, array('option_name' => $name), array('%s'));
+			}
+			if ($with_sitemeta) {
+				$key = 'sitemeta:' . $name;
+				if (isset($final[$key])) {
+					$exists = $wpdb->get_var($wpdb->prepare("SELECT COUNT(*) FROM {$wpdb->sitemeta} WHERE meta_key = %s", $name));
+					if ($exists) {
+						$wpdb->update($wpdb->sitemeta, array('meta_value' => $final[$key]), array('meta_key' => $name), array('%s'), array('%s'));
+					} else {
+						$wpdb->insert($wpdb->sitemeta, array('site_id' => 1, 'meta_key' => $name, 'meta_value' => $final[$key]), array('%d', '%s', '%s'));
+					}
+				} else {
+					$wpdb->delete($wpdb->sitemeta, array('meta_key' => $name), array('%s'));
+				}
+			}
+			$this->invalidate_option_cache($name);
+		}
+	}
+
+	/**
+	 * Record and report a health key decision: sgbackup_health_last_restore (the
+	 * Health tab's "last restore" line and "Switch to the backup's key"), one
+	 * result line, and warnings. Hints and fingerprints only; the declined hash
+	 * is stored but never shown.
+	 */
+	private function record_health_outcome(array $plan, $site_host = null) {
+		global $wp_version;
+		$P = 'SiteGuard_Backup_Health_Key_Policy';
+		$this->health_applied = true;
+		$this->health_outcome = $plan['outcome'];
+		$report = $plan['report'];
+
+		$this->invalidate_option_cache($P::LAST_RESTORE);
+		SiteGuard_Backup_Options::instance()->update_option($P::LAST_RESTORE, array(
+			'at'            => time(),
+			'backup_ts'     => (int) $this->restore_timestamp(),
+			'policy'        => $plan['policy'],
+			'outcome'       => $plan['outcome'],
+			'reason'        => $plan['reason'],
+			'site_hint'     => $report['site_hint'],
+			'site_fp'       => $report['site_fp'],
+			'backup_hint'   => $report['backup_hint'],
+			'backup_fp'     => $report['backup_fp'],
+			'backup_origin' => $report['backup_origin'],
+			'declined_hash' => ('kept_site' === $plan['outcome'] && $P::is_valid_hash($plan['declined_hash'])) ? $plan['declined_hash'] : '',
+		), false);
+
+		// Failed-auth counters and cooldowns can live only in the object cache
+		// (Redis on the standby); a bot refused before the switch must not stay
+		// rate-limited after it. The database transients are cleared at cleanup.
+		if (function_exists('wp_cache_supports') && wp_cache_supports('flush_group')) {
+			wp_cache_flush_group('transient');
+		}
+
+		$this->progress($P::summary($plan));
+
+		if (null === $site_host) {
+			$site_host = (string) parse_url($this->pre_import_siteurl ? $this->pre_import_siteurl : home_url(), PHP_URL_HOST);
+		}
+		if ('backup' === $plan['source'] && '' !== $report['backup_origin'] && $report['backup_origin'] === $site_host
+			&& '' !== $report['backup_fp'] && '' !== $report['site_fp'] && $report['backup_fp'] !== $report['site_fp']) {
+			$this->health_warning("This restores an older monitor key that was rotated ({$report['site_fp']} was replaced by {$report['backup_fp']}). Give the bot that key, or regenerate one.");
+		}
+		if (!empty($plan['effective_hash']) && 0 === strpos($plan['effective_hash'], '$wp') && version_compare($wp_version, '6.8', '<')) {
+			$this->health_warning("The monitor key was hashed by WordPress 6.8 or later; WordPress {$wp_version} cannot check it and the bot will be refused. Update WordPress or regenerate the key.");
+		}
+		if (!empty($this->restore_options['wpcore']) && !empty($this->backup_set['wpcore'])) {
+			$this->health_warning("WordPress core files are restored too: if the backup's core is older than 6.8, a monitor key hashed by 6.8 or later cannot be checked.");
+		}
+	}
+
+	private function health_warning($message) {
+		$this->progress[] = "WARNING: {$message}";
+		$this->sgbackup->log("[Restore] WARNING: {$message}", 'warning');
+		if (defined('DOING_AJAX') && DOING_AJAX) {
+			echo 'RINFO:' . json_encode(array('type' => 'warning', 'message' => $message)) . "\n";
+			if (ob_get_level()) @ob_flush();
+			@flush();
+		}
+	}
+
+	/**
+	 * Make the health check cron match the restored settings. The imported cron
+	 * array is the backup's: its event may be missing, or scheduled at the
+	 * backup's interval, and sgbackup_ensure_health_cron() only adds a missing
+	 * event, and only on admin, cron or CLI loads.
+	 */
+	private function reconcile_health_cron() {
+		require_once SGBACKUP_DIR . 'includes/class-health-monitor.php';
+		wp_cache_delete('cron', 'options');
+		$hook = 'sgbackup_health_check';
+		if (!SiteGuard_Backup_Health_Monitor::is_enabled()) {
+			if (wp_next_scheduled($hook)) {
+				wp_clear_scheduled_hook($hook);
+				$this->sgbackup->log("[Restore] Health monitor is disabled: removed its scheduled check");
+			}
+			return;
+		}
+		$interval = SiteGuard_Backup_Options::instance()->get_option('sgbackup_health_interval', 'every10min');
+		$schedules = wp_get_schedules();
+		if (!is_string($interval) || !isset($schedules[$interval])) {
+			$interval = 'every10min';
+		}
+		if (!wp_next_scheduled($hook) || wp_get_schedule($hook) !== $interval) {
+			wp_clear_scheduled_hook($hook);
+			wp_schedule_event(time() + 60, $interval, $hook);
+			$this->sgbackup->log("[Restore] Scheduled the health check at this site's interval ({$interval})");
+		}
+	}
+
+	/**
+	 * Say why a restore did not decide the health monitor key.
+	 */
+	private function log_health_not_applicable() {
+		if (in_array($this->subsite_mode, array(self::SUBSITE_MODE_IMPORT_AS, self::SUBSITE_MODE_BATCH), true) && is_multisite()) {
+			$why = 'main site untouched';
+		} elseif ($this->db_restore_mode === self::DB_RESTORE_SKIP_DB) {
+			$why = 'database not restored (skip-db)';
+		} else {
+			$why = 'database not restored';
+		}
+		$this->progress("Health monitor key policy: not applicable ({$why}); this site's key is unchanged.");
 	}
 
 	/**

@@ -14,6 +14,9 @@ class SiteGuard_Backup_Health_Monitor {
 
 	private static $instance = null;
 
+	/** @var array|null Fingerprint and source of the key matched by validate_api_key(). */
+	private $matched = null;
+
 	/** @var int Max failed auth attempts before lockout */
 	private static $AUTH_RATE_LIMIT = 20;
 
@@ -689,23 +692,45 @@ class SiteGuard_Backup_Health_Monitor {
 	}
 
 	/**
-	 * Get or auto-generate the API key for external polling.
+	 * Whether the monitor is on. SGBACKUP_HEALTH_ENABLED in wp-config.php (main
+	 * site only) overrides the option, so a restore or raw database sync onto a
+	 * standby cannot switch it off.
+	 */
+	public static function is_enabled() {
+		if (defined('SGBACKUP_HEALTH_ENABLED') && (!is_multisite() || is_main_site())) {
+			return (bool) SGBACKUP_HEALTH_ENABLED;
+		}
+		return (bool) SiteGuard_Backup_Options::instance()->get_option('sgbackup_health_enabled', false);
+	}
+
+	/**
+	 * Key hashes pinned in wp-config.php (SGBACKUP_HEALTH_API_KEY_HASH, a string or
+	 * an array; main site only). They are accepted in addition to the stored key
+	 * and survive every restore, because wp-config.php is never restored.
+	 *
+	 * @param int $invalid Set to the number of entries ignored as malformed.
+	 * @return array Valid hashes.
+	 */
+	public static function pinned_hashes(&$invalid = 0) {
+		$invalid = 0;
+		if (!defined('SGBACKUP_HEALTH_API_KEY_HASH') || (is_multisite() && !is_main_site())) return array();
+		require_once SGBACKUP_DIR . 'includes/class-health-key-policy.php';
+		$valid = array();
+		foreach ((array) SGBACKUP_HEALTH_API_KEY_HASH as $hash) {
+			if (SiteGuard_Backup_Health_Key_Policy::is_valid_hash($hash)) {
+				$valid[] = $hash;
+			} else {
+				$invalid++;
+			}
+		}
+		return $valid;
+	}
+
+	/**
+	 * Formerly generated a key when none existed. Keys are created only by an
+	 * explicit regenerate or --set now; the plaintext is never retrievable.
 	 */
 	public function get_api_key() {
-		$opts = SiteGuard_Backup_Options::instance();
-
-		// Migrate legacy plaintext key to hashed storage
-		$legacy = $opts->get_option('sgbackup_health_api_key', '');
-		if (!empty($legacy)) {
-			$opts->update_option('sgbackup_health_api_key_hash', wp_hash_password($legacy));
-			$opts->delete_option('sgbackup_health_api_key');
-			return $legacy;
-		}
-
-		$hash = $opts->get_option('sgbackup_health_api_key_hash', '');
-		if (empty($hash)) {
-			return $this->regenerate_api_key();
-		}
 		return '';
 	}
 
@@ -714,39 +739,183 @@ class SiteGuard_Backup_Health_Monitor {
 	 */
 	public function regenerate_api_key() {
 		$key = wp_generate_password(48, false, false);
-		$opts = SiteGuard_Backup_Options::instance();
-		$opts->update_option('sgbackup_health_api_key_hash', wp_hash_password($key));
-		$opts->delete_option('sgbackup_health_api_key');
+		$this->store_api_key($key, 'generated');
 		return $key;
 	}
 
 	/**
-	 * Validate a provided API key against the stored hash.
+	 * Set a key the caller already has (wp siteguardbackup health_api_key --set),
+	 * e.g. the one the bot uses for production, on a standby.
+	 *
+	 * @return true|WP_Error
+	 */
+	public function set_api_key($key) {
+		require_once SGBACKUP_DIR . 'includes/class-health-key-policy.php';
+		if (!SiteGuard_Backup_Health_Key_Policy::is_valid_plain_key($key)) {
+			return new WP_Error('invalid_key', 'The key must be at least 32 letters and digits (A-Z, a-z, 0-9).');
+		}
+		$this->store_api_key($key, 'set');
+		return true;
+	}
+
+	/**
+	 * Store a key as a hash plus its metadata (hint, fingerprint, origin), drop any
+	 * legacy plaintext row and any declined key from the last restore.
+	 */
+	private function store_api_key($key, $source) {
+		require_once SGBACKUP_DIR . 'includes/class-health-key-policy.php';
+		$opts = SiteGuard_Backup_Options::instance();
+		$opts->update_option('sgbackup_health_api_key_hash', wp_hash_password($key));
+		$opts->update_option('sgbackup_health_api_key_meta', SiteGuard_Backup_Health_Key_Policy::build_meta($key, $source, (string) wp_parse_url(home_url(), PHP_URL_HOST), time()));
+		$opts->delete_option('sgbackup_health_api_key');
+		$this->clear_declined_key();
+	}
+
+	/**
+	 * Make the backup key that the last restore did not apply (kept this site's)
+	 * the primary key. For a restore that should have used the backup's key.
+	 *
+	 * @return array|WP_Error The adopted key's hint and fingerprint.
+	 */
+	public function adopt_restored_key() {
+		require_once SGBACKUP_DIR . 'includes/class-health-key-policy.php';
+		$opts = SiteGuard_Backup_Options::instance();
+		$last = $opts->get_option('sgbackup_health_last_restore', array());
+		if (!is_array($last) || !$this->has_declined_key($last)) {
+			return new WP_Error('no_declined_key', 'The last restore did not leave a backup key to switch to (none was declined, or it is older than 7 days).');
+		}
+		$opts->update_option('sgbackup_health_api_key_hash', $last['declined_hash']);
+		$opts->update_option('sgbackup_health_api_key_meta', array(
+			'hint'    => isset($last['backup_hint']) ? (string) $last['backup_hint'] : '',
+			'fp'      => isset($last['backup_fp']) ? (string) $last['backup_fp'] : '',
+			'created' => time(),
+			'origin'  => isset($last['backup_origin']) ? (string) $last['backup_origin'] : '',
+			'source'  => 'adopted',
+		));
+		$opts->delete_option('sgbackup_health_api_key');
+		$this->clear_declined_key();
+		return array(
+			'hint' => isset($last['backup_hint']) ? (string) $last['backup_hint'] : '',
+			'fp'   => isset($last['backup_fp']) ? (string) $last['backup_fp'] : '',
+		);
+	}
+
+	/**
+	 * Whether a last-restore record still offers a usable declined key.
+	 */
+	private function has_declined_key($last) {
+		return is_array($last) && !empty($last['declined_hash'])
+			&& SiteGuard_Backup_Health_Key_Policy::is_valid_hash($last['declined_hash'])
+			&& !empty($last['at']) && (time() - (int) $last['at']) <= SiteGuard_Backup_Health_Key_Policy::DECLINED_TTL;
+	}
+
+	private function clear_declined_key() {
+		$opts = SiteGuard_Backup_Options::instance();
+		$last = $opts->get_option('sgbackup_health_last_restore', array());
+		if (is_array($last) && !empty($last['declined_hash'])) {
+			$last['declined_hash'] = '';
+			$opts->update_option('sgbackup_health_last_restore', $last);
+		}
+	}
+
+	/**
+	 * Key status for the Health tab and CLI: hints and fingerprints only (never a
+	 * key or a hash).
+	 */
+	public function get_key_info() {
+		global $wp_version;
+		require_once SGBACKUP_DIR . 'includes/class-health-key-policy.php';
+		$opts = SiteGuard_Backup_Options::instance();
+		$hash = (string) $opts->get_option('sgbackup_health_api_key_hash', '');
+		$legacy = (string) $opts->get_option('sgbackup_health_api_key', '');
+		$meta = SiteGuard_Backup_Health_Key_Policy::parse_meta($opts->get_option('sgbackup_health_api_key_meta', null));
+		$invalid_pins = 0;
+		$pins = self::pinned_hashes($invalid_pins);
+
+		$info = array(
+			'has_key'       => ('' !== $hash || '' !== $legacy),
+			'hint'          => $meta ? $meta['hint'] : '',
+			'fp'            => $meta ? $meta['fp'] : '',
+			'created'       => $meta ? $meta['created'] : 0,
+			'origin'        => $meta ? $meta['origin'] : '',
+			'source'        => $meta ? $meta['source'] : '',
+			'meta_missing'  => ('' !== $hash && !$meta),
+			'pinned'        => count($pins),
+			'pin_invalid'   => $invalid_pins,
+			'enabled_pinned' => defined('SGBACKUP_HEALTH_ENABLED') && (!is_multisite() || is_main_site()),
+			'wp_hash_unsupported' => false,
+			'last_restore'  => null,
+			'has_declined'  => false,
+			'site_host'     => (string) wp_parse_url(home_url(), PHP_URL_HOST),
+		);
+		if (version_compare($wp_version, '6.8', '<')) {
+			foreach (array_merge(array($hash), $pins) as $h) {
+				if (0 === strpos($h, '$wp')) $info['wp_hash_unsupported'] = true;
+			}
+		}
+		$last = $opts->get_option('sgbackup_health_last_restore', array());
+		if (is_array($last) && !empty($last['at'])) {
+			$info['has_declined'] = $this->has_declined_key($last);
+			unset($last['declined_hash']);
+			$info['last_restore'] = $last;
+		}
+		return $info;
+	}
+
+	/**
+	 * The key that matched in the last successful validate_api_key() call of this
+	 * request: its fingerprint and whether it was the stored key or a pin.
+	 */
+	public function get_matched_key() {
+		return $this->matched;
+	}
+
+	/**
+	 * Validate a provided API key against the stored hash, then any pinned hashes.
 	 */
 	public function validate_api_key($key) {
-		if (empty($key) || strlen($key) < 16) return false;
+		$this->matched = null;
+		if (empty($key) || !is_string($key) || strlen($key) < 16) return false;
 
+		require_once SGBACKUP_DIR . 'includes/class-health-key-policy.php';
 		$opts = SiteGuard_Backup_Options::instance();
 
+		// Plaintext key from before 1.3.13: hash it once. When a hash already
+		// exists the plaintext is stale (e.g. carried in by an old backup) and must
+		// not replace the key the bot uses: drop it.
 		$legacy = $opts->get_option('sgbackup_health_api_key', '');
 		if (!empty($legacy)) {
-			$opts->update_option('sgbackup_health_api_key_hash', wp_hash_password($legacy));
+			if ('' === (string) $opts->get_option('sgbackup_health_api_key_hash', '')) {
+				$opts->update_option('sgbackup_health_api_key_hash', wp_hash_password($legacy));
+				$opts->update_option('sgbackup_health_api_key_meta', SiteGuard_Backup_Health_Key_Policy::build_meta($legacy, 'legacy-migrated', (string) wp_parse_url(home_url(), PHP_URL_HOST), time()));
+			}
 			$opts->delete_option('sgbackup_health_api_key');
-			return hash_equals($legacy, $key);
 		}
-
-		$hash = $opts->get_option('sgbackup_health_api_key_hash', '');
-		if (empty($hash)) return false;
 
 		if (!function_exists('wp_check_password')) {
 			require_once ABSPATH . WPINC . '/pluggable.php';
 		}
-		return wp_check_password($key, $hash);
+		$source = '';
+		$hash = $opts->get_option('sgbackup_health_api_key_hash', '');
+		if (!empty($hash) && wp_check_password($key, $hash)) {
+			$source = 'db';
+		} else {
+			foreach (self::pinned_hashes() as $pin) {
+				if (wp_check_password($key, $pin)) {
+					$source = 'pin';
+					break;
+				}
+			}
+		}
+		if ('' === $source) return false;
+		$this->matched = array('fp' => SiteGuard_Backup_Health_Key_Policy::fingerprint($key), 'source' => $source);
+		return true;
 	}
 
 	public function has_api_key() {
 		$opts = SiteGuard_Backup_Options::instance();
-		return !empty($opts->get_option('sgbackup_health_api_key_hash', '')) || !empty($opts->get_option('sgbackup_health_api_key', ''));
+		return !empty($opts->get_option('sgbackup_health_api_key_hash', '')) || !empty($opts->get_option('sgbackup_health_api_key', ''))
+			|| !empty(self::pinned_hashes());
 	}
 
 	public function is_rate_limited($ip) {

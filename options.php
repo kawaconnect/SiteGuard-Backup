@@ -752,6 +752,7 @@ class SiteGuard_Backup_Options {
 			'default_db_restore_mode' => 0,
 			'default_subsite_mode' => 0,
 			'default_keep_protocol' => 0,
+			'default_health_key_policy' => 'keep',
 			'low_memory_mode'    => 'auto',
 		);
 	}

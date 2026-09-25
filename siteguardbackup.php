@@ -261,11 +261,10 @@ function sgbackup_cron_backup_incremental() {
 
 function sgbackup_cron_health_check() {
 	sgbackup_load_classes();
-	$opts = SiteGuard_Backup_Options::instance();
-	if ( ! $opts->get_option( 'sgbackup_health_enabled', false ) ) {
+	require_once SGBACKUP_DIR . 'includes/class-health-monitor.php';
+	if ( ! SiteGuard_Backup_Health_Monitor::is_enabled() ) {
 		return;
 	}
-	require_once SGBACKUP_DIR . 'includes/class-health-monitor.php';
 	SiteGuard_Backup_Health_Monitor::instance()->run_checks();
 }
 
@@ -278,8 +277,9 @@ function sgbackup_ensure_health_cron() {
 		return; // never load the full class set on anonymous front-end views
 	}
 	sgbackup_load_classes();
+	require_once SGBACKUP_DIR . 'includes/class-health-monitor.php';
 	$opts = SiteGuard_Backup_Options::instance();
-	if ( ! $opts->get_option( 'sgbackup_health_enabled', false ) ) {
+	if ( ! SiteGuard_Backup_Health_Monitor::is_enabled() ) {
 		return;
 	}
 	if ( wp_next_scheduled( 'sgbackup_health_check' ) ) {
@@ -470,13 +470,20 @@ add_action('rest_api_init', 'sgbackup_register_health_api');
  * health run).
  */
 function sgbackup_health_api_ping_callback(WP_REST_Request $request) {
-	return rest_ensure_response(array(
+	$response = array(
 		'ok'          => true,
 		'site_url'    => get_site_url(),
 		'version'     => SGBACKUP_VERSION,
 		'api_version' => 2,
 		'time'        => time(),
-	));
+	);
+	// Which key the (already authenticated) caller used: its fingerprint and
+	// whether it is the stored key or one pinned in wp-config.php.
+	$matched = SiteGuard_Backup_Health_Monitor::instance()->get_matched_key();
+	if ($matched) {
+		$response['key'] = $matched;
+	}
+	return rest_ensure_response($response);
 }
 
 /**
@@ -512,8 +519,7 @@ function sgbackup_health_api_auth(WP_REST_Request $request) {
 	$monitor = SiteGuard_Backup_Health_Monitor::instance();
 
 	// Block if health monitor is disabled
-	$opts = SiteGuard_Backup_Options::instance();
-	if (!$opts->get_option('sgbackup_health_enabled', false)) {
+	if (!SiteGuard_Backup_Health_Monitor::is_enabled()) {
 		return new WP_Error('disabled', 'Health monitor is not enabled', array('status' => 404));
 	}
 
