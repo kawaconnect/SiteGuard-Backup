@@ -4363,6 +4363,9 @@
 			if (info.enabled_pinned) {
 				lines.push('Enabled state pinned in wp-config (SGBACKUP_HEALTH_ENABLED).');
 			}
+			if (info.enabled_pin_invalid) {
+				lines.push('<span style="color:#d63638;">SGBACKUP_HEALTH_ENABLED is not true or false; it is ignored and the Health tab setting applies.</span>');
+			}
 			if (info.wp_hash_unsupported) {
 				lines.push('<span style="color:#d63638;">A key hash was made by WordPress 6.8 or later and cannot be checked on this WordPress version. Update WordPress or generate a new key.</span>');
 			}
@@ -4376,7 +4379,8 @@
 				adopted_backup: 'This site had no key; the backup\'s key (' + bak + ') is used.',
 				took_backup: 'The backup\'s key (' + bak + ') is used (policy: backup).',
 				unchanged: 'The backup had this site\'s key; unchanged.',
-				no_backup_key: 'The backup had no monitor key; this site\'s key was kept.'
+				no_backup_key: 'The backup had no monitor key; this site\'s key was kept.',
+				adopted_after_restore: 'Kept this site\'s key; switched to the backup\'s key (' + bak + ')' + (lr.adopted_at ? ' on ' + fmtDate(lr.adopted_at) : '') + '.'
 			};
 			$('#sgbackup-health-last-restore').text(fmtDate(lr.at) + ': ' + (outcomes[lr.outcome] || lr.outcome || ''));
 			if (info.has_declined) {

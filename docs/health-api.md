@@ -20,7 +20,7 @@ Generate the key in **SiteGuard Backup → Health** → "Generate New Key". The 
 
 **Rate limiting.** 20 failed auth attempts per 5-minute window per client IP triggers HTTP 429. The client IP is `REMOTE_ADDR`, or `CF-Connecting-IP` when the connecting peer is a trusted proxy. `X-Forwarded-For` is never used.
 
-**Disabled state.** If the health monitor is disabled in admin, all endpoints return `404 {"code":"disabled"}`. `define('SGBACKUP_HEALTH_ENABLED', true);` in `wp-config.php` overrides the setting on the main site.
+**Disabled state.** If the health monitor is disabled in admin, all endpoints return `404 {"code":"disabled"}`. `define('SGBACKUP_HEALTH_ENABLED', true);` in `wp-config.php` overrides the setting on the main site. Use a real boolean (`true`/`false`, or `wp config set SGBACKUP_HEALTH_ENABLED true --raw`); a value that is not a boolean is ignored and the Health tab warns.
 
 Restores and failover are covered in [Keys, backups, restores and failover](#keys-backups-restores-and-failover).
 
@@ -207,7 +207,16 @@ For the second case, give the standby's main site production's key in one of the
    # prints: define('SGBACKUP_HEALTH_API_KEY_HASH', '$wp$2y$10$…');
    ```
 
-   Add that line to the standby's `wp-config.php` (or its `WORDPRESS_CONFIG_EXTRA`), with `define('SGBACKUP_HEALTH_ENABLED', true);`. The pinned hash is accepted in addition to the standby's own key; the constant can also be an array of hashes. The Health tab shows "Pinned in wp-config". Main site only.
+   Add that line to the standby's `wp-config.php`, with `define('SGBACKUP_HEALTH_ENABLED', true);`. The pinned hash is accepted in addition to the standby's own key; the constant can also be an array of hashes. The Health tab shows "Pinned in wp-config". Main site only.
+
+   The simplest way is WP-CLI on the standby, which writes both lines to `wp-config.php` with the `$` signs intact (single quotes keep the shell from expanding them):
+
+   ```sh
+   wp config set SGBACKUP_HEALTH_API_KEY_HASH '$wp$2y$10$…' --type=constant
+   wp config set SGBACKUP_HEALTH_ENABLED true --raw --type=constant
+   ```
+
+   **Docker Compose (`WORDPRESS_CONFIG_EXTRA`, `.env`):** Compose reads every `$` in those values as the start of a variable. `$wp` and `$abc…` become empty and `$2y` is an error, so the hash arrives broken. Write every `$` as `$$` there, or use `wp config set` / a mounted `wp-config.php` instead. The Health tab and `wp siteguardbackup health_api_key` report a mangled hash as a malformed `SGBACKUP_HEALTH_API_KEY_HASH` entry, and it is ignored; check that line after setting the pin.
 2. **Set the same key on both.** `printf %s "$KEY" | wp siteguardbackup health_api_key --set` stores the key the bot already has (read from STDIN, or prompted for with hidden input; at least 32 letters and digits). This replaces the standby's own key.
 3. **Let restores bring production's key.** Set the standby's Settings → "Default Health Monitor Key on Restore" to "Use the key from the backup". This covers restores through SiteGuard only, and replaces the standby's own key on every restore.
 

@@ -697,10 +697,26 @@ class SiteGuard_Backup_Health_Monitor {
 	 * standby cannot switch it off.
 	 */
 	public static function is_enabled() {
-		if (defined('SGBACKUP_HEALTH_ENABLED') && (!is_multisite() || is_main_site())) {
-			return (bool) SGBACKUP_HEALTH_ENABLED;
+		$pinned = self::pinned_enabled();
+		if (null !== $pinned) {
+			return $pinned;
 		}
 		return (bool) SiteGuard_Backup_Options::instance()->get_option('sgbackup_health_enabled', false);
+	}
+
+	/**
+	 * SGBACKUP_HEALTH_ENABLED as a boolean, or null when it is not defined, this
+	 * is not the main site, or it is not a boolean. A (bool) cast read the string
+	 * 'false' (what `wp config set` writes without --raw) as on.
+	 *
+	 * @param bool $invalid Set to true when the constant is defined but ignored.
+	 */
+	public static function pinned_enabled(&$invalid = false) {
+		$invalid = false;
+		if (!defined('SGBACKUP_HEALTH_ENABLED') || (is_multisite() && !is_main_site())) return null;
+		$value = filter_var(SGBACKUP_HEALTH_ENABLED, FILTER_VALIDATE_BOOLEAN, FILTER_NULL_ON_FAILURE);
+		$invalid = (null === $value);
+		return $value;
 	}
 
 	/**
@@ -793,7 +809,12 @@ class SiteGuard_Backup_Health_Monitor {
 			'source'  => 'adopted',
 		));
 		$opts->delete_option('sgbackup_health_api_key');
-		$this->clear_declined_key();
+		// The last-restore line then says the switch happened, instead of still
+		// saying the backup's key was not applied.
+		$last['declined_hash'] = '';
+		$last['outcome'] = 'adopted_after_restore';
+		$last['adopted_at'] = time();
+		$opts->update_option('sgbackup_health_last_restore', $last);
 		return array(
 			'hint' => isset($last['backup_hint']) ? (string) $last['backup_hint'] : '',
 			'fp'   => isset($last['backup_fp']) ? (string) $last['backup_fp'] : '',
@@ -831,6 +852,8 @@ class SiteGuard_Backup_Health_Monitor {
 		$meta = SiteGuard_Backup_Health_Key_Policy::parse_meta($opts->get_option('sgbackup_health_api_key_meta', null));
 		$invalid_pins = 0;
 		$pins = self::pinned_hashes($invalid_pins);
+		$enabled_invalid = false;
+		$enabled_pin = self::pinned_enabled($enabled_invalid);
 
 		$info = array(
 			'has_key'       => ('' !== $hash || '' !== $legacy),
@@ -842,7 +865,8 @@ class SiteGuard_Backup_Health_Monitor {
 			'meta_missing'  => ('' !== $hash && !$meta),
 			'pinned'        => count($pins),
 			'pin_invalid'   => $invalid_pins,
-			'enabled_pinned' => defined('SGBACKUP_HEALTH_ENABLED') && (!is_multisite() || is_main_site()),
+			'enabled_pinned' => (null !== $enabled_pin),
+			'enabled_pin_invalid' => $enabled_invalid,
 			'wp_hash_unsupported' => false,
 			'last_restore'  => null,
 			'has_declined'  => false,

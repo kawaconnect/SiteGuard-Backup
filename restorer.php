@@ -5918,6 +5918,31 @@ class SiteGuard_Backup_Restorer {
 			}
 		}
 
+		// A plaintext key from before 1.3.13 is kept in restore state only as its
+		// hash: sgbackup_restore_preserved outlives a restore that is never
+		// continued, and every later backup would dump it. The hash is all a re-run
+		// needs to decide again.
+		$site_origin = (string) parse_url($this->pre_import_siteurl ? $this->pre_import_siteurl : home_url(), PHP_URL_HOST);
+		$hashed = $P::hash_legacy($dest, 'wp_hash_password', $site_origin, time());
+		if ($hashed !== $dest) {
+			$legacy_autoload = isset($autoload['options:' . $P::LEGACY]) ? $autoload['options:' . $P::LEGACY] : 'no';
+			foreach (array($P::LEGACY, $P::HASH, $P::META) as $name) {
+				foreach ($P::SCOPES as $scope) {
+					if (!is_multisite() && 'options:' !== $scope) continue;
+					$snap_key = is_multisite() ? $scope . $name : $name;
+					if (!isset($hashed[$scope . $name])) {
+						unset($this->health_dest[$snap_key], $autoload[$scope . $name]);
+					} elseif ('sitemeta:' === $scope) {
+						$this->health_dest[$snap_key] = $hashed[$scope . $name];
+					} else {
+						if (!isset($autoload[$scope . $name])) $autoload[$scope . $name] = $legacy_autoload;
+						$this->health_dest[$snap_key] = array('value' => $hashed[$scope . $name], 'autoload' => $autoload[$scope . $name]);
+					}
+				}
+			}
+			$dest = $hashed;
+		}
+
 		$imported_autoload = array();
 		$imported = $this->read_health_unit_rows($wpdb->options, is_multisite(), $imported_autoload);
 		$origin = parse_url((string) $wpdb->get_var($wpdb->prepare("SELECT option_value FROM {$wpdb->options} WHERE option_name = %s", 'siteurl')), PHP_URL_HOST);
@@ -5925,7 +5950,7 @@ class SiteGuard_Backup_Restorer {
 		$plan = $P::resolve($this->health_key_policy, $dest, $imported, array(
 			'hasher'      => 'wp_hash_password',
 			'origin'      => $origin ? $origin : '',
-			'site_origin' => (string) parse_url($this->pre_import_siteurl ? $this->pre_import_siteurl : home_url(), PHP_URL_HOST),
+			'site_origin' => $site_origin,
 			'backup_ts'   => (int) $this->restore_timestamp(),
 			'now'         => time(),
 		));
@@ -5957,6 +5982,9 @@ class SiteGuard_Backup_Restorer {
 			'site_origin' => (string) parse_url($site_url, PHP_URL_HOST),
 			'backup_ts'   => (int) $this->restore_timestamp(),
 			'now'         => time(),
+			// This path always dropped the subsite's SiteGuard rows: when this
+			// site's key wins, none of the subsite's health settings come along.
+			'fill_settings' => false,
 		));
 		$row_autoload = ('backup' === $plan['source']) ? $imported_autoload + $autoload : $autoload + $imported_autoload;
 		$this->write_health_unit_rows($table, false, $plan['final'], $row_autoload);

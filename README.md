@@ -77,6 +77,7 @@ wp siteguardbackup health_api_key [--format=table|json]   # fingerprint, wp-conf
 wp siteguardbackup health_api_key --regenerate
 printf %s "$KEY" | wp siteguardbackup health_api_key --set   # use a key you already have (STDIN or hidden prompt)
 wp siteguardbackup health_api_key --print-hash                # define() line to pin this key on a standby
+                                                              # (in docker-compose/.env write each $ as $$; see docs/health-api.md)
 wp siteguardbackup health_api_key --adopt-restored            # switch to the key the last restore did not apply
 
 # Settings

@@ -44,11 +44,17 @@ class SiteGuard_Backup_Health_Key_Policy {
 	}
 
 	/**
-	 * Whether a string looks like a password hash WordPress can check.
+	 * Whether a string is a whole password hash WordPress can check. The full
+	 * structure is checked, not just the prefix: a pin pasted through
+	 * docker-compose loses everything after a "$" it reads as a variable
+	 * ('$wp$2y$10$...' becomes '$2y$10'), which can never match, and must show
+	 * as a malformed entry instead of a working pin.
 	 */
 	public static function is_valid_hash($hash) {
-		return is_string($hash) && strlen($hash) <= 255 && !preg_match('/\s/', $hash)
-			&& (bool) preg_match('/^(\$wp\$2y\$|\$2y\$|\$P\$|\$argon2)/', $hash);
+		if (!is_string($hash) || strlen($hash) > 255) return false;
+		return (bool) preg_match('/^(\$wp)?\$2y\$\d{2}\$[.\/A-Za-z0-9]{53}$/D', $hash)
+			|| (bool) preg_match('/^\$P\$[.\/0-9A-Za-z]{31}$/D', $hash)
+			|| (bool) preg_match('/^\$argon2(id|i)\$v=\d+\$m=\d+,t=\d+,p=\d+\$[A-Za-z0-9+\/]+\$[A-Za-z0-9+\/]+$/D', $hash);
 	}
 
 	/**
@@ -110,7 +116,10 @@ class SiteGuard_Backup_Health_Key_Policy {
 	 * @param array  $imported The unit rows the import brought in.
 	 * @param array  $ctx      'hasher' => callable(plaintext): hash, 'origin' => the
 	 *                         backup's host, 'site_origin' => this site's host,
-	 *                         'backup_ts', 'now'.
+	 *                         'backup_ts', 'now', 'fill_settings' => false where
+	 *                         the backup's SiteGuard rows were always dropped
+	 *                         (default true: when this site's unit wins, settings
+	 *                         rows only the backup has are kept, as in 1.5.1).
 	 * @return array source ('destination'|'backup'), final (the unit rows to end
 	 *               with), write/delete (changes against $imported), outcome,
 	 *               reason, report (hints and fingerprints only), declined_hash
@@ -123,6 +132,7 @@ class SiteGuard_Backup_Health_Key_Policy {
 		$now = isset($ctx['now']) ? (int) $ctx['now'] : 0;
 		$origin = isset($ctx['origin']) ? (string) $ctx['origin'] : '';
 		$site_origin = isset($ctx['site_origin']) ? (string) $ctx['site_origin'] : '';
+		$fill_settings = !isset($ctx['fill_settings']) || $ctx['fill_settings'];
 
 		$d = self::side($dest);
 		$b = self::side($imported);
@@ -157,14 +167,16 @@ class SiteGuard_Backup_Health_Key_Policy {
 		// key). When this site wins, settings rows only the backup has survive,
 		// as they always have, except a per-site row for a setting this site keeps
 		// in wp_sitemeta: it would hide that setting the same way (a backup's
-		// enabled=0 turned the kept key into 404 "disabled").
+		// enabled=0 turned the kept key into 404 "disabled"). Without
+		// fill_settings (subsite into single) none survive: they would switch on
+		// a monitor this site never enabled.
 		$final = array();
 		$winner = ('backup' === $source) ? $imported : $dest;
 		$winner_side = ('backup' === $source) ? $b : $d;
 		foreach (self::UNIT as $name) {
 			foreach (self::SCOPES as $scope) {
 				$v = self::row($winner, $scope . $name);
-				if (null === $v && 'destination' === $source && in_array($name, self::SETTINGS, true)
+				if (null === $v && $fill_settings && 'destination' === $source && in_array($name, self::SETTINGS, true)
 					&& !('options:' === $scope && null !== self::effective($dest, $name))) {
 					$v = self::row($imported, $scope . $name);
 				}
@@ -221,6 +233,28 @@ class SiteGuard_Backup_Health_Key_Policy {
 			'enabled_from_backup' => $enabled_from_backup,
 			'effective_hash'      => $final_side['hash'],
 		);
+	}
+
+	/**
+	 * Rows with a legacy plaintext key replaced by its hash (plus metadata when
+	 * there is none), for keeping this site's rows in restore state: that state
+	 * can outlive a restore that is never continued. A hash already there wins,
+	 * as it does for the monitor, and the plaintext is just dropped.
+	 *
+	 * @param array    $rows   Scope-prefixed raw rows, as for resolve().
+	 * @param callable $hasher callable(plaintext): hash.
+	 */
+	public static function hash_legacy(array $rows, $hasher, $origin, $now) {
+		$side = self::side($rows);
+		if (null === $side['legacy']) return $rows;
+		if (null === $side['hash']) {
+			$rows['options:' . self::HASH] = (string) call_user_func($hasher, $side['legacy']);
+			if (null === $side['meta']) {
+				$rows['options:' . self::META] = serialize(self::build_meta($side['legacy'], 'legacy-migrated', $origin, $now));
+			}
+		}
+		foreach (self::SCOPES as $scope) unset($rows[$scope . self::LEGACY]);
+		return $rows;
 	}
 
 	/**

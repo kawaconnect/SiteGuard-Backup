@@ -189,6 +189,33 @@ check('kept_site summary names both hints and the origin',
 check('kept_site keeps this site\'s interval', 'every5min' === $plan['final']["options:$IV"]);
 check('kept_site: backup-only setting rows survive (as in 1.5.1)', '5' === $plan['final']["options:$TO"]);
 
+// Subsite into single (fill_settings false): this site's unit wins alone; the
+// subsite's settings do not switch on a monitor this site never enabled.
+$nofill = $ctx + array('fill_settings' => false);
+$plan = $P::resolve('keep', array("options:$H" => $HA), $backups['hash'][0], $nofill);
+check('no fill: this site\'s key kept', 'kept_site' === $plan['outcome'] && $plan['final']["options:$H"] === $HA);
+check('no fill: no settings row from the backup', array("options:$H" => $HA) === $plan['final']
+	&& in_array("options:$EN", $plan['delete'], true) && in_array("options:$IV", $plan['delete'], true));
+$plan = $P::resolve('keep', array("options:$H" => $HA, "options:$EN" => '0'), $backups['none'][0], $nofill);
+check('no fill, backup without a key: this site\'s rows exactly', array("options:$H" => $HA, "options:$EN" => '0') === $plan['final']);
+$plan = $P::resolve('keep', array(), $backups['hash'][0], $nofill);
+check('no fill, keyless site: the backup\'s unit is still used', 'adopted_backup' === $plan['outcome'] && '1' === $plan['final']["options:$EN"] && 'everyhour' === $plan['final']["options:$IV"]);
+
+// This site's legacy plaintext is kept in restore state only as a hash.
+$rows = $P::hash_legacy(array("options:$L" => $plainA, "options:$EN" => '1'), 'stub_hash', 'standby.example.com', 5);
+check('hash_legacy: no plaintext row, the key validates', !isset($rows["options:$L"]) && stub_check($plainA, $rows["options:$H"]) && '1' === $rows["options:$EN"]);
+$meta = $P::parse_meta($rows["options:$M"]);
+check('hash_legacy: meta with the key\'s fingerprint', $meta && $P::fingerprint($plainA) === $meta['fp'] && 'legacy-migrated' === $meta['source']);
+check('hash_legacy: no plaintext anywhere', false === strpos(serialize($rows), $plainA));
+$rows = $P::hash_legacy(array("options:$H" => $HA, "sitemeta:$L" => $plainX), 'stub_hash', 'x', 5);
+check('hash_legacy: an existing hash wins, the stale plaintext is dropped', array("options:$H" => $HA) === $rows);
+$rows = $P::hash_legacy($dests['hash'][0], 'stub_hash', 'x', 5);
+check('hash_legacy: rows without plaintext are unchanged', $dests['hash'][0] === $rows);
+$plan1 = $P::resolve('keep', $dests['legacy'][0], $backups['hash'][0], $ctx);
+$plan2 = $P::resolve('keep', $P::hash_legacy($dests['legacy'][0], 'stub_hash', 'standby.example.com', 5), $backups['hash'][0], $ctx);
+check('hash_legacy: a re-run decides the same', $plan1['outcome'] === $plan2['outcome'] && $plan1['report'] === $plan2['report']
+	&& stub_check($plainA, $plan2['final']["options:$H"]));
+
 $plan = $P::resolve('backup', $dests['hash'][0], $backups['legacy'][0], $ctx);
 check('legacy backup key under "backup" is stored only as a hash', stub_check($plainB, $plan['final']["options:$H"]) && !isset($plan['final']["options:$L"]));
 $meta = $P::parse_meta($plan['final']["options:$M"]);
@@ -214,10 +241,15 @@ foreach (array("''" => '', "'BACKUP'" => 'BACKUP', 'array' => array('backup'), '
 }
 check('fingerprint format', 'sgk-ba7816bf8f01' === $P::fingerprint('abc'));
 check('hint is the last four characters', '9f3c' === $P::hint($plainB));
-check('hash format: $wp$2y$', $P::is_valid_hash('$wp$2y$10$abcdefghijklmnopqrstuv'));
-check('hash format: $2y$', $P::is_valid_hash('$2y$10$abcdefghijklmnopqrstuv'));
+$bcrypt = password_hash('x', PASSWORD_BCRYPT);
+check('hash format: $wp$2y$', $P::is_valid_hash('$wp' . $bcrypt));
+check('hash format: $2y$', $P::is_valid_hash($bcrypt));
 check('hash format: $P$', $P::is_valid_hash('$P$Babcdefghijklmnopqrstuvwxyz0123'));
-check('hash format: $argon2id', $P::is_valid_hash('$argon2id$v=19$m=65536,t=4,p=1$abc$def'));
+check('hash format: $argon2id', $P::is_valid_hash('$argon2id$v=19$m=65536,t=4,p=1$dmNxd2UwanFTbWVxYkg3QQ$1CMvGIfsvrbIww7HeOHjZXOjSrNhqGbrwxf4bsVCmX4'));
+// What docker-compose leaves of a pasted pin ("$wp", "$abc..." read as variables).
+foreach (array('$2y$10', '$wp$2y$10$', '$wp$2y$10$abcdefghijklmnopqrstuv', substr('$wp' . $bcrypt, 0, -1), '$P$', '$P$Babc', '$argon2', '$argon2id$v=19$m=65536,t=4,p=1$', $bcrypt . "\n") as $bad) {
+	check('hash format rejects truncated ' . json_encode($bad), !$P::is_valid_hash($bad));
+}
 check('hash format rejects plaintext', !$P::is_valid_hash($plainA));
 check('hash format rejects whitespace', !$P::is_valid_hash('$2y$10$abc def'));
 check('hash format rejects arrays', !$P::is_valid_hash(array('$2y$10$abc')));

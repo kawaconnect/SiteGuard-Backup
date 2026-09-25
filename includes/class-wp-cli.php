@@ -335,9 +335,10 @@ class SiteGuard_Backup_CLI_Command extends WP_CLI_Command {
      *
      * [--health-key=<policy>]
      * : Health monitor API key after a database restore: keep (this site's key)
-     *   or backup (the backup's key, e.g. production restored onto a failover
-     *   server). Overrides a preset; falls back to the site default, then keep.
-     *   If this site has no key, the backup's key is used either way.
+     *   or backup (the backup's key; only when the bot polls this site with the
+     *   backup site's key, as it replaces this site's key). Overrides a preset;
+     *   falls back to the site default, then keep. If this site has no key, the
+     *   backup's key is used either way.
      *
      * [--yes]
      * : Skip the confirmation prompt (for scripted/non-interactive use).
@@ -4205,12 +4206,18 @@ class SiteGuard_Backup_CLI_Command extends WP_CLI_Command {
             if ($info['enabled_pinned']) {
                 WP_CLI::log('Enabled state pinned in wp-config (SGBACKUP_HEALTH_ENABLED).');
             }
+            if ($info['enabled_pin_invalid']) {
+                WP_CLI::warning('SGBACKUP_HEALTH_ENABLED is not true or false; it is ignored (set it with --raw: wp config set SGBACKUP_HEALTH_ENABLED true --raw).');
+            }
             if ($info['wp_hash_unsupported']) {
                 WP_CLI::warning('A key hash was made by WordPress 6.8 or later and cannot be checked on this WordPress version.');
             }
             if (!empty($info['last_restore'])) {
                 $lr = $info['last_restore'];
                 WP_CLI::log('Last restore: ' . gmdate('Y-m-d H:i', (int) $lr['at']) . ' UTC, ' . (isset($lr['outcome']) ? $lr['outcome'] : '?') . ' (policy: ' . (isset($lr['policy']) ? $lr['policy'] : '?') . ')');
+                if ('adopted_after_restore' === (isset($lr['outcome']) ? $lr['outcome'] : '') && !empty($lr['adopted_at'])) {
+                    WP_CLI::log("  Switched to the backup's key (…{$lr['backup_hint']}) on " . gmdate('Y-m-d H:i', (int) $lr['adopted_at']) . ' UTC.');
+                }
                 if ($info['has_declined']) {
                     WP_CLI::log("  The backup's key (…{$lr['backup_hint']}" . (!empty($lr['backup_origin']) ? ", from {$lr['backup_origin']}" : '') . ') was not applied. Use --adopt-restored to switch to it.');
                 }

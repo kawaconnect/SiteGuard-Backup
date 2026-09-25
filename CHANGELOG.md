@@ -75,6 +75,18 @@
   `SGBACKUP_HEALTH_ENABLED`) in `wp-config.php` are honoured on the main site
   whatever a restore or raw database sync does; `health_api_key --print-hash`
   prints the define, `--set` stores a key read from STDIN.
+  A pinned hash must be complete: one cut short (Docker Compose reads `$` in
+  `WORDPRESS_CONFIG_EXTRA` as a variable) is reported as malformed instead of
+  shown as a working pin. `SGBACKUP_HEALTH_ENABLED` must be a boolean; a
+  string such as `'false'` is ignored with a warning instead of turning the
+  monitor on.
+- A subsite restored into a single site that keeps its own key keeps its own
+  health settings too; the subsite's (for example `enabled=1`) no longer fill
+  in settings this site had no row for.
+- A plaintext key from before 1.3.13 on this site is kept in the restore's
+  saved state only as a hash.
+- After "Switch to the backup's key", the last-restore line says the switch
+  was made instead of still saying the backup's key was not applied.
 - Docs: "Keys, backups, restores and failover" in `docs/health-api.md`, and the
   client IP note corrected (`CF-Connecting-IP` only from a trusted proxy).
 
