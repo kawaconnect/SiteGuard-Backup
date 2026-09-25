@@ -259,5 +259,20 @@ check('plain key: punctuation rejected', !$P::is_valid_plain_key(str_repeat('a',
 check('meta with a bad fingerprint is not trusted', '' === $P::parse_meta(serialize(array('fp' => '<script>', 'hint' => 'ab"c')))['fp']);
 check('meta never unserializes objects', null === $P::parse_meta('O:8:"stdClass":0:{}') || !is_object($P::parse_meta('O:8:"stdClass":0:{}')));
 
+// Same-site restore of a site that only had a pre-1.3.13 plaintext key: this
+// site's copy was hashed before the snapshot, the backup still has the
+// plaintext. Same key, so "unchanged" (no declined key, no switch offer), and
+// this site's hash is what remains.
+$same_dest = $P::hash_legacy($dests['legacy'][0], 'stub_hash', 'site.example.com', 5);
+$same_backup = array("options:$L" => $plainA, "options:$EN" => '1');
+$plan = $P::resolve('keep', $same_dest, $same_backup, $ctx);
+check('same key stored differently: outcome unchanged', 'unchanged' === $plan['outcome']);
+check('same key stored differently: nothing declined', null === $plan['declined_hash']);
+check('same key stored differently: this site\'s hash kept', $plan['final']["options:$H"] === $same_dest["options:$H"]
+	&& !isset($plan['final']["options:$L"]));
+check('same key stored differently: summary says unchanged', false !== strpos($P::summary($plan), 'unchanged'));
+$other = $P::resolve('keep', $same_dest, $backups['legacy'][0], $ctx);
+check('different legacy key in the backup is still declined', 'kept_site' === $other['outcome'] && null !== $other['declined_hash']);
+
 echo "\n{$count} checks, {$failures} failed\n";
 exit($failures ? 1 : 0);

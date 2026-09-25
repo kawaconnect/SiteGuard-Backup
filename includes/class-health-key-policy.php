@@ -147,11 +147,16 @@ class SiteGuard_Backup_Health_Key_Policy {
 			}
 		}
 		$same_hash = (null !== $d['hash'] && $d['hash'] === $b['hash']);
+		// Same key stored differently (e.g. this site's legacy plaintext was
+		// hashed before the snapshot while the backup still has the plaintext):
+		// the fingerprints match. This site's rows still win, as for "identical";
+		// it only stops the report from calling the same key "not applied".
+		$same_fp = ('' !== (string) $d['fp'] && (string) $d['fp'] === (string) $b['fp']);
 
 		$declined = null;
 		if (!$b['has_key']) {
 			$source = 'destination'; $reason = 'no_backup_key'; $outcome = 'no_backup_key';
-		} elseif ($same_credentials || $same_hash) {
+		} elseif ($same_credentials || $same_hash || $same_fp) {
 			$source = 'destination'; $reason = 'identical'; $outcome = 'unchanged';
 		} elseif (self::BACKUP === $policy) {
 			$source = 'backup'; $reason = 'policy_backup'; $outcome = 'took_backup';
