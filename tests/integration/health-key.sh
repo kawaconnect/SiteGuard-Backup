@@ -17,6 +17,10 @@
 #   HK151_PLUGIN  path to a SiteGuard 1.5.1 plugin directory: enables H19
 #                 (golden diff against 1.5.1) and H20 (downgrade).
 #   HK_PLUGIN     path to this build's plugin directory (reinstalled after H19/H20).
+#                 Both directories must be named "siteguardbackup": instance.sh
+#                 install-plugin installs under the directory's name, so any other
+#                 name adds a second copy next to the active one (fatal on activation)
+#                 and H19/H20 would test this build twice.
 # =============================================================================
 set -uo pipefail
 
@@ -32,6 +36,10 @@ for n in "$SRC" "$DST" "$MULTI"; do
 	[[ "$n" =~ ^[a-z0-9][a-z0-9-]{0,30}$ ]] || { echo "bad instance name $n" >&2; exit 2; }
 done
 command -v jq >/dev/null || { echo "jq is required" >&2; exit 2; }
+for d in "${HK151_PLUGIN:-}" "${HK_PLUGIN:-}"; do
+	[ -z "$d" ] || [ "$(basename "$d")" = siteguardbackup ] \
+		|| { echo "HK151_PLUGIN/HK_PLUGIN must be directories named siteguardbackup: $d" >&2; exit 2; }
+done
 INSTDIR="$(cd "$(dirname "$IM")/.." && pwd)/instances"
 
 exec 9>/tmp/siteguard-integration.lock
@@ -619,10 +627,20 @@ H20() { # downgrade to 1.5.1 keeps the stored key working
 	[ -n "${HK151_PLUGIN:-}" ] && [ -n "${HK_PLUGIN:-}" ] || { echo "  skip (HK151_PLUGIN/HK_PLUGIN not set)"; return 0; }
 	standby
 	"$IM" install-plugin "$DST" "$HK151_PLUGIN" --activate >/dev/null
+	# PHP-FPM's opcache keeps serving this build's files for up to its revalidate
+	# interval. 1.5.1's /ping has no "key" field: wait (at most 2 minutes) until
+	# the web side answers without it, or the check below tests this build.
+	web_has_key_field() { clear_rl "$DST"; auth "$DST" "$KB" >/dev/null; jq -e 'has("key")' <<<"$LAST_BODY" >/dev/null 2>&1; }
+	local i
+	for i in $(seq 1 24); do web_has_key_field || break; sleep 5; done
+	check "1.5.1: the web side runs 1.5.1 (no key field in /ping)" bash -c '! jq -e "has(\"key\")" <<<"$0" >/dev/null 2>&1' "$LAST_BODY"
 	clear_rl "$DST"
 	expect_auth "1.5.1: KB works" 200 "$DST" "$KB"
 	check "1.5.1: plugin loads (health_api_key runs)" W "$DST" siteguardbackup health_api_key
 	"$IM" install-plugin "$DST" "$HK_PLUGIN" --activate >/dev/null
+	for i in $(seq 1 24); do web_has_key_field && break; sleep 5; done
+	check "reinstalled: the web side runs this build again" web_has_key_field
+	clear_rl "$DST"
 	expect_auth "reinstalled: KB works" 200 "$DST" "$KB"
 }
 
