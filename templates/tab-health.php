@@ -88,7 +88,7 @@ $next_check = wp_next_scheduled('sgbackup_health_check');
 			<td>
 				<div id="sgbackup-health-last-restore"></div>
 				<button type="button" class="button" id="sgbackup-health-adopt-key" style="display:none;margin-top:6px;"></button>
-				<p class="description"><?php esc_html_e('Which monitor key the last database restore left in place. To make a failover server always take the backup\'s key, set Settings → "Default Health Monitor Key on Restore".', 'siteguardbackup'); ?></p>
+				<p class="description"><?php esc_html_e('Which monitor key the last database restore left in place. Restores keep this site\'s key unless the restore (or Settings → "Default Health Monitor Key on Restore") says to use the backup\'s.', 'siteguardbackup'); ?></p>
 			</td>
 		</tr>
 	</table>

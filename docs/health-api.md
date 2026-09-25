@@ -172,7 +172,7 @@ The scheduled check is set to match the restored settings at the end of the rest
 - **Per restore, browser:** the restore dialog's "Health monitor API key" choice (shown when the database is restored). The verification step shows what will happen, and warns when a backup of this same site would bring back a key that was rotated since.
 - **Per restore, WP-CLI:** `wp siteguardbackup restore <ts> --health-key=backup` (or `keep`); `wp siteguardbackup import <dir> --restore --health-key=backup`. Any other value is an error.
 - **Presets:** a restore preset saved from the dialog remembers the choice. Presets saved before this setting existed follow the site default.
-- **Site default:** Settings → "Default Health Monitor Key on Restore". On a standby/failover server choose "Use the key from the backup".
+- **Site default:** Settings → "Default Health Monitor Key on Restore". Keep the default if the bot monitors this server with this server's own key. Choose "Use the key from the backup" only if the bot polls this server with the backup site's key: it then replaces this server's own key on every restore.
 
 ### Interrupted and resumed restores
 
@@ -192,7 +192,12 @@ Neither shows a key or a hash.
 
 ### Production and a standby with one key
 
-The bot keeps one URL (the main site's `rest_url('sgbackup/v1/health')`, which follows the domain through a DNS failover) and one key. Pick one of these for the standby:
+The bot polls one URL with one key. Check which URL and key it is configured with before changing anything on the standby.
+
+- **The bot monitors the standby itself, with the standby's own key.** Keep the default policy (`keep`). Restores of production's backups then never change the standby's key, and the bot stays connected. Do not choose "Use the key from the backup" here: it would replace the standby's key with production's on every restore.
+- **The bot polls production's domain, and a DNS failover points that domain at the standby.** This works only if the standby's **main site** answers production's main-site domain, which is the case after a raw database sync (the README's failover flow) or a network restore in mirror mode. A migrate restore keeps the standby's main site on its own domain, so no key setting makes the bot's production URL reach it. The health API also runs per site: a production domain mapped to a standby **subsite** answers with that subsite's settings (usually `404 disabled`), and the `wp-config.php` pin below applies to the main site only.
+
+For the second case, give the standby's main site production's key in one of these ways. The first is recommended because it is additive: the standby keeps its own key as well.
 
 1. **Pin production's key hash in the standby's `wp-config.php`.** It works whatever a restore or a raw database sync does, because `wp-config.php` is never restored:
 
@@ -203,8 +208,8 @@ The bot keeps one URL (the main site's `rest_url('sgbackup/v1/health')`, which f
    ```
 
    Add that line to the standby's `wp-config.php` (or its `WORDPRESS_CONFIG_EXTRA`), with `define('SGBACKUP_HEALTH_ENABLED', true);`. The pinned hash is accepted in addition to the standby's own key; the constant can also be an array of hashes. The Health tab shows "Pinned in wp-config". Main site only.
-2. **Set the same key on both.** `printf %s "$KEY" | wp siteguardbackup health_api_key --set` stores the key the bot already has (read from STDIN, or prompted for with hidden input; at least 32 letters and digits).
-3. **Let restores bring production's key.** Set the standby's Settings → "Default Health Monitor Key on Restore" to "Use the key from the backup". This covers restores through SiteGuard only.
+2. **Set the same key on both.** `printf %s "$KEY" | wp siteguardbackup health_api_key --set` stores the key the bot already has (read from STDIN, or prompted for with hidden input; at least 32 letters and digits). This replaces the standby's own key.
+3. **Let restores bring production's key.** Set the standby's Settings → "Default Health Monitor Key on Restore" to "Use the key from the backup". This covers restores through SiteGuard only, and replaces the standby's own key on every restore.
 
 After a raw database sync (for example `mysqldump | mysql`) or a DNS failover, run `wp siteguardbackup postfailover --flush-only` on the standby so a persistent object cache (Redis) does not serve old option values.
 

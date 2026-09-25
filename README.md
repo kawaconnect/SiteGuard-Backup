@@ -44,7 +44,7 @@ Every direction is supported, either by downloading a backup zip and uploading i
 
 URLs are rewritten everywhere, including inside serialized data and escaped JSON, and the uploads path follows the site (`uploads/` <-> `uploads/sites/<id>/`). The destination keeps its own address, admin login and SiteGuard settings; the source's other users are added (matched by email, with their roles and passwords) and authorship is kept.
 
-The health monitor API key is the one setting you choose per restore: keep this site's key (default) or use the backup's (for a failover server that must answer the bot with production's key). A site without a key takes the backup's either way. See [docs/health-api.md](docs/health-api.md#keys-backups-restores-and-failover), which also covers pinning one key on production and a standby in `wp-config.php`.
+The health monitor API key is the one setting you choose per restore: keep this site's key (default) or use the backup's (only when the bot polls this site with the backup site's key). A site without a key takes the backup's either way. See [docs/health-api.md](docs/health-api.md#keys-backups-restores-and-failover), which also covers pinning one key on production and a standby in `wp-config.php`.
 
 ## Site-to-Site Migration
 

@@ -320,7 +320,7 @@ $period_labels = array(
 					<option value="keep" <?php selected($default_health_key_policy, 'keep'); ?>><?php esc_html_e("Keep this site's monitor key (default)", 'siteguardbackup'); ?></option>
 					<option value="backup" <?php selected($default_health_key_policy, 'backup'); ?>><?php esc_html_e('Use the key from the backup', 'siteguardbackup'); ?></option>
 				</select>
-				<p class="description"><?php esc_html_e("On a standby/failover server choose 'Use the key from the backup' so the Discord bot keeps working after failover. Applies to database restores that do not choose otherwise; if this site has no key, the backup's key is used either way.", 'siteguardbackup'); ?></p>
+				<p class="description"><?php esc_html_e("If the bot monitors this server with this server's own key, keep the default: restores then never change it. Choose 'Use the key from the backup' only if the bot polls this server with the backup site's key. Applies to database restores that do not choose otherwise; if this site has no key, the backup's key is used either way.", 'siteguardbackup'); ?></p>
 			</td>
 		</tr>
 		<?php if (is_multisite()) : ?>
