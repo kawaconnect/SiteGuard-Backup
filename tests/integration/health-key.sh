@@ -68,7 +68,9 @@ IPN=0
 auth() {
 	IPN=$((IPN + 1))
 	local out code body err
-	out="$(curl -s -w '\n%{http_code}' -H "Host: $1.test" -H "CF-Connecting-IP: 198.51.100.$((IPN % 250 + 1))" \
+	# No CF-Connecting-IP: from the instance's Docker gateway it is ignored (1.5.4+),
+	# so all requests share one rate-limit bucket; scenarios call clear_rl.
+	out="$(curl -s -w '\n%{http_code}' -H "Host: $1.test" \
 		${2:+-H "Authorization: Bearer $2"} "http://127.0.0.1:$(port "$1")${4:-}/?rest_route=/sgbackup/v1/${3:-health/ping}")"
 	code="${out##*$'\n'}"; body="${out%$'\n'*}"
 	err="$(jq -r 'if type == "object" then (.code // empty) else empty end' <<<"$body" 2>/dev/null)"
@@ -608,6 +610,10 @@ H17() { # wp-config pin
 	expect_auth "--set: KA works without the pin" 200 "$DST" "$KA"
 	out="$(printf %s "short0123456789" | "$IM" wp "$DST" siteguardbackup health_api_key --set 2>&1)"
 	check "--set rejects a key shorter than 32 characters" grep_out "$out" "at least 32"
+	# PHP-FPM's opcache rechecks wp-config.php only every 60 s (revalidate_freq),
+	# so web requests can still see the KA pin removed above. Wait it out, or the
+	# next scenario's "KA refused" checks run against the old pin.
+	sleep 61
 }
 
 H18() { # secrets never leak (run last: it greps everything the other scenarios produced)
