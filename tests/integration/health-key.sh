@@ -103,10 +103,13 @@ sg_rows() {
 		}
 		ksort($o); echo json_encode($o);'
 }
+# Every row this site had keeps its value. Rows only the backup had are added,
+# as in 1.5.1 (H19 compares the whole set against 1.5.1).
 same_rows() { # <inst> <before-json>
-	local after; after="$(sg_rows "$1")"
-	if [ "$after" = "$2" ]; then return 0; fi
-	echo "    differing rows: $(jq -n --argjson a "$2" --argjson b "$after" '[($a|keys[]), ($b|keys[])] | unique | map(select($a[.] != $b[.]))' -c)"
+	local after diff; after="$(sg_rows "$1")"
+	diff="$(jq -n -c --argjson a "$2" --argjson b "$after" '[$a | keys[] | select($a[.] != $b[.])]')"
+	[ "$diff" = "[]" ] && return 0
+	echo "    rows changed or lost: $diff"
 	return 1
 }
 cron_schedule() { E "$1" 'echo wp_next_scheduled("sgbackup_health_check") ? wp_get_schedule("sgbackup_health_check") : "none";'; }
