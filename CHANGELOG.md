@@ -32,6 +32,9 @@
   restore lock back. A restore lock that came in with the imported database
   (a pre-restore backup is dumped while its restore holds the lock) is removed
   at the end of the restore.
+- A browser restore whose search-replace checkpoint cannot be saved (for
+  example a row larger than `max_allowed_packet`) finishes the search-replace
+  in the same request, instead of relying on a checkpoint that is not there.
 
 ### Health monitor key survives restores and failover
 - Why the bot lost access: backups always held the monitor key's hash, but

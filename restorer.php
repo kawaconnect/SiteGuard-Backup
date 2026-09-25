@@ -3996,6 +3996,7 @@ class SiteGuard_Backup_Restorer {
 			$state = null;
 		}
 		$resuming = (is_array($state) && !empty($state['search']) && !empty($state['tables']));
+		$sr_checkpoint_saved = true;
 
 		if ($resuming) {
 			$search                  = $state['search'];
@@ -4131,7 +4132,7 @@ class SiteGuard_Backup_Restorer {
 
 			// Persist everything the resume path needs so a checkpointed run can
 			// continue with the identical pairs and one-time captures.
-			$opts->update_option($this->sr_state_option, array(
+			$sr_state_saved = $opts->update_option($this->sr_state_option, array(
 				'timestamp'               => $this_ts,
 				'search'                  => $search,
 				'replace'                 => $replace,
@@ -4165,12 +4166,19 @@ class SiteGuard_Backup_Restorer {
 					'health_outcome'              => $this->health_outcome,
 				),
 			), false);
+			// Without a checkpoint (e.g. a row over max_allowed_packet) the browser's
+			// continuation finds none and imports the database again, forever.
+			// Finish search-replace in this request instead.
+			if (!$sr_state_saved && !is_array($opts->get_option($this->sr_state_option, null))) {
+				$sr_checkpoint_saved = false;
+				$this->sgbackup->log("[Restore] Could not save the search-replace checkpoint; finishing search-replace in this request", 'warning');
+			}
 		}
 
 		// Under AJAX/browser, bound this pass so it checkpoints before a proxy idle
 		// timeout; WP-CLI (no DOING_AJAX) passes no deadline and runs to completion.
 		$deadline = null;
-		if (defined('DOING_AJAX') && DOING_AJAX) {
+		if (defined('DOING_AJAX') && DOING_AJAX && $sr_checkpoint_saved) {
 			$budget = (int) apply_filters('sgbackup_restore_sr_budget_seconds', 45);
 			$deadline = $this->restore_started_at + max(15, $budget);
 		}
