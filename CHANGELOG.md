@@ -26,6 +26,12 @@
   imports the database again (reusing the saved settings) instead of running a
   search-replace with no URLs.
 - A resumed network migration keeps each subsite's own SiteGuard rows.
+- Lock rows (`sgbackup_restore`, `sgbackup_lock`, `sgbackup_boot`,
+  `sgbackup_history`, `sgbackup_sem_*`) are never saved or written back with
+  this site's settings, so a resumed restore cannot put the interrupted run's
+  restore lock back. A restore lock that came in with the imported database
+  (a pre-restore backup is dumped while its restore holds the lock) is removed
+  at the end of the restore.
 
 ### Health monitor key survives restores and failover
 - Why the bot lost access: backups always held the monitor key's hash, but

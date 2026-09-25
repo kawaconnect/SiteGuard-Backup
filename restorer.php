@@ -35,6 +35,10 @@ class SiteGuard_Backup_Restorer {
 	 *  so a resumed or re-run restore writes back the same rows as an uninterrupted one. */
 	const PRESERVED_OPTION = 'sgbackup_restore_preserved';
 
+	/** Semaphore rows (SiteGuard_Backup_Semaphore) besides the sgbackup_sem_* ones.
+	 *  They are live process state, never settings to save or write back. */
+	const LOCK_ROWS = array('sgbackup_restore', 'sgbackup_lock', 'sgbackup_boot', 'sgbackup_history');
+
 	/** @var SiteGuard_Backup */
 	private $sgbackup;
 
@@ -3734,7 +3738,7 @@ class SiteGuard_Backup_Restorer {
 			$sitemeta_count = 0;
 			foreach ($sitemeta_rows as $row) {
 				if (strpos($row['meta_key'], 'sgbackup_jobdata_') === 0) continue;
-				if (strpos($row['meta_key'], 'sgbackup_sem_') === 0) continue;
+				if ($this->is_lock_row($row['meta_key'])) continue;
 				if (in_array($row['meta_key'], array('sgbackup_restore_sr_state', 'sgbackup_sr_progress', self::PRESERVED_OPTION), true)) continue;
 				$this->pre_import_sgbackup_options['sitemeta:' . $row['meta_key']] = $row['meta_value'];
 				$sitemeta_count++;
@@ -3748,7 +3752,7 @@ class SiteGuard_Backup_Restorer {
 			$options_count = 0;
 			foreach ($options_rows as $row) {
 				if (strpos($row['option_name'], 'sgbackup_jobdata_') === 0) continue;
-				if (strpos($row['option_name'], 'sgbackup_sem_') === 0) continue;
+				if ($this->is_lock_row($row['option_name'])) continue;
 				if (in_array($row['option_name'], array('sgbackup_restore_sr_state', 'sgbackup_sr_progress', self::PRESERVED_OPTION), true)) continue;
 				$this->pre_import_sgbackup_options['options:' . $row['option_name']] = array(
 					'value' => $row['option_value'],
@@ -3767,7 +3771,7 @@ class SiteGuard_Backup_Restorer {
 			), ARRAY_A);
 			foreach ($rows as $row) {
 				if (strpos($row['option_name'], 'sgbackup_jobdata_') === 0) continue;
-				if (strpos($row['option_name'], 'sgbackup_sem_') === 0) continue;
+				if ($this->is_lock_row($row['option_name'])) continue;
 				if (in_array($row['option_name'], array('sgbackup_restore_sr_state', 'sgbackup_sr_progress', self::PRESERVED_OPTION), true)) continue;
 				$this->pre_import_sgbackup_options[$row['option_name']] = array(
 					'value' => $row['option_value'],
@@ -3778,6 +3782,19 @@ class SiteGuard_Backup_Restorer {
 				$this->sgbackup->log("Saved " . count($this->pre_import_sgbackup_options) . " destination sgbackup_* options before import");
 			}
 		}
+	}
+
+	/**
+	 * Whether an sgbackup_* row is a lock. The snapshot must never carry one: once
+	 * it became durable, a resumed or continued restore wrote the interrupted
+	 * run's "sgbackup_restore" row back, its own unlock() did not match it, and
+	 * every later restore was refused for up to an hour.
+	 *
+	 * @param string $name Row name, bare or 'options:'/'sitemeta:' prefixed.
+	 */
+	private function is_lock_row($name) {
+		$name = preg_replace('/^(options|sitemeta):/', '', (string) $name);
+		return strpos($name, 'sgbackup_sem_') === 0 || in_array($name, self::LOCK_ROWS, true);
 	}
 
 	/**
@@ -5654,6 +5671,9 @@ class SiteGuard_Backup_Restorer {
 		$restored_options = 0;
 
 		foreach ($rows as $prefixed_key => $saved) {
+			// Snapshots and search-replace checkpoints saved by an older build
+			// still carry lock rows.
+			if ($this->is_lock_row($prefixed_key)) continue;
 			if (is_multisite() && strpos($prefixed_key, 'sitemeta:') === 0) {
 				$key = substr($prefixed_key, 9); // Remove 'sitemeta:' prefix
 				$exists = $wpdb->get_var($wpdb->prepare(
@@ -5829,6 +5849,9 @@ class SiteGuard_Backup_Restorer {
 		if (null === $row) $row = $this->read_preserved_state();
 		if (!$row) return false;
 		$this->pre_import_sgbackup_options = $row['options'];
+		foreach (array_keys($this->pre_import_sgbackup_options) as $key) {
+			if ($this->is_lock_row($key)) unset($this->pre_import_sgbackup_options[$key]);
+		}
 		$this->health_dest = (isset($row['health_dest']) && is_array($row['health_dest'])) ? $row['health_dest'] : array();
 		if ($rerun) {
 			$this->pre_import_sgbackup_options = array_merge($this->pre_import_sgbackup_options, $this->health_dest);
@@ -6159,6 +6182,20 @@ class SiteGuard_Backup_Restorer {
 			// Semaphore locks from the imported DB.
 			$wpdb->query($wpdb->prepare("DELETE FROM `{$table}` WHERE option_name LIKE %s", $wpdb->esc_like('sgbackup_sem_') . '%'));
 			if ($bid && function_exists('clean_blog_cache')) clean_blog_cache($bid);
+		}
+
+		// A restore lock row the import brought in (a pre-restore backup is dumped
+		// while its restore holds the lock) is not this run's: unlock() would not
+		// match it and the next restore would be refused for up to an hour. The
+		// write-back used to cover it with this run's own row; it no longer
+		// carries lock rows. This run's row is never older than its start.
+		if ($this->restore_lock && $this->restore_lock->is_locked() && $this->restore_started_at) {
+			$wpdb->query($wpdb->prepare(
+				"DELETE FROM {$wpdb->options} WHERE option_name = %s AND CAST(SUBSTRING_INDEX(SUBSTRING_INDEX(option_value, '|', -2), '|', 1) AS UNSIGNED) < %d",
+				'sgbackup_restore',
+				$this->restore_started_at
+			));
+			$this->invalidate_option_cache('sgbackup_restore');
 		}
 		wp_cache_delete('cron', 'options');
 		wp_cache_delete('alloptions', 'options');

@@ -7,7 +7,7 @@
 # <instance-manager> is WPMultisiteDocker's scripts/instance.sh. The three
 # instances must already exist, be up, and have the plugin active. This script
 # never creates, destroys or stops an instance. <src-single> plays production,
-# <dst-single> the standby. Scenarios: H1 ... H20 (default: all implemented).
+# <dst-single> the standby. Scenarios: H1 ... H21 (default: all implemented).
 #
 # All plugin code runs inside the instances' cli containers as www-data. Keys
 # live only in this script's memory. Takes the shared integration lock (waits
@@ -613,8 +613,23 @@ H20() { # downgrade to 1.5.1 keeps the stored key working
 	expect_auth "reinstalled: KB works" 200 "$DST" "$KB"
 }
 
+H21() { # a restore lock row that came in with the imported database
+	reset_restore_state "$SRC"
+	local ts out
+	# A pre-restore backup is dumped while its restore holds the lock.
+	E "$SRC" 'global $wpdb; $wpdb->replace($wpdb->options, array("option_name" => "sgbackup_restore", "option_value" => "hk21lock|" . time() . "|3600", "autoload" => "no")); wp_cache_flush(); echo 1;' >/dev/null
+	ts="$(make_backup "$SRC")"
+	reset_restore_state "$SRC"
+	out="$(restore "$SRC" "$ts" --entities=db)"
+	check "restore of a backup holding a restore lock succeeds" bash -c '! grep -q "Error:" <<<"$0"' "$out"
+	check "the imported restore lock is gone" no_row "$SRC" sgbackup_restore
+	out="$(restore "$SRC" "$ts" --entities=db)"
+	check "the next restore is not refused" bash -c '! grep -q "Another restore is already running" <<<"$0"' "$out"
+	check "no restore lock left behind" no_row "$SRC" sgbackup_restore
+}
+
 # -----------------------------------------------------------------------------
-SCENARIOS=(H1 H2 H3 H4 H5 H6 H7 H8 H9 H10 H11 H12 H13 H14 H15 H16 H17 H19 H20 H18)
+SCENARIOS=(H1 H2 H3 H4 H5 H6 H7 H8 H9 H10 H11 H12 H13 H14 H15 H16 H17 H19 H20 H21 H18)
 
 for n in "$SRC" "$DST" "$MULTI"; do
 	W "$n" plugin is-active siteguardbackup >/dev/null || W "$n" plugin is-active siteguardbackup --network >/dev/null \
