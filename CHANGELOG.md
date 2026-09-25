@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.5.2
 
 ### Interrupted restores keep this site's settings
 - A restore keeps the backup's timestamp from the start. It used to look the
