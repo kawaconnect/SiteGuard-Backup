@@ -82,6 +82,14 @@ reset_state() {
 		$o->update_option("sgbackup_retain_db", 50);
 		$o->update_option("sgbackup_retain_extrarules", array());
 		$o->delete_option("sgbackup_dir");
+		global $wpdb;
+		foreach (array("sgbackup_health_api_key_hash", "sgbackup_health_api_key", "sgbackup_health_api_key_meta", "sgbackup_health_enabled", "sgbackup_health_interval", "sgbackup_health_timeout", "sgbackup_health_ssl_warn_days", "sgbackup_health_last_restore", "sgbackup_restore_sr_state", "sgbackup_sr_progress", "sgbackup_restore_preserved") as $n) {
+			$wpdb->delete($wpdb->options, array("option_name" => $n));
+			if (is_multisite()) $wpdb->delete($wpdb->sitemeta, array("meta_key" => $n));
+		}
+		delete_transient("sgbackup_restore_progress");
+		wp_clear_scheduled_hook("sgbackup_health_check");
+		wp_cache_flush();
 	' >/dev/null
 	SH 'rm -f wp-content/mu-plugins/sg-test-*.php' >/dev/null
 }
@@ -304,8 +312,56 @@ t_data_fidelity() {
 	check "serialized option still an array" test "$(PHP 'echo is_array(get_option("sgx_ser")) ? "y" : "n";')" = y
 }
 
+key_ok() { PHP "require_once SGBACKUP_DIR . 'includes/class-health-monitor.php'; echo SiteGuard_Backup_Health_Monitor::instance()->validate_api_key('$1') ? 'y' : 'n';"; }
+new_key() { W siteguardbackup health_api_key --regenerate | sed -n 's/^API Key: //p'; }
+
+# A same-site restore of an older backup keeps the current monitor key by default
+# and takes the backup's with --health-key=backup (main site on multisite).
+t_health_key_restore() {
+	local saved=("${URL[@]}"); URL=()
+	W siteguardbackup health_config enable >/dev/null
+	local k1 k2 ts out
+	k1="$(new_key)"
+	make_backup
+	ts="$(history_ts)"; ts="${ts##* }"
+	k2="$(new_key)"
+	out="$(W siteguardbackup restore "$ts" --entities=db --yes 2>&1)"
+	check "result line says this site's key was kept" grep -q "kept this site's key" <<<"$out"
+	check "current key still valid" test "$(key_ok "$k2")" = y
+	check "backup's key not applied" test "$(key_ok "$k1")" = n
+	W siteguardbackup restore "$ts" --entities=db --health-key=backup --yes >/dev/null 2>&1
+	check "--health-key=backup applies the backup's key" test "$(key_ok "$k1")" = y
+	check "--health-key=backup retires the current key" test "$(key_ok "$k2")" = n
+	check "--health-key=bogus is refused" bash -c '! "$0" wp "$1" siteguardbackup restore "$2" --entities=db --health-key=bogus --yes >/dev/null 2>&1' "$IM" "$INST" "$ts"
+	URL=("${saved[@]}")
+}
+
+# A restore interrupted after its database phase resumes: the set is found, the
+# database is not imported again, and this site's SiteGuard settings come back.
+t_resume_after_db() {
+	[ "$INST" = "$SINGLE" ] || return 0
+	make_backup
+	local ts; ts="$(history_ts)"; ts="${ts##* }"
+	PHP 'SiteGuard_Backup_Options::instance()->update_option("sgbackup_retain", 41);' >/dev/null
+	local out
+	out="$(W eval "
+		add_action('set_transient_sgbackup_restore_progress', function (\$v) {
+			if (isset(\$v['entities']['plugins']) && \$v['entities']['plugins'] === 'started') { echo \"SIMULATED CRASH\n\"; exit(3); }
+		});
+		require_once SGBACKUP_DIR . 'restorer.php';
+		\$r = new SiteGuard_Backup_Restorer(SiteGuard_Backup_History::get_history($ts), array('db' => true, 'plugins' => true, 'restore_plugins_items' => array('akismet')));
+		\$r->perform_restore();" 2>&1)"
+	check "restore crashed after the database phase" grep -q "SIMULATED CRASH" <<<"$out"
+	check "this site's history is back before the resume" test -n "$(PHP "echo SiteGuard_Backup_History::get_history($ts) ? 'y' : '';")"
+	out="$(W siteguardbackup resume_restore 2>&1)"
+	check "resume finds the backup" bash -c '! grep -q "Backup not found" <<<"$0"' "$out"
+	check "resume skips the database" grep -q "Database already restored" <<<"$out"
+	check "this site's settings written back (retain 41)" test "$(WQ option get sgbackup_retain)" = 41
+	check "destination snapshot removed" test -z "$(PHP 'echo get_option("sgbackup_restore_preserved") ? "left" : "";')"
+}
+
 # -----------------------------------------------------------------------------
-TESTS=(t_legacy_cleanup t_backup_verify t_delete_scoped t_retention_count t_retention_extrarule_db t_cleanup_symlink t_hostile_backup_dir t_restore_db t_data_fidelity t_pre_restore_backup t_delete_shared_file_protected t_remote_delete_names t_multisite_scoping)
+TESTS=(t_legacy_cleanup t_backup_verify t_delete_scoped t_retention_count t_retention_extrarule_db t_cleanup_symlink t_hostile_backup_dir t_restore_db t_data_fidelity t_pre_restore_backup t_delete_shared_file_protected t_remote_delete_names t_multisite_scoping t_health_key_restore t_resume_after_db)
 
 command -v jq >/dev/null || { echo "jq is required" >&2; exit 2; }
 
