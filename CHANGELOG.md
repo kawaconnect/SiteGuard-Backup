@@ -1,5 +1,10 @@
 # Changelog
 
+## [1.6.1] - 2026-10-14
+
+### Changed
+- Docs: README and tests/README describe the merge-request pipelines and list all six unit tests. No plugin code changes.
+
 ## 1.6.0
 
 ### Sync API (pull backups from a site)
