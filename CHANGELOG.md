@@ -5,7 +5,7 @@
 ### Sync API (pull backups from a site)
 - New REST routes under `sgbackup/v1/sync/` for a trusted puller (the wpops
   node agent): start a full backup, poll the job, list complete sets with
-  file sizes (and SHA-256 on request), download files with HTTP `Range`
+  file sizes (and SHA-256 on request), download files (`/file?name=`) with HTTP `Range`
   (resumable through proxies with request time limits, e.g. Azure App
   Service), delete a set once copied. Multisite answers on the main site
   only; a set contains every blog.

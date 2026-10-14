@@ -8,7 +8,7 @@
  *   POST   /backup  {label, entities?} start a full backup (service: none); returns the job nonce
  *   GET    /jobs/<nonce>               job status; nudges WP-Cron while the job is running
  *   GET    /sets[?hash=1]              complete full sets with their files (sizes; sha256 when ?hash=1)
- *   GET    /sets/<nonce>/files/<name>  stream a file (HTTP Range supported, so slow links can resume)
+ *   GET    /sets/<nonce>/file?name=   stream a file (HTTP Range supported, so slow links can resume)
  *   DELETE /sets/<nonce>               remove a set after it was copied (optional)
  *
  * The sync key is separate from the health key, stored hashed
@@ -113,8 +113,11 @@ class SiteGuard_Backup_Sync_API {
 		register_rest_route($ns, '/sync/sets/(?P<nonce>[A-Za-z0-9]{4,40})', array(
 			'methods' => 'DELETE', 'callback' => array($this, 'delete_set'), 'permission_callback' => $auth,
 		));
-		register_rest_route($ns, '/sync/sets/(?P<nonce>[A-Za-z0-9]{4,40})/files/(?P<name>backup_[A-Za-z0-9._-]+)', array(
+		// The file name travels in the query string: web servers commonly deny
+		// any URI ending in .zip/.gz (this repo's nginx does), REST path or not.
+		register_rest_route($ns, '/sync/sets/(?P<nonce>[A-Za-z0-9]{4,40})/file', array(
 			'methods' => 'GET', 'callback' => array($this, 'file'), 'permission_callback' => $auth,
+			'args' => array('name' => array('required' => true, 'type' => 'string', 'pattern' => '^backup_[A-Za-z0-9._-]+$')),
 		));
 	}
 
@@ -319,7 +322,10 @@ class SiteGuard_Backup_Sync_API {
 	public function file(WP_REST_Request $request) {
 		sgbackup_load_classes();
 		$nonce = (string) $request['nonce'];
-		$name = (string) $request['name'];
+		$name = (string) $request->get_param('name');
+		if (!preg_match('/^backup_[A-Za-z0-9._-]+$/', $name) || false !== strpos($name, '..')) {
+			return new WP_Error('bad_name', 'Invalid file name', array('status' => 400));
+		}
 		$set = SiteGuard_Backup_History::get_backup_set_by_nonce($nonce);
 		if (!$set) {
 			return new WP_Error('not_found', 'No such set', array('status' => 404));
