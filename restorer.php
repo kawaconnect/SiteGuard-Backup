@@ -5468,6 +5468,10 @@ class SiteGuard_Backup_Restorer {
 	}
 
 	private function post_restore_cleanup() {
+		// The restored database may carry the source site's in-flight backup job
+		// marker (the dump was taken while that job ran there). It means nothing on
+		// this site and would make the scheduler poll a job that never existed here.
+		delete_option('sgbackup_active_job_nonce');
 		$this->progress("Running post-restore cleanup");
 
 		// A run that resumed after the import writes back the snapshot the

@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.6.2
+
+### Fixed
+- Fatal "Class SiteGuard_Backup not found" from the sync API ping/health paths
+  when `sgbackup_active_job_nonce` is set: the job scheduler's fallback branch
+  now loads the core class before using it.
+- Post-restore cleanup clears a job marker inherited from the source site's
+  database (a dump taken while a backup ran there).
+
 ## 1.6.1
 
 ### Changed

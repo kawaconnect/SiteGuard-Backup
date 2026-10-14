@@ -336,6 +336,10 @@ class SiteGuard_Backup_Job_Scheduler {
 		if (empty($jobs)) {
 			$active_nonce = get_option('sgbackup_active_job_nonce');
 			if (!empty($active_nonce)) {
+				if (!class_exists('SiteGuard_Backup')) {
+					// Reached from REST/health paths that only loaded the helper classes.
+					require_once SGBACKUP_DIR . 'class-siteguardbackup.php';
+				}
 				$sgbackup = SiteGuard_Backup::instance();
 				$jobdata = $sgbackup->jobdata_getarray($active_nonce);
 				if (!empty($jobdata)) {
