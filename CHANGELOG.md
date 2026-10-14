@@ -11,7 +11,9 @@
   only; a set contains every blog.
 - Separate sync key, stored hashed; `wp siteguardbackup sync_api_key
   [--regenerate|--delete]`. Failed authentications share the health API's
-  per-IP limiter; every response is `Cache-Control: no-store`.
+  per-IP limiter; every response is `Cache-Control: no-store`. A key hash can
+  be pinned with `SGBACKUP_SYNC_API_KEY_HASH` in wp-config.php for hosts
+  without WP-CLI.
 - The set listing includes the network's site list (blog id, domain, path)
   so a puller can map subsites when restoring elsewhere.
 

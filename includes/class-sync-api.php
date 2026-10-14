@@ -40,8 +40,18 @@ class SiteGuard_Backup_Sync_API {
 
 	// ------------------------------------------------------------------ keys
 
+	/**
+	 * A key hash can also be pinned in wp-config.php:
+	 *   define('SGBACKUP_SYNC_API_KEY_HASH', '$2y$...');   // password_hash($key, PASSWORD_BCRYPT)
+	 * for hosts without WP-CLI access (e.g. an App Service managed over FTPS).
+	 */
+	private function pinned_hash() {
+		return defined('SGBACKUP_SYNC_API_KEY_HASH') ? (string) SGBACKUP_SYNC_API_KEY_HASH : '';
+	}
+
 	public function has_key() {
-		return '' !== (string) SiteGuard_Backup_Options::instance()->get_option(self::OPTION_HASH, '');
+		return '' !== $this->pinned_hash()
+			|| '' !== (string) SiteGuard_Backup_Options::instance()->get_option(self::OPTION_HASH, '');
 	}
 
 	public function regenerate_key() {
@@ -71,6 +81,10 @@ class SiteGuard_Backup_Sync_API {
 		$key = (string) $key;
 		if ('' === $key || strlen($key) > 200) {
 			return false;
+		}
+		$pinned = $this->pinned_hash();
+		if ('' !== $pinned && password_verify($key, $pinned)) {
+			return true;
 		}
 		$hash = (string) SiteGuard_Backup_Options::instance()->get_option(self::OPTION_HASH, '');
 		if ('' === $hash) {
