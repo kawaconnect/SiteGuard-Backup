@@ -2,7 +2,7 @@
 /**
  * Plugin Name: SiteGuard Backup
  * Description: Complete WordPress backup, restore, and migration solution with scheduled, incremental, and site-to-site migration support.
- * Version: 1.5.5
+ * Version: 1.6.0
  * Author: KawaConnect LLC
  * License: GPL-2.0-or-later
  * Requires at least: 5.6
@@ -13,7 +13,7 @@
 if (!defined('ABSPATH')) die('No direct access.');
 
 // Core constants
-define('SGBACKUP_VERSION', '1.5.5');
+define('SGBACKUP_VERSION', '1.6.0');
 define('SGBACKUP_DIR', plugin_dir_path(__FILE__));
 define('SGBACKUP_URL', plugin_dir_url(__FILE__));
 define('SGBACKUP_PLUGIN_SLUG', plugin_basename(__FILE__));
@@ -463,6 +463,17 @@ function sgbackup_register_health_api() {
 	));
 }
 add_action('rest_api_init', 'sgbackup_register_health_api');
+
+/**
+ * Sync API (pull backups from this site: wpops node agent). See includes/class-sync-api.php.
+ */
+function sgbackup_register_sync_api() {
+	sgbackup_load_classes();
+	require_once SGBACKUP_DIR . 'includes/class-sync-api.php';
+	SiteGuard_Backup_Sync_API::instance()->register_routes();
+	add_filter('rest_post_dispatch', array('SiteGuard_Backup_Sync_API', 'no_store'), 10, 3);
+}
+add_action('rest_api_init', 'sgbackup_register_sync_api');
 
 /**
  * Health responses carry site status and are keyed on the bearer token: no

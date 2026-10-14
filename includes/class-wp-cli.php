@@ -4170,6 +4170,58 @@ class SiteGuard_Backup_CLI_Command extends WP_CLI_Command {
     }
 
     /**
+     * Sync API key management (pull backups from this site with the wpops agent).
+     *
+     * The key is stored as a hash; it is shown once when generated.
+     *
+     * ## OPTIONS
+     *
+     * [--regenerate]
+     * : Generate a new key (replaces any existing one) and print it.
+     *
+     * [--delete]
+     * : Remove the key and disable the sync API.
+     *
+     * ## EXAMPLES
+     *
+     *     wp siteguardbackup sync_api_key
+     *     wp siteguardbackup sync_api_key --regenerate
+     *     wp siteguardbackup sync_api_key --delete
+     *
+     * @subcommand sync_api_key
+     */
+    public function sync_api_key($args, $assoc_args) {
+        require_once SGBACKUP_DIR . 'includes/class-sync-api.php';
+        $api = SiteGuard_Backup_Sync_API::instance();
+        if (isset($assoc_args['regenerate']) && isset($assoc_args['delete'])) {
+            WP_CLI::error('Use only one of --regenerate, --delete.');
+        }
+        if (isset($assoc_args['regenerate'])) {
+            $key = $api->regenerate_key();
+            WP_CLI::success('New sync API key generated. Copy it now; it cannot be retrieved later (stored as hash).');
+            WP_CLI::log('');
+            WP_CLI::log('Sync key: ' . $key);
+            WP_CLI::log('Endpoint: ' . rest_url('sgbackup/v1/sync/ping'));
+            WP_CLI::log('On the node: WPOPS_SYNC_KEY_<SOURCE>=' . $key . ' in .env');
+            return;
+        }
+        if (isset($assoc_args['delete'])) {
+            $api->delete_key();
+            WP_CLI::success('Sync API key removed; the sync API is disabled.');
+            return;
+        }
+        if (!$api->has_key()) {
+            WP_CLI::log('Sync API: disabled (no key). Run with --regenerate to enable.');
+            return;
+        }
+        $meta = $api->key_meta();
+        WP_CLI::log('Sync API: enabled');
+        WP_CLI::log('  Fingerprint: ' . (isset($meta['fingerprint']) ? $meta['fingerprint'] : '?'));
+        WP_CLI::log('  Created:     ' . (isset($meta['created']) ? gmdate('Y-m-d H:i', (int) $meta['created']) . ' UTC' : '?'));
+        WP_CLI::log('  Endpoint:    ' . rest_url('sgbackup/v1/sync/ping'));
+    }
+
+    /**
      * Show, regenerate, set or pin the health monitor API key.
      *
      * The key is stored only as a hash. A backup carries that hash; which key a

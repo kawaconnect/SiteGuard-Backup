@@ -91,6 +91,9 @@ wp siteguardbackup migrate_send <timestamp> <site_id>
 wp siteguardbackup migrate_clone <site_id>
 wp siteguardbackup migrate_destinations list [--format=table|json]
 
+# Sync API (pull backups from this site; used by the wpops node agent)
+wp siteguardbackup sync_api_key [--regenerate|--delete]
+
 # Diagnostics
 wp siteguardbackup sysinfo
 wp siteguardbackup db_tables [--format=table|json]

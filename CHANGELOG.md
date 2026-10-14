@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.6.0
+
+### Sync API (pull backups from a site)
+- New REST routes under `sgbackup/v1/sync/` for a trusted puller (the wpops
+  node agent): start a full backup, poll the job, list complete sets with
+  file sizes (and SHA-256 on request), download files with HTTP `Range`
+  (resumable through proxies with request time limits, e.g. Azure App
+  Service), delete a set once copied. Multisite answers on the main site
+  only; a set contains every blog.
+- Separate sync key, stored hashed; `wp siteguardbackup sync_api_key
+  [--regenerate|--delete]`. Failed authentications share the health API's
+  per-IP limiter; every response is `Cache-Control: no-store`.
+- The set listing includes the network's site list (blog id, domain, path)
+  so a puller can map subsites when restoring elsewhere.
+
 ## 1.5.5
 
 - CI: pipelines run on merge requests (tests/Linux builds; Windows/macOS manual;
