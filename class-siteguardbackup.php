@@ -1172,8 +1172,7 @@ class SiteGuard_Backup {
 			// Cron run through WP-CLI (`wp cron event run`, e.g. a wp-cron container
 			// with DISABLE_WP_CRON): there is no direct chain and no CLI loop, so
 			// the next resumption must be queued here or the job stalls forever.
-			$active = SiteGuard_Backup_Job_Scheduler::get_active_jobs();
-			if (empty($active[$bnonce])) {
+			if (!SiteGuard_Backup_Job_Scheduler::has_queued_resumption($bnonce)) {
 				SiteGuard_Backup_Job_Scheduler::schedule_resumption($resumption_no + 1, $bnonce, 30);
 			}
 		}

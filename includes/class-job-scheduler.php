@@ -269,6 +269,23 @@ class SiteGuard_Backup_Job_Scheduler {
 	 *
 	 * @return array
 	 */
+	/**
+	 * Is a resumption for this nonce actually queued in WP-Cron? Unlike
+	 * get_active_jobs() this never reports the phantom "active job marker"
+	 * entry, so callers can decide whether the chain needs re-queuing.
+	 */
+	public static function has_queued_resumption($nonce) {
+		$crons = _get_cron_array();
+		if (empty($crons)) return false;
+		foreach ($crons as $time => $hooks) {
+			if (!isset($hooks['sgbackup_backup_resume'])) continue;
+			foreach ($hooks['sgbackup_backup_resume'] as $event) {
+				if (isset($event['args'][1]) && (string) $event['args'][1] === (string) $nonce) return true;
+			}
+		}
+		return false;
+	}
+
 	public static function get_active_jobs() {
 		$crons = _get_cron_array();
 		$jobs = array();
