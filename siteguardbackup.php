@@ -250,7 +250,11 @@ function sgbackup_cron_backup_all($options = array()) {
 function sgbackup_cron_backup_resume($resumption_no, $nonce) {
 	sgbackup_load_classes();
 	require_once SGBACKUP_DIR . 'class-siteguardbackup.php';
-	SiteGuard_Backup::instance()->backup_resume($resumption_no, $nonce);
+	$sgbackup = SiteGuard_Backup::instance();
+	// Mark this as a cron-driven resumption: under WP-CLI (`wp cron event run`)
+	// there is no in-process chain, so backup_resume() must queue the next one.
+	$sgbackup->via_cron = true;
+	$sgbackup->backup_resume($resumption_no, $nonce);
 }
 
 function sgbackup_cron_backup_incremental() {

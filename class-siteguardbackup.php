@@ -20,6 +20,8 @@ class SiteGuard_Backup {
 	public $something_useful_happened = false;
 	public $newresumption_scheduled = false;
 	public $boot_error = '';
+	/** True while a resumption runs from the sgbackup_backup_resume cron hook (see sgbackup_cron_backup_resume). */
+	public $via_cron = false;
 
 	private $jobdata = array();
 	private $logfile_handle = false;
@@ -1166,7 +1168,7 @@ class SiteGuard_Backup {
 		// Direct chain: continue in this PHP process if time permits.
 		// Skip in WP-CLI (has its own loop) and when job is done.
 		$jobstatus = $this->jobdata_get('jobstatus', '');
-		if (defined('WP_CLI') && WP_CLI && defined('DOING_CRON') && DOING_CRON && !in_array($jobstatus, $terminal, true)) {
+		if (defined('WP_CLI') && WP_CLI && $this->via_cron && !in_array($jobstatus, $terminal, true)) {
 			// Cron run through WP-CLI (`wp cron event run`, e.g. a wp-cron container
 			// with DISABLE_WP_CRON): there is no direct chain and no CLI loop, so
 			// the next resumption must be queued here or the job stalls forever.
