@@ -153,11 +153,11 @@ Tests live in `tests/` and must only run on disposable hosts; see `tests/README.
 
 ## Building / Releases (GitLab CI)
 
-The plugin is built and released by `.gitlab-ci.yml` on the GitLab runners (GitHub Actions is disabled; the old `.github/workflows/` files are kept but no longer run). Pipelines start only on a `v*` tag or when run from the GitLab UI / API, never on plain pushes or merge requests.
+The plugin is built and released by `.gitlab-ci.yml` on the GitLab runners (GitHub Actions is disabled; the old `.github/workflows/` files are kept but no longer run). Pipelines start on a `v*` tag, when run from the GitLab UI / API, and on merge requests (test and build-zip only, nothing is published); never on plain pushes.
 
 | Job | Runs on | What it does |
 |---|---|---|
-| `test` | `php:8.3-cli-bookworm` on the Linux (Kubernetes) runner | `ci/test.sh`: `php -l` on every PHP file outside `vendor/`, then `tests/test-*.php` (delete guard, encryption) as `nobody`, since those tests refuse root |
+| `test` | `php:8.3-cli-bookworm` on the Linux (Kubernetes) runner | `ci/test.sh`: `php -l` on every PHP file outside `vendor/`, then `tests/test-*.php` (delete guard, encryption, health API, client IP) as `nobody`, since those tests refuse root |
 | `build-zip` | `alpine:3.22` | `ci/build-zip.sh`: builds `siteguardbackup-<version>.zip` (one `siteguardbackup/` folder, without `docs/`, `tests/`, git and CI files), kept 30 days as a job artifact |
 | `release` | `alpine:3.22`, tags / `RELEASE_VERSION` only | `ci/release.sh`: uploads the zip to the project's Generic Package Registry (`siteguardbackup/<version>`) and creates or updates the GitLab release for the tag, with this version's `CHANGELOG.md` section as the notes |
 

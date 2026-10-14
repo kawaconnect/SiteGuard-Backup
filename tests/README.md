@@ -54,7 +54,7 @@ php tests/test-health-api.php        # health REST API: one key check per reques
 
 The GitLab pipeline's `test` job (`ci/test.sh`, see `.gitlab-ci.yml`) lints
 every PHP file and runs these in a throwaway PHP 8.3 container, as `nobody`, on
-each `v*` tag and on manual pipelines.
+each `v*` tag, on manual pipelines and on merge requests.
 
 ## Integration tests (real WordPress)
 
