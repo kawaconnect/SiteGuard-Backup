@@ -25,6 +25,11 @@
   stalled after the first batch. The next resumption is now scheduled in
   that case, and the sync API's job endpoint re-queues a running job that
   has no pending resumption.
+- Restore: the backup's table prefix is decided from the dump's table list, and
+  the URL pre-scan reads the whole dump. A multisite dump lists `wp_10_*`
+  before `wp_*`, so the old 200 000-line scan limit left the prefix at a
+  subsite's (`wp_10_`) and a whole-network restore was refused with a
+  "table prefix mismatch".
 
 ## 1.5.5
 

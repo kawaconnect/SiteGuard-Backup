@@ -3917,6 +3917,19 @@ class SiteGuard_Backup_Restorer {
 
 		$is_gz ? @gzclose($fh) : @fclose($fh);
 
+		// The prefix must be the install's base prefix, not a subsite's: a multisite
+		// dump sorted by table name lists wp_10_* before wp_*, so the first *options
+		// table seen is a subsite table. Decide from the full table list instead.
+		$scan_tables = $this->cached_tables_in_sql_file($file_path);
+		if (!empty($scan_tables)) {
+			$bp_now = $GLOBALS['wpdb']->base_prefix;
+			if (in_array($bp_now . 'options', $scan_tables, true)) {
+				$this->old_table_prefix = $bp_now;
+			} elseif (preg_match('/^(.*?_)\d+_$/', (string) $this->old_table_prefix, $pm) && in_array($pm[1] . 'options', $scan_tables, true)) {
+				$this->old_table_prefix = $pm[1];
+			}
+		}
+
 		// Auto-detect subsite backup when metadata is missing
 		if (!$this->is_subsite_backup && !$has_main_options && $detected_subsite_id > 0) {
 			$this->is_subsite_backup = true;
