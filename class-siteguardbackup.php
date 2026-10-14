@@ -1166,6 +1166,15 @@ class SiteGuard_Backup {
 		// Direct chain: continue in this PHP process if time permits.
 		// Skip in WP-CLI (has its own loop) and when job is done.
 		$jobstatus = $this->jobdata_get('jobstatus', '');
+		if (defined('WP_CLI') && WP_CLI && defined('DOING_CRON') && DOING_CRON && !in_array($jobstatus, $terminal, true)) {
+			// Cron run through WP-CLI (`wp cron event run`, e.g. a wp-cron container
+			// with DISABLE_WP_CRON): there is no direct chain and no CLI loop, so
+			// the next resumption must be queued here or the job stalls forever.
+			$active = SiteGuard_Backup_Job_Scheduler::get_active_jobs();
+			if (empty($active[$bnonce])) {
+				SiteGuard_Backup_Job_Scheduler::schedule_resumption($resumption_no + 1, $bnonce, 30);
+			}
+		}
 		if (!defined('WP_CLI') && !in_array($jobstatus, $terminal, true)) {
 			// Use process wall-clock time (not per-resumption) for the budget
 			$process_elapsed = microtime(true) - $this->_process_start;

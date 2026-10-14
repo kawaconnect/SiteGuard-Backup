@@ -224,8 +224,19 @@ class SiteGuard_Backup_Sync_API {
 		$status = isset($jobdata['jobstatus']) ? (string) $jobdata['jobstatus'] : '';
 		$terminal = in_array($status, array('complete', 'finished', 'warning', 'error', 'aborted', 'failed'), true);
 		$succeeded = in_array($status, array('complete', 'finished', 'warning'), true);
-		if (!$terminal && function_exists('spawn_cron')) {
-			spawn_cron();
+		if (!$terminal) {
+			// Self-heal: a running job with no queued resumption (lost cron event,
+			// resumption run by WP-CLI) would stall; queue the next one.
+			require_once SGBACKUP_DIR . 'includes/class-job-scheduler.php';
+			$active = SiteGuard_Backup_Job_Scheduler::get_active_jobs();
+			$last_touch = isset($jobdata['run_times']) && is_array($jobdata['run_times']) ? count($jobdata['run_times']) : 0;
+			if (empty($active[$nonce]) && 'running' === $status) {
+				$next = isset($jobdata['current_resumption']) ? (int) $jobdata['current_resumption'] + 1 : max(1, $last_touch);
+				SiteGuard_Backup_Job_Scheduler::schedule_resumption($next, $nonce, 5);
+			}
+			if (function_exists('spawn_cron')) {
+				spawn_cron();
+			}
 		}
 		return rest_ensure_response(array(
 			'nonce'      => $nonce,

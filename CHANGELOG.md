@@ -17,6 +17,15 @@
 - The set listing includes the network's site list (blog id, domain, path)
   so a puller can map subsites when restoring elsewhere.
 
+### Fixes
+- A backup resumption executed by `wp cron event run` (WP-CLI with
+  `DOING_CRON`, the usual wp-cron container setup with `DISABLE_WP_CRON`)
+  never queued the next resumption: WP-CLI skips the in-process chain and
+  only the interactive `backup` command loops itself, so cron-driven backups
+  stalled after the first batch. The next resumption is now scheduled in
+  that case, and the sync API's job endpoint re-queues a running job that
+  has no pending resumption.
+
 ## 1.5.5
 
 - CI: pipelines run on merge requests (tests/Linux builds; Windows/macOS manual;
