@@ -226,5 +226,22 @@ check('stale data: probe-failed alert only, no expiry alert', array('ssl_probe_f
 check('ok site: no alert', !isset($by['ok.test']));
 check('payload still has api_version 2 and the rows as stored', 2 === $payload['api_version'] && 8 === count($payload['sites']) && !array_key_exists('ssl_expires_at', $payload['sites'][3]));
 
+// --- Sync API key check: one verdict per request, never reused across requests ---
+require_once SGBACKUP_DIR . 'includes/class-sync-api.php';
+$sync = SiteGuard_Backup_Sync_API::instance();
+$sync_key = 'sgs_' . str_repeat('ab', 24);
+$options[SiteGuard_Backup_Sync_API::OPTION_HASH] = wp_hash_password($sync_key);
+function sync_auth($req) { return code_of(SiteGuard_Backup_Sync_API::instance()->auth($req)); }
+$_SERVER = array('REMOTE_ADDR' => '192.0.2.60');
+$bcrypt_calls = 0;
+$req = new WP_REST_Request('/sgbackup/v1/sync/ping', array('Authorization' => 'Bearer ' . $sync_key));
+check('sync: good key ok on both passes', array('ok', 'ok') === array(sync_auth($req), sync_auth($req)));
+check('sync: one bcrypt check for the request', 1 === $bcrypt_calls);
+$req = new WP_REST_Request('/sgbackup/v1/sync/sets', array('Authorization' => 'Bearer ' . $bad));
+check('sync: a later request with a bad key is refused, not served the earlier verdict', 'forbidden' === sync_auth($req));
+check('sync: bad key counted once over both passes', 'forbidden' === sync_auth($req) && 1 === attempts('192.0.2.60'));
+$req = new WP_REST_Request('/sgbackup/v1/sync/sets', array('Authorization' => 'Bearer ' . $sync_key));
+check('sync: good key after a bad one is ok', 'ok' === sync_auth($req));
+
 echo "\n$count checks, $failures failed\n";
 exit($failures ? 1 : 0);

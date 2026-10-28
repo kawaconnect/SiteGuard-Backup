@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.6.3
+
+### Security
+- Sync API: the key check's per-request cache was not tied to the request. A
+  PHP process that served more than one REST request (internal
+  `rest_do_request()` calls, persistent PHP workers) reused the first
+  request's verdict, so a later request with a wrong key could be let in. The verdict is now kept only for the same request
+  object and Authorization header, like the health API's.
+
 ## 1.6.2
 
 ### Fixed

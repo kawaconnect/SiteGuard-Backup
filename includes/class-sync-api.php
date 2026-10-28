@@ -150,14 +150,20 @@ class SiteGuard_Backup_Sync_API {
 		}
 		// WordPress calls the permission callback twice per request (once for the
 		// Allow header); cache the verdict for this request so bcrypt runs once.
-		static $verdict = null;
-		if (null === $verdict) {
+		// The cache is tied to this request object and its Authorization header:
+		// a process that serves more than one REST request (internal
+		// rest_do_request() calls, persistent PHP workers) must not reuse an
+		// earlier request's verdict for a different key.
+		static $memo = null;
+		$auth_hash = hash('sha256', $auth);
+		if (null === $memo || $memo['request'] !== $request || $memo['auth'] !== $auth_hash) {
 			$verdict = $this->validate_key(substr($auth, 7));
 			if (!$verdict) {
 				$monitor->record_failed_auth($ip);
 			}
+			$memo = array('request' => $request, 'auth' => $auth_hash, 'verdict' => $verdict);
 		}
-		return $verdict ? true : new WP_Error('forbidden', 'Invalid sync key', array('status' => 403));
+		return $memo['verdict'] ? true : new WP_Error('forbidden', 'Invalid sync key', array('status' => 403));
 	}
 
 	// ------------------------------------------------------------- callbacks
