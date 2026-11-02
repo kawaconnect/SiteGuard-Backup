@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.6.4
+
+### Added
+- Node key for the health API: `wp siteguardbackup health_api_key --set-node`
+  (read from STDIN) stores a second key, held by the agent of the docker node
+  that hosts the site (wpops). It is accepted next to the site's own key, which
+  it never replaces; `--clear-node` removes it. `/health/ping` reports
+  `key.source: "node"` for it, and `health_api_key` (text and JSON) shows its
+  hint and fingerprint. Restores keep this site's node key. This lets one node
+  track every site it hosts, one install per site, without sharing or
+  replacing the keys the sites already use.
+- `/health` returns `environment`: WordPress and PHP versions, whether the
+  install is a multisite, and the time and count of local backups. Additive;
+  `api_version` stays 2.
+
 ## 1.6.3
 
 ### Security

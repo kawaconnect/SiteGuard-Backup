@@ -14,6 +14,10 @@ class SiteGuard_Backup_Health_Monitor {
 
 	private static $instance = null;
 
+	/** Node key (wpops agent of the hosting node): hash and metadata options. */
+	const NODE_HASH = 'sgbackup_health_node_key_hash';
+	const NODE_META = 'sgbackup_health_node_key_meta';
+
 	/** @var array|null Fingerprint and source of the key matched by validate_api_key(). */
 	private $matched = null;
 
@@ -836,6 +840,50 @@ class SiteGuard_Backup_Health_Monitor {
 	}
 
 	/**
+	 * Set the node key: a second key, held by the agent of the docker node that
+	 * hosts this site (wpops), accepted next to the site's own key. Setting or
+	 * clearing it never touches the site's own key. A restore keeps this site's
+	 * node key, like every other SiteGuard setting outside the health key unit.
+	 *
+	 * @return true|WP_Error
+	 */
+	public function set_node_key($key) {
+		require_once SGBACKUP_DIR . 'includes/class-health-key-policy.php';
+		if (!SiteGuard_Backup_Health_Key_Policy::is_valid_plain_key($key)) {
+			return new WP_Error('invalid_key', 'The key must be at least 32 letters and digits (A-Z, a-z, 0-9).');
+		}
+		$opts = SiteGuard_Backup_Options::instance();
+		$opts->update_option(self::NODE_HASH, wp_hash_password($key));
+		$opts->update_option(self::NODE_META, SiteGuard_Backup_Health_Key_Policy::build_meta($key, 'node', (string) wp_parse_url(home_url(), PHP_URL_HOST), time()));
+		return true;
+	}
+
+	/**
+	 * Remove the node key. The site's own key is not touched.
+	 */
+	public function clear_node_key() {
+		$opts = SiteGuard_Backup_Options::instance();
+		$opts->delete_option(self::NODE_HASH);
+		$opts->delete_option(self::NODE_META);
+	}
+
+	/**
+	 * Node key status: present, hint, fingerprint, creation time (never the hash).
+	 */
+	public function get_node_key_info() {
+		require_once SGBACKUP_DIR . 'includes/class-health-key-policy.php';
+		$opts = SiteGuard_Backup_Options::instance();
+		$hash = (string) $opts->get_option(self::NODE_HASH, '');
+		$meta = SiteGuard_Backup_Health_Key_Policy::parse_meta($opts->get_option(self::NODE_META, null));
+		return array(
+			'present' => SiteGuard_Backup_Health_Key_Policy::is_valid_hash($hash),
+			'hint'    => $meta ? $meta['hint'] : '',
+			'fp'      => $meta ? $meta['fp'] : '',
+			'created' => $meta ? $meta['created'] : 0,
+		);
+	}
+
+	/**
 	 * Make the backup key that the last restore did not apply (kept this site's)
 	 * the primary key. For a restore that should have used the backup's key.
 	 *
@@ -919,6 +967,7 @@ class SiteGuard_Backup_Health_Monitor {
 			'last_restore'  => null,
 			'has_declined'  => false,
 			'site_host'     => (string) wp_parse_url(home_url(), PHP_URL_HOST),
+			'node_key'      => $this->get_node_key_info(),
 		);
 		if (version_compare($wp_version, '6.8', '<')) {
 			foreach (array_merge(array($hash), $pins) as $h) {
@@ -943,7 +992,8 @@ class SiteGuard_Backup_Health_Monitor {
 	}
 
 	/**
-	 * Validate a provided API key against the stored hash, then any pinned hashes.
+	 * Validate a provided API key against the stored hash, the node key, then any
+	 * pinned hashes.
 	 */
 	public function validate_api_key($key) {
 		$this->matched = null;
@@ -969,8 +1019,11 @@ class SiteGuard_Backup_Health_Monitor {
 		}
 		$source = '';
 		$hash = $opts->get_option('sgbackup_health_api_key_hash', '');
+		$node_hash = (string) $opts->get_option(self::NODE_HASH, '');
 		if (!empty($hash) && wp_check_password($key, $hash)) {
 			$source = 'db';
+		} elseif ('' !== $node_hash && SiteGuard_Backup_Health_Key_Policy::is_valid_hash($node_hash) && wp_check_password($key, $node_hash)) {
+			$source = 'node';
 		} else {
 			foreach (self::pinned_hashes() as $pin) {
 				if (wp_check_password($key, $pin)) {
@@ -987,7 +1040,7 @@ class SiteGuard_Backup_Health_Monitor {
 	public function has_api_key() {
 		$opts = SiteGuard_Backup_Options::instance();
 		return !empty($opts->get_option('sgbackup_health_api_key_hash', '')) || !empty($opts->get_option('sgbackup_health_api_key', ''))
-			|| !empty(self::pinned_hashes());
+			|| !empty($opts->get_option(self::NODE_HASH, '')) || !empty(self::pinned_hashes());
 	}
 
 	public function is_rate_limited($ip) {

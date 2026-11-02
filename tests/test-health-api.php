@@ -48,6 +48,8 @@ function wp_check_password($p, $h) { global $bcrypt_calls; $bcrypt_calls++; retu
 function wp_get_schedules() { return array('every10min' => array('interval' => 600)); }
 function get_site_url() { return 'https://example.test'; }
 function rest_ensure_response($data) { return $data; }
+function home_url($path = '') { return 'https://example.test' . $path; }
+function wp_parse_url($url, $component = -1) { return parse_url($url, $component); }
 
 class WP_Error {
 	private $code; private $data;
@@ -242,6 +244,34 @@ check('sync: a later request with a bad key is refused, not served the earlier v
 check('sync: bad key counted once over both passes', 'forbidden' === sync_auth($req) && 1 === attempts('192.0.2.60'));
 $req = new WP_REST_Request('/sgbackup/v1/sync/sets', array('Authorization' => 'Bearer ' . $sync_key));
 check('sync: good key after a bad one is ok', 'ok' === sync_auth($req));
+
+// --- Node key: a second key for the hosting node's agent, beside the site's own ---
+$M = SiteGuard_Backup_Health_Monitor::instance();
+$node_key = str_repeat('n', 16) . 'NodeKey0123456789abcdefABCDEF';
+$own_hash = $options['sgbackup_health_api_key_hash'];
+check('node key: too short is refused', is_object($M->set_node_key('short')));
+check('node key: set', true === $M->set_node_key($node_key));
+check("node key: site's own key unchanged", $own_hash === $options['sgbackup_health_api_key_hash']);
+check('node key: stored as a hash only', false === strpos(serialize($options), $node_key));
+check('node key: accepted', array('ok', 'ok') === wp_request($node_key, '192.0.2.70'));
+check('node key: matched with source node', $M->validate_api_key($node_key) && 'node' === $M->get_matched_key()['source']);
+check("node key: site's own key still accepted (source db)", array('ok', 'ok') === wp_request($key, '192.0.2.70') && $M->validate_api_key($key) && 'db' === $M->get_matched_key()['source']);
+$info = $M->get_key_info();
+check('node key: listed in key info with fingerprint, never the hash', $info['node_key']['present'] && 0 === strpos($info['node_key']['fp'], 'sgk-') && false === strpos(json_encode($info), '$2y$'));
+check("node key: has_key reflects the site's own key only", true === $info['has_key']);
+$M->clear_node_key();
+check('node key: cleared, refused again', array('forbidden', 'forbidden') === wp_request($node_key, '192.0.2.71'));
+check("node key: clearing keeps the site's own key", array('ok', 'ok') === wp_request($key, '192.0.2.71'));
+$M->set_node_key($node_key);
+$options['sgbackup_health_node_key_hash'] = '$2y$10';    // mangled: ignored, never a match
+check('node key: a malformed hash is never accepted', !$M->validate_api_key($node_key));
+$M->clear_node_key();
+
+// --- environment block (versions and latest backup for multi-install monitors) ---
+$GLOBALS['wp_version'] = '6.9';
+$payload = sgbackup_health_api_callback(new WP_REST_Request('/sgbackup/v1/health'));
+check('environment: WordPress and PHP versions', '6.9' === $payload['environment']['wp_version'] && PHP_VERSION === $payload['environment']['php_version']);
+check('environment: multisite flag and backup fields', false === $payload['environment']['multisite'] && array_key_exists('last_backup', $payload['environment']) && array_key_exists('backup_count', $payload['environment']));
 
 echo "\n$count checks, $failures failed\n";
 exit($failures ? 1 : 0);

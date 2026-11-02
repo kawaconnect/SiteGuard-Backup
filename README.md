@@ -44,6 +44,8 @@ Every direction is supported, either by downloading a backup zip and uploading i
 
 URLs are rewritten everywhere, including inside serialized data and escaped JSON, and the uploads path follows the site (`uploads/` <-> `uploads/sites/<id>/`). The destination keeps its own address, admin login and SiteGuard settings; the source's other users are added (matched by email, with their roles and passwords) and authorship is kept.
 
+On a docker node built with WPMultisiteDocker, the node's agent tracks every site it hosts (one install each) with a node key it sets itself next to each site's own key; the bot then needs only the node's token. See [docs/health-api.md](docs/health-api.md#sites-hosted-on-a-docker-node-node-key).
+
 The health monitor API key is the one setting you choose per restore: keep this site's key (default) or use the backup's (only when the bot polls this site with the backup site's key). A site without a key takes the backup's either way. See [docs/health-api.md](docs/health-api.md#keys-backups-restores-and-failover), which also covers pinning one key on production and a standby in `wp-config.php`.
 
 ## Site-to-Site Migration
@@ -79,6 +81,8 @@ printf %s "$KEY" | wp siteguardbackup health_api_key --set   # use a key you alr
 wp siteguardbackup health_api_key --print-hash                # define() line to pin this key on a standby
                                                               # (in docker-compose/.env write each $ as $$; see docs/health-api.md)
 wp siteguardbackup health_api_key --adopt-restored            # switch to the key the last restore did not apply
+printf %s "$KEY" | wp siteguardbackup health_api_key --set-node   # node key for the hosting docker node's agent (site key untouched)
+wp siteguardbackup health_api_key --clear-node
 
 # Settings
 wp siteguardbackup settings get [--key=<key>] [--format=table|json]

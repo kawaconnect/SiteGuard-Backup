@@ -4247,6 +4247,14 @@ class SiteGuard_Backup_CLI_Command extends WP_CLI_Command {
      * : Switch to the backup's key that the last restore did not apply because
      *   this site's key was kept (within 7 days of that restore).
      *
+     * [--set-node]
+     * : Set the node key: a second key for the agent of the docker node that
+     *   hosts this site (wpops), accepted next to the site's own key, which is
+     *   not changed. Read from STDIN like --set. Restores keep it.
+     *
+     * [--clear-node]
+     * : Remove the node key. The site's own key is not changed.
+     *
      * [--format=<format>]
      * : Status output format: table or json. Default: table.
      *
@@ -4257,6 +4265,7 @@ class SiteGuard_Backup_CLI_Command extends WP_CLI_Command {
      *     printf %s "$KEY" | wp siteguardbackup health_api_key --set
      *     wp siteguardbackup health_api_key --print-hash
      *     wp siteguardbackup health_api_key --adopt-restored
+     *     printf %s "$NODE_KEY" | wp siteguardbackup health_api_key --set-node
      *     wp siteguardbackup health_api_key --format=json
      *
      * @subcommand health_api_key
@@ -4266,9 +4275,9 @@ class SiteGuard_Backup_CLI_Command extends WP_CLI_Command {
         require_once SGBACKUP_DIR . 'includes/class-health-key-policy.php';
         $monitor = SiteGuard_Backup_Health_Monitor::instance();
 
-        $actions = array_values(array_intersect(array('regenerate', 'set', 'print-hash', 'adopt-restored'), array_keys($assoc_args)));
+        $actions = array_values(array_intersect(array('regenerate', 'set', 'print-hash', 'adopt-restored', 'set-node', 'clear-node'), array_keys($assoc_args)));
         if (count($actions) > 1) {
-            WP_CLI::error('Use only one of --regenerate, --set, --print-hash, --adopt-restored.');
+            WP_CLI::error('Use only one of --regenerate, --set, --print-hash, --adopt-restored, --set-node, --clear-node.');
         }
         $action = $actions ? $actions[0] : '';
 
@@ -4293,6 +4302,21 @@ class SiteGuard_Backup_CLI_Command extends WP_CLI_Command {
             }
             $info = $monitor->get_key_info();
             WP_CLI::success("API key set (…{$info['hint']}, {$info['fp']}). A bot already using this key keeps working.");
+        } elseif ('set-node' === $action) {
+            if (function_exists('posix_isatty') && posix_isatty(STDIN)) {
+                $key = \cli\prompt('Node key (input hidden)', false, ': ', true);
+            } else {
+                $key = stream_get_contents(STDIN);
+            }
+            $result = $monitor->set_node_key(trim((string) $key));
+            if (is_wp_error($result)) {
+                WP_CLI::error($result->get_error_message());
+            }
+            $node = $monitor->get_node_key_info();
+            WP_CLI::success("Node key set (…{$node['hint']}, {$node['fp']}). This site's own key is unchanged.");
+        } elseif ('clear-node' === $action) {
+            $monitor->clear_node_key();
+            WP_CLI::success("Node key removed. This site's own key is unchanged.");
         } elseif ('print-hash' === $action) {
             if (is_multisite() && !is_main_site()) {
                 WP_CLI::error('The pin is honoured on the main site only. Run this with the main site\'s --url.');
@@ -4328,6 +4352,10 @@ class SiteGuard_Backup_CLI_Command extends WP_CLI_Command {
                 WP_CLI::log('Use --regenerate to create a new key.');
             } else {
                 WP_CLI::log('No API key generated yet. Use --regenerate to create one.');
+            }
+            if (!empty($info['node_key']['present'])) {
+                $nk = $info['node_key'];
+                WP_CLI::log("Node key also accepted (…{$nk['hint']}, {$nk['fp']}" . ($nk['created'] ? ', set ' . gmdate('Y-m-d H:i', $nk['created']) . ' UTC' : '') . ').');
             }
             if ($info['pinned']) {
                 WP_CLI::log("Pinned in wp-config: {$info['pinned']} key hash(es) also accepted.");

@@ -106,6 +106,8 @@ Returns the cached health payload (refreshed by cron on the configured interval,
 }
 ```
 
+`environment` (1.6.4+) carries `wp_version`, `php_version`, `multisite`, `last_backup` (unix time of the newest local backup, 0 if none) and `backup_count`. Monitors that track many installs read versions and backup age from it without WP-CLI.
+
 ### `GET /health/ping`
 
 Minimal auth smoke-test endpoint. Returns 200 + tiny body without triggering a health run.
@@ -121,7 +123,7 @@ Minimal auth smoke-test endpoint. Returns 200 + tiny body without triggering a h
 }
 ```
 
-`key` names the key that authenticated this request: its fingerprint, and `source` `db` (the key stored on the site) or `pin` (a hash pinned in `wp-config.php`). It is additive; bots that ignore it keep working. Compare `fp` with your key's own fingerprint: `printf %s "$KEY" | sha256sum | cut -c1-12` gives the 12 hex digits after `sgk-`.
+`key` names the key that authenticated this request: its fingerprint, and `source` `db` (the key stored on the site), `node` (the node key, see below) or `pin` (a hash pinned in `wp-config.php`). It is additive; bots that ignore it keep working. Compare `fp` with your key's own fingerprint: `printf %s "$KEY" | sha256sum | cut -c1-12` gives the 12 hex digits after `sgk-`.
 
 ### `POST /health/check`
 
@@ -246,6 +248,31 @@ After a raw database sync (for example `mysqldump | mysql`) or a DNS failover, r
 
 A downgrade to 1.5.1 keeps the stored key working. The `wp-config.php` pin, the key metadata and the last-restore record are ignored by 1.5.1 (the rows are harmless), so do not rely on the pin until you have confirmed the version.
 
+## Sites hosted on a docker node (node key)
+
+When every site runs as its own install on a docker node (WPMultisiteDocker),
+each install has its own SiteGuard and its own key. The node's agent (`wpops`)
+reads every one of them and offers the whole node to the bot through one API
+and one agent token (WPMultisiteDocker `docs/wpops-design.md`, section 2.6).
+For that the agent needs a key on each install, without taking over the key
+the site already has. That is the node key:
+
+```sh
+printf %s "$NODE_KEY" | wp siteguardbackup health_api_key --set-node   # from STDIN, 32+ letters and digits
+wp siteguardbackup health_api_key --format=json                         # key.node_key: present, hint, fp
+wp siteguardbackup health_api_key --clear-node
+```
+
+- It is accepted in addition to the site's own key and any pinned hashes;
+  the site's own key is never changed by it.
+- It is stored as a hash (`sgbackup_health_node_key_hash`, metadata in
+  `sgbackup_health_node_key_meta`), like the site's key.
+- A restore keeps this site's node key (it is not part of the health key
+  unit that the restore policy decides), so the node keeps reading the site
+  after restoring a backup from elsewhere.
+- The agent enrols it by itself (`registry.siteguard_enroll: auto`) and turns
+  the monitor on if it was off. Nothing has to be configured by hand.
+
 ## Backward compatibility
 
 - `api_version: 1` - original shape, no `summary`, no `alerts`, no `ssl_checked_at`, fewer SSL per-site fields.
@@ -255,6 +282,7 @@ A downgrade to 1.5.1 keeps the stored key working. The `wp-config.php` pin, the 
 
 ## Changelog
 
+- **1.6.4** - node key (`health_api_key --set-node` / `--clear-node`, `key.source: "node"` on `/health/ping`); `environment` block on `/health` (WordPress/PHP versions, multisite, latest local backup).
 - **1.5.4** - per-site `ssl_expires_at`. `ssl_expired` (and `summary.ssl_expired`) fires for every expired certificate; it used to fire only at exactly 0 days, and a certificate that expired less than a day ago read as -1 ("unknown"). A certificate with hours left is `ssl_expiring` with `ssl_expiry_days: 0`, not expired. The time-budget skip's `ssl_error` names the domain ("SSL probe skipped for <domain>: time budget exceeded"). Every response sends `Cache-Control: no-store, private, max-age=0` and `Vary: Authorization`; a failed attempt counts once (429 after 20, not 10); IPv6 is rate-limited per /64; `CF-Connecting-IP` is trusted only from Cloudflare, loopback and `SGBACKUP_TRUSTED_PROXIES`.
 - **1.5.3** - no API change (the Uptime Kuma push is separate and not part of any REST payload).
 - **1.5.2** - `/health/ping` adds `key` (`fp`, `source`). The monitor key survives restores and failover: health key policy, key fingerprints, "Switch to the backup's key", `wp-config.php` pin (`SGBACKUP_HEALTH_API_KEY_HASH`, `SGBACKUP_HEALTH_ENABLED`), `health_api_key --set/--print-hash/--adopt-restored/--format`.

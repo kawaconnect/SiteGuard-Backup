@@ -2,7 +2,7 @@
 /**
  * Plugin Name: SiteGuard Backup
  * Description: Complete WordPress backup, restore, and migration solution with scheduled, incremental, and site-to-site migration support.
- * Version: 1.6.3
+ * Version: 1.6.4
  * Author: KawaConnect LLC
  * License: GPL-2.0-or-later
  * Requires at least: 5.6
@@ -13,7 +13,7 @@
 if (!defined('ABSPATH')) die('No direct access.');
 
 // Core constants
-define('SGBACKUP_VERSION', '1.6.3');
+define('SGBACKUP_VERSION', '1.6.4');
 define('SGBACKUP_DIR', plugin_dir_path(__FILE__));
 define('SGBACKUP_URL', plugin_dir_url(__FILE__));
 define('SGBACKUP_PLUGIN_SLUG', plugin_basename(__FILE__));
@@ -717,6 +717,32 @@ function sgbackup_health_api_callback(WP_REST_Request $request) {
 		'sites'                => $results,
 		'version'              => SGBACKUP_VERSION,
 		'api_version'          => 2,
+		'environment'          => sgbackup_health_environment(),
 	));
+}
+
+/**
+ * WordPress and PHP versions and the latest local backup, for monitors that
+ * track many installs (one per site on a docker node). Read with the same key
+ * as the rest of the payload; cheap (options only).
+ */
+function sgbackup_health_environment() {
+	global $wp_version;
+	$env = array(
+		'wp_version'   => (string) $wp_version,
+		'php_version'  => PHP_VERSION,
+		'multisite'    => is_multisite(),
+		'last_backup'  => 0,
+		'backup_count' => 0,
+	);
+	if (class_exists('SiteGuard_Backup_History')) {
+		$history = SiteGuard_Backup_History::get_history();
+		$env['backup_count'] = is_array($history) ? count($history) : 0;
+		$latest = SiteGuard_Backup_History::get_latest();
+		if ($latest && isset($latest['timestamp'])) {
+			$env['last_backup'] = (int) $latest['timestamp'];
+		}
+	}
+	return $env;
 }
 
