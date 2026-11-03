@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.6.5
+
+### Fixed
+- Fatal "Class SiteGuard_Backup not found" from the sync API ping and the
+  health paths when a scheduled backup resumption is still in WP-Cron (for
+  example one left by a restore): the job scheduler now loads the core class
+  before it checks those jobs, as its other fallback branch already did.
+
 ## 1.6.4
 
 ### Added

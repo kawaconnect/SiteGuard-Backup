@@ -317,6 +317,10 @@ class SiteGuard_Backup_Job_Scheduler {
 		// (seen after "Backup Now": done in seconds, event due minutes later),
 		// which reported a phantom running job and refused the next backup.
 		if (!empty($jobs)) {
+			if (!class_exists('SiteGuard_Backup')) {
+				// Reached from REST/health paths that only loaded the helper classes.
+				require_once SGBACKUP_DIR . 'class-siteguardbackup.php';
+			}
 			$sgbackup = SiteGuard_Backup::instance();
 			$terminal = array('complete', 'finished', 'error', 'aborted', 'failed', 'warning');
 			foreach (array_keys($jobs) as $nonce) {
