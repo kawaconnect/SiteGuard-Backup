@@ -1,5 +1,25 @@
 # Changelog
 
+## 1.6.6
+
+### Fixed
+- A backup whose first resumption was lost right after boot stayed at
+  `begun` forever, and every later backup on that site was refused with
+  "A backup job is already running" (sync API `409 busy`). The resumption
+  event is written to the cron option at boot; a `wp cron event run` (the
+  wp-cron container) that loaded the option a moment earlier saves its older
+  copy back when it reschedules a recurring event, which drops the backup's
+  event. Seen on two sites on 9 and 10 November 2026, both in the same second
+  as an `action_scheduler_run_queue` run.
+  - Sync API `GET /jobs/<nonce>`: a `begun` job with no queued resumption
+    more than 2 minutes after boot gets resumption 0 queued again, the same
+    way a stalled `running` job already got its next one.
+  - A job held only by the active-job marker, with nothing queued and no
+    activity for 6 hours (`sgbackup_stale_job_after` filter), is marked
+    aborted and the marker is released, so the next backup can start. The
+    abort is written to the job's errors, the PHP error log and the audit log
+    (`backup_stale_aborted`).
+
 ## 1.6.5
 
 ### Fixed

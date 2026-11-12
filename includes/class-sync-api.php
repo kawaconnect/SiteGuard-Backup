@@ -234,12 +234,27 @@ class SiteGuard_Backup_Sync_API {
 		$terminal = in_array($status, array('complete', 'finished', 'warning', 'error', 'aborted', 'failed'), true);
 		$succeeded = in_array($status, array('complete', 'finished', 'warning'), true);
 		if (!$terminal) {
-			// Self-heal: a running job with no queued resumption (lost cron event,
-			// resumption run by WP-CLI) would stall; queue the next one.
+			// Self-heal: a job with no queued resumption would stall; queue the
+			// next one. Two ways to get there:
+			// - 'running': a resumption ran under WP-CLI or its event was lost.
+			// - 'begun': resumption 0 never ran. Its event is written to the cron
+			//   option at boot; a `wp cron event run` that loaded the option a
+			//   moment earlier saves its older copy back when it reschedules a
+			//   recurring event, and the backup's event is gone. The job then
+			//   stays 'begun' forever and every later backup gets 409 busy.
 			require_once SGBACKUP_DIR . 'includes/class-job-scheduler.php';
-			if ('running' === $status && !SiteGuard_Backup_Job_Scheduler::has_queued_resumption($nonce)) {
-				$next = isset($jobdata['current_resumption']) ? (int) $jobdata['current_resumption'] + 1 : 1;
-				SiteGuard_Backup_Job_Scheduler::schedule_resumption($next, $nonce, 5);
+			if (!SiteGuard_Backup_Job_Scheduler::has_queued_resumption($nonce)) {
+				if ('running' === $status) {
+					$next = isset($jobdata['current_resumption']) ? (int) $jobdata['current_resumption'] + 1 : 1;
+					SiteGuard_Backup_Job_Scheduler::schedule_resumption($next, $nonce, 5);
+				} elseif ('begun' === $status) {
+					// Boot queues resumption 0 five seconds out; once it has run the
+					// status is 'running'. Only re-queue when it is clearly lost.
+					$started = isset($jobdata['backup_time']) ? (int) $jobdata['backup_time'] : 0;
+					if ($started > 0 && (time() - $started) >= SiteGuard_Backup_Job_Scheduler::BEGUN_GRACE) {
+						SiteGuard_Backup_Job_Scheduler::schedule_resumption(0, $nonce, 5);
+					}
+				}
 			}
 			if (function_exists('spawn_cron')) {
 				spawn_cron();
