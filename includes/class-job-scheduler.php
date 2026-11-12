@@ -16,6 +16,16 @@ class SiteGuard_Backup_Job_Scheduler {
 	 *  resume_interval so backoff can't feed on its own ever-growing value. */
 	const ACTIVITY_WINDOW = 300;
 
+	/** @var int Seconds a 'begun' job may wait for resumption 0 before a status
+	 *  poll re-queues it (the first one is queued 5s after boot). */
+	const BEGUN_GRACE = 120;
+
+	/** @var int A job held only by the active-job marker (no resumption queued)
+	 *  with no activity for this long is stale: it is marked aborted so it no
+	 *  longer blocks new backups. Resumptions are at most MAX_RESUME_INTERVAL
+	 *  apart, so a live job is never this quiet. Filter: sgbackup_stale_job_after. */
+	const STALE_AFTER = 21600;
+
 	/**
 	 * Record that something useful happened during this resumption.
 	 * Schedules the next resumption if needed.
@@ -349,7 +359,13 @@ class SiteGuard_Backup_Job_Scheduler {
 				if (!empty($jobdata)) {
 					$status = isset($jobdata['jobstatus']) ? $jobdata['jobstatus'] : '';
 					$terminal = array('complete', 'finished', 'error', 'aborted', 'failed', 'warning');
-					if (!in_array($status, $terminal, true)) {
+					if (!in_array($status, $terminal, true) && self::is_stale($jobdata)) {
+						// Nothing queued and no activity for hours: the chain is lost
+						// (for example resumption 0 dropped from the cron option right
+						// after boot). Without this the job counted as running forever
+						// and every new backup was refused as busy.
+						self::abort_stale($active_nonce, $jobdata);
+					} elseif (!in_array($status, $terminal, true)) {
 						$resumption = isset($jobdata['current_resumption']) ? (int) $jobdata['current_resumption'] : 0;
 						$jobs[$active_nonce] = array(
 							'resumption' => $resumption,
@@ -368,5 +384,67 @@ class SiteGuard_Backup_Job_Scheduler {
 		}
 
 		return $jobs;
+	}
+
+	/**
+	 * Time of the job's last sign of life: boot, a useful check-in or a
+	 * recorded resumption run.
+	 *
+	 * @param array $jobdata
+	 * @return int Unix time, 0 when unknown.
+	 */
+	public static function last_activity($jobdata) {
+		$last = isset($jobdata['backup_time']) ? (int) $jobdata['backup_time'] : 0;
+		if (!empty($jobdata['useful_checkins']) && is_array($jobdata['useful_checkins'])) {
+			$last = max($last, (int) max(array_map('intval', $jobdata['useful_checkins'])));
+		}
+		return $last;
+	}
+
+	/**
+	 * Is this unfinished job stale? Callers check first that no resumption is
+	 * queued for it. A job with no known start time is never treated as stale.
+	 *
+	 * @param array $jobdata
+	 * @return bool
+	 */
+	public static function is_stale($jobdata) {
+		$last = self::last_activity($jobdata);
+		if ($last <= 0) {
+			return false;
+		}
+		$after = (int) apply_filters('sgbackup_stale_job_after', self::STALE_AFTER);
+		if ($after <= 0) {
+			return false;
+		}
+		return (time() - $last) > $after;
+	}
+
+	/**
+	 * Mark a stale job aborted and release the active-job marker so the next
+	 * backup can start. Archives the job may have written are left in place.
+	 *
+	 * @param string $nonce
+	 * @param array  $jobdata
+	 */
+	public static function abort_stale($nonce, $jobdata) {
+		$opts = SiteGuard_Backup_Options::instance();
+		$status = isset($jobdata['jobstatus']) ? (string) $jobdata['jobstatus'] : '';
+		$idle = time() - self::last_activity($jobdata);
+		$msg = "Stale job aborted: status '{$status}', no resumption queued, no activity for {$idle}s";
+		$jobdata['jobstatus'] = 'aborted';
+		if (!isset($jobdata['errors']) || !is_array($jobdata['errors'])) {
+			$jobdata['errors'] = array();
+		}
+		$jobdata['errors'][] = $msg;
+		$opts->update_option('sgbackup_jobdata_' . $nonce, $jobdata, false);
+		self::clear_scheduled_events($nonce);
+		if (get_option('sgbackup_active_job_nonce') === $nonce) {
+			delete_option('sgbackup_active_job_nonce');
+		}
+		error_log("SiteGuard Backup: {$msg} (nonce {$nonce})");
+		if (class_exists('SiteGuard_Backup_Audit_Log')) {
+			SiteGuard_Backup_Audit_Log::instance()->log('backup_stale_aborted', $msg, array('nonce' => $nonce, 'status' => $status, 'idle' => $idle));
+		}
 	}
 }
