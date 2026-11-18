@@ -17,10 +17,13 @@ if (!defined('ABSPATH') || !class_exists('SiteGuard_Backup')) {
 
 $method_id = isset($args[0]) ? $args[0] : '';
 $opts = isset($args[1]) ? json_decode($args[1], true) : null;
-if (!in_array($method_id, array('s3', 'azure', 's3generic', 'b2', 'webdav'), true) || !is_array($opts)) {
-	fwrite(STDERR, "usage: <s3|azure|s3generic|b2|webdav> '<json options>'\n");
+$all_methods = array('s3', 'azure', 's3generic', 'b2', 'gcs', 'webdav', 'sftp', 'ftp', 'openstack', 'dropbox', 'googledrive', 'onedrive', 'pcloud', 'email');
+if (!in_array($method_id, $all_methods, true) || !is_array($opts)) {
+	fwrite(STDERR, 'usage: <' . implode('|', $all_methods) . "> '<json options>'\n");
 	exit(2);
 }
+$oauth = in_array($method_id, array('dropbox', 'googledrive', 'onedrive'), true);
+$upload_only = ('email' === $method_id);
 
 require_once SGBACKUP_DIR . 'methods/backup-module.php';
 require_once SGBACKUP_DIR . 'methods/' . $method_id . '.php';
@@ -30,7 +33,7 @@ unset($opts['__create']);
 
 // Store the options as instance "sgtest" exactly as the settings screen would.
 $iid = 'sgtest';
-SiteGuard_Backup_Options::instance()->update_option('sgbackup_' . $method_id, array(
+SiteGuard_Backup_Options::instance()->update_option(SiteGuard_Backup_Options::method_option($method_id), array(
 	'version'  => 1,
 	'settings' => array($iid => $opts),
 ));
@@ -45,8 +48,14 @@ if ($create) {
 	$req->setAccessible(true);
 	if ('azure' === $method_id) {
 		$req->invoke($m, 'PUT', '/' . rawurlencode($opts['container']), '', array(), 'restype=container');
-	} else {
-		$req->invoke($m, 'PUT', '', '', array(), true);
+	} else { // s3, s3generic, b2, gcs
+		// Outside us-east-1 S3 wants the region as LocationConstraint.
+		$sr = new ReflectionMethod($m, 'get_signing_region');
+		$sr->setAccessible(true);
+		$region = $sr->invoke($m);
+		$cfg = 'us-east-1' === $region ? '' : '<CreateBucketConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><LocationConstraint>' . $region . '</LocationConstraint></CreateBucketConfiguration>';
+		$cr = $req->invoke($m, 'PUT', '', $cfg, array(), true);
+		if (is_wp_error($cr)) echo "  info bucket create: " . $cr->get_error_message() . "\n";
 	}
 }
 
@@ -77,6 +86,11 @@ $files = array(
 	'backup_2026-01-01-0000_sgtest_small000000-db.gz' => 200 * 1024,
 	'backup_2026-01-01-0000_sgtest_large000000-uploads.zip' => 70 * 1024 * 1024, // > single-put limits: multipart / block list
 );
+if ($upload_only) {
+	// Email: the small archive goes out as an attachment (storage.sh checks it
+	// arrived byte-identical); anything over the limit is refused, not mailed.
+	$files['backup_2026-01-01-0000_sgtest_large000000-uploads.zip'] = 30 * 1024 * 1024;
+}
 foreach ($files as $name => $size) {
 	$path = $work . '/up/' . $name;
 	$fh = fopen($path, 'wb');
@@ -89,6 +103,15 @@ foreach ($files as $name => $size) {
 	fclose($fh);
 
 	$r = $m->backup($path);
+	if ($upload_only) {
+		if ($size > 25 * 1024 * 1024) {
+			$check("{$method_id}: oversized attachment refused", is_wp_error($r) && 'email_attachment_too_large' === $r->get_error_code(), $err($r));
+		} else {
+			$check("{$method_id}: send {$name} (" . size_format($size) . ')', true === $r, $err($r));
+			echo "  info sent-md5 " . md5_file($path) . "\n";
+		}
+		continue;
+	}
 	$check("{$method_id}: upload {$name} (" . size_format($size) . ')', true === $r, $err($r));
 
 	$r = $m->download($name, $work . '/down/');
@@ -97,10 +120,31 @@ foreach ($files as $name => $size) {
 	$check("{$method_id}: downloaded bytes identical", file_exists($got) && md5_file($got) === md5_file($path));
 }
 
+if ($upload_only) {
+	$r = $m->delete(array('', '.', '..', 'x/../y'));
+	$check("{$method_id}: delete of unsafe names is a no-op", true === $r, $err($r));
+	echo $fails ? "{$fails} failure(s)\n" : "all passed\n";
+	exit($fails ? 1 : 0);
+}
+
+if ($oauth) {
+	// The test seeds an expired access token: the first call must have refreshed
+	// it and saved the new one, keeping the refresh token.
+	$saved = $m->get_options();
+	$tok = isset($saved['token']) && is_array($saved['token']) ? $saved['token'] : array();
+	$check("{$method_id}: expired access token was refreshed and saved",
+		!empty($tok['access_token']) && 'expired-token' !== $tok['access_token'] && !empty($tok['refresh_token']) && !empty($tok['obtained_at']) && $tok['obtained_at'] > time() - 3600,
+		json_encode(array_map(function ($v) { return is_string($v) ? substr($v, 0, 12) : $v; }, $tok)));
+}
+
 if (method_exists($m, 'listfiles')) {
 	$list = $m->listfiles();
 	$names = is_array($list) ? array_map(function ($f) { return is_array($f) ? (isset($f['name']) ? $f['name'] : '') : (string) $f; }, $list) : array();
 	$check("{$method_id}: listing shows both files", count(array_intersect(array_keys($files), array_map('basename', $names))) === 2, is_wp_error($list) ? $err($list) : json_encode($names));
+	// Anything else in the listing (multipart segments, folders) would be offered
+	// as a backup by a remote rescan and counted by retention.
+	$extra = array_values(array_diff(array_map('basename', $names), array_keys($files)));
+	$check("{$method_id}: listing holds only the backup files", empty($extra), json_encode($extra));
 }
 
 // The unsafe-name guard must drop these without touching anything.

@@ -1,5 +1,77 @@
 # Changelog
 
+## 1.7.0
+
+Every storage destination was tested end to end against a real server or a
+protocol fake written from the provider's API documentation
+(tests/integration/storage.sh), and a backup job was run to several
+destinations at once. What did not work is fixed below.
+
+### Fixed
+- **OAuth sign-in (Google Drive, Dropbox, OneDrive) never completed.** The
+  redirect URI pointed at `admin-ajax.php?action=sgbackup_ajax&subaction=...`,
+  which only reads POST and answered "Missing subaction", so the code was never
+  exchanged. Sign-in now returns to a REST route without a query string,
+  `/wp-json/sgbackup/v1/oauth/callback` (Microsoft rejects query strings in
+  redirect URIs for personal accounts). The request is authorized by a random,
+  single-use state stored server-side for 15 minutes and bound to the admin,
+  the provider and the account (instance). Each OAuth panel shows the exact
+  redirect URI to register. Plain permalinks get a warning.
+- Only the first account of a provider could ever be signed in or tested:
+  "Sign in" and "Test Connection" now act on the account whose panel they are
+  on.
+- **Saving settings signed every OAuth account out** and reset the pinned SFTP
+  host key: the save replaced the whole instance with the form fields, and
+  tokens are not form fields. Values the plugin stores itself (OAuth tokens,
+  the SFTP fingerprint, the cached Google Drive folder) are kept while the
+  settings they depend on are unchanged. Clearing the SFTP fingerprint field
+  still re-learns it.
+- **Dropbox: downloads (restores) and the connection test failed with HTTP
+  400.** WordPress sends `Content-Type: application/x-www-form-urlencoded` with
+  a body-less POST, which Dropbox rejects. The connection test reported that
+  400 as success.
+- **pCloud: archives over 20 MB failed to upload.** Chunks went up as a raw
+  POST body, which pCloud does not accept; they are sent as PUT (as pCloud's
+  protocol page and SDK do). pCloud also gets a "Sign in with pCloud" button
+  (code flow, data region detected); a pasted token still works.
+- **SFTP/SCP was a fatal error** ("Class phpseclib\Net\SSH2 not found") on
+  every host without the ssh2 extension: the bundled phpseclib had no
+  autoloader.
+- **SFTP key login from the settings page always failed**: the field asks for
+  the key itself, the code only accepted a file path. Pasted RSA keys (PEM,
+  PKCS#8, OpenSSH, with passphrase) now work; Ed25519/ECDSA keys, which the
+  bundled library cannot read, get a clear message.
+- **FTPS did not work** against servers that require TLS session reuse on the
+  data connection (vsftpd, ProFTPD, FileZilla Server): PHP's ftp extension
+  cannot reuse the session. FTP now goes through curl: explicit FTPS, implicit
+  FTPS on port 990 (previously refused), and the server certificate is
+  verified with WordPress' CA bundle (it was never verified). The ftp
+  extension remains a fallback. Without either, FTP reports that instead of a
+  fatal error. The FTP listing no longer includes `.` and `..`.
+- **Backblaze B2 settings were silently discarded**: B2 had a settings panel
+  but was missing from the save handler's allow-list, so its settings and the
+  B2 destination were dropped, and its secret key was not encrypted at rest.
+- **Configuring the Email destination made every backup fail**, after all
+  uploads, with "is_email(): array given": its settings were stored in
+  `sgbackup_email`, the report address option. They now live in
+  `sgbackup_email_destination` (moved automatically on first use), and the
+  Email destination has a settings panel with its own address.
+- OneDrive and WebDAV had no settings panel. OneDrive gains a tenant setting
+  for single-tenant app registrations and asks for `Files.ReadWrite` instead of
+  `Files.ReadWrite.All`.
+
+### Tests
+- `tests/integration/storage.sh` covers every destination: versitygw (S3,
+  generic S3, B2, GCS), Azurite, WebDAV, OpenSSH (SFTP, SCP, key file, pasted
+  key), ProFTPD (FTP, explicit and implicit FTPS, certificate verification,
+  ext-ftp fallback), Swift SAIO behind Keystone v3 and v2.0, Mailpit, and
+  protocol fakes for Dropbox, Google Drive, OneDrive and pCloud (US and EU),
+  plus the full OAuth sign-in flow and a backup job to five destinations.
+  MinIO images are no longer published, so S3 tests use versitygw.
+- `tests/test-method-registry.php` (CI) checks that every storage method is
+  registered consistently: settings save allow-list, settings panel,
+  "configured" list, and encryption of its secret fields.
+
 ## 1.6.6
 
 ### Fixed

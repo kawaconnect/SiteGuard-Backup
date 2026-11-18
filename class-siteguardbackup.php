@@ -1953,7 +1953,7 @@ class SiteGuard_Backup {
 		// Fallback to the admin email option
 		if (empty($recipients)) {
 			$fallback = $opts->get_option('sgbackup_email', '');
-			if (!empty($fallback) && is_email($fallback)) {
+			if (is_string($fallback) && '' !== $fallback && is_email($fallback)) {
 				$recipients[] = array(
 					'address'       => $fallback,
 					'warnings_only' => false,

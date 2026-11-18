@@ -30,6 +30,31 @@ class SiteGuard_Backup_Options {
 	}
 
 	/**
+	 * Option name holding a storage method's settings: "sgbackup_<method>".
+	 *
+	 * Except the Email destination: "sgbackup_email" is also the report email
+	 * address setting, so both features wrote the same option. Configuring the
+	 * Email destination turned the report address into an array (every backup
+	 * then failed in the report step with "is_email(): array given"), and saving
+	 * the report address erased the destination. It now lives in
+	 * "sgbackup_email_destination"; settings stored under the old name move on
+	 * first use.
+	 */
+	public static function method_option($method_id) {
+		if ('email' !== $method_id) return 'sgbackup_' . $method_id;
+		$opts = self::instance();
+		$new = 'sgbackup_email_destination';
+		$old = $opts->get_option('sgbackup_email', '');
+		if (is_array($old)) {
+			if (array() === $opts->get_option($new, array())) {
+				$opts->update_option($new, $old);
+			}
+			$opts->update_option('sgbackup_email', '');
+		}
+		return $new;
+	}
+
+	/**
 	 * Get an option value.
 	 * On multisite: per-site first, falling back to network option for backward compat.
 	 */

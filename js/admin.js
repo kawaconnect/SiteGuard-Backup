@@ -2898,10 +2898,12 @@
 			$(document).on('click', '.sgbackup-test-credentials', function() {
 				var $btn = $(this);
 				var method = $btn.data('method');
+				var instance = $btn.data('instance') || $btn.closest('.sgbackup-instance-panel').data('instance') || '';
 				var $result = $btn.siblings('.sgbackup-test-result');
 				$result.text('Testing...').removeClass('success error');
 
-				self.ajax('credentials_test', { method: method }, function(data) {
+				// Tests the saved settings of this account (save first after editing).
+				self.ajax('credentials_test', { method: method, instance: instance }, function(data) {
 					$result.text(data.message || 'Success!').addClass('success');
 				}, function(msg) {
 					$result.text('Error: ' + msg).addClass('error');
@@ -2910,11 +2912,20 @@
 
 			// OAuth auth buttons
 			$(document).on('click', '.sgbackup-auth-btn', function() {
-				var method = $(this).data('method');
-				self.ajax('get_auth_url', { method: method }, function(data) {
+				var $btn = $(this);
+				var method = $btn.data('method');
+				var instance = $btn.data('instance') || $btn.closest('.sgbackup-instance-panel').data('instance') || '';
+				var $result = $btn.siblings('.sgbackup-test-result');
+				// Open the popup synchronously (popup blockers), then point it at the provider.
+				var popup = window.open('about:blank', 'sgbackup_auth', 'width=600,height=750');
+				self.ajax('get_auth_url', { method: method, instance: instance, return_url: window.location.href }, function(data) {
 					if (data.auth_url) {
-						window.open(data.auth_url, 'sgbackup_auth', 'width=600,height=700');
+						if (popup && !popup.closed) { popup.location.href = data.auth_url; }
+						else { window.location.href = data.auth_url; }
 					}
+				}, function(msg) {
+					if (popup && !popup.closed) popup.close();
+					$result.text('Error: ' + msg).removeClass('success').addClass('error');
 				});
 			});
 

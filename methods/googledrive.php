@@ -25,36 +25,33 @@ class SiteGuard_Backup_Method_Googledrive extends SiteGuard_Backup_Module {
 	}
 
 	/**
-	 * Get OAuth2 authorization URL.
+	 * OAuth2 authorization URL (see SiteGuard_Backup_OAuth::start()).
 	 */
-	public function get_auth_url() {
+	public function get_auth_url($state, $redirect_uri) {
 		$options = $this->get_options();
-		$redirect = admin_url('admin-ajax.php') . '?action=sgbackup_ajax&subaction=googledrive_auth_callback';
-
 		return $this->auth_url . '?' . http_build_query(array(
 			'client_id'     => $options['client_id'],
-			'redirect_uri'  => $redirect,
+			'redirect_uri'  => $redirect_uri,
 			'response_type' => 'code',
 			'scope'         => 'https://www.googleapis.com/auth/drive.file',
 			'access_type'   => 'offline',
 			'prompt'        => 'consent',
-			'state'         => wp_create_nonce('sgbackup-oauth-googledrive'),
+			'state'         => $state,
 		));
 	}
 
 	/**
-	 * Exchange authorization code for tokens.
+	 * Exchange an authorization code for tokens and store them on this instance.
 	 */
-	public function exchange_code($code) {
+	public function exchange_code($code, $redirect_uri) {
 		$options = $this->get_options();
-		$redirect = admin_url('admin-ajax.php') . '?action=sgbackup_ajax&subaction=googledrive_auth_callback';
 
 		$response = wp_remote_post($this->token_url, array(
 			'body' => array(
 				'code'          => $code,
 				'client_id'     => $options['client_id'],
 				'client_secret' => $options['client_secret'],
-				'redirect_uri'  => $redirect,
+				'redirect_uri'  => $redirect_uri,
 				'grant_type'    => 'authorization_code',
 			),
 		));
@@ -62,12 +59,17 @@ class SiteGuard_Backup_Method_Googledrive extends SiteGuard_Backup_Module {
 		if (is_wp_error($response)) return $response;
 
 		$body = json_decode(wp_remote_retrieve_body($response), true);
-		if (isset($body['error'])) {
-			return new WP_Error('gdrive_auth', $body['error_description'] ?? $body['error']);
+		if (!is_array($body) || isset($body['error']) || empty($body['access_token'])) {
+			$msg = is_array($body) ? ($body['error_description'] ?? ($body['error'] ?? 'no access token')) : 'HTTP ' . wp_remote_retrieve_response_code($response);
+			return new WP_Error('gdrive_auth', $msg);
+		}
+		if (empty($body['refresh_token'])) {
+			return new WP_Error('gdrive_auth', 'Google returned no refresh token, so backups would stop after an hour. Remove SiteGuard\'s access at myaccount.google.com/permissions and sign in again.');
 		}
 
 		$options['token'] = $body;
 		$options['token']['obtained_at'] = time();
+		$options['folder_id'] = ''; // a different account cannot see the old folder
 		$this->save_options($options);
 
 		return true;

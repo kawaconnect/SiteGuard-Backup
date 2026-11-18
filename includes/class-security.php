@@ -21,6 +21,7 @@ class SiteGuard_Backup_Security {
 	private static $sensitive_fields = array(
 		's3'         => array('secret_key'),
 		's3generic'  => array('secret_key'),
+		'b2'         => array('secret_key'),
 		'azure'      => array('account_key', 'sas_token'),
 		'googledrive' => array('client_secret', 'token', 'access_token', 'refresh_token'),
 		'dropbox'    => array('app_secret', 'token', 'access_token', 'refresh_token'),
@@ -28,7 +29,7 @@ class SiteGuard_Backup_Security {
 		'ftp'        => array('pass'),
 		'sftp'       => array('pass', 'key'),
 		'webdav'     => array('pass'),
-		'pcloud'     => array('access_token'),
+		'pcloud'     => array('access_token', 'client_secret'),
 		'gcs'        => array('secret_key'),
 		'openstack'  => array('password', 'api_key'),
 	);

@@ -13,10 +13,54 @@ class SiteGuard_Backup_Method_Pcloud extends SiteGuard_Backup_Module {
 
 	public function get_default_options() {
 		return array(
-			'access_token' => '',
-			'folder_id'    => 0,
-			'use_eu'       => false,
+			'client_id'     => '',
+			'client_secret' => '',
+			'access_token'  => '',
+			'folder_id'     => 0,
+			'use_eu'        => false,
 		);
+	}
+
+	/**
+	 * OAuth2 authorization URL, code flow (see SiteGuard_Backup_OAuth::start()).
+	 * https://docs.pcloud.com/methods/oauth_2.0/authorize.html
+	 */
+	public function get_auth_url($state, $redirect_uri) {
+		$options = $this->get_options();
+		return 'https://my.pcloud.com/oauth2/authorize?' . http_build_query(array(
+			'client_id'     => $options['client_id'],
+			'response_type' => 'code',
+			'redirect_uri'  => $redirect_uri,
+			'state'         => $state,
+		));
+	}
+
+	/**
+	 * Exchange the code at the API host of the user's data region. The callback
+	 * names that host; only pCloud's two API hosts are accepted, so the client
+	 * secret never goes anywhere else. pCloud tokens do not expire.
+	 */
+	public function exchange_code($code, $redirect_uri, $extra = array()) {
+		$options = $this->get_options();
+		$host = isset($extra['hostname']) ? strtolower((string) $extra['hostname']) : 'api.pcloud.com';
+		if (!in_array($host, array('api.pcloud.com', 'eapi.pcloud.com'), true)) {
+			return new WP_Error('pcloud_auth', 'Unexpected pCloud API host: ' . $host);
+		}
+		$response = wp_remote_get('https://' . $host . '/oauth2_token?' . http_build_query(array(
+			'client_id'     => $options['client_id'],
+			'client_secret' => $options['client_secret'],
+			'code'          => $code,
+		)), array('timeout' => 30));
+		if (is_wp_error($response)) return $response;
+		$body = json_decode(wp_remote_retrieve_body($response), true);
+		if (!is_array($body) || (isset($body['result']) && 0 !== (int) $body['result']) || empty($body['access_token'])) {
+			$msg = is_array($body) && isset($body['error']) ? $body['error'] : 'HTTP ' . wp_remote_retrieve_response_code($response);
+			return new WP_Error('pcloud_auth', 'pCloud sign-in failed: ' . $msg);
+		}
+		$options['access_token'] = $body['access_token'];
+		$options['use_eu'] = ('eapi.pcloud.com' === $host) || (isset($body['locationid']) && 2 === (int) $body['locationid']);
+		$this->save_options($options);
+		return true;
 	}
 
 	/**
@@ -201,8 +245,13 @@ class SiteGuard_Backup_Method_Pcloud extends SiteGuard_Backup_Module {
 				'uploadoffset' => $offset,
 			));
 
+			// pCloud takes uploaded data as multipart/form-data POST or as the raw
+			// body of a PUT (docs.pcloud.com, "Uploading files"; the official SDK
+			// sends upload_write as PUT). A raw-body POST is neither, so every
+			// archive over 20 MB failed to upload.
 			$response = $this->request_with_retries(function() use ($url, $chunk, $options) {
-				return wp_remote_post($url, array(
+				return wp_remote_request($url, array(
+					'method'  => 'PUT',
 					'headers' => array(
 						'Content-Type'  => 'application/octet-stream',
 						'Authorization' => 'Bearer ' . $options['access_token'],

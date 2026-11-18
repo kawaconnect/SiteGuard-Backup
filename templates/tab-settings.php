@@ -37,7 +37,42 @@ $entities_list = array(
 
 $sgbackup = SiteGuard_Backup::instance();
 // Only show methods that have a configuration panel in this template
-$configurable_methods = array('s3', 's3generic', 'b2', 'googledrive', 'dropbox', 'ftp', 'sftp', 'azure', 'gcs', 'pcloud', 'openstack', 'email');
+$configurable_methods = array('s3', 's3generic', 'b2', 'googledrive', 'dropbox', 'onedrive', 'ftp', 'sftp', 'webdav', 'azure', 'gcs', 'pcloud', 'openstack', 'email');
+
+if (!function_exists('sgbackup_oauth_rows')) {
+	/**
+	 * Sign-in rows for an OAuth storage instance: the redirect URI to register
+	 * with the provider, the connection state, and the buttons.
+	 */
+	function sgbackup_oauth_rows($method, $iid, $iopts, $provider_label, $console_hint) {
+		require_once SGBACKUP_DIR . 'includes/class-oauth.php';
+		$redirect = SiteGuard_Backup_OAuth::redirect_uri();
+		?>
+		<tr>
+			<th><?php esc_html_e('Redirect URI', 'siteguardbackup'); ?></th>
+			<td>
+				<code class="sgbackup-redirect-uri" style="user-select:all"><?php echo esc_html($redirect); ?></code>
+				<p class="description"><?php echo esc_html(sprintf(__('Register exactly this URI in your %s app (%s), save the credentials above, then sign in.', 'siteguardbackup'), $provider_label, $console_hint)); ?></p>
+				<?php if (SiteGuard_Backup_OAuth::redirect_uri_has_query()): ?>
+					<p class="description" style="color:#b32d2e"><?php esc_html_e('This site uses plain permalinks, so the redirect URI contains a query string. Microsoft rejects that for personal accounts; switch Settings > Permalinks to any other structure.', 'siteguardbackup'); ?></p>
+				<?php endif; ?>
+			</td>
+		</tr>
+		<tr>
+			<td colspan="2">
+				<?php if (!empty($iopts['token']['access_token']) || ('pcloud' === $method && !empty($iopts['access_token']))): ?>
+					<span class="sgbackup-auth-status sgbackup-status success"><?php esc_html_e('Signed in', 'siteguardbackup'); ?></span>
+					<button type="button" class="button sgbackup-auth-btn" data-method="<?php echo esc_attr($method); ?>" data-instance="<?php echo esc_attr($iid); ?>"><?php esc_html_e('Sign in again', 'siteguardbackup'); ?></button>
+				<?php else: ?>
+					<button type="button" class="button button-primary sgbackup-auth-btn" data-method="<?php echo esc_attr($method); ?>" data-instance="<?php echo esc_attr($iid); ?>"><?php echo esc_html(sprintf(__('Sign in with %s', 'siteguardbackup'), $provider_label)); ?></button>
+				<?php endif; ?>
+				<button type="button" class="button sgbackup-test-credentials" data-method="<?php echo esc_attr($method); ?>" data-instance="<?php echo esc_attr($iid); ?>"><?php esc_html_e('Test Connection', 'siteguardbackup'); ?></button>
+				<span class="sgbackup-test-result"></span>
+			</td>
+		</tr>
+		<?php
+	}
+}
 $methods = array_intersect_key($sgbackup->get_backup_methods(), array_flip($configurable_methods));
 $current_services = $settings['service'];
 if (!is_array($current_services)) $current_services = array($current_services);
@@ -448,7 +483,7 @@ $period_labels = array(
 	 */
 	if (!function_exists('sgbackup_get_method_instances')) {
 	function sgbackup_get_method_instances($opts, $method_id, $defaults = array()) {
-		$stored = $opts->get_option('sgbackup_' . $method_id, array());
+		$stored = $opts->get_option(SiteGuard_Backup_Options::method_option($method_id), array());
 		$instances = array();
 
 		if (isset($stored['settings']) && is_array($stored['settings'])) {
@@ -772,17 +807,7 @@ $period_labels = array(
 							<p class="description"><?php esc_html_e('Name of the folder in your Google Drive root. Will be created if it does not exist (e.g., "Backups/MySite").', 'siteguardbackup'); ?></p>
 						</td>
 					</tr>
-					<tr>
-						<td colspan="2">
-							<?php if (!empty($iopts['token']['access_token'])): ?>
-								<span class="sgbackup-auth-status sgbackup-status success"><?php esc_html_e('Authenticated', 'siteguardbackup'); ?></span>
-							<?php else: ?>
-								<button type="button" class="button sgbackup-auth-btn" data-method="googledrive"><?php esc_html_e('Authenticate with Google', 'siteguardbackup'); ?></button>
-							<?php endif; ?>
-							<button type="button" class="button sgbackup-test-credentials" data-method="googledrive"><?php esc_html_e('Test Connection', 'siteguardbackup'); ?></button>
-							<span class="sgbackup-test-result"></span>
-						</td>
-					</tr>
+					<?php sgbackup_oauth_rows('googledrive', $iid, $iopts, 'Google', 'Google Cloud Console > APIs & Services > Credentials, OAuth client type \'Web application\', Google Drive API enabled'); ?>
 				</table>
 			</div>
 			<?php endforeach; ?>
@@ -830,22 +855,70 @@ $period_labels = array(
 							<p class="description"><?php esc_html_e('Path within your Dropbox. Must start with / (e.g., "/Backups/MySite").', 'siteguardbackup'); ?></p>
 						</td>
 					</tr>
-					<tr>
-						<td colspan="2">
-							<?php if (!empty($iopts['token']['access_token'])): ?>
-								<span class="sgbackup-auth-status sgbackup-status success"><?php esc_html_e('Authenticated', 'siteguardbackup'); ?></span>
-							<?php else: ?>
-								<button type="button" class="button sgbackup-auth-btn" data-method="dropbox"><?php esc_html_e('Authenticate with Dropbox', 'siteguardbackup'); ?></button>
-							<?php endif; ?>
-							<button type="button" class="button sgbackup-test-credentials" data-method="dropbox"><?php esc_html_e('Test Connection', 'siteguardbackup'); ?></button>
-							<span class="sgbackup-test-result"></span>
-						</td>
-					</tr>
+					<?php sgbackup_oauth_rows('dropbox', $iid, $iopts, 'Dropbox', 'dropbox.com/developers/apps > your app > Settings > Redirect URIs'); ?>
 				</table>
 			</div>
 			<?php endforeach; ?>
 		</div>
 		<a href="#" class="sgbackup-add-instance" data-method="dropbox"><?php esc_html_e('+ Add another Dropbox account', 'siteguardbackup'); ?></a>
+	</div>
+
+	<!-- OneDrive Configuration -->
+	<div class="sgbackup-method-config" id="sgbackup-config-onedrive" style="<?php echo in_array('onedrive', $current_services) ? '' : 'display:none;'; ?>">
+		<h3><?php esc_html_e('Microsoft OneDrive Settings', 'siteguardbackup'); ?></h3>
+		<?php
+		$od_defaults = array('client_id' => '', 'client_secret' => '', 'tenant' => 'common', 'token' => array(), 'folder' => 'SiteGuard Backups', 'instance_label' => '', 'instance_enabled' => '1');
+		$od_instances = sgbackup_get_method_instances($opts, 'onedrive', $od_defaults);
+		?>
+		<div class="sgbackup-instance-container" data-method="onedrive">
+			<div class="sgbackup-instance-tabs">
+				<?php foreach ($od_instances as $iid => $iopts): ?>
+					<span class="sgbackup-instance-tab" data-instance="<?php echo esc_attr($iid); ?>">
+						<span class="sgbackup-instance-label" contenteditable="true"><?php echo esc_html(!empty($iopts['instance_label']) ? $iopts['instance_label'] : __('OneDrive', 'siteguardbackup')); ?></span>
+						<?php if ($iid !== 's-0'): ?>
+							<button type="button" class="sgbackup-delete-instance" data-method="onedrive" data-instance="<?php echo esc_attr($iid); ?>" title="<?php esc_attr_e('Delete instance', 'siteguardbackup'); ?>">&times;</button>
+						<?php endif; ?>
+					</span>
+				<?php endforeach; ?>
+			</div>
+			<?php foreach ($od_instances as $iid => $iopts): ?>
+			<div class="sgbackup-instance-panel" data-method="onedrive" data-instance="<?php echo esc_attr($iid); ?>">
+				<table class="form-table">
+					<tr>
+						<th><?php esc_html_e('Enabled', 'siteguardbackup'); ?></th>
+						<td><label><input type="checkbox" class="sgbackup-instance-enabled" data-method="onedrive" data-instance="<?php echo esc_attr($iid); ?>" value="1" <?php checked($iopts['instance_enabled'] ?? '1', '1'); ?> /> <?php esc_html_e('Enable this instance', 'siteguardbackup'); ?></label></td>
+					</tr>
+					<tr>
+						<th><?php esc_html_e('Application (client) ID', 'siteguardbackup'); ?></th>
+						<td><input type="text" class="sgbackup-instance-field regular-text" data-key="client_id" data-method="onedrive" data-instance="<?php echo esc_attr($iid); ?>" value="<?php echo esc_attr($iopts['client_id'] ?? ''); ?>" /></td>
+					</tr>
+					<tr>
+						<th><?php esc_html_e('Client Secret', 'siteguardbackup'); ?></th>
+						<td>
+							<input type="password" class="sgbackup-instance-field regular-text" data-key="client_secret" data-method="onedrive" data-instance="<?php echo esc_attr($iid); ?>" value="<?php echo esc_attr(SiteGuard_Backup_Security::mask_secret($iopts['client_secret'] ?? '')); ?>" autocomplete="off" />
+							<p class="description"><?php esc_html_e('The secret Value (not its ID) from Certificates & secrets. Secrets expire; sign in again after replacing one.', 'siteguardbackup'); ?></p>
+						</td>
+					</tr>
+					<tr>
+						<th><?php esc_html_e('Tenant', 'siteguardbackup'); ?></th>
+						<td>
+							<input type="text" class="sgbackup-instance-field regular-text" data-key="tenant" data-method="onedrive" data-instance="<?php echo esc_attr($iid); ?>" value="<?php echo esc_attr($iopts['tenant'] ?? 'common'); ?>" />
+							<p class="description"><?php esc_html_e('"common" for apps that allow personal and work accounts. For an app registered for a single organization, enter its tenant ID or domain.', 'siteguardbackup'); ?></p>
+						</td>
+					</tr>
+					<tr>
+						<th><?php esc_html_e('Folder', 'siteguardbackup'); ?></th>
+						<td>
+							<input type="text" class="sgbackup-instance-field regular-text" data-key="folder" data-method="onedrive" data-instance="<?php echo esc_attr($iid); ?>" value="<?php echo esc_attr($iopts['folder'] ?? 'SiteGuard Backups'); ?>" />
+							<p class="description"><?php esc_html_e('Folder in the root of the signed-in account\'s OneDrive. Created if it does not exist.', 'siteguardbackup'); ?></p>
+						</td>
+					</tr>
+					<?php sgbackup_oauth_rows('onedrive', $iid, $iopts, 'Microsoft', 'Microsoft Entra admin center > App registrations > Authentication > Web platform; API permission Files.ReadWrite (delegated)'); ?>
+				</table>
+			</div>
+			<?php endforeach; ?>
+		</div>
+		<a href="#" class="sgbackup-add-instance" data-method="onedrive"><?php esc_html_e('+ Add another OneDrive account', 'siteguardbackup'); ?></a>
 	</div>
 
 	<!-- FTP Configuration -->
@@ -966,7 +1039,7 @@ $period_labels = array(
 						<th><?php esc_html_e('SSH Key (optional)', 'siteguardbackup'); ?></th>
 						<td>
 							<textarea class="sgbackup-instance-field regular-text" data-key="key" data-method="sftp" data-instance="<?php echo esc_attr($iid); ?>" rows="3" style="font-family:monospace;"><?php echo esc_textarea(SiteGuard_Backup_Security::mask_secret($iopts['key'] ?? '')); ?></textarea>
-							<p class="description"><?php esc_html_e('Paste private key contents. Leave empty to use password auth.', 'siteguardbackup'); ?></p>
+							<p class="description"><?php esc_html_e('Paste the private key (RSA, in PEM or OpenSSH format; Ed25519 and ECDSA keys are not supported). With a key, the password field is the key passphrase. Leave empty to log in with the password.', 'siteguardbackup'); ?></p>
 						</td>
 					</tr>
 					<tr>
@@ -1001,6 +1074,66 @@ $period_labels = array(
 			<?php endforeach; ?>
 		</div>
 		<a href="#" class="sgbackup-add-instance" data-method="sftp"><?php esc_html_e('+ Add another SFTP account', 'siteguardbackup'); ?></a>
+	</div>
+
+	<!-- WebDAV Configuration -->
+	<div class="sgbackup-method-config" id="sgbackup-config-webdav" style="<?php echo in_array('webdav', $current_services) ? '' : 'display:none;'; ?>">
+		<h3><?php esc_html_e('WebDAV Settings', 'siteguardbackup'); ?></h3>
+		<?php
+		$wd_defaults = array('url' => '', 'user' => '', 'pass' => '', 'path' => '/', 'instance_label' => '', 'instance_enabled' => '1');
+		$wd_instances = sgbackup_get_method_instances($opts, 'webdav', $wd_defaults);
+		?>
+		<div class="sgbackup-instance-container" data-method="webdav">
+			<div class="sgbackup-instance-tabs">
+				<?php foreach ($wd_instances as $iid => $iopts): ?>
+					<span class="sgbackup-instance-tab" data-instance="<?php echo esc_attr($iid); ?>">
+						<span class="sgbackup-instance-label" contenteditable="true"><?php echo esc_html(!empty($iopts['instance_label']) ? $iopts['instance_label'] : __('WebDAV', 'siteguardbackup')); ?></span>
+						<?php if ($iid !== 's-0'): ?>
+							<button type="button" class="sgbackup-delete-instance" data-method="webdav" data-instance="<?php echo esc_attr($iid); ?>" title="<?php esc_attr_e('Delete instance', 'siteguardbackup'); ?>">&times;</button>
+						<?php endif; ?>
+					</span>
+				<?php endforeach; ?>
+			</div>
+			<?php foreach ($wd_instances as $iid => $iopts): ?>
+			<div class="sgbackup-instance-panel" data-method="webdav" data-instance="<?php echo esc_attr($iid); ?>">
+				<table class="form-table">
+					<tr>
+						<th><?php esc_html_e('Enabled', 'siteguardbackup'); ?></th>
+						<td><label><input type="checkbox" class="sgbackup-instance-enabled" data-method="webdav" data-instance="<?php echo esc_attr($iid); ?>" value="1" <?php checked($iopts['instance_enabled'] ?? '1', '1'); ?> /> <?php esc_html_e('Enable this instance', 'siteguardbackup'); ?></label></td>
+					</tr>
+					<tr>
+						<th><?php esc_html_e('Server URL', 'siteguardbackup'); ?></th>
+						<td>
+							<input type="url" class="sgbackup-instance-field regular-text" data-key="url" data-method="webdav" data-instance="<?php echo esc_attr($iid); ?>" value="<?php echo esc_attr($iopts['url'] ?? ''); ?>" placeholder="https://cloud.example.com/remote.php/dav/files/USER" />
+							<p class="description"><?php esc_html_e('WebDAV base URL (Nextcloud, ownCloud, a NAS, ...). Use https://; plain http sends the password in cleartext.', 'siteguardbackup'); ?></p>
+						</td>
+					</tr>
+					<tr>
+						<th><?php esc_html_e('Username', 'siteguardbackup'); ?></th>
+						<td><input type="text" class="sgbackup-instance-field regular-text" data-key="user" data-method="webdav" data-instance="<?php echo esc_attr($iid); ?>" value="<?php echo esc_attr($iopts['user'] ?? ''); ?>" autocomplete="off" /></td>
+					</tr>
+					<tr>
+						<th><?php esc_html_e('Password', 'siteguardbackup'); ?></th>
+						<td><input type="password" class="sgbackup-instance-field regular-text" data-key="pass" data-method="webdav" data-instance="<?php echo esc_attr($iid); ?>" value="<?php echo esc_attr(SiteGuard_Backup_Security::mask_secret($iopts['pass'] ?? '')); ?>" autocomplete="off" /></td>
+					</tr>
+					<tr>
+						<th><?php esc_html_e('Folder', 'siteguardbackup'); ?></th>
+						<td>
+							<input type="text" class="sgbackup-instance-field regular-text" data-key="path" data-method="webdav" data-instance="<?php echo esc_attr($iid); ?>" value="<?php echo esc_attr($iopts['path'] ?? '/'); ?>" />
+							<p class="description"><?php esc_html_e('Existing folder under the server URL (e.g., "/Backups/MySite").', 'siteguardbackup'); ?></p>
+						</td>
+					</tr>
+					<tr>
+						<td colspan="2">
+							<button type="button" class="button sgbackup-test-credentials" data-method="webdav" data-instance="<?php echo esc_attr($iid); ?>"><?php esc_html_e('Test Connection', 'siteguardbackup'); ?></button>
+							<span class="sgbackup-test-result"></span>
+						</td>
+					</tr>
+				</table>
+			</div>
+			<?php endforeach; ?>
+		</div>
+		<a href="#" class="sgbackup-add-instance" data-method="webdav"><?php esc_html_e('+ Add another WebDAV server', 'siteguardbackup'); ?></a>
 	</div>
 
 	<!-- Azure Blob Storage Configuration -->
@@ -1165,7 +1298,7 @@ $period_labels = array(
 	<div class="sgbackup-method-config" id="sgbackup-config-pcloud" style="<?php echo in_array('pcloud', $current_services) ? '' : 'display:none;'; ?>">
 		<h3><?php esc_html_e('pCloud Settings', 'siteguardbackup'); ?></h3>
 		<?php
-		$pcloud_defaults = array('access_token' => '', 'folder_id' => 0, 'use_eu' => false, 'instance_label' => '', 'instance_enabled' => '1');
+		$pcloud_defaults = array('client_id' => '', 'client_secret' => '', 'access_token' => '', 'folder_id' => 0, 'use_eu' => false, 'instance_label' => '', 'instance_enabled' => '1');
 		$pcloud_instances = sgbackup_get_method_instances($opts, 'pcloud', $pcloud_defaults);
 		?>
 		<div class="sgbackup-instance-container" data-method="pcloud">
@@ -1187,10 +1320,21 @@ $period_labels = array(
 						<td><label><input type="checkbox" class="sgbackup-instance-enabled" data-method="pcloud" data-instance="<?php echo esc_attr($iid); ?>" value="1" <?php checked($iopts['instance_enabled'] ?? '1', '1'); ?> /> <?php esc_html_e('Enable this instance', 'siteguardbackup'); ?></label></td>
 					</tr>
 					<tr>
+						<th><?php esc_html_e('Client ID', 'siteguardbackup'); ?></th>
+						<td>
+							<input type="text" class="sgbackup-instance-field regular-text" data-key="client_id" data-method="pcloud" data-instance="<?php echo esc_attr($iid); ?>" value="<?php echo esc_attr($iopts['client_id'] ?? ''); ?>" />
+							<p class="description"><?php esc_html_e('From your app at docs.pcloud.com > My Apps. Then use "Sign in with pCloud" below; the data region (US/EU) is detected automatically.', 'siteguardbackup'); ?></p>
+						</td>
+					</tr>
+					<tr>
+						<th><?php esc_html_e('Client Secret', 'siteguardbackup'); ?></th>
+						<td><input type="password" class="sgbackup-instance-field regular-text" data-key="client_secret" data-method="pcloud" data-instance="<?php echo esc_attr($iid); ?>" value="<?php echo esc_attr(SiteGuard_Backup_Security::mask_secret($iopts['client_secret'] ?? '')); ?>" autocomplete="off" /></td>
+					</tr>
+					<tr>
 						<th><?php esc_html_e('Access Token', 'siteguardbackup'); ?></th>
 						<td>
 							<input type="password" class="sgbackup-instance-field regular-text" data-key="access_token" data-method="pcloud" data-instance="<?php echo esc_attr($iid); ?>" value="<?php echo esc_attr(SiteGuard_Backup_Security::mask_secret($iopts['access_token'] ?? '')); ?>" autocomplete="off" />
-							<p class="description"><?php esc_html_e('OAuth 2.0 access token from pCloud. Generate at my.pcloud.com.', 'siteguardbackup'); ?></p>
+							<p class="description"><?php esc_html_e('Filled in by "Sign in with pCloud". Only paste a token here if you obtained one yourself (pCloud tokens do not expire); then set EU Region to match the account.', 'siteguardbackup'); ?></p>
 						</td>
 					</tr>
 					<tr>
@@ -1209,9 +1353,35 @@ $period_labels = array(
 							</label>
 						</td>
 					</tr>
+					<?php sgbackup_oauth_rows('pcloud', $iid, $iopts, 'pCloud', 'docs.pcloud.com > My Apps > your app > Redirect URIs'); ?>
+				</table>
+			</div>
+			<?php endforeach; ?>
+		</div>
+		<a href="#" class="sgbackup-add-instance" data-method="pcloud"><?php esc_html_e('+ Add another pCloud account', 'siteguardbackup'); ?></a>
+	</div>
+
+	<!-- Email destination -->
+	<div class="sgbackup-method-config" id="sgbackup-config-email" style="<?php echo in_array('email', $current_services) ? '' : 'display:none;'; ?>">
+		<h3><?php esc_html_e('Email Destination', 'siteguardbackup'); ?></h3>
+		<?php
+		$em_defaults = array('address' => get_option('admin_email'), 'instance_label' => '', 'instance_enabled' => '1');
+		$em_instances = sgbackup_get_method_instances($opts, 'email', $em_defaults);
+		?>
+		<div class="sgbackup-instance-container" data-method="email">
+			<?php foreach ($em_instances as $iid => $iopts): ?>
+			<div class="sgbackup-instance-panel" data-method="email" data-instance="<?php echo esc_attr($iid); ?>">
+				<table class="form-table">
+					<tr>
+						<th><?php esc_html_e('Send archives to', 'siteguardbackup'); ?></th>
+						<td>
+							<input type="email" class="sgbackup-instance-field regular-text" data-key="address" data-method="email" data-instance="<?php echo esc_attr($iid); ?>" value="<?php echo esc_attr($iopts['address'] ?? get_option('admin_email')); ?>" />
+							<p class="description"><?php esc_html_e('Each archive is mailed as an attachment through wp_mail(). Archives over 25 MB are not sent (most mail servers reject them), so use email only for small sites or alongside another destination. Backup report emails are set under Email Reports.', 'siteguardbackup'); ?></p>
+						</td>
+					</tr>
 					<tr>
 						<td colspan="2">
-							<button type="button" class="button sgbackup-test-credentials" data-method="pcloud"><?php esc_html_e('Test Connection', 'siteguardbackup'); ?></button>
+							<button type="button" class="button sgbackup-test-credentials" data-method="email" data-instance="<?php echo esc_attr($iid); ?>"><?php esc_html_e('Send Test Email', 'siteguardbackup'); ?></button>
 							<span class="sgbackup-test-result"></span>
 						</td>
 					</tr>
@@ -1219,7 +1389,6 @@ $period_labels = array(
 			</div>
 			<?php endforeach; ?>
 		</div>
-		<a href="#" class="sgbackup-add-instance" data-method="pcloud"><?php esc_html_e('+ Add another pCloud account', 'siteguardbackup'); ?></a>
 	</div>
 
 	<!-- OpenStack (Swift / Rackspace) Configuration -->

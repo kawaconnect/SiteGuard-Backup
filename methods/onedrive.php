@@ -10,51 +10,72 @@ if (!defined('ABSPATH')) die('No direct access.');
 
 class SiteGuard_Backup_Method_Onedrive extends SiteGuard_Backup_Module {
 
-    private $auth_url = 'https://login.microsoftonline.com/common/oauth2/v2.0/authorize';
-    private $token_url = 'https://login.microsoftonline.com/common/oauth2/v2.0/token';
     private $graph_url = 'https://graph.microsoft.com/v1.0';
+
+    /**
+     * Microsoft identity platform endpoint for the configured tenant: "common"
+     * (personal and work accounts, the default), "organizations", "consumers",
+     * or a tenant ID/domain for single-tenant app registrations.
+     */
+    private function login_url($what) {
+        $options = $this->get_options();
+        $tenant = isset($options['tenant']) ? trim((string) $options['tenant']) : '';
+        if ('' === $tenant || !preg_match('/^[A-Za-z0-9.-]{1,100}$/', $tenant)) $tenant = 'common';
+        return 'https://login.microsoftonline.com/' . rawurlencode($tenant) . '/oauth2/v2.0/' . $what;
+    }
 
     public function get_default_options() {
         return array(
             'client_id'     => '',
             'client_secret' => '',
+            'tenant'        => 'common',
             'token'         => array(),
             'folder'        => 'SiteGuard Backups',
         );
     }
 
-    public function get_auth_url() {
+    /**
+     * OAuth2 authorization URL (see SiteGuard_Backup_OAuth::start()).
+     */
+    public function get_auth_url($state, $redirect_uri) {
         $options = $this->get_options();
-        $redirect = admin_url('admin-ajax.php') . '?action=sgbackup_ajax&subaction=onedrive_auth_callback';
-
-        return $this->auth_url . '?' . http_build_query(array(
+        return $this->login_url('authorize') . '?' . http_build_query(array(
             'client_id'     => $options['client_id'],
-            'redirect_uri'  => $redirect,
+            'redirect_uri'  => $redirect_uri,
             'response_type' => 'code',
-            'scope'         => 'Files.ReadWrite.All offline_access',
-            'state'         => wp_create_nonce('sgbackup-oauth-onedrive'),
+            'response_mode' => 'query',
+            // Files.ReadWrite covers the signed-in user's own drive; .All is not needed.
+            'scope'         => 'Files.ReadWrite offline_access',
+            'state'         => $state,
         ));
     }
 
-    public function exchange_code($code) {
+    /**
+     * Exchange an authorization code for tokens and store them on this instance.
+     */
+    public function exchange_code($code, $redirect_uri) {
         $options = $this->get_options();
-        $redirect = admin_url('admin-ajax.php') . '?action=sgbackup_ajax&subaction=onedrive_auth_callback';
 
-        $response = wp_remote_post($this->token_url, array(
+        $response = wp_remote_post($this->login_url('token'), array(
             'body' => array(
                 'client_id'     => $options['client_id'],
                 'client_secret' => $options['client_secret'],
                 'code'          => $code,
-                'redirect_uri'  => $redirect,
+                'redirect_uri'  => $redirect_uri,
                 'grant_type'    => 'authorization_code',
+                'scope'         => 'Files.ReadWrite offline_access',
             ),
         ));
 
         if (is_wp_error($response)) return $response;
 
         $body = json_decode(wp_remote_retrieve_body($response), true);
-        if (isset($body['error'])) {
-            return new WP_Error('onedrive_auth', $body['error_description'] ?? $body['error']);
+        if (!is_array($body) || isset($body['error']) || empty($body['access_token'])) {
+            $msg = is_array($body) ? ($body['error_description'] ?? ($body['error'] ?? 'no access token')) : 'HTTP ' . wp_remote_retrieve_response_code($response);
+            return new WP_Error('onedrive_auth', $msg);
+        }
+        if (empty($body['refresh_token'])) {
+            return new WP_Error('onedrive_auth', 'Microsoft returned no refresh token (offline_access was not granted), so backups would stop after an hour.');
         }
 
         $options['token'] = $body;
@@ -80,7 +101,7 @@ class SiteGuard_Backup_Method_Onedrive extends SiteGuard_Backup_Module {
                 return new WP_Error('onedrive_no_refresh', 'No refresh token. Re-authenticate.');
             }
 
-            $response = wp_remote_post($this->token_url, array(
+            $response = wp_remote_post($this->login_url('token'), array(
                 'body' => array(
                     'client_id'     => $options['client_id'],
                     'client_secret' => $options['client_secret'],

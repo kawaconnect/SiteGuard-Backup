@@ -60,7 +60,7 @@ abstract class SiteGuard_Backup_Module {
 		if (null !== $this->options) return $this->options;
 
 		$opts = SiteGuard_Backup_Options::instance();
-		$stored = $opts->get_option('sgbackup_' . $this->method_id, array());
+		$stored = $opts->get_option(SiteGuard_Backup_Options::method_option($this->method_id), array());
 
 		// Multi-instance format
 		if (isset($stored['settings']) && is_array($stored['settings'])) {
@@ -89,7 +89,7 @@ abstract class SiteGuard_Backup_Module {
 		$this->options = $options;
 
 		// Store in multi-instance format
-		$stored = $opts->get_option('sgbackup_' . $this->method_id, array());
+		$stored = $opts->get_option(SiteGuard_Backup_Options::method_option($this->method_id), array());
 		$instance = $this->instance_id ?: 's-0';
 
 		if (!isset($stored['settings'])) {
@@ -104,7 +104,7 @@ abstract class SiteGuard_Backup_Module {
 			$to_store = SiteGuard_Backup_Security::encrypt_method_options($this->method_id, $to_store);
 		}
 		$stored['settings'][$instance] = $to_store;
-		$opts->update_option('sgbackup_' . $this->method_id, $stored);
+		$opts->update_option(SiteGuard_Backup_Options::method_option($this->method_id), $stored);
 	}
 
 	/**
@@ -391,7 +391,7 @@ abstract class SiteGuard_Backup_Module {
 	 */
 	public function get_instance_label() {
 		$opts = SiteGuard_Backup_Options::instance();
-		$stored = $opts->get_option('sgbackup_' . $this->method_id, array());
+		$stored = $opts->get_option(SiteGuard_Backup_Options::method_option($this->method_id), array());
 		$instance = $this->instance_id ?: 's-0';
 
 		if (isset($stored['settings'][$instance]['instance_label'])) {

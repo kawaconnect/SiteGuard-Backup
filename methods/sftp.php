@@ -31,8 +31,12 @@ class SiteGuard_Backup_Method_Sftp extends SiteGuard_Backup_Module {
 
 		$port = !empty($options['port']) ? intval($options['port']) : 22;
 
+		// A pasted private key (what the settings page asks for) is loaded by
+		// phpseclib from memory; the ssh2 extension only takes key files.
+		$pasted_key = $this->is_pasted_key($options);
+
 		// Try native ssh2 extension
-		if (function_exists('ssh2_connect')) {
+		if (function_exists('ssh2_connect') && !$pasted_key) {
 			$conn = $this->connect_ssh2($options, $port);
 		}
 		// Try phpseclib
@@ -114,6 +118,12 @@ class SiteGuard_Backup_Method_Sftp extends SiteGuard_Backup_Module {
 		return true;
 	}
 
+	/** Is the "key" option the key itself rather than a path to a key file? */
+	private function is_pasted_key($options) {
+		$k = isset($options['key']) ? (string) $options['key'] : '';
+		return '' !== $k && (false !== strpos($k, '-----BEGIN') || false !== strpos($k, 'PuTTY-User-Key-File'));
+	}
+
 	private function connect_ssh2($options, $port) {
 		$conn = @ssh2_connect($options['host'], $port);
 		if (!$conn) {
@@ -159,9 +169,8 @@ class SiteGuard_Backup_Method_Sftp extends SiteGuard_Backup_Module {
 	}
 
 	private function connect_phpseclib($options, $port) {
-		if (!class_exists('phpseclib\\Net\\SFTP') && !class_exists('Net_SFTP')) {
-			require_once SGBACKUP_DIR . 'vendor/phpseclib/Net/SFTP.php';
-		}
+		// phpseclib 2 needs an autoloader (SFTP extends SSH2, uses Math, Crypt, ...).
+		require_once SGBACKUP_DIR . 'vendor/phpseclib/autoload.php';
 
 		if (class_exists('phpseclib\\Net\\SFTP')) {
 			$sftp = new \phpseclib\Net\SFTP($options['host'], $port);
@@ -178,25 +187,27 @@ class SiteGuard_Backup_Method_Sftp extends SiteGuard_Backup_Module {
 
 		$auth = false;
 		if (!empty($options['key'])) {
-			$key_file = $options['key'];
-
-			// Validate key path: must be within ABSPATH or wp-content, no '..' traversal
-			$real_key = realpath($key_file);
-			if (false === $real_key
-				|| strpos($key_file, '..') !== false
-				|| (strpos($real_key, rtrim(ABSPATH, '/') . '/') !== 0 && strpos($real_key, rtrim(WP_CONTENT_DIR, '/') . '/') !== 0)
-			) {
-				return new WP_Error('sftp_invalid_key', 'SFTP key path must be within ABSPATH or wp-content and must not contain path traversal.');
-			}
-
-			if (class_exists('phpseclib\\Crypt\\RSA')) {
-				$key = new \phpseclib\Crypt\RSA();
+			if ($this->is_pasted_key($options)) {
+				$key_data = (string) $options['key'];
 			} else {
-				require_once SGBACKUP_DIR . 'vendor/phpseclib/Crypt/RSA.php';
-				$key = new Crypt_RSA();
+				$key_file = $options['key'];
+
+				// Validate key path: must be within ABSPATH or wp-content, no '..' traversal
+				$real_key = realpath($key_file);
+				if (false === $real_key
+					|| strpos($key_file, '..') !== false
+					|| (strpos($real_key, rtrim(ABSPATH, '/') . '/') !== 0 && strpos($real_key, rtrim(WP_CONTENT_DIR, '/') . '/') !== 0)
+				) {
+					return new WP_Error('sftp_invalid_key', 'SFTP key: paste the private key itself, or give a key file path within ABSPATH or wp-content (no path traversal).');
+				}
+				$key_data = (string) file_get_contents($real_key);
 			}
+
+			$key = new \phpseclib\Crypt\RSA();
 			if (!empty($options['pass'])) $key->setPassword($options['pass']);
-			$key->loadKey(file_get_contents($key_file));
+			if (!$key->loadKey($key_data)) {
+				return new WP_Error('sftp_invalid_key', 'SFTP key could not be read. The bundled SSH library supports RSA keys (PEM, PKCS#8 or OpenSSH format), not Ed25519 or ECDSA keys; for an encrypted key, enter its passphrase as the password.');
+			}
 			$auth = $sftp->login($options['user'], $key);
 		} else {
 			$auth = $sftp->login($options['user'], $options['pass']);

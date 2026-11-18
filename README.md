@@ -8,7 +8,7 @@ A WordPress backup, restore, and migration plugin built for multisite networks. 
 - **Per-subsite backup and restore** from Network Admin - back up or restore individual subsites without touching the rest of the network
 - **Site-to-site migration** - pull backups directly from a remote WordPress site over an authenticated, encrypted connection (RSA+AES). No manual file downloads or uploads required
 - **Domain remapping** - migrate between independent domains and subdomains automatically. Handles multisite blog tables, sitemeta, and serialization-aware search-replace across all subsites
-- **12+ remote storage backends** - S3, Google Drive, Dropbox, OneDrive, Azure Blob, GCS, pCloud, FTP, SFTP, WebDAV, OpenStack, Email
+- **15 remote storage destinations**: Amazon S3 and S3-compatible services, Backblaze B2, Google Cloud Storage, Azure Blob, Google Drive, Dropbox, OneDrive, pCloud, FTP/FTPS, SFTP/SCP, WebDAV, OpenStack Swift, Email (see [Remote storage](#remote-storage))
 - **WP-CLI integration** - 45+ subcommands covering backups, restores, settings, migrations, and diagnostics
 - **Resumable jobs** - long-running backups resume automatically via WP-Cron if interrupted
 - **Atomic database restores** - imports into temporary tables, then swaps all tables in a single `RENAME TABLE` operation
@@ -129,6 +129,41 @@ wp siteguardbackup sysinfo      # shows memory_limit, system_memory, and whether
 ```
 
 Finished backups can be downloaded as one streamed zip bundle (no temp file, constant memory) or pushed to another WordPress site in 1-2 MB encrypted chunks.
+
+## Remote storage
+
+Every destination is exercised by `tests/integration/storage.sh` (upload,
+multipart/chunked upload, listing, byte-identical download, delete) against a
+real server or a protocol fake written from the provider's API docs.
+
+| Destination | Needs | Notes |
+|---|---|---|
+| Amazon S3, S3-compatible, B2, GCS | access key + secret | SigV4; B2 and GCS use their S3-compatible APIs (GCS: HMAC keys) |
+| Azure Blob | account + key or SAS | block blobs |
+| Google Drive, Dropbox, OneDrive, pCloud | your own OAuth app | sign in from the settings page (below) |
+| FTP / FTPS | PHP curl (or ext-ftp for plain FTP) | explicit and implicit FTPS; the server certificate is verified |
+| SFTP / SCP | password, or a pasted RSA private key | bundled phpseclib; Ed25519/ECDSA keys are not supported |
+| WebDAV | URL, user, password | Nextcloud, ownCloud, NAS |
+| OpenStack Swift | Keystone v2.0 or v3 credentials | large files as static large objects |
+| Email | an address | upload only; archives over 25 MB are not sent |
+
+### OAuth sign-in
+
+Create an app with the provider, register this redirect URI (shown in each
+OAuth panel), save the app credentials, then click "Sign in with ...":
+
+    https://<your site>/wp-json/sgbackup/v1/oauth/callback
+
+- Google: OAuth client of type "Web application", Google Drive API enabled.
+  Scope `drive.file` (SiteGuard only sees files it created).
+- Dropbox: app with `files.content.read` and `files.content.write`.
+- Microsoft: app registration, platform "Web", delegated permission
+  `Files.ReadWrite`. Use tenant `common` for apps that allow personal and work
+  accounts, or the tenant ID for a single-organization app.
+- pCloud: app at docs.pcloud.com > My Apps. The data region is detected.
+
+The redirect URI must not contain a query string (Microsoft rejects it for
+personal accounts), so the site needs pretty permalinks.
 
 ## Backup Storage Location
 

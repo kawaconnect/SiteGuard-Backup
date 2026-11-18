@@ -24,33 +24,30 @@ class SiteGuard_Backup_Method_Dropbox extends SiteGuard_Backup_Module {
 	}
 
 	/**
-	 * Get OAuth2 authorization URL.
+	 * OAuth2 authorization URL (see SiteGuard_Backup_OAuth::start()).
 	 */
-	public function get_auth_url() {
+	public function get_auth_url($state, $redirect_uri) {
 		$options = $this->get_options();
-		$redirect = admin_url('admin-ajax.php') . '?action=sgbackup_ajax&subaction=dropbox_auth_callback';
-
 		return $this->auth_url . '?' . http_build_query(array(
-			'client_id'     => $options['app_key'],
-			'redirect_uri'  => $redirect,
-			'response_type' => 'code',
+			'client_id'         => $options['app_key'],
+			'redirect_uri'      => $redirect_uri,
+			'response_type'     => 'code',
 			'token_access_type' => 'offline',
-			'state'         => wp_create_nonce('sgbackup-oauth-dropbox'),
+			'state'             => $state,
 		));
 	}
 
 	/**
-	 * Exchange authorization code for tokens.
+	 * Exchange an authorization code for tokens and store them on this instance.
 	 */
-	public function exchange_code($code) {
+	public function exchange_code($code, $redirect_uri) {
 		$options = $this->get_options();
-		$redirect = admin_url('admin-ajax.php') . '?action=sgbackup_ajax&subaction=dropbox_auth_callback';
 
 		$response = wp_remote_post($this->token_url, array(
 			'body' => array(
 				'code'          => $code,
 				'grant_type'    => 'authorization_code',
-				'redirect_uri'  => $redirect,
+				'redirect_uri'  => $redirect_uri,
 				'client_id'     => $options['app_key'],
 				'client_secret' => $options['app_secret'],
 			),
@@ -59,8 +56,11 @@ class SiteGuard_Backup_Method_Dropbox extends SiteGuard_Backup_Module {
 		if (is_wp_error($response)) return $response;
 
 		$body = json_decode(wp_remote_retrieve_body($response), true);
-		if (isset($body['error'])) {
-			$err_msg = isset($body['error_summary']) ? $body['error_summary'] : (is_string($body['error']) ? $body['error'] : 'Unknown error');
+		if (!is_array($body) || isset($body['error']) || empty($body['access_token'])) {
+			$err_msg = 'HTTP ' . wp_remote_retrieve_response_code($response);
+			if (is_array($body) && isset($body['error'])) {
+				$err_msg = isset($body['error_description']) ? $body['error_description'] : (isset($body['error_summary']) ? $body['error_summary'] : (is_string($body['error']) ? $body['error'] : 'Unknown error'));
+			}
 			return new WP_Error('dropbox_auth', $err_msg);
 		}
 
@@ -275,9 +275,13 @@ class SiteGuard_Backup_Method_Dropbox extends SiteGuard_Backup_Module {
 		$local_path = trailingslashit($dest_dir) . basename($file);
 
 		// Stream download to file to avoid memory issues
+		// WordPress gives a body-less POST "Content-Type: application/x-www-form-urlencoded",
+		// which Dropbox rejects with HTTP 400 on download endpoints: every restore
+		// from Dropbox failed. Name an accepted type explicitly.
 		$response = wp_remote_post($this->content_url . '/files/download', array(
 			'headers' => array(
 				'Authorization'   => "Bearer {$token}",
+				'Content-Type'    => 'application/octet-stream',
 				'Dropbox-API-Arg' => json_encode(array('path' => $remote_path)),
 			),
 			'timeout'  => 300,
@@ -394,15 +398,25 @@ class SiteGuard_Backup_Method_Dropbox extends SiteGuard_Backup_Module {
 		$token = $this->get_access_token();
 		if (is_wp_error($token)) return $token;
 
+		// An RPC call without arguments takes the JSON body "null" (a body-less POST
+		// gets WordPress' form Content-Type, which Dropbox rejects with HTTP 400).
 		$response = wp_remote_post($this->api_url . '/users/get_current_account', array(
-			'headers' => array('Authorization' => "Bearer {$token}"),
+			'headers' => array(
+				'Authorization' => "Bearer {$token}",
+				'Content-Type'  => 'application/json',
+			),
+			'body'    => 'null',
 		));
 
 		if (is_wp_error($response)) return $response;
 
-		$body = json_decode(wp_remote_retrieve_body($response), true);
-		if (isset($body['error'])) {
-			return new WP_Error('dropbox_test', $body['error_summary']);
+		$code = (int) wp_remote_retrieve_response_code($response);
+		$raw  = (string) wp_remote_retrieve_body($response);
+		$body = json_decode($raw, true);
+		if (200 !== $code || !is_array($body) || isset($body['error'])) {
+			// Dropbox answers 400s in plain text, which used to pass as success.
+			$msg = is_array($body) && isset($body['error_summary']) ? $body['error_summary'] : trim(substr(wp_strip_all_tags($raw), 0, 300));
+			return new WP_Error('dropbox_test', "Dropbox connection test failed (HTTP {$code}): {$msg}");
 		}
 
 		return true;

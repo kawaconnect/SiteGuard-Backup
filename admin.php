@@ -34,7 +34,6 @@ class SiteGuard_Backup_Admin {
 		add_action('wp_ajax_sgbackup_download_bundle', array($this, 'ajax_download_bundle'));
 		add_action('wp_ajax_sgbackup_restore', array($this, 'ajax_restore'));
 		add_action('wp_ajax_sgbackup_upload', array($this, 'ajax_upload'));
-		add_action('wp_ajax_sgbackup_oauth_callback', array($this, 'ajax_oauth_callback'));
 		add_action('wp_ajax_sgbackup_unlock', array($this, 'ajax_unlock'));
 		add_action('admin_bar_menu', array($this, 'admin_bar_menu'), 100);
 		add_action('admin_head', array($this, 'admin_bar_css'));
@@ -1111,53 +1110,6 @@ class SiteGuard_Backup_Admin {
 	}
 
 	/**
-	 * Handle OAuth callback redirect (GET from Google/Dropbox).
-	 */
-	public function ajax_oauth_callback() {
-		if (!$this->user_can_manage()) wp_die('Unauthorized');
-
-		$code = isset($_GET['code']) ? sanitize_text_field($_GET['code']) : '';
-		$state = isset($_GET['state']) ? sanitize_text_field($_GET['state']) : '';
-		$method = isset($_GET['method']) ? sanitize_text_field($_GET['method']) : '';
-
-		if (empty($code) || empty($method)) {
-			wp_die('Missing OAuth parameters.');
-		}
-
-		if (null === $this->commands) {
-			require_once SGBACKUP_DIR . 'includes/class-commands.php';
-			$this->commands = new SiteGuard_Backup_Commands();
-		}
-
-		// Whitelist valid OAuth methods to prevent arbitrary method invocation
-		$valid_oauth_methods = array('googledrive', 'dropbox', 'onedrive');
-		if (!in_array($method, $valid_oauth_methods, true)) {
-			wp_die('Unknown OAuth method.');
-		}
-
-		// Validate state nonce to prevent CSRF on OAuth callback
-		if (empty($state) || !wp_verify_nonce($state, 'sgbackup-oauth-' . $method)) {
-			wp_die('Invalid OAuth state. Please try again.');
-		}
-
-		$callback_method = $method . '_auth_callback';
-
-		$result = $this->commands->$callback_method(array('code' => $code, 'state' => $state));
-
-		if (is_wp_error($result)) {
-			wp_die('OAuth error: ' . esc_html($result->get_error_message()));
-		}
-
-		// Close the popup and notify the parent window
-		header("Content-Security-Policy: default-src 'none'; script-src 'unsafe-inline'");
-		echo '<html><body><script>
-			if (window.opener) { window.opener.location.reload(); }
-			window.close();
-		</script><p>Authentication successful. You may close this window.</p></body></html>';
-		exit;
-	}
-
-	/**
 	 * L6: Admin bar quick link for SiteGuard Backup.
 	 *
 	 * @param WP_Admin_Bar $wp_admin_bar The admin bar instance.
@@ -1615,10 +1567,10 @@ class SiteGuard_Backup_Admin {
 	 */
 	private function get_configured_methods() {
 		$opts = SiteGuard_Backup_Options::instance();
-		$all_methods = array('s3', 's3generic', 'googledrive', 'dropbox', 'onedrive', 'azure', 'gcs', 'pcloud', 'ftp', 'sftp', 'webdav', 'openstack', 'email');
+		$all_methods = array('s3', 's3generic', 'b2', 'googledrive', 'dropbox', 'onedrive', 'azure', 'gcs', 'pcloud', 'ftp', 'sftp', 'webdav', 'openstack', 'email');
 		$configured = array();
 		foreach ($all_methods as $method) {
-			$settings = $opts->get_option('sgbackup_' . $method, array());
+			$settings = $opts->get_option(SiteGuard_Backup_Options::method_option($method), array());
 			if (!empty($settings)) {
 				$configured[] = $method;
 			}

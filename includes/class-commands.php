@@ -13,7 +13,42 @@ class SiteGuard_Backup_Commands {
 	private static $valid_entities = array('plugins', 'themes', 'uploads', 'others', 'wpcore');
 
 	/** @var array Allowed storage methods */
-	private static $valid_methods = array('email', 'ftp', 'sftp', 's3', 's3generic', 'googledrive', 'dropbox', 'onedrive', 'webdav', 'remotesend', 'azure', 'gcs', 'pcloud', 'openstack');
+	private static $valid_methods = array('email', 'ftp', 'sftp', 's3', 's3generic', 'b2', 'googledrive', 'dropbox', 'onedrive', 'webdav', 'remotesend', 'azure', 'gcs', 'pcloud', 'openstack');
+
+	/**
+	 * Keep values the plugin stores itself, which the settings form never sends:
+	 * OAuth tokens, the pinned SFTP host key, the cached Google Drive folder ID.
+	 * Saving settings used to replace the whole instance and drop them, which
+	 * signed every OAuth account out and silently reset SFTP host-key pinning.
+	 * A field is only kept while the settings it depends on are unchanged.
+	 */
+	private static function keep_server_fields($method, $new, $previous) {
+		if (!is_array($new) || !is_array($previous)) return $new;
+		$same = function ($keys) use ($new, $previous) {
+			foreach ($keys as $k) {
+				$a = isset($new[$k]) ? (string) $new[$k] : null;
+				$b = isset($previous[$k]) ? (string) $previous[$k] : null;
+				if (null !== $a && $a !== $b) return false;
+			}
+			return true;
+		};
+		$rules = array(
+			'googledrive' => array('token' => array('client_id'), 'folder_id' => array('client_id', 'folder_name')),
+			'dropbox'     => array('token' => array('app_key')),
+			'onedrive'    => array('token' => array('client_id', 'tenant')),
+			'sftp'        => array('fingerprint' => array('host', 'port')),
+		);
+		if (empty($rules[$method])) return $new;
+		foreach ($rules[$method] as $field => $depends) {
+			// A field the form does send (the SFTP fingerprint: "clear to re-learn")
+			// is taken as sent, even when blank.
+			if (array_key_exists($field, $new)) continue;
+			if (isset($previous[$field]) && $same($depends)) {
+				$new[$field] = $previous[$field];
+			}
+		}
+		return $new;
+	}
 
 	/**
 	 * Trigger a backup now.
@@ -591,7 +626,7 @@ class SiteGuard_Backup_Commands {
 				require_once SGBACKUP_DIR . 'includes/class-security.php';
 				// Encrypt existing plaintext credentials for all storage methods
 				foreach (self::$valid_methods as $method_id) {
-					$stored = $opts->get_option('sgbackup_' . $method_id, array());
+					$stored = $opts->get_option(SiteGuard_Backup_Options::method_option($method_id), array());
 					if (empty($stored) || !isset($stored['settings'])) continue;
 					$changed = false;
 					foreach ($stored['settings'] as $instance_id => &$instance_settings) {
@@ -604,7 +639,7 @@ class SiteGuard_Backup_Commands {
 					}
 					unset($instance_settings);
 					if ($changed) {
-						$opts->update_option('sgbackup_' . $method_id, $stored);
+						$opts->update_option(SiteGuard_Backup_Options::method_option($method_id), $stored);
 					}
 				}
 			}
@@ -750,7 +785,7 @@ class SiteGuard_Backup_Commands {
 
 				// Check if data uses multi-instance format (has 'settings' sub-key)
 				if (isset($method_data['settings']) && is_array($method_data['settings'])) {
-					$stored = $opts->get_option('sgbackup_' . $method, array());
+					$stored = $opts->get_option(SiteGuard_Backup_Options::method_option($method), array());
 					if (!isset($stored['version'])) {
 						$stored = array('version' => 1, 'settings' => array());
 					}
@@ -761,6 +796,7 @@ class SiteGuard_Backup_Commands {
 						require_once SGBACKUP_DIR . 'includes/class-security.php';
 						$previous = isset($stored['settings'][$instance_id]) ? SiteGuard_Backup_Security::decrypt_method_options($method, $stored['settings'][$instance_id]) : array();
 						$instance_settings = SiteGuard_Backup_Security::keep_unchanged_secrets($instance_settings, $previous);
+						$instance_settings = self::keep_server_fields($method, $instance_settings, $previous);
 						// Encrypt credentials at rest if enabled
 						if ($opts->get_option('sgbackup_encrypt_credentials', false)) {
 							require_once SGBACKUP_DIR . 'includes/class-security.php';
@@ -768,18 +804,19 @@ class SiteGuard_Backup_Commands {
 						}
 						$stored['settings'][$instance_id] = $instance_settings;
 					}
-					$opts->update_option('sgbackup_' . $method, $stored);
+					$opts->update_option(SiteGuard_Backup_Options::method_option($method), $stored);
 				} else {
 					// Legacy flat format
 					array_walk($method_data, $sanitize_method_value);
 					require_once SGBACKUP_DIR . 'includes/class-security.php';
-					$method_data = SiteGuard_Backup_Security::keep_unchanged_secrets($method_data,
-						SiteGuard_Backup_Security::decrypt_method_options($method, (array) $opts->get_option('sgbackup_' . $method, array())));
+					$previous_flat = SiteGuard_Backup_Security::decrypt_method_options($method, (array) $opts->get_option(SiteGuard_Backup_Options::method_option($method), array()));
+					$method_data = SiteGuard_Backup_Security::keep_unchanged_secrets($method_data, $previous_flat);
+					$method_data = self::keep_server_fields($method, $method_data, $previous_flat);
 					if ($opts->get_option('sgbackup_encrypt_credentials', false)) {
 						require_once SGBACKUP_DIR . 'includes/class-security.php';
 						$method_data = SiteGuard_Backup_Security::encrypt_method_options($method, $method_data);
 					}
-					$opts->update_option('sgbackup_' . $method, $method_data);
+					$opts->update_option(SiteGuard_Backup_Options::method_option($method), $method_data);
 				}
 			}
 		}
@@ -1390,96 +1427,6 @@ class SiteGuard_Backup_Commands {
 	}
 
 	/**
-	 * Handle Google Drive OAuth2 callback.
-	 */
-	public function googledrive_auth_callback($params) {
-		if (empty($params['code'])) {
-			// Return the auth URL for the user to visit
-			require_once SGBACKUP_DIR . 'methods/backup-module.php';
-			require_once SGBACKUP_DIR . 'methods/googledrive.php';
-
-			$method = new SiteGuard_Backup_Method_Googledrive();
-			return array('auth_url' => $method->get_auth_url());
-		}
-
-		// Verify state nonce
-		$state = isset($params['state']) ? $params['state'] : '';
-		if (!wp_verify_nonce($state, 'sgbackup-oauth-googledrive')) {
-			return new WP_Error('invalid_state', 'Invalid OAuth state. Please try again.');
-		}
-
-		require_once SGBACKUP_DIR . 'methods/backup-module.php';
-		require_once SGBACKUP_DIR . 'methods/googledrive.php';
-
-		$method = new SiteGuard_Backup_Method_Googledrive();
-		$result = $method->exchange_code(sanitize_text_field($params['code']));
-
-		if (is_wp_error($result)) return $result;
-
-		return array('success' => true, 'message' => 'Google Drive authenticated successfully.');
-	}
-
-	/**
-	 * Handle Dropbox OAuth2 callback.
-	 */
-	public function dropbox_auth_callback($params) {
-		if (empty($params['code'])) {
-			// Return the auth URL for the user to visit
-			require_once SGBACKUP_DIR . 'methods/backup-module.php';
-			require_once SGBACKUP_DIR . 'methods/dropbox.php';
-
-			$method = new SiteGuard_Backup_Method_Dropbox();
-			return array('auth_url' => $method->get_auth_url());
-		}
-
-		// Verify state nonce
-		$state = isset($params['state']) ? $params['state'] : '';
-		if (!wp_verify_nonce($state, 'sgbackup-oauth-dropbox')) {
-			return new WP_Error('invalid_state', 'Invalid OAuth state. Please try again.');
-		}
-
-		require_once SGBACKUP_DIR . 'methods/backup-module.php';
-		require_once SGBACKUP_DIR . 'methods/dropbox.php';
-
-		$method = new SiteGuard_Backup_Method_Dropbox();
-		$result = $method->exchange_code(sanitize_text_field($params['code']));
-
-		if (is_wp_error($result)) return $result;
-
-		return array('success' => true, 'message' => 'Dropbox authenticated successfully.');
-	}
-
-	/**
-	 * Handle OneDrive OAuth2 callback.
-	 */
-	public function onedrive_auth_callback($params) {
-		if (empty($params['code'])) {
-			// Return the auth URL for the user to visit
-			require_once SGBACKUP_DIR . 'methods/backup-module.php';
-			require_once SGBACKUP_DIR . 'methods/onedrive.php';
-
-			$method = new SiteGuard_Backup_Method_Onedrive();
-			return array('auth_url' => $method->get_auth_url());
-		}
-
-		// Verify state nonce
-		$state = isset($params['state']) ? $params['state'] : '';
-		if (!wp_verify_nonce($state, 'sgbackup-oauth-onedrive')) {
-			return new WP_Error('invalid_state', 'Invalid OAuth state. Please try again.');
-		}
-
-		require_once SGBACKUP_DIR . 'methods/backup-module.php';
-		require_once SGBACKUP_DIR . 'methods/onedrive.php';
-
-		$method = new SiteGuard_Backup_Method_Onedrive();
-		$result = $method->exchange_code(sanitize_text_field($params['code']));
-
-		if (is_wp_error($result)) return $result;
-
-		return array('success' => true, 'message' => 'OneDrive authenticated successfully.');
-	}
-
-	/**
 	 * Get the contents of a backup set for selective restore.
 	 * Returns lists of tables, plugins, and themes in the backup.
 	 */
@@ -2005,6 +1952,14 @@ class SiteGuard_Backup_Commands {
 		}
 
 		$method = new $class();
+		// Test the account whose panel the button is on, not always the first one.
+		if (!empty($params['instance'])) {
+			$instance = sanitize_text_field($params['instance']);
+			if (!preg_match('/^[A-Za-z0-9_-]{1,40}$/', $instance)) {
+				return new WP_Error('invalid_instance', 'Invalid storage instance');
+			}
+			$method->set_instance_id($instance);
+		}
 		if (!method_exists($method, 'credentials_test')) {
 			return new WP_Error('not_supported', 'This storage method does not support credential testing');
 		}
@@ -2021,30 +1976,17 @@ class SiteGuard_Backup_Commands {
 	}
 
 	/**
-	 * Get OAuth authentication URL for a storage method.
+	 * Start an OAuth sign-in for a storage instance; returns the provider's
+	 * authorization URL (see includes/class-oauth.php).
 	 */
 	public function get_auth_url($params) {
 		if (empty($params['method'])) {
 			return new WP_Error('missing_param', 'Missing storage method');
 		}
-
-		$method_name = sanitize_text_field($params['method']);
-		$valid_oauth = array('googledrive', 'dropbox', 'onedrive');
-		if (!in_array($method_name, $valid_oauth, true)) {
-			return new WP_Error('invalid_method', 'This method does not use OAuth');
-		}
-
-		require_once SGBACKUP_DIR . 'methods/backup-module.php';
-		require_once SGBACKUP_DIR . 'methods/' . $method_name . '.php';
-
-		$class = 'SiteGuard_Backup_Method_' . ucfirst($method_name);
-		$method = new $class();
-
-		if (!method_exists($method, 'get_auth_url')) {
-			return new WP_Error('not_supported', 'Method does not support OAuth');
-		}
-
-		return array('auth_url' => $method->get_auth_url());
+		require_once SGBACKUP_DIR . 'includes/class-oauth.php';
+		$instance = isset($params['instance']) ? sanitize_text_field($params['instance']) : 's-0';
+		$return = isset($params['return_url']) ? esc_url_raw($params['return_url']) : '';
+		return SiteGuard_Backup_OAuth::start(sanitize_text_field($params['method']), $instance, $return);
 	}
 
 	/**
@@ -2599,7 +2541,7 @@ class SiteGuard_Backup_Commands {
 		}
 
 		foreach (self::$valid_methods as $method) {
-			$method_settings = $opts->get_option('sgbackup_' . $method, array());
+			$method_settings = $opts->get_option(SiteGuard_Backup_Options::method_option($method), array());
 			if (!empty($method_settings)) {
 				$settings['method_' . $method] = $method_settings;
 			}
@@ -2669,7 +2611,7 @@ class SiteGuard_Backup_Commands {
 						}
 						$clean['settings'][sanitize_text_field($instance_id)] = $instance_settings;
 					}
-					$opts->update_option('sgbackup_' . $method, $clean);
+					$opts->update_option(SiteGuard_Backup_Options::method_option($method), $clean);
 					$imported++;
 				} elseif ($this->is_flat_method_settings($value)) {
 					// Legacy flat format: array(field=>scalar).
@@ -2677,7 +2619,7 @@ class SiteGuard_Backup_Commands {
 					if ($encrypt_creds) {
 						$clean = SiteGuard_Backup_Security::encrypt_method_options($method, $clean);
 					}
-					$opts->update_option('sgbackup_' . $method, $clean);
+					$opts->update_option(SiteGuard_Backup_Options::method_option($method), $clean);
 					$imported++;
 				} else {
 					// Unexpected structure: skip rather than persist an attacker-shaped blob.
