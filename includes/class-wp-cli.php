@@ -1338,16 +1338,28 @@ class SiteGuard_Backup_CLI_Command extends WP_CLI_Command {
     /**
      * Create a migration key.
      *
+     * ## OPTIONS
+     *
+     * [--name=<name>]
+     * : A name for the key.
+     *
+     * [--expires=<days>]
+     * : Days until the key stops working (0 = never, the default; use it for
+     *   scheduled sends).
+     *
      * ## EXAMPLES
      *
-     *     wp siteguardbackup create_migration_key
+     *     wp siteguardbackup create_migration_key --name=staging --expires=7
      *
      * @subcommand create_migration_key
      */
     public function create_migration_key($args, $assoc_args) {
         require_once SGBACKUP_DIR . 'includes/class-commands.php';
         $commands = new SiteGuard_Backup_Commands();
-        $result = $commands->migrate_key_create(array());
+        $result = $commands->migrate_key_create(array(
+            'name'         => isset($assoc_args['name']) ? $assoc_args['name'] : 'default',
+            'expires_days' => isset($assoc_args['expires']) ? (int) $assoc_args['expires'] : 0,
+        ));
 
         if (is_wp_error($result)) {
             WP_CLI::error($result->get_error_message());

@@ -30,143 +30,40 @@ class SiteGuard_Backup_Remote_Send {
 	}
 
 	/**
-	 * Handle incoming RPC messages (runs before the main AJAX handler).
-	 * Security: authentication is via RSA-encrypted messages, not WordPress nonces.
-	 * The sender must possess the receiver's public key to encrypt, and only the
-	 * receiver's private key can decrypt - this provides authentication.
+	 * RPC from a logged-in administrator's browser session (the same action name
+	 * as the admin AJAX dispatcher; this runs first and only for rpc_message).
 	 */
 	public function handle_rpc_message() {
 		if (empty($_POST['subaction']) || $_POST['subaction'] !== 'rpc_message') return;
-
-		error_log("SiteGuard Backup RPC Receiver: handle_rpc_message entered (authenticated path)");
-
 		if (!current_user_can('manage_options')) {
-			error_log("SiteGuard Backup RPC Receiver: rejected - insufficient permissions");
 			wp_send_json_error(array('message' => 'Insufficient permissions.'));
-			return;
 		}
-
-		// Verify required RPC header is present
-		if (empty($_SERVER['HTTP_X_SGBACKUP_RPC'])) {
-			error_log("SiteGuard Backup RPC Receiver: rejected - missing X-SGBackup-RPC header");
-			return;
-		}
-
-		if (empty($_POST['encrypted']) || empty($_POST['key'])) {
-			error_log("SiteGuard Backup RPC Receiver: rejected - missing encrypted/key POST data");
-			return;
-		}
-
-		// Rate limiting: max 600 requests per 60-second sliding window per IP.
-		// Uses a stored window start time so the counter resets properly even
-		// during sustained transfers (set_transient alone resets TTL on every
-		// call, which would make the counter never expire).
-		require_once SGBACKUP_DIR . 'includes/class-security.php';
-		$ip = SiteGuard_Backup_Security::get_client_ip();
-		if ('' === $ip) $ip = 'unknown';
-		$rate_key = 'sgbackup_rpc_rate_' . md5($ip);
-		$rate_data = get_transient($rate_key);
-		if (!is_array($rate_data) || !isset($rate_data['t']) || (time() - $rate_data['t']) >= 60) {
-			$rate_data = array('c' => 0, 't' => time());
-		}
-		$rate_data['c']++;
-		if ($rate_data['c'] > 600) {
-			wp_send_json_error(array('message' => 'Rate limit exceeded. Try again later.'));
-			return;
-		}
-		set_transient($rate_key, $rate_data, 120);
-
-		$name_hash = isset($_POST['name_hash']) ? sanitize_text_field($_POST['name_hash']) : '';
-
-		// Find the matching local key
-		$opts = SiteGuard_Backup_Options::instance();
-		$local_keys = $opts->get_option('sgbackup_migrator_localkeys', array());
-
-		if (empty($name_hash) || !isset($local_keys[$name_hash])) {
-			wp_send_json_error(array('message' => 'Unknown key identifier.'));
-			return;
-		}
-
-		$key_data = $local_keys[$name_hash];
-
-		// Validate key data structure before use
-		if (empty($key_data['private_key']) || !is_string($key_data['private_key'])) {
-			wp_send_json_error(array('message' => 'Migration key data is corrupted.'));
-			return;
-		}
-
-		// Decrypt the message
-		require_once SGBACKUP_DIR . 'includes/class-remote-communications.php';
-		$rpc = new SiteGuard_Backup_Remote_Communications();
-
-		// Validate base64 format before passing to decryption
-		$encrypted = isset($_POST['encrypted']) ? $_POST['encrypted'] : '';
-		$enc_key = isset($_POST['key']) ? $_POST['key'] : '';
-		if (!is_string($encrypted) || !is_string($enc_key) || !preg_match('/^[A-Za-z0-9+\/=\s]+$/', $encrypted) || !preg_match('/^[A-Za-z0-9+\/=\s]+$/', $enc_key)) {
-			wp_send_json_error(array('message' => 'Invalid data format.'));
-			return;
-		}
-
-		$payload = $rpc->decrypt_message(
-			$encrypted,
-			$enc_key,
-			$this->decrypt_private_key($key_data['private_key'])
-		);
-
-		if (is_wp_error($payload)) {
-			// Generic error to avoid leaking internal details to unauthenticated callers
-			wp_send_json_error(array('message' => 'Authentication failed.'));
-			return;
-		}
-
-		// Route command
-		$command = isset($payload['command']) ? $payload['command'] : '';
-		$data = isset($payload['data']) ? $payload['data'] : array();
-
-		$result = $this->dispatch_command($command, $data, $name_hash, $key_data);
-
-		if (is_wp_error($result)) {
-			wp_send_json_error(array('message' => $result->get_error_message()));
-			return;
-		}
-
-		wp_send_json_success($result);
+		$this->process_rpc();
 	}
 
 	/**
-	 * Handle incoming RPC messages from unauthenticated (nopriv) requests.
-	 * Validates that migration keys exist and checks for HMAC pre-check header
-	 * BEFORE processing any data, to reject invalid requests early.
+	 * RPC from another site (no WordPress session). Authorized by the migration
+	 * key: see process_rpc().
 	 */
 	public function handle_rpc_message_nopriv() {
-		// Require HMAC pre-check header to be present
-		if (empty($_SERVER['HTTP_X_SGBACKUP_HMAC'])) {
-			wp_send_json_error(array('message' => 'Missing HMAC pre-check header.'));
-			return;
-		}
-
-		// Validate that migration keys exist before processing anything
-		$opts = SiteGuard_Backup_Options::instance();
-		$local_keys = $opts->get_option('sgbackup_migrator_localkeys', array());
-		if (empty($local_keys)) {
-			wp_send_json_error(array('message' => 'No migration keys configured.'));
-			return;
-		}
-
-		// Validate name_hash maps to a known key before decryption
-		$name_hash = isset($_POST['name_hash']) ? sanitize_text_field($_POST['name_hash']) : '';
-		if (empty($name_hash) || !isset($local_keys[$name_hash])) {
-			wp_send_json_error(array('message' => 'Unknown key identifier.'));
-			return;
-		}
-
-		// Process the RPC message directly (skip current_user_can check since
-		// authentication is done via RSA key encryption, not WordPress sessions)
 		if (empty($_POST['subaction']) || $_POST['subaction'] !== 'rpc_message') return;
-		if (empty($_SERVER['HTTP_X_SGBACKUP_RPC'])) return;
-		if (empty($_POST['encrypted']) || empty($_POST['key'])) return;
+		$this->process_rpc();
+	}
 
-		// Rate limiting (shares counter with authenticated path above)
+	/**
+	 * Authenticate, decrypt, run and answer one RPC message.
+	 *
+	 * Order: rate limit, key lookup, HMAC with the key's secret (before any RSA
+	 * work), key binding and expiry, decryption and replay checks, command. The
+	 * answer is signed with the same secret and bound to the message nonce. Every
+	 * authentication failure answers the same generic message.
+	 */
+	private function process_rpc() {
+		if (empty($_SERVER['HTTP_X_SGBACKUP_RPC'])) {
+			wp_send_json_error(array('message' => 'Authentication failed.'));
+		}
+
+		// Rate limiting: max 600 requests per 60-second window per IP.
 		require_once SGBACKUP_DIR . 'includes/class-security.php';
 		$ip = SiteGuard_Backup_Security::get_client_ip();
 		if ('' === $ip) $ip = 'unknown';
@@ -178,44 +75,70 @@ class SiteGuard_Backup_Remote_Send {
 		$rate_data['c']++;
 		if ($rate_data['c'] > 600) {
 			wp_send_json_error(array('message' => 'Rate limit exceeded. Try again later.'));
-			return;
 		}
 		set_transient($rate_key, $rate_data, 120);
 
-		$key_data = $local_keys[$name_hash];
+		$fail = function () { wp_send_json_error(array('message' => 'Authentication failed.')); };
 
+		$name_hash = isset($_POST['name_hash']) && is_string($_POST['name_hash']) ? sanitize_text_field($_POST['name_hash']) : '';
+		$encrypted = isset($_POST['encrypted']) && is_string($_POST['encrypted']) ? $_POST['encrypted'] : '';
+		$enc_key   = isset($_POST['key']) && is_string($_POST['key']) ? $_POST['key'] : '';
+		$mac       = isset($_POST['mac']) && is_string($_POST['mac']) ? $_POST['mac'] : '';
+		if ('' === $name_hash || '' === $encrypted || '' === $enc_key
+			|| !preg_match('/^[A-Za-z0-9+\/=\s]+$/', $encrypted) || !preg_match('/^[A-Za-z0-9+\/=\s]+$/', $enc_key)) {
+			$fail();
+		}
+
+		$opts = SiteGuard_Backup_Options::instance();
+		$local_keys = $opts->get_option('sgbackup_migrator_localkeys', array());
+		if (!is_array($local_keys) || !isset($local_keys[$name_hash]) || !is_array($local_keys[$name_hash])) {
+			$fail();
+		}
+		$key_data = $local_keys[$name_hash];
 		if (empty($key_data['private_key']) || !is_string($key_data['private_key'])) {
-			wp_send_json_error(array('message' => 'Migration key data is corrupted.'));
-			return;
+			$fail();
 		}
 
 		require_once SGBACKUP_DIR . 'includes/class-remote-communications.php';
+		$secret = SiteGuard_Backup_Remote_Communications::key_secret(isset($key_data['secret']) ? $key_data['secret'] : '');
+		if ('' !== $secret) {
+			$expected = SiteGuard_Backup_Remote_Communications::mac($secret, array('request', $name_hash, $encrypted, $enc_key));
+			if ('' === $mac || !hash_equals($expected, $mac)) {
+				$fail();
+			}
+		} elseif (!SiteGuard_Backup_Remote_Communications::legacy_keys_allowed()) {
+			wp_send_json_error(array('message' => 'This migration key was made by a SiteGuard Backup version older than 1.7.0 and cannot authenticate messages. Create a new key on this site and add the destination again on the sending site.'));
+		}
+
+		// A key belongs to the site it was created on (keys are stored network-wide).
+		if (isset($key_data['blog_id']) && (int) $key_data['blog_id'] !== (int) get_current_blog_id()) {
+			$fail();
+		}
+		if (!empty($key_data['expires']) && time() > (int) $key_data['expires']) {
+			wp_send_json_error(array('message' => 'This migration key has expired. Create a new key on this site and add the destination again on the sending site.'));
+		}
+
 		$rpc = new SiteGuard_Backup_Remote_Communications();
-
-		$encrypted = isset($_POST['encrypted']) ? $_POST['encrypted'] : '';
-		$enc_key = isset($_POST['key']) ? $_POST['key'] : '';
-		if (!is_string($encrypted) || !is_string($enc_key) || !preg_match('/^[A-Za-z0-9+\/=\s]+$/', $encrypted) || !preg_match('/^[A-Za-z0-9+\/=\s]+$/', $enc_key)) {
-			wp_send_json_error(array('message' => 'Invalid data format.'));
-			return;
-		}
-
 		$payload = $rpc->decrypt_message($encrypted, $enc_key, $this->decrypt_private_key($key_data['private_key']));
-
 		if (is_wp_error($payload)) {
-			wp_send_json_error(array('message' => 'Authentication failed.'));
-			return;
+			$fail();
 		}
 
-		$command = isset($payload['command']) ? $payload['command'] : '';
-		$data = isset($payload['data']) ? $payload['data'] : array();
+		$command = isset($payload['command']) && is_string($payload['command']) ? $payload['command'] : '';
+		$data = isset($payload['data']) && is_array($payload['data']) ? $payload['data'] : array();
 
 		$result = $this->dispatch_command($command, $data, $name_hash, $key_data);
-
 		if (is_wp_error($result)) {
 			wp_send_json_error(array('message' => $result->get_error_message()));
-			return;
 		}
 
+		if ('' !== $secret) {
+			$json = wp_json_encode($result);
+			wp_send_json_success(array(
+				'signed' => $json,
+				'mac'    => SiteGuard_Backup_Remote_Communications::mac($secret, array('response', (string) $payload['nonce'], $json)),
+			));
+		}
 		wp_send_json_success($result);
 	}
 
@@ -262,7 +185,7 @@ class SiteGuard_Backup_Remote_Send {
 				return $this->cmd_upload_complete($data);
 
 			case 'set_backup_metadata':
-				return $this->cmd_set_backup_metadata($data);
+				return $this->cmd_set_backup_metadata($data, $name_hash);
 
 			default:
 				error_log("SiteGuard Backup RPC Receiver: unknown command '{$command}'");
@@ -413,7 +336,7 @@ class SiteGuard_Backup_Remote_Send {
 				// A peer may replace only its own earlier transfer. A file not in
 				// history at all (null) may be a local backup still being written,
 				// so it is protected too; that used to be deleted and replaced.
-				if (true !== $this->file_owned_by_remote_set($final_file)) {
+				if (true !== $this->file_owned_by_remote_set($final_file, $name_hash)) {
 					@unlink($tmp_file);
 					return new WP_Error('file_exists', 'A local backup file with this name already exists and will not be overwritten.');
 				}
@@ -435,7 +358,7 @@ class SiteGuard_Backup_Remote_Send {
 			$result['size'] = filesize($final_file);
 
 			// Register in backup history
-			$this->register_received_file($filename);
+			$this->register_received_file($filename, $name_hash);
 		}
 
 		return $result;
@@ -487,7 +410,7 @@ class SiteGuard_Backup_Remote_Send {
 	/**
 	 * Set metadata (label, always_keep, source_url) on a received backup.
 	 */
-	private function cmd_set_backup_metadata($data) {
+	private function cmd_set_backup_metadata($data, $name_hash = '') {
 		$timestamp = (isset($data['timestamp']) && is_scalar($data['timestamp'])) ? intval($data['timestamp']) : 0;
 		$nonce = (isset($data['nonce']) && is_string($data['nonce'])) ? sanitize_text_field($data['nonce']) : '';
 		// Scalar fields must be strings - an array here is a TypeError on PHP 8.
@@ -536,6 +459,10 @@ class SiteGuard_Backup_Remote_Send {
 		$target_services = isset($history[$target_ts]['service']) ? (array) $history[$target_ts]['service'] : array();
 		if (!in_array('remotesend', $target_services, true)) {
 			return new WP_Error('not_remote', 'Backup set was not received from a remote site; metadata cannot be changed remotely.');
+		}
+		// ...and only by the peer (migration key) that sent it.
+		if (!isset($history[$target_ts]['remote_key']) || !hash_equals((string) $history[$target_ts]['remote_key'], (string) $name_hash)) {
+			return new WP_Error('not_owner', 'This backup set was received with a different migration key; its metadata cannot be changed with this one.');
 		}
 
 		$changed = false;
@@ -599,7 +526,7 @@ class SiteGuard_Backup_Remote_Send {
 	 * @return bool|null True: in a remotesend set. False: in a locally created
 	 *                   set (must not be touched by a peer). Null: not in history.
 	 */
-	private function file_owned_by_remote_set($path) {
+	private function file_owned_by_remote_set($path, $name_hash = '') {
 		$name = basename($path);
 		$history = SiteGuard_Backup_History::get_history_raw();
 		foreach ($history as $entry) {
@@ -609,7 +536,10 @@ class SiteGuard_Backup_Remote_Send {
 				$files = is_array($entry[$ent]) ? $entry[$ent] : array($entry[$ent]);
 				if (in_array($name, $files, true)) {
 					$services = isset($entry['service']) ? (array) $entry['service'] : array();
-					return in_array('remotesend', $services, true);
+					// Only the peer that sent the set may replace its files.
+					return in_array('remotesend', $services, true)
+						&& isset($entry['remote_key']) && '' !== (string) $name_hash
+						&& hash_equals((string) $entry['remote_key'], (string) $name_hash);
 				}
 			}
 		}
@@ -619,7 +549,7 @@ class SiteGuard_Backup_Remote_Send {
 	/**
 	 * Register a received file in backup history.
 	 */
-	private function register_received_file($filename) {
+	private function register_received_file($filename, $name_hash = '') {
 		// Parse filename: backup_{date}_{site}_{nonce}-{entity}.{ext}
 		if (!preg_match('/^backup_(\d{4}-\d{2}-\d{2}-\d{4})_([^_]+)_([a-zA-Z0-9]+)/', $filename, $m)) {
 			error_log("SiteGuard Backup: Failed to register received file (filename doesn't match pattern): {$filename}");
@@ -665,13 +595,15 @@ class SiteGuard_Backup_Remote_Send {
 				$existing = $history[$timestamp];
 				$existing_services = isset($existing['service']) ? (array) $existing['service'] : array();
 				$same_nonce = isset($existing['nonce']) && $existing['nonce'] === $nonce;
-				if ($same_nonce && in_array('remotesend', $existing_services, true)) break;
+				$same_key = isset($existing['remote_key']) && (string) $existing['remote_key'] === (string) $name_hash;
+				if ($same_nonce && $same_key && in_array('remotesend', $existing_services, true)) break;
 				$timestamp++;
 			}
 			if (!isset($history[$timestamp])) {
 				$history[$timestamp] = array(
-					'nonce'   => $nonce,
-					'service' => array('remotesend'),
+					'nonce'      => $nonce,
+					'service'    => array('remotesend'),
+					'remote_key' => (string) $name_hash,
 				);
 			}
 

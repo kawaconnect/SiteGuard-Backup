@@ -163,6 +163,43 @@ if (method_exists($m, 'listfiles')) {
 	$check("{$method_id}: files gone after delete", 0 === count(array_intersect(array_keys($files), array_map('basename', $names))));
 }
 
+// S3 family: a multipart upload interrupted mid-way (the process killed)
+// resumes from the parts already on S3 instead of starting again.
+if ($m instanceof SiteGuard_Backup_Method_S3 && !$upload_only) {
+	$rname = 'backup_2026-01-01-0000_sgtest_resume00000-uploads.zip';
+	$rpath = $work . '/up/' . $rname;
+	$fh = fopen($rpath, 'wb');
+	for ($i = 0; $i < 21; $i++) fwrite($fh, random_bytes(1048576));
+	fclose($fh);
+	$ps = function () { return 5 * 1048576; };
+	add_filter('sgbackup_s3_part_size', $ps);
+	$puts = 0; $kill = true;
+	$hook = function ($pre, $args, $url) use (&$puts, &$kill) {
+		if (isset($args['method']) && 'PUT' === $args['method'] && false !== strpos($url, 'partNumber=')) {
+			$puts++;
+			if ($kill && 3 === $puts) throw new RuntimeException('simulated kill');
+		}
+		return $pre;
+	};
+	add_filter('pre_http_request', $hook, 10, 3);
+	$interrupted = false;
+	try { $m->backup($rpath); } catch (RuntimeException $e) { $interrupted = true; }
+	$check("{$method_id}: upload interrupted after 2 of 5 parts (simulated kill)", $interrupted);
+	$state = get_option(SiteGuard_Backup_Method_S3::MPU_STATE_OPTION, array());
+	$check("{$method_id}: the unfinished upload is recorded for resume", is_array($state) && 1 === count($state));
+	$kill = false; $puts = 0;
+	$r = $m->backup($rpath);
+	remove_filter('pre_http_request', $hook, 10);
+	remove_filter('sgbackup_s3_part_size', $ps);
+	$check("{$method_id}: the next attempt completes the upload", true === $r, $err($r));
+	$check("{$method_id}: ...uploading only the 3 missing parts", 3 === $puts, "uploaded {$puts} part(s)");
+	$check("{$method_id}: resume record removed after completion", array() === get_option(SiteGuard_Backup_Method_S3::MPU_STATE_OPTION, array()));
+	$r = $m->download($rname, $work . '/down/');
+	$check("{$method_id}: resumed object downloads byte-identical", true === $r && md5_file($work . '/down/' . $rname) === md5_file($rpath), $err($r));
+	$m->delete(array($rname));
+	foreach (array('up', 'down') as $d) { if (is_file("{$work}/{$d}/{$rname}")) unlink("{$work}/{$d}/{$rname}"); }
+}
+
 // Download of a missing object must fail cleanly and leave nothing behind.
 $r = $m->download('backup_missing_sgtest-db.gz', $work . '/down/');
 $check("{$method_id}: missing object download reports an error", is_wp_error($r));

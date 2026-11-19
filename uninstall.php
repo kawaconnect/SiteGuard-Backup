@@ -27,6 +27,7 @@ $wpdb->query($wpdb->prepare(
 // (Mirror every sgbackup_* hook that sgbackup_deactivate() clears in siteguardbackup.php.)
 wp_clear_scheduled_hook('sgbackup_backup');
 wp_clear_scheduled_hook('sgbackup_backup_database');
+wp_clear_scheduled_hook('sgbackup_backup_database_deferred');
 wp_clear_scheduled_hook('sgbackup_backup_all');
 wp_clear_scheduled_hook('sgbackup_backup_incremental');
 wp_clear_scheduled_hook('sgbackup_backup_remotesend');
@@ -90,6 +91,7 @@ if (is_multisite()) {
 		// Per-site cron hooks
 		wp_clear_scheduled_hook('sgbackup_backup');
 		wp_clear_scheduled_hook('sgbackup_backup_database');
+		wp_clear_scheduled_hook('sgbackup_backup_database_deferred');
 		wp_clear_scheduled_hook('sgbackup_backup_all');
 		wp_clear_scheduled_hook('sgbackup_backup_incremental');
 		wp_clear_scheduled_hook('sgbackup_backup_remotesend');

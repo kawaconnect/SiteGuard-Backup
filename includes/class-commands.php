@@ -1131,9 +1131,11 @@ class SiteGuard_Backup_Commands {
 
 		$name = isset($params['name']) ? sanitize_text_field($params['name']) : 'default';
 		$key_size = isset($params['key_size']) ? intval($params['key_size']) : 2048;
+		if (!in_array($key_size, array(2048, 3072, 4096), true)) $key_size = 2048;
+		$expires_days = isset($params['expires_days']) && is_scalar($params['expires_days']) ? max(0, min(3650, intval($params['expires_days']))) : 0;
 
 		$rpc = new SiteGuard_Backup_Remote_Communications();
-		$result = $rpc->generate_key($name, $key_size);
+		$result = $rpc->generate_key($name, $key_size, $expires_days);
 
 		if (is_wp_error($result)) return $result;
 
@@ -1158,6 +1160,17 @@ class SiteGuard_Backup_Commands {
 		$result = $rpc->decode_portable_bundle($params['key_bundle']);
 
 		if (is_wp_error($result)) return $result;
+
+		// The secret is stored encrypted: a copy of this site's database (a
+		// backup, a leak) must not be enough to send to the destination.
+		if (!empty($result['secret'])) {
+			require_once SGBACKUP_DIR . 'includes/class-security.php';
+			$enc = SiteGuard_Backup_Security::encrypt_option($result['secret']);
+			if (!SiteGuard_Backup_Security::is_encrypted($enc)) {
+				return new WP_Error('no_encryption', 'The migration key secret cannot be stored encrypted (OpenSSL or AUTH_KEY missing in wp-config.php).');
+			}
+			$result['secret'] = $enc;
+		}
 
 		// Save destination
 		$opts = SiteGuard_Backup_Options::instance();
@@ -1400,9 +1413,14 @@ class SiteGuard_Backup_Commands {
 		$result = array();
 
 		foreach ($keys as $hash => $key_data) {
+			// Keys are stored network-wide; list this site's own (and pre-1.7.0
+			// keys, which carry no site).
+			if (isset($key_data['blog_id']) && (int) $key_data['blog_id'] !== (int) get_current_blog_id()) continue;
 			$result[$hash] = array(
 				'name'    => isset($key_data['name']) ? $key_data['name'] : 'unnamed',
 				'created' => isset($key_data['created']) ? $key_data['created'] : 0,
+				'expires' => isset($key_data['expires']) ? (int) $key_data['expires'] : 0,
+				'legacy'  => empty($key_data['secret']),
 			);
 		}
 
@@ -1421,6 +1439,10 @@ class SiteGuard_Backup_Commands {
 		$keys = $opts->get_option('sgbackup_migrator_localkeys', array());
 		$key_id = sanitize_text_field($params['key_id']);
 
+		// Another site's key (keys are stored network-wide) is not this site's to delete.
+		if (isset($keys[$key_id]) && isset($keys[$key_id]['blog_id']) && (int) $keys[$key_id]['blog_id'] !== (int) get_current_blog_id()) {
+			return new WP_Error('not_found', 'Key not found');
+		}
 		if (isset($keys[$key_id])) {
 			unset($keys[$key_id]);
 			$opts->update_option('sgbackup_migrator_localkeys', $keys);

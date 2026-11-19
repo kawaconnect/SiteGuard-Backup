@@ -2704,7 +2704,8 @@
 
 				$('#sgbackup-key-status').text('Generating key...').removeClass('success error');
 
-				self.ajax('migrate_key_create', { name: name, key_size: keySize }, function(data) {
+				var expiresDays = parseInt($('#sgbackup-migrate-keyexpires').val(), 10) || 0;
+				self.ajax('migrate_key_create', { name: name, key_size: keySize, expires_days: expiresDays }, function(data) {
 					$('#sgbackup-key-status').text('Key created!').addClass('success');
 					$('#sgbackup-key-bundle').val(data.bundle);
 					$('#sgbackup-key-result').show();

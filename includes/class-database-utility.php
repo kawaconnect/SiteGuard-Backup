@@ -824,9 +824,18 @@ class SiteGuard_Backup_Database_Utility {
 
 	/**
 	 * Atomic table restore: create tables with temp prefix, then RENAME atomically.
+	 *
+	 * @param array|null $only_tables Import only these tables (exact names); the
+	 *        dump's other tables are skipped and their live copies are not touched.
+	 *        Migrations (which keep the destination's users) and selective,
+	 *        tables-only and skipped-subsite restores used to go through the
+	 *        non-atomic filtered executor: a failure halfway left the live site
+	 *        with some tables dropped and others half imported. They are staged and
+	 *        swapped in only when every statement succeeded, like a full restore.
 	 */
-	public static function execute_sql_file_atomic($sql_file, $progress_callback = null) {
+	public static function execute_sql_file_atomic($sql_file, $progress_callback = null, $only_tables = null) {
 		global $wpdb;
+		$only = (null === $only_tables) ? null : array_fill_keys(array_map('strval', (array) $only_tables), true);
 
 		$temp_prefix = '_sgb_tmp_' . substr(md5(time()), 0, 6) . '_';
 
@@ -847,6 +856,9 @@ class SiteGuard_Backup_Database_Utility {
 		$is_gz = (substr($sql_file, -3) === '.gz');
 		$fh = $is_gz ? @gzopen($sql_file, 'rb') : @fopen($sql_file, 'r');
 		if (!$fh) {
+			if (null !== $only) {
+				return array('success' => false, 'errors' => array("Failed to open SQL file: {$sql_file}"), 'tables_restored' => 0);
+			}
 			return self::execute_sql_file($sql_file, $progress_callback);
 		}
 
@@ -967,6 +979,10 @@ class SiteGuard_Backup_Database_Utility {
 				// rewrote row data that happened to quote a table name). Unbackticked
 				// identifiers are accepted too.
 				$ident = '`?([A-Za-z0-9_$]+)`?';
+				if (null !== $only && preg_match('/^(?:DROP\s+TABLE\s+(?:IF\s+EXISTS\s+)?|CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?|(?:INSERT(?:\s+IGNORE)?|REPLACE)\s+INTO\s+|TRUNCATE\s+(?:TABLE\s+)?|ALTER\s+TABLE\s+|DELETE\s+FROM\s+|UPDATE\s+)' . $ident . '/i', $query, $om)
+					&& !isset($only[$om[1]])) {
+					continue; // not selected: the live table stays as it is
+				}
 				if (preg_match('/^(DROP\s+TABLE\s+(?:IF\s+EXISTS\s+)?)' . $ident . '/i', $query, $m)) {
 					$original = $m[2];
 					$temp = $make_temp($original);
@@ -984,7 +1000,9 @@ class SiteGuard_Backup_Database_Utility {
 					// at the staged parent so the swap keeps the relationship intact.
 					if (stripos($query, 'FOREIGN KEY') !== false) {
 						$query = preg_replace('/CONSTRAINT\s+`[^`]+`\s+FOREIGN\s+KEY/i', 'FOREIGN KEY', $query);
-						$query = preg_replace_callback('/(REFERENCES\s+)`([^`]+)`/i', function($rm) use (&$tables_created, $make_temp) {
+						$query = preg_replace_callback('/(REFERENCES\s+)`([^`]+)`/i', function($rm) use (&$tables_created, $make_temp, $only) {
+							// A parent that is not being imported stays the live table.
+							if (null !== $only && !isset($only[$rm[2]])) return $rm[0];
 							if (!isset($tables_created[$rm[2]])) {
 								$tables_created[$rm[2]] = $make_temp($rm[2]);
 							}
@@ -1523,13 +1541,88 @@ class SiteGuard_Backup_Database_Utility {
 	 * Remove quoted strings, backticked identifiers and comments from a (short)
 	 * statement so keywords can be looked for in what is left.
 	 */
+	/** Like strip_sql_literals(), but comments are left as they are (to detect them). */
+	private static function strip_sql_literals_keep_comments($query) {
+		$q = (string) $query;
+		$len = strlen($q);
+		$out = '';
+		$i = 0;
+		while ($i < $len) {
+			$c = $q[$i];
+			if ("'" === $c || '"' === $c || '`' === $c) {
+				$j = $i + 1;
+				while ($j < $len) {
+					if ('`' !== $c && '\\' === $q[$j]) { $j += 2; continue; }
+					if ($q[$j] === $c) {
+						if ($j + 1 < $len && $q[$j + 1] === $c) { $j += 2; continue; }
+						break;
+					}
+					$j++;
+				}
+				$out .= ('`' === $c) ? '`i`' : $c . $c;
+				$i = $j + 1;
+				continue;
+			}
+			$out .= $c;
+			$i++;
+		}
+		return $out;
+	}
+
 	private static function strip_sql_literals($query) {
-		$out = preg_replace(
-			array("/'(?:[^'\\\\]|\\\\.|'')*'/s", '/"(?:[^"\\\\]|\\\\.|"")*"/s', '/`[^`]*`/', '#/\*.*?\*/#s'),
-			array("''", '""', '`i`', ' '),
-			$query
-		);
-		return null === $out ? $query : $out;
+		// One left-to-right scan with a single quoting state, as MySQL reads it.
+		// (Separate regex passes per quote type let a quote inside another kind
+		// of quoting swallow real keywords.) Strings and identifiers become empty
+		// placeholders, ordinary comments become a space, and the CONTENT of a
+		// MySQL versioned comment (/*! ... */) is kept: the server executes it.
+		$q = (string) $query;
+		$len = strlen($q);
+		$out = '';
+		$i = 0;
+		while ($i < $len) {
+			$c = $q[$i];
+			if ("'" === $c || '"' === $c || '`' === $c) {
+				$j = $i + 1;
+				while ($j < $len) {
+					if ('`' !== $c && '\\' === $q[$j]) { $j += 2; continue; }
+					if ($q[$j] === $c) {
+						if ($j + 1 < $len && $q[$j + 1] === $c) { $j += 2; continue; }
+						break;
+					}
+					$j++;
+				}
+				$out .= ('`' === $c) ? '`i`' : $c . $c;
+				$i = $j + 1;
+				continue;
+			}
+			if ('/' === $c && $i + 1 < $len && '*' === $q[$i + 1]) {
+				if ($i + 2 < $len && '!' === $q[$i + 2]) {
+					// Versioned comment: drop the markers and the version number only.
+					$i += 3;
+					$i += strspn($q, '0123456789', $i);
+					$out .= ' ';
+					continue;
+				}
+				$end = strpos($q, '*/', $i + 2);
+				$i = (false === $end) ? $len : $end + 2;
+				$out .= ' ';
+				continue;
+			}
+			if ('*' === $c && $i + 1 < $len && '/' === $q[$i + 1]) {
+				$i += 2; // end of a versioned comment
+				$out .= ' ';
+				continue;
+			}
+			if ('#' === $c || ('-' === $c && $i + 2 < $len && '-' === $q[$i + 1] && (' ' === $q[$i + 2] || "\t" === $q[$i + 2] || "\n" === $q[$i + 2]))) {
+				$end = strpos($q, "\n", $i);
+				$i = (false === $end) ? $len : $end + 1;
+				$out .= ' ';
+				continue;
+			}
+			$out .= $c;
+			$i++;
+		}
+		return $out;
 	}
 
 	/**
@@ -1562,8 +1655,13 @@ class SiteGuard_Backup_Database_Utility {
 		} elseif (preg_match('/^CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?`([^`]+)`\s*\(/i', $head, $m)) {
 			$table = $m[1];
 			if (strlen($query) > 1048576) return false;
+			// No comments of any kind in a table definition from a subsite import
+			// (a versioned comment is executed by MySQL). Neither dumper writes them
+			// inside CREATE TABLE.
+			$bare_for_comments = self::strip_sql_literals_keep_comments($query);
+			if (false !== strpos($bare_for_comments, '/*') || false !== strpos($bare_for_comments, '#') || preg_match('/--\s/', $bare_for_comments)) return false;
 			if (preg_match('/\b(?:SELECT|UNION|DIRECTORY|CONNECTION|TABLESPACE)\b|;/i', self::strip_sql_literals($query))) return false;
-		} elseif (preg_match('/^INSERT\s+INTO\s+`([^`]+)`\s*(?:\(\s*`[^`]+`(?:\s*,\s*`[^`]+`)*\s*\)\s*)?VALUES\b/i', $head, $m)) {
+		} elseif (preg_match('/^INSERT\s+INTO\s+`([^`]+)`\s*(?:\(\s*`[^`]+`(?:\s*,\s*`[^`]+`)*\s*\)\s*)?VALUES\b/i', substr($query, 0, 262144), $m)) {
 			$table = $m[1];
 			if (!self::insert_values_are_literals(substr($query, strlen($m[0])))) return false;
 		} else {

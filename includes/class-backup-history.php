@@ -320,6 +320,7 @@ class SiteGuard_Backup_History {
 		$history = self::get_history_raw();
 		krsort($history); // newest first - retention keeps the most recent N
 		$count = 0;
+		$seen = 0;
 		$to_delete = array();
 
 		foreach ($history as $timestamp => $backup) {
@@ -336,8 +337,18 @@ class SiteGuard_Backup_History {
 			// not one of the N copies to keep: two bad runs in a row used to push out
 			// the last complete backup. It is still removed once N complete sets are
 			// newer than it.
-			$incomplete = !empty($backup['failed_entities']) || ($type === 'db' && !empty($backup['db_failed_tables']));
-			if ($count >= $retain) {
+			// Only failures that matter for this type: a set with a good database
+			// dump and a failed uploads archive is a complete database copy.
+			$failed = array_map('strval', (array) (isset($backup['failed_entities']) ? $backup['failed_entities'] : array()));
+			$db_failed = false;
+			foreach ($failed as $f) { if (0 === strpos($f, 'database')) { $db_failed = true; break; } }
+			$file_failed = count($failed) > ($db_failed ? 1 : 0);
+			$incomplete = ($type === 'db') ? $db_failed : $file_failed;
+			$seen++;
+			// Hard cap: incomplete sets are kept only while fewer than N complete
+			// ones exist, and never beyond 2 x N sets in all, so an entity that
+			// fails on every run cannot stop retention and fill the disk.
+			if ($count >= $retain || $seen > 2 * $retain) {
 				$to_delete[] = $timestamp;
 				continue;
 			}

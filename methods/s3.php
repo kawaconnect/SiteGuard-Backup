@@ -564,58 +564,174 @@ class SiteGuard_Backup_Method_S3 extends SiteGuard_Backup_Module {
 		return true;
 	}
 
+	/** Option holding unfinished multipart uploads (resume state), per site. */
+	const MPU_STATE_OPTION = 'sgbackup_s3_multipart_state';
+	/** An unfinished upload not resumed within this time is aborted. */
+	const MPU_STATE_TTL = 86400;
+
+	/** Identifies one object on one account of one S3-family method. */
+	protected function mpu_state_key($key) {
+		$o = $this->get_options();
+		return md5(implode('|', array($this->get_id(), (string) $this->instance_id, isset($o['bucket']) ? $o['bucket'] : '', isset($o['path']) ? $o['path'] : '', $key)));
+	}
+
+	protected function mpu_state_get($key) {
+		$all = get_option(self::MPU_STATE_OPTION, array());
+		$k = $this->mpu_state_key($key);
+		return (is_array($all) && isset($all[$k]) && is_array($all[$k])) ? $all[$k] : null;
+	}
+
+	protected function mpu_state_set($key, $state) {
+		$all = get_option(self::MPU_STATE_OPTION, array());
+		if (!is_array($all)) $all = array();
+		$k = $this->mpu_state_key($key);
+		if (null === $state) {
+			unset($all[$k]);
+		} else {
+			$all[$k] = $state;
+		}
+		if (empty($all)) {
+			delete_option(self::MPU_STATE_OPTION);
+		} else {
+			update_option(self::MPU_STATE_OPTION, $all, false);
+		}
+	}
+
+	/**
+	 * Abort recorded uploads of this account that were not resumed in time
+	 * (their job was abandoned), so their parts are not billed forever.
+	 */
+	protected function abort_expired_recorded_uploads() {
+		$all = get_option(self::MPU_STATE_OPTION, array());
+		if (!is_array($all) || empty($all)) return;
+		$changed = false;
+		foreach ($all as $k => $st) {
+			if (!is_array($st) || empty($st['updated']) || (time() - (int) $st['updated']) < self::MPU_STATE_TTL) continue;
+			if (!isset($st['method'], $st['instance'], $st['key'], $st['upload_id'])) { unset($all[$k]); $changed = true; continue; }
+			if ($st['method'] !== $this->get_id() || (string) $st['instance'] !== (string) $this->instance_id) continue;
+			$this->abort_multipart_upload($st['key'], $st['upload_id']);
+			unset($all[$k]);
+			$changed = true;
+		}
+		if ($changed) {
+			empty($all) ? delete_option(self::MPU_STATE_OPTION) : update_option(self::MPU_STATE_OPTION, $all, false);
+		}
+	}
+
+	/**
+	 * Parts S3 already holds for an unfinished upload (ListParts), as
+	 * part number => ETag; null when the upload no longer exists.
+	 */
+	protected function list_uploaded_parts($key, $upload_id) {
+		$parts = array();
+		$marker = 0;
+		for ($page = 0; $page < 20; $page++) {
+			$q = $key . '?uploadId=' . rawurlencode($upload_id) . ($marker ? '&part-number-marker=' . $marker : '');
+			$r = $this->request('GET', $q);
+			if (is_wp_error($r)) return null;
+			$body = wp_remote_retrieve_body($r);
+			if (!preg_match_all('#<Part>(.*?)</Part>#s', $body, $pm)) break;
+			foreach ($pm[1] as $p) {
+				if (!preg_match('#<PartNumber>(\d+)</PartNumber>#', $p, $n) || !preg_match('#<ETag>([^<]+)</ETag>#', $p, $e)) continue;
+				$size = preg_match('#<Size>(\d+)</Size>#', $p, $sz) ? (int) $sz[1] : -1;
+				$parts[(int) $n[1]] = array('etag' => trim(html_entity_decode($e[1], ENT_QUOTES | ENT_XML1), '"'), 'size' => $size);
+			}
+			if (!preg_match('#<IsTruncated>true</IsTruncated>#i', $body) || !preg_match('#<NextPartNumberMarker>(\d+)</NextPartNumberMarker>#', $body, $nm)) break;
+			$marker = (int) $nm[1];
+		}
+		return $parts;
+	}
+
+	/**
+	 * Multipart upload that resumes after an interruption.
+	 *
+	 * The upload id and part size are recorded before the first part. When the
+	 * process is killed (execution time limit, memory, a deploy) and the job
+	 * resumes, the next attempt asks S3 which parts it already has (ListParts),
+	 * keeps those that are complete and uploads only the rest. It used to start a
+	 * new upload from the first byte every time, so on a host with a short time
+	 * limit a large archive could never finish, and every attempt left billable
+	 * parts behind.
+	 *
+	 * A returned error (S3 refused something) still aborts the upload. Recorded
+	 * uploads not resumed within a day are aborted, as are unfinished uploads of
+	 * the same object that this site has no record of.
+	 */
 	protected function multipart_upload($file, $key) {
 		// Object Lock (B2) and storage-class/SSE headers belong on
 		// CreateMultipartUpload; they apply to the assembled object.
 		$storage_headers = array_merge($this->get_storage_headers(), $this->get_object_lock_headers());
+		clearstatcache(true, $file);
+		$filesize = (int) filesize($file);
+		$mtime = (int) filemtime($file);
 
-		// Parts left by an earlier attempt that died (killed process, timeout) are
-		// invisible and billed until aborted. Clear them before starting again.
-		$this->abort_stale_multipart_uploads($key);
+		$this->abort_expired_recorded_uploads();
 
-		$init = $this->request_with_retries(function () use ($key, $storage_headers) {
-			return $this->request('POST', $key . '?uploads', '', array_merge(array(
-				'Content-Type' => 'application/octet-stream',
-			), $storage_headers));
-		}, "S3 multipart initiate for {$key}");
-
-		if (is_wp_error($init)) return $init;
-
-		$body = wp_remote_retrieve_body($init);
-		if (!preg_match('/<UploadId>([^<]+)</', $body, $m)) {
-			return new WP_Error('s3_multipart_init', 'Failed to initiate multipart upload.');
-		}
-		$upload_id = html_entity_decode($m[1], ENT_QUOTES | ENT_XML1);
-
-		// Any failure after a successful CreateMultipartUpload must abort the
-		// upload, otherwise orphaned parts accrue storage charges indefinitely.
-		// That includes PHP ending the request (execution time limit, memory):
-		// shutdown functions still run then.
-		$pending = (object) array('open' => true);
-		$self = $this;
-		register_shutdown_function(function () use ($pending, $self, $key, $upload_id) {
-			if ($pending->open) {
-				$pending->open = false;
-				$self->abort_multipart_upload_on_shutdown($key, $upload_id);
+		$upload_id = '';
+		$part_size = 0;
+		$done = array();
+		$state = $this->mpu_state_get($key);
+		if ($state && isset($state['upload_id'], $state['size'], $state['mtime'], $state['part_size'])
+			&& (int) $state['size'] === $filesize && (int) $state['mtime'] === $mtime) {
+			$listed = $this->list_uploaded_parts($key, $state['upload_id']);
+			if (is_array($listed)) {
+				$upload_id = (string) $state['upload_id'];
+				$part_size = (int) $state['part_size'];
+				$last_part = (int) ceil($filesize / $part_size);
+				foreach ($listed as $num => $info) {
+					$expected = ($num < $last_part) ? $part_size : $filesize - ($last_part - 1) * $part_size;
+					// Only parts S3 holds in full (a part cut short is uploaded again).
+					if ($num >= 1 && $num <= $last_part && '' !== $info['etag'] && ($info['size'] < 0 || $info['size'] === $expected)) {
+						$done[$num] = $info['etag'];
+					}
+				}
+				$this->note(sprintf('S3: resuming the upload of %s: %d of %d parts already on S3', $key, count($done), $last_part));
+			} else {
+				$this->mpu_state_set($key, null); // the upload is gone (aborted or expired)
 			}
-		});
-		$result = $this->upload_parts_and_complete($file, $key, $upload_id);
-		$pending->open = false;
+		} elseif ($state) {
+			// The local file changed since: that upload cannot be continued.
+			$this->abort_multipart_upload($key, (string) $state['upload_id']);
+			$this->mpu_state_set($key, null);
+		}
+
+		if ('' === $upload_id) {
+			// Unfinished uploads of this object that this site has no record of
+			// (left by a version without resume, or another installation's run)
+			// are invisible and billed until aborted.
+			$this->abort_stale_multipart_uploads($key);
+
+			$init = $this->request_with_retries(function () use ($key, $storage_headers) {
+				return $this->request('POST', $key . '?uploads', '', array_merge(array(
+					'Content-Type' => 'application/octet-stream',
+				), $storage_headers));
+			}, "S3 multipart initiate for {$key}");
+			if (is_wp_error($init)) return $init;
+
+			$body = wp_remote_retrieve_body($init);
+			if (!preg_match('/<UploadId>([^<]+)</', $body, $m)) {
+				return new WP_Error('s3_multipart_init', 'Failed to initiate multipart upload.');
+			}
+			$upload_id = html_entity_decode($m[1], ENT_QUOTES | ENT_XML1);
+			$part_size = $this->part_size($filesize);
+		}
+
+		// Record before the first part, so a kill at any point can be resumed.
+		$record = array(
+			'method' => $this->get_id(), 'instance' => (string) $this->instance_id, 'key' => $key,
+			'upload_id' => $upload_id, 'size' => $filesize, 'mtime' => $mtime, 'part_size' => $part_size,
+			'updated' => time(),
+		);
+		$this->mpu_state_set($key, $record);
+
+		$result = $this->upload_parts_and_complete($file, $key, $upload_id, $part_size, $done, $record);
 		if (is_wp_error($result)) {
 			$this->abort_multipart_upload($key, $upload_id);
+			$this->mpu_state_set($key, null);
 			return $result;
 		}
-
+		$this->mpu_state_set($key, null);
 		return true;
-	}
-
-	/** Shutdown hook entry (must be public to be callable from the closure's scope on old PHP). */
-	public function abort_multipart_upload_on_shutdown($key, $upload_id) {
-		try {
-			$this->abort_multipart_upload($key, $upload_id);
-		} catch (\Throwable $e) {
-			// Nothing more can be done at shutdown.
-		}
 	}
 
 	/**
@@ -653,9 +769,9 @@ class SiteGuard_Backup_Method_S3 extends SiteGuard_Backup_Module {
 	 * @param string $upload_id Multipart upload ID.
 	 * @return bool|WP_Error
 	 */
-	protected function upload_parts_and_complete($file, $key, $upload_id) {
+	protected function upload_parts_and_complete($file, $key, $upload_id, $chunk_size = 0, $done = array(), $record = null) {
 		$filesize = filesize($file);
-		$chunk_size = $this->part_size($filesize);
+		if ($chunk_size <= 0) $chunk_size = $this->part_size($filesize);
 		$fh = fopen($file, 'rb');
 		if (!$fh) {
 			return new WP_Error('s3_read', 'Failed to open file for reading: ' . $file);
@@ -663,8 +779,21 @@ class SiteGuard_Backup_Method_S3 extends SiteGuard_Backup_Module {
 		$part_number = 1;
 		$etags = array();
 		$sent = 0;
+		$last_touch = time();
 
 		while ($sent < $filesize) {
+			// Already on S3 (resumed upload): skip this part's bytes.
+			if (isset($done[$part_number])) {
+				$skip = min($chunk_size, $filesize - $sent);
+				if (0 !== fseek($fh, $sent + $skip)) {
+					fclose($fh);
+					return new WP_Error('s3_read', 'Could not seek in ' . basename($file));
+				}
+				$etags[$part_number] = $done[$part_number];
+				$sent += $skip;
+				$part_number++;
+				continue;
+			}
 			// fread() on a local file can return fewer bytes than asked; S3 needs
 			// every part but the last to be at least 5 MiB, so fill the part.
 			$chunk = '';
@@ -699,6 +828,11 @@ class SiteGuard_Backup_Method_S3 extends SiteGuard_Backup_Module {
 			$etags[$part_number] = $etag;
 
 			$part_number++;
+			// Keep the record fresh while parts are going up (expiry is a day).
+			if (null !== $record && time() - $last_touch > 300) {
+				$record['updated'] = $last_touch = time();
+				$this->mpu_state_set($key, $record);
+			}
 			SiteGuard_Backup_Job_Scheduler::something_useful_happened();
 		}
 		fclose($fh);

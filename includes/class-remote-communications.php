@@ -3,9 +3,22 @@
  * SiteGuard Backup - Remote Communications (RPC Protocol)
  *
  * RSA key generation, encrypted message sending/receiving for site-to-site migration.
- * Two message formats:
- *   Format 1: One-sided encryption (initial handshake) - sender encrypts with receiver's public key
- *   Format 2: Mutual authentication (after key exchange) - both sides have each other's public keys
+ *
+ * A migration key is created on the RECEIVING site. Its bundle (pasted into the
+ * sending site) holds the receiver's URL, RSA public key and, since 1.7.0, a
+ * random 256-bit secret. Every request carries an HMAC-SHA256 over the
+ * encrypted message made with that secret, and every answer is signed with it
+ * too, bound to the request's nonce:
+ *
+ *   - the public key alone no longer authorizes anything (it encrypts, it does
+ *     not authenticate), and a bundle copied from the sender's database is
+ *     useless without wp-config.php: the sender stores the secret encrypted;
+ *   - a forged answer ("already uploaded") is detected by the sender;
+ *   - a key can expire, is bound to the site (blog) it was made on, and each
+ *     message nonce is accepted once.
+ *
+ * Bundles and keys made before 1.7.0 have no secret and are refused unless the
+ * network option sgbackup_allow_legacy_migration_keys is set.
  */
 
 if (!defined('ABSPATH')) die('No direct access.');
@@ -22,7 +35,54 @@ class SiteGuard_Backup_Remote_Communications {
 	 * @param int    $key_size RSA key size (2048 or 4096).
 	 * @return array|WP_Error  ['bundle' => base64-encoded portable bundle, 'name' => name]
 	 */
-	public function generate_key($name, $key_size = 2048) {
+	/** HMAC-SHA256 over the parts, joined by newlines. */
+	public static function mac($secret, array $parts) {
+		return hash_hmac('sha256', implode("\n", $parts), (string) $secret);
+	}
+
+	/** A key's stored (encrypted) secret, in plain text; '' for a pre-1.7.0 key. */
+	public static function key_secret($stored) {
+		if (!is_string($stored) || '' === $stored) return '';
+		require_once SGBACKUP_DIR . 'includes/class-security.php';
+		$plain = SiteGuard_Backup_Security::decrypt_option($stored);
+		return (is_string($plain) && !SiteGuard_Backup_Security::is_encrypted($plain)) ? $plain : '';
+	}
+
+	/** Are keys and bundles without a secret (made before 1.7.0) accepted? */
+	public static function legacy_keys_allowed() {
+		return (bool) get_site_option('sgbackup_allow_legacy_migration_keys', false);
+	}
+
+	/**
+	 * Accept each message nonce once (atomic: INSERT IGNORE on the options
+	 * table's unique key). The old get-then-set transient let two concurrent
+	 * replays through.
+	 */
+	public static function claim_nonce($nonce, $window) {
+		global $wpdb;
+		$name = 'sgbackup_rpcn_' . md5((string) $nonce);
+		$now = time();
+		$inserted = $wpdb->query($wpdb->prepare(
+			"INSERT IGNORE INTO {$wpdb->options} (option_name, option_value, autoload) VALUES (%s, %s, 'no')",
+			$name, (string) $now
+		));
+		if (1 !== (int) $inserted) {
+			// Already there: a replay, unless it is a stale row past the window.
+			$seen = (int) $wpdb->get_var($wpdb->prepare("SELECT option_value FROM {$wpdb->options} WHERE option_name = %s", $name));
+			if ($seen && ($now - $seen) <= 2 * $window) return false;
+			$wpdb->query($wpdb->prepare("UPDATE {$wpdb->options} SET option_value = %s WHERE option_name = %s AND option_value = %s", (string) $now, $name, (string) $seen));
+			if (1 !== (int) $wpdb->rows_affected) return false;
+		}
+		if (0 === wp_rand(0, 49)) {
+			$wpdb->query($wpdb->prepare(
+				"DELETE FROM {$wpdb->options} WHERE option_name LIKE %s AND CAST(option_value AS UNSIGNED) < %d",
+				$wpdb->esc_like('sgbackup_rpcn_') . '%', $now - 2 * $window
+			));
+		}
+		return true;
+	}
+
+	public function generate_key($name, $key_size = 2048, $expires_days = 0) {
 		if (!function_exists('openssl_pkey_new')) {
 			return new WP_Error('no_openssl', 'OpenSSL extension is required for key generation.');
 		}
@@ -62,18 +122,26 @@ class SiteGuard_Backup_Remote_Communications {
 			}
 		}
 
+		// Shared secret: authenticates every message in both directions.
+		$secret = bin2hex(random_bytes(32));
+		require_once SGBACKUP_DIR . 'includes/class-security.php';
+		$expires_days = max(0, min(3650, (int) $expires_days));
+
 		$local_keys[$name_hash] = array(
 			'name'        => $name,
 			'private_key' => $stored_private_key,
 			'public_key'  => $public_key,
+			'secret'      => SiteGuard_Backup_Security::encrypt_option($secret),
+			'blog_id'     => (int) get_current_blog_id(),
+			'expires'     => $expires_days ? time() + $expires_days * DAY_IN_SECONDS : 0,
 			'created'     => time(),
-			'format'      => 1, // Start with format 1 until sender upgrades
+			'format'      => 2,
 		);
 
 		$opts->update_option('sgbackup_migrator_localkeys', $local_keys);
 
-		// Create portable bundle (contains public key + site URL + name)
-		$bundle = $this->create_portable_bundle($name_hash, $name, $public_key);
+		// Create portable bundle (public key + site URL + name + secret)
+		$bundle = $this->create_portable_bundle($name_hash, $name, $public_key, $secret);
 
 		return array(
 			'bundle'    => $bundle,
@@ -90,15 +158,16 @@ class SiteGuard_Backup_Remote_Communications {
 	 * @param string $public_key
 	 * @return string Base64-encoded bundle.
 	 */
-	public function create_portable_bundle($name_hash, $name, $public_key) {
+	public function create_portable_bundle($name_hash, $name, $public_key, $secret = '') {
 		$data = array(
-			'version'    => 1,
+			'version'    => ('' !== $secret) ? 2 : 1,
 			'name'       => $name,
 			'name_hash'  => $name_hash,
 			'url'        => site_url(),
 			'public_key' => $public_key,
 			'plugin'     => 'siteguardbackup',
 		);
+		if ('' !== $secret) $data['secret'] = $secret;
 
 		return base64_encode(json_encode($data));
 	}
@@ -116,11 +185,23 @@ class SiteGuard_Backup_Remote_Communications {
 		}
 
 		$data = @json_decode($decoded, true);
-		if (!is_array($data) || empty($data['url']) || empty($data['public_key'])) {
+		if (!is_array($data) || empty($data['url']) || empty($data['public_key']) || !is_string($data['url']) || !is_string($data['public_key'])) {
 			return new WP_Error('invalid_bundle', 'Invalid key bundle: missing required fields.');
 		}
-
-		return $data;
+		if (!preg_match('#^https?://#i', $data['url'])) {
+			return new WP_Error('invalid_bundle', 'Invalid key bundle: the site URL must start with http:// or https://.');
+		}
+		if (empty($data['name_hash']) || !is_string($data['name_hash']) || !preg_match('/^[A-Za-z0-9]{6,40}$/', $data['name_hash'])) {
+			return new WP_Error('invalid_bundle', 'Invalid key bundle: missing key identifier.');
+		}
+		if (isset($data['secret']) && (!is_string($data['secret']) || !preg_match('/^[a-f0-9]{64}$/', $data['secret']))) {
+			return new WP_Error('invalid_bundle', 'Invalid key bundle: malformed secret.');
+		}
+		if (empty($data['secret']) && !self::legacy_keys_allowed()) {
+			return new WP_Error('legacy_bundle', 'This key bundle was made by a SiteGuard Backup version older than 1.7.0 and cannot authenticate its messages. Update the receiving site, create a new key there and paste the new bundle.');
+		}
+		$keep = array('version', 'name', 'name_hash', 'url', 'public_key', 'plugin', 'secret');
+		return array_intersect_key($data, array_flip($keep));
 	}
 
 	/**
@@ -156,20 +237,27 @@ class SiteGuard_Backup_Remote_Communications {
 		// Determine endpoint
 		$name_hash = isset($site['name_hash']) ? $site['name_hash'] : '';
 		$endpoint = trailingslashit($site['url']) . 'wp-admin/admin-ajax.php';
+		$secret = self::key_secret(isset($site['secret']) ? $site['secret'] : '');
+		if ('' === $secret && !self::legacy_keys_allowed()) {
+			return new WP_Error('legacy_bundle', 'This destination was added with a key bundle from before SiteGuard Backup 1.7.0, which cannot authenticate its messages. Create a new key on the receiving site and add the destination again.');
+		}
 
-		error_log("SiteGuard Backup RPC: Sending '{$command}' to {$endpoint} (name_hash={$name_hash})");
+		$body = array(
+			'action'    => 'sgbackup_ajax',
+			'subaction' => 'rpc_message',
+			'nonce'     => 'rpc',
+			'format'    => ('' !== $secret) ? 2 : 1,
+			'name_hash' => $name_hash,
+			'encrypted' => $encrypted['data'],
+			'key'       => $encrypted['key'],
+		);
+		if ('' !== $secret) {
+			$body['mac'] = self::mac($secret, array('request', $name_hash, $encrypted['data'], $encrypted['key']));
+		}
 
 		// Send via POST
 		$response = wp_remote_post($endpoint, array(
-			'body' => array(
-				'action'    => 'sgbackup_ajax',
-				'subaction' => 'rpc_message',
-				'nonce'     => 'rpc',
-				'format'    => 1,
-				'name_hash' => $name_hash,
-				'encrypted' => $encrypted['data'],
-				'key'       => $encrypted['key'],
-			),
+			'body' => $body,
 			'timeout' => 120,
 			'headers' => array(
 				'X-SGBackup-RPC'  => '1',
@@ -185,7 +273,7 @@ class SiteGuard_Backup_Remote_Communications {
 		$code = wp_remote_retrieve_response_code($response);
 		$body = wp_remote_retrieve_body($response);
 
-		error_log("SiteGuard Backup RPC: Response for '{$command}': HTTP {$code}, body=" . substr($body, 0, 500));
+		error_log("SiteGuard Backup RPC: Response for '{$command}': HTTP {$code}, " . strlen($body) . ' bytes');
 
 		if ($code !== 200) {
 			return new WP_Error('rpc_error', "RPC error (HTTP {$code}): " . substr($body, 0, 200));
@@ -202,6 +290,19 @@ class SiteGuard_Backup_Remote_Communications {
 			$msg = isset($result['data']['message']) ? $result['data']['message'] : 'RPC error';
 			error_log("SiteGuard Backup RPC: Remote error for '{$command}': {$msg}");
 			return new WP_Error('rpc_remote_error', $msg);
+		}
+
+		if ('' !== $secret) {
+			// The answer must be signed with the key's secret and bound to this
+			// request's nonce: anyone answering at that URL (a hijacked domain, a
+			// man in the middle on http) could otherwise report "already uploaded".
+			$d = isset($result['data']) && is_array($result['data']) ? $result['data'] : array();
+			if (!isset($d['signed'], $d['mac']) || !is_string($d['signed']) || !is_string($d['mac'])
+				|| !hash_equals(self::mac($secret, array('response', $payload['nonce'], $d['signed'])), $d['mac'])) {
+				return new WP_Error('rpc_unsigned', 'The receiving site\'s answer is not signed with this migration key. Make sure it runs SiteGuard Backup 1.7.0 or later and that the key still exists there.');
+			}
+			$inner = json_decode($d['signed'], true);
+			return is_array($inner) ? $inner : array();
 		}
 
 		return isset($result['data']) ? $result['data'] : $result;
@@ -320,21 +421,17 @@ class SiteGuard_Backup_Remote_Communications {
 			return new WP_Error('invalid_payload', 'Could not parse decrypted payload.');
 		}
 
-		// Replay protection: timestamp check (reject past AND future messages)
-		if (isset($payload['timestamp'])) {
-			$age = time() - $payload['timestamp'];
-			if ($age < -10 || $age > $this->replay_window) {
-				return new WP_Error('replay', "Message timestamp out of window ({$age}s). Check server time sync.");
-			}
+		// Replay protection: every message has a timestamp and a nonce (all
+		// SiteGuard senders always sent both; a message without them is refused).
+		if (!isset($payload['timestamp']) || !is_numeric($payload['timestamp']) || empty($payload['nonce']) || !is_string($payload['nonce'])) {
+			return new WP_Error('replay', 'Message has no timestamp or nonce.');
 		}
-
-		// Replay protection: nonce uniqueness (prevents same message being replayed)
-		if (!empty($payload['nonce'])) {
-			$nonce_key = 'sgbackup_rpc_nonce_' . md5($payload['nonce']);
-			if (get_transient($nonce_key)) {
-				return new WP_Error('replay', 'Duplicate message nonce detected.');
-			}
-			set_transient($nonce_key, 1, $this->replay_window * 2);
+		$age = time() - (int) $payload['timestamp'];
+		if ($age < -10 || $age > $this->replay_window) {
+			return new WP_Error('replay', "Message timestamp out of window ({$age}s). Check server time sync.");
+		}
+		if (!self::claim_nonce($payload['nonce'], $this->replay_window)) {
+			return new WP_Error('replay', 'Duplicate message nonce detected.');
 		}
 
 		return $payload;

@@ -129,6 +129,22 @@ transport() { # method src src_url dst
 		local added; added="$(wp "$src" --url="$su/" siteguardbackup migrate_add_destination "$key")" || return 1
 		local did; did="$(sed -nE 's/.*\(ID: ([0-9]+)\).*/\1/p' <<<"$added")"
 		[ -n "$did" ] || { echo "could not parse destination id: $added" >&2; return 1; }
+		# The migration key authenticates every message (1.7.0): a request with a
+		# wrong MAC, one without a MAC, and a bundle without a secret are refused.
+		if [ -z "${KEYCHECKS_DONE:-}" ]; then
+			KEYCHECKS_DONE=1
+			local probe; probe='$s = SiteGuard_Backup_Options::instance()->get_option("sgbackup_remotesites")['"$did"'];
+				$post = function ($extra) use ($s) { $r = wp_remote_post(trailingslashit($s["url"]) . "wp-admin/admin-ajax.php", array("timeout" => 30, "headers" => array("X-SGBackup-RPC" => "1", "X-SGBackup-HMAC" => "1"), "body" => array_merge(array("action" => "sgbackup_ajax", "subaction" => "rpc_message", "name_hash" => $s["name_hash"], "encrypted" => "QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQQ==", "key" => "QUFBQQ=="), $extra))); return is_wp_error($r) ? "ERR" : wp_remote_retrieve_body($r); };
+				$a = $post(array("mac" => str_repeat("0", 64))); $b = $post(array());
+				require_once SGBACKUP_DIR . "includes/class-remote-communications.php";
+				$legacy = (new SiteGuard_Backup_Remote_Communications())->decode_portable_bundle(base64_encode(json_encode(array("url" => "https://x.test", "public_key" => "k", "name_hash" => "abcdef123456"))));
+				echo (false !== strpos($a, "Authentication failed") ? "1" : "0"), (false !== strpos($b, "Authentication failed") ? "1" : "0"), (is_wp_error($legacy) && "legacy_bundle" === $legacy->get_error_code() ? "1" : "0"), (0 === strpos((string) $s["secret"], "sgenc:") ? "1" : "0");'
+			local kc; kc="$(wp "$src" --url="$su/" eval "$probe" 2>/dev/null)"
+			check "migration key: a request with a wrong MAC is refused"       eq "${kc:0:1}" 1
+			check "migration key: a request without a MAC is refused"          eq "${kc:1:1}" 1
+			check "migration key: a bundle without a secret is refused"        eq "${kc:2:1}" 1
+			check "migration key: the sender stores the secret encrypted"      eq "${kc:3:1}" 1
+		fi
 		local before; before="$(wp "$src" --url="$su/" eval 'echo count(SiteGuard_Backup_History::get_history_raw());')"
 		wp "$src" --url="$su/" siteguardbackup migrate_send "$sts" "$did" >/dev/null || { echo "migrate_send failed" >&2; return 1; }
 		local after; after="$(wp "$src" --url="$su/" eval 'echo count(SiteGuard_Backup_History::get_history_raw());')"

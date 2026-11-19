@@ -133,6 +133,17 @@ check('trailing ";" accepted on SET', true === $allowed("SET FOREIGN_KEY_CHECKS 
 check('a second statement after ";" is still refused', false === $allowed("INSERT INTO `wp_7_options` VALUES (1,'a'); DROP TABLE `wp_users`;"));
 check('restore accepts INSERT with trailing ";"', false === $dangerous("INSERT INTO `wp_posts` (`ID`, `t`) VALUES\n('1', 'a');\n"));
 check('restore refuses stacked statement after INSERT', true === $dangerous("INSERT INTO `wp_posts` VALUES (1,'a'); DROP TABLE x;"));
+// Review findings: versioned comments and mixed quoting.
+check('subsite import refuses a versioned comment in CREATE TABLE', false === $allowed("CREATE TABLE `wp_7_x` (`a` text) /*!50000 SELECT user_pass AS a FROM wp_users */"));
+check('subsite import refuses a plain comment in CREATE TABLE', false === $allowed("CREATE TABLE `wp_7_x` (`a` int) /* x */"));
+check('subsite import refuses a line comment in CREATE TABLE', false === $allowed("CREATE TABLE `wp_7_x` (`a` int) -- x\n SELECT 1"));
+check('subsite import refuses SELECT hidden by a quote in a backticked name', false === $allowed("CREATE TABLE `wp_7_x` (`a'b` int) SELECT user_pass FROM wp_users WHERE 'x'='x'"));
+check('subsite import refuses SELECT hidden by a quote in a double-quoted string', false === $allowed("CREATE TABLE `wp_7_x` (`a` int COMMENT \"it's\") SELECT user_pass FROM wp_users -- '"));
+check('restore refuses SELECT inside a versioned comment', true === $dangerous("CREATE TABLE `wp_x` (`a` text) /*!50000 SELECT user_pass AS a FROM wp_users */"));
+check('restore refuses SELECT hidden by mixed quoting', true === $dangerous("CREATE TABLE `wp_x` (`a'b` int) SELECT user_pass FROM wp_users WHERE 'x'='x'"));
+check('restore accepts a quote inside a column comment', false === $dangerous("CREATE TABLE `wp_x` (`a` int COMMENT 'it''s a \"select\"') ENGINE=InnoDB"));
+$wide = "INSERT INTO `wp_7_wide` (" . implode(', ', array_map(function ($i) { return "`column_with_a_long_name_$i`"; }, range(1, 300))) . ") VALUES (" . implode(',', range(1, 300)) . ")";
+check('subsite import allows an INSERT with a very long column list', true === $allowed($wide));
 check('a table under another mapped prefix is allowed', true === $allowed("DROP TABLE `wp_9_posts`", array('wp_7_', 'wp_9_')));
 check('an empty prefix allows nothing', false === $allowed("DROP TABLE `wp_7_posts`", array('')));
 

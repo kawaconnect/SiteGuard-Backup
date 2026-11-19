@@ -1,6 +1,9 @@
 <?php if (!defined('ABSPATH')) die('No direct access.');
 $opts = SiteGuard_Backup_Options::instance();
-$local_keys = $opts->get_option('sgbackup_migrator_localkeys', array());
+$local_keys = array_filter((array) $opts->get_option('sgbackup_migrator_localkeys', array()), function ($k) {
+	// Keys are stored network-wide: show this site's own (and pre-1.7.0 keys).
+	return is_array($k) && (!isset($k['blog_id']) || (int) $k['blog_id'] === (int) get_current_blog_id());
+});
 $remote_sites = $opts->get_option('sgbackup_remotesites', array());
 ?>
 
@@ -26,6 +29,19 @@ $remote_sites = $opts->get_option('sgbackup_remotesites', array());
 				</select>
 			</td>
 		</tr>
+		<tr>
+			<th><?php esc_html_e('Expires', 'siteguardbackup'); ?></th>
+			<td>
+				<select id="sgbackup-migrate-keyexpires">
+					<option value="0"><?php esc_html_e('Never (scheduled sends)', 'siteguardbackup'); ?></option>
+					<option value="1"><?php esc_html_e('After 1 day', 'siteguardbackup'); ?></option>
+					<option value="7" selected><?php esc_html_e('After 7 days (one-off migration)', 'siteguardbackup'); ?></option>
+					<option value="30"><?php esc_html_e('After 30 days', 'siteguardbackup'); ?></option>
+					<option value="365"><?php esc_html_e('After 1 year', 'siteguardbackup'); ?></option>
+				</select>
+				<p class="description"><?php esc_html_e('The bundle holds a secret: anyone who has it can send backups to this site until the key expires or is deleted.', 'siteguardbackup'); ?></p>
+			</td>
+		</tr>
 	</table>
 
 	<button type="button" class="button button-primary" id="sgbackup-create-key-btn">
@@ -46,6 +62,7 @@ $remote_sites = $opts->get_option('sgbackup_remotesites', array());
 			<tr>
 				<th><?php esc_html_e('Name', 'siteguardbackup'); ?></th>
 				<th><?php esc_html_e('Created', 'siteguardbackup'); ?></th>
+				<th><?php esc_html_e('Expires', 'siteguardbackup'); ?></th>
 				<th><?php esc_html_e('Actions', 'siteguardbackup'); ?></th>
 			</tr>
 		</thead>
@@ -54,6 +71,15 @@ $remote_sites = $opts->get_option('sgbackup_remotesites', array());
 			<tr>
 				<td><?php echo esc_html(isset($key_data['name']) ? $key_data['name'] : $hash); ?></td>
 				<td><?php echo esc_html(isset($key_data['created']) ? date_i18n(get_option('date_format'), $key_data['created']) : '?'); ?></td>
+				<td><?php
+					if (empty($key_data['secret'])) {
+						esc_html_e('Made before 1.7.0: no longer accepted. Delete it and create a new key.', 'siteguardbackup');
+					} elseif (!empty($key_data['expires'])) {
+						echo esc_html(((int) $key_data['expires'] < time() ? __('Expired ', 'siteguardbackup') : '') . date_i18n(get_option('date_format'), (int) $key_data['expires']));
+					} else {
+						esc_html_e('Never', 'siteguardbackup');
+					}
+				?></td>
 				<td>
 					<button type="button" class="button button-small sgbackup-delete-key" data-key-id="<?php echo esc_attr($hash); ?>">
 						<?php esc_html_e('Delete', 'siteguardbackup'); ?>

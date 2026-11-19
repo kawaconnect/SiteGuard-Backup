@@ -846,6 +846,130 @@ class SiteGuard_Backup_Restorer {
 	 * disk) and falling back to copy+unlink across filesystems. Used for subsite
 	 * upload extraction so we don't need a second full copy of multi-GB uploads.
 	 */
+	/**
+	 * Import subsite tables under a staging prefix, then swap them in with one
+	 * RENAME TABLE.
+	 *
+	 * The subsite import paths used to drop the target's tables first and then
+	 * import straight into the live names: an error or a timeout halfway left
+	 * the subsite (or, for a subsite restored into a single site, the whole site)
+	 * with tables missing or half filled. Now the live tables are only touched
+	 * after every statement succeeded; on failure the staged copies are dropped
+	 * and the site is as it was.
+	 *
+	 * @param array  $paths        SQL files (already decrypted).
+	 * @param array  $prefix_map   source prefix => target prefix.
+	 * @param string $base_prefix  Network base prefix (users/usermeta are never remapped).
+	 * @param bool   $drop_extras  After the swap, drop target-prefix tables the
+	 *                             backup did not have (a subsite is replaced whole;
+	 *                             never for the base prefix of a single site).
+	 * @return array ['success' => bool, 'errors' => array, 'tables_restored' => int]
+	 */
+	private function import_remapped_staged(array $paths, array $prefix_map, $base_prefix, $drop_extras) {
+		global $wpdb;
+		$out = array('success' => true, 'errors' => array(), 'tables_restored' => 0);
+		// Leftovers of an earlier run that was killed (restores hold a lock, so
+		// none is running): staged copies never swapped in, and old copies of
+		// tables that were already replaced by the single RENAME.
+		foreach (array('_sgbs', '_sgbo') as $leftover_prefix) {
+			foreach (SiteGuard_Backup_Database_Utility::get_tables($leftover_prefix) as $t) {
+				$safe = SiteGuard_Backup_Database_Utility::sanitize_table_name($t);
+				if ($safe && $safe === $t) $wpdb->query("DROP TABLE IF EXISTS `{$safe}`");
+			}
+		}
+		$tag = substr(md5(uniqid('', true)), 0, 5);
+		$stage = array();
+		$i = 0;
+		foreach ($prefix_map as $src => $dst) {
+			$stage[$src] = '_sgbs' . $tag . ($i++) . '_';
+		}
+		$cb = function ($lines_done) {
+			@set_time_limit(SGBACKUP_SET_TIME_LIMIT);
+			$this->progress("Database import: {$lines_done} lines processed");
+		};
+		foreach ($paths as $path) {
+			if (1 === count($prefix_map)) {
+				$src = key($prefix_map);
+				$r = SiteGuard_Backup_Database_Utility::execute_sql_file_remap_prefix($path, $src, $stage[$src], $base_prefix);
+			} else {
+				$r = SiteGuard_Backup_Database_Utility::execute_sql_file_multi_remap($path, $stage, $base_prefix, $cb);
+			}
+			$out['tables_restored'] += (int) $r['tables_restored'];
+			if (!empty($r['errors'])) $out['errors'] = array_merge($out['errors'], (array) $r['errors']);
+			if (empty($r['success'])) $out['success'] = false;
+		}
+
+		$staged = array();
+		foreach ($stage as $sp) {
+			$staged[$sp] = SiteGuard_Backup_Database_Utility::get_tables($sp);
+		}
+		$drop_staged = function () use ($staged, $wpdb) {
+			foreach ($staged as $tables) {
+				foreach ($tables as $t) {
+					$safe = SiteGuard_Backup_Database_Utility::sanitize_table_name($t);
+					if ($safe) $wpdb->query("DROP TABLE IF EXISTS `{$safe}`");
+				}
+			}
+		};
+		if (!$out['success'] || 0 === $out['tables_restored']) {
+			$drop_staged();
+			if ($out['success']) $out['success'] = false;
+			$out['errors'][] = 'The database import did not complete; the live tables were not changed.';
+			return $out;
+		}
+
+		$pairs = array();
+		$olds = array();
+		$replaced = array();
+		foreach ($stage as $src => $sp) {
+			$dst = $prefix_map[$src];
+			foreach ($staged[$sp] as $t) {
+				$final = $dst . substr($t, strlen($sp));
+				$safe_t = SiteGuard_Backup_Database_Utility::sanitize_table_name($t);
+				$safe_f = SiteGuard_Backup_Database_Utility::sanitize_table_name($final);
+				if (!$safe_t || !$safe_f || $safe_f !== $final || strlen($final) > 64) {
+					$drop_staged();
+					$out['success'] = false;
+					$out['errors'][] = "Cannot swap in table {$final}; the live tables were not changed.";
+					return $out;
+				}
+				if ($wpdb->get_var($wpdb->prepare('SHOW TABLES LIKE %s', $wpdb->esc_like($final)))) {
+					$old = '_sgbo' . $tag . '_' . substr(md5($final), 0, 10);
+					$pairs[] = "`{$final}` TO `{$old}`";
+					$olds[] = $old;
+				}
+				$pairs[] = "`{$safe_t}` TO `{$final}`";
+				$replaced[$final] = true;
+			}
+		}
+		$wpdb->query('SET FOREIGN_KEY_CHECKS = 0');
+		$swapped = empty($pairs) ? true : $wpdb->query('RENAME TABLE ' . implode(', ', $pairs));
+		if (false === $swapped) {
+			$err = $wpdb->last_error;
+			$wpdb->query('SET FOREIGN_KEY_CHECKS = 1');
+			$drop_staged();
+			$out['success'] = false;
+			$out['errors'][] = 'Could not swap the imported tables in (' . $err . '); the live tables were not changed.';
+			return $out;
+		}
+		foreach ($olds as $old) {
+			$wpdb->query("DROP TABLE IF EXISTS `{$old}`");
+		}
+		if ($drop_extras) {
+			foreach (array_unique(array_values($prefix_map)) as $dst) {
+				if ($dst === $base_prefix) continue; // never the base tables of a site
+				foreach (SiteGuard_Backup_Database_Utility::get_tables($dst) as $t) {
+					if (isset($replaced[$t])) continue;
+					$safe = SiteGuard_Backup_Database_Utility::sanitize_table_name($t);
+					if ($safe && $safe === $t) $wpdb->query("DROP TABLE IF EXISTS `{$safe}`");
+				}
+			}
+		}
+		$wpdb->query('SET FOREIGN_KEY_CHECKS = 1');
+		wp_cache_flush();
+		return $out;
+	}
+
 	/** Count of files left out of a subsite uploads import (see below). */
 	private $unsafe_uploads_skipped = 0;
 
@@ -1197,21 +1321,21 @@ class SiteGuard_Backup_Restorer {
 					continue;
 				}
 				$this->sgbackup->log("Tables-only mode: importing " . count($new_tables) . " new tables: " . implode(', ', $new_tables));
-				$import_result = SiteGuard_Backup_Database_Utility::execute_sql_file_filtered(
+				$import_result = SiteGuard_Backup_Database_Utility::execute_sql_file_atomic(
 					$file_path,
-					$new_tables,
 					function($lines_done) {
 						@set_time_limit(SGBACKUP_SET_TIME_LIMIT); $this->progress("Database import: {$lines_done} lines processed");
-					}
+					},
+					array_values((array) $new_tables)
 				);
 			} elseif ($selected_tables !== null) {
 				// Use filtered method when selective tables are specified
-				$import_result = SiteGuard_Backup_Database_Utility::execute_sql_file_filtered(
+				$import_result = SiteGuard_Backup_Database_Utility::execute_sql_file_atomic(
 					$file_path,
-					$selected_tables,
 					function($lines_done) {
 						@set_time_limit(SGBACKUP_SET_TIME_LIMIT); $this->progress("Database import: {$lines_done} lines processed");
-					}
+					},
+					array_values((array) $selected_tables)
 				);
 			} elseif ($has_skips) {
 				// Custom/mirror mode with __skip__ entries: use filtered import to
@@ -1248,12 +1372,12 @@ class SiteGuard_Backup_Restorer {
 					$this->filtered_import_used = true;
 					$this->sgbackup->log("Filtered import: {$skipped_count} tables excluded for skipped subsites, importing " . count($tables_to_import) . " tables");
 					$this->progress("Importing " . count($tables_to_import) . " tables (skipping {$skipped_count} subsite tables)");
-					$import_result = SiteGuard_Backup_Database_Utility::execute_sql_file_filtered(
+					$import_result = SiteGuard_Backup_Database_Utility::execute_sql_file_atomic(
 						$file_path,
-						$tables_to_import,
 						function($lines_done) {
 							@set_time_limit(SGBACKUP_SET_TIME_LIMIT); $this->progress("Database import: {$lines_done} lines processed");
-						}
+						},
+						array_values((array) $tables_to_import)
 					);
 				}
 			} elseif ($skip_user_tables) {
@@ -1266,12 +1390,12 @@ class SiteGuard_Backup_Restorer {
 				$this->user_tables_skipped = true;
 				$this->sgbackup->log("Migration: skipping user tables (" . implode(', ', $user_tables) . ") to preserve destination credentials");
 				$this->progress("Importing " . count($tables_to_import) . " tables (preserving user credentials)");
-				$import_result = SiteGuard_Backup_Database_Utility::execute_sql_file_filtered(
+				$import_result = SiteGuard_Backup_Database_Utility::execute_sql_file_atomic(
 					$file_path,
-					$tables_to_import,
 					function($lines_done) {
 						@set_time_limit(SGBACKUP_SET_TIME_LIMIT); $this->progress("Database import: {$lines_done} lines processed");
-					}
+					},
+					array_values((array) $tables_to_import)
 				);
 			} else {
 				// Use atomic restore (temp table → RENAME) for crash safety
@@ -1483,22 +1607,9 @@ class SiteGuard_Backup_Restorer {
 			// Drop existing subsite tables so we can import fresh
 			$target_prefix = $wpdb->base_prefix . $target_id . '_';
 			$preserved_sg_options = $this->read_plugin_option_rows($target_prefix . 'options');
-			// Only when a database is going to be imported: an uploads-only import (or
-			// a set without a database file) used to drop every table of the target
-			// site and import nothing.
-			$will_import_db = !empty($this->restore_options['db']) && !empty($this->backup_set['db']);
-			$existing_tables = $will_import_db ? SiteGuard_Backup_Database_Utility::get_tables($target_prefix) : array();
-			if (!empty($existing_tables)) {
-				$wpdb->query('SET FOREIGN_KEY_CHECKS = 0');
-				foreach ($existing_tables as $table) {
-					$safe = SiteGuard_Backup_Database_Utility::sanitize_table_name($table);
-					if ($safe) {
-						$wpdb->query("DROP TABLE IF EXISTS `{$safe}`");
-					}
-				}
-				$wpdb->query('SET FOREIGN_KEY_CHECKS = 1');
-				$this->sgbackup->log("Dropped " . count($existing_tables) . " existing tables for blog #{$target_id}");
-			}
+			// The existing tables are replaced by the staged import (see
+			// import_remapped_staged()) only once it has fully succeeded; nothing is
+			// dropped up front.
 		} else {
 			// Create new subsite
 			$network = get_network();
@@ -1525,20 +1636,9 @@ class SiteGuard_Backup_Restorer {
 			$this->sgbackup->log("Created new subsite: blog #{$target_id} ({$target_domain}{$target_path})");
 			$this->progress("Created new subsite blog #{$target_id}");
 
-			// Drop the auto-created tables (we'll import from backup)
+			// The tables WordPress just created for the new subsite are replaced
+			// by the staged import once it has fully succeeded.
 			$target_prefix = $wpdb->base_prefix . $target_id . '_';
-			$auto_tables = (!empty($this->restore_options['db']) && !empty($this->backup_set['db']))
-				? SiteGuard_Backup_Database_Utility::get_tables($target_prefix) : array();
-			if (!empty($auto_tables)) {
-				$wpdb->query('SET FOREIGN_KEY_CHECKS = 0');
-				foreach ($auto_tables as $table) {
-					$safe = SiteGuard_Backup_Database_Utility::sanitize_table_name($table);
-					if ($safe) {
-						$wpdb->query("DROP TABLE IF EXISTS `{$safe}`");
-					}
-				}
-				$wpdb->query('SET FOREIGN_KEY_CHECKS = 1');
-			}
 		}
 
 		// Step 2: Import SQL with prefix remapping
@@ -1610,20 +1710,17 @@ class SiteGuard_Backup_Restorer {
 				}
 
 				$resolved_db_paths[] = $file_path;
+			}
 
-				$import_result = SiteGuard_Backup_Database_Utility::execute_sql_file_remap_prefix(
-					$file_path,
-					$source_prefix,
-					$target_prefix,
-					$wpdb->base_prefix
-				);
-
+			if (!empty($resolved_db_paths) && $result['success']) {
+				$import_result = $this->import_remapped_staged($resolved_db_paths, array($source_prefix => $target_prefix), $wpdb->base_prefix, true);
 				$result['messages'][] = "Database: {$import_result['tables_restored']} tables imported (remapped to blog #{$target_id})";
 				if (!empty($import_result['errors'])) {
 					$result['errors'] = array_merge($result['errors'], $import_result['errors']);
 				}
 				if (!$import_result['success']) {
 					$result['success'] = false;
+					return $result; // live tables unchanged: nothing to merge or fix up
 				}
 			}
 
@@ -2722,19 +2819,8 @@ class SiteGuard_Backup_Restorer {
 				// Drop existing subsite tables
 				$target_prefix = $base_prefix . $target_id . '_';
 				$batch_preserved_sg[$target_id] = $this->read_plugin_option_rows($target_prefix . 'options');
-				$batch_will_import_db = !empty($this->restore_options['db']) && !empty($this->backup_set['db']);
-				$existing_tables = $batch_will_import_db ? SiteGuard_Backup_Database_Utility::get_tables($target_prefix) : array();
-				if (!empty($existing_tables)) {
-					$wpdb->query('SET FOREIGN_KEY_CHECKS = 0');
-					foreach ($existing_tables as $table) {
-						$safe = SiteGuard_Backup_Database_Utility::sanitize_table_name($table);
-						if ($safe) {
-							$wpdb->query("DROP TABLE IF EXISTS `{$safe}`");
-						}
-					}
-					$wpdb->query('SET FOREIGN_KEY_CHECKS = 1');
-					$this->sgbackup->log("Batch: dropped " . count($existing_tables) . " existing tables for target blog #{$target_id}");
-				}
+				// Existing tables are replaced by the staged import once it fully
+				// succeeded (import_remapped_staged()); nothing is dropped up front.
 
 				$prefix_map[$source_prefix] = $target_prefix;
 				$target_map[$source_id] = $target_id;
@@ -2815,22 +2901,17 @@ class SiteGuard_Backup_Restorer {
 				}
 
 				$resolved_db_paths[] = $file_path;
+			}
 
-				$import_result = SiteGuard_Backup_Database_Utility::execute_sql_file_multi_remap(
-					$file_path,
-					$prefix_map,
-					$base_prefix,
-					function($lines_done) {
-						@set_time_limit(SGBACKUP_SET_TIME_LIMIT); $this->progress("Database import: {$lines_done} lines processed");
-					}
-				);
-
+			if (!empty($resolved_db_paths) && $result['success']) {
+				$import_result = $this->import_remapped_staged($resolved_db_paths, $prefix_map, $base_prefix, true);
 				$result['messages'][] = "Database: {$import_result['tables_restored']} tables imported across " . count($prefix_map) . " subsites";
 				if (!empty($import_result['errors'])) {
 					$result['errors'] = array_merge($result['errors'], $import_result['errors']);
 				}
 				if (!$import_result['success']) {
 					$result['success'] = false;
+					return $result; // live tables unchanged
 				}
 			}
 
@@ -2983,14 +3064,13 @@ class SiteGuard_Backup_Restorer {
 		}
 
 		$this->progress("Importing database: remapping {$src_prefix}* -> {$base}*");
-		$tables = 0;
-		foreach ($paths as $path) {
-			$r = SiteGuard_Backup_Database_Utility::execute_sql_file_remap_prefix($path, $src_prefix, $base, $base);
-			$tables += (int) $r['tables_restored'];
-			if (!$r['success']) {
-				$out['success'] = false;
-				$out['errors'] = array_merge($out['errors'], (array) $r['errors']);
-			}
+		// Staged under a temporary prefix and swapped in only on full success: this
+		// replaces the whole single site's tables (users excepted, merged below).
+		$r = $this->import_remapped_staged($paths, array($src_prefix => $base), $base, false);
+		$tables = (int) $r['tables_restored'];
+		if (!$r['success']) {
+			$out['success'] = false;
+			$out['errors'] = array_merge($out['errors'], (array) $r['errors']);
 		}
 		if (!$out['success'] || 0 === $tables) {
 			$out['success'] = false;
@@ -5795,6 +5875,9 @@ class SiteGuard_Backup_Restorer {
 	 */
 	private function remove_source_only_settings(array $preserved) {
 		global $wpdb;
+		// Only for a backup of ANOTHER site. Restoring this site's own backup onto
+		// a fresh install (disaster recovery) must keep the settings it brings.
+		if (!$this->is_migration) return;
 		$had = array();
 		foreach (array_keys($preserved) as $k) {
 			$had[preg_replace('/^(options|sitemeta):/', '', (string) $k)] = true;

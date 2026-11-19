@@ -706,8 +706,34 @@ class SiteGuard_Backup {
 		// schedule. When both are due together, run one job that does both.
 		$db_next = wp_next_scheduled('sgbackup_backup_database');
 		$db_due = ($db_next && $db_next <= time() + 120) || get_transient('sgbackup_db_backup_deferred');
-		delete_transient('sgbackup_db_backup_deferred');
 		$this->boot_backup(true, (bool) $db_due);
+		if ($db_due) {
+			if (empty($this->boot_error)) {
+				delete_transient('sgbackup_db_backup_deferred');
+			} else {
+				// The file job did not start: keep the database run owed, and run it
+				// on its own at the next chance rather than dropping it.
+				set_transient('sgbackup_db_backup_deferred', 1, DAY_IN_SECONDS);
+				if (!wp_next_scheduled('sgbackup_backup_database_deferred')) {
+					wp_schedule_single_event(time() + 15 * MINUTE_IN_SECONDS, 'sgbackup_backup_database_deferred');
+				}
+				error_log('SiteGuard Backup: scheduled database backup deferred, the file backup could not start: ' . $this->boot_error);
+			}
+		}
+	}
+
+	/**
+	 * A database backup owed by backup_files() that could not start. Runs the
+	 * database alone, unless a file job picked it up in the meantime.
+	 */
+	public function backup_database_deferred() {
+		if (!get_transient('sgbackup_db_backup_deferred')) return;
+		$this->boot_backup(false, true);
+		if (empty($this->boot_error)) {
+			delete_transient('sgbackup_db_backup_deferred');
+		} elseif (!wp_next_scheduled('sgbackup_backup_database_deferred')) {
+			wp_schedule_single_event(time() + 15 * MINUTE_IN_SECONDS, 'sgbackup_backup_database_deferred');
+		}
 	}
 
 	/**
@@ -718,7 +744,11 @@ class SiteGuard_Backup {
 		// takes the database with it.
 		$files_next = wp_next_scheduled('sgbackup_backup');
 		if ($files_next && $files_next <= time() + 120) {
-			set_transient('sgbackup_db_backup_deferred', 1, 10 * MINUTE_IN_SECONDS);
+			set_transient('sgbackup_db_backup_deferred', 1, DAY_IN_SECONDS);
+			// Safety net if the file run never happens (WP-Cron not reached).
+			if (!wp_next_scheduled('sgbackup_backup_database_deferred')) {
+				wp_schedule_single_event(time() + HOUR_IN_SECONDS, 'sgbackup_backup_database_deferred');
+			}
 			return;
 		}
 		$this->boot_backup(false, true);
@@ -1602,7 +1632,8 @@ class SiteGuard_Backup {
 		// good destination out of two used to count: the job was reported complete
 		// and, with "delete local copies" on, the only other copy was removed.
 		$this->jobdata_set('remote_upload_succeeded', $any_service_succeeded && empty($failed_services));
-		$this->jobdata_set('remote_upload_any_succeeded', $any_service_succeeded);
+		$this->jobdata_set('remote_upload_any_succeeded', $any_service_succeeded || 0 === $attempted_services);
+		$this->jobdata_set('remote_upload_attempted', $attempted_services);
 		$this->jobdata_set('remote_upload_failed_services', $failed_services);
 		return true;
 	}
@@ -1731,6 +1762,7 @@ class SiteGuard_Backup {
 			}
 			$failed_services = (array) $this->jobdata_get('remote_upload_failed_services', array());
 			$remote_all_failed = $has_remote_services
+				&& (int) $this->jobdata_get('remote_upload_attempted', 1) > 0
 				&& $this->jobdata_get('upload_phase_complete', false)
 				&& !$this->jobdata_get('remote_upload_any_succeeded', $this->jobdata_get('remote_upload_succeeded', false));
 
@@ -2278,7 +2310,11 @@ class SiteGuard_Backup {
 			// Build per-recipient attachments
 			$attachments = $base_attachments;
 
-			if (!empty($recipient['send_backup']) || !empty($recipient['send_db_only'])) {
+			// Never attach archives of a job that failed: they may be the very
+			// plaintext files the job refused to upload (encryption on, no
+			// passphrase), or incomplete.
+			$job_failed = in_array($this->jobdata_get('jobstatus', ''), array('error', 'failed'), true);
+			if (!$job_failed && (!empty($recipient['send_backup']) || !empty($recipient['send_db_only']))) {
 				$attach_files = array();
 				if (!empty($recipient['send_db_only'])) {
 					// Only attach DB backup files

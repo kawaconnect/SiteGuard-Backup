@@ -74,6 +74,31 @@ single-site installs were not affected by them.
 - The file-list cache written during a backup no longer has a `.php`
   extension.
 
+- **Site-to-site migration keys authenticate every message.** A key used to
+  be its RSA public key: anyone holding the bundle (it sat in plaintext in the
+  sending site's database and therefore in its backups) could write archives
+  into the receiving site and edit received sets, on every subsite of a
+  network, forever. Now:
+  - each key has a random 256-bit secret, carried in the bundle and stored
+    encrypted on both sites; every request carries an HMAC made with it, checked
+    before any decryption, and every answer is signed with it and bound to the
+    request, so a forged "already uploaded" reply is detected;
+  - a key belongs to the site it was created on, can expire (the Migrate tab
+    offers 1, 7, 30 or 365 days, or never for scheduled sends;
+    `wp siteguardbackup create_migration_key --expires=<days>`), and each
+    message is accepted once (atomic nonce record);
+  - a received set can only be changed by the key that sent it;
+  - keys and bundles made before 1.7.0 are refused with a message saying to
+    create a new key (the network option `sgbackup_allow_legacy_migration_keys`
+    re-enables them).
+- The subsite import SQL filter could be bypassed by a versioned comment
+  (`/*! ... */`) or by mixing quote types in a `CREATE TABLE`; the statement is
+  now read in one pass the way MySQL reads it, and table definitions in a
+  subsite import may not contain comments.
+- A failed job no longer attaches its archives to the report email (with
+  encryption on and no passphrase, those were the plaintext files the job had
+  refused to upload).
+
 ### Fixed (found by the same audit)
 - **The scheduled database backup never ran when it shared its time of day
   with the file backup** (the default): only one job runs at a time and the
@@ -160,6 +185,30 @@ single-site installs were not affected by them.
 - Database anonymisation left every `usermeta` value as it was (names,
   billing and shipping addresses, login session tokens, application
   passwords) and missed the order address index and customer IP.
+- **Migration restores are atomic.** A migration (which keeps this site's
+  users), a selected-tables or tables-only restore and a network restore with
+  skipped subsites ran their statements against the live tables: an error or a
+  timeout halfway left the site with tables dropped and others half imported.
+  They are now staged and swapped in with one `RENAME TABLE` only when every
+  statement succeeded, like a full restore. The same for subsite imports
+  (into a subsite, into a single site, and batch imports), which used to drop
+  the target's tables first.
+- **S3-compatible uploads resume after an interruption.** A multipart upload
+  killed mid-way (execution time limit, memory) started again from the first
+  byte on the next attempt, so a large archive could never finish on a host
+  with a short time limit. The upload is recorded before the first part and the
+  next attempt uploads only the parts S3 does not have. Uploads not resumed
+  within a day are aborted.
+- Retention never deleted anything when every set was incomplete (an entity
+  failing on every run). Incomplete sets are kept only while fewer than N
+  complete ones exist, and never beyond 2 x N sets in all; database and file
+  retention each look only at their own failures.
+- Restoring a site's own backup onto a fresh install no longer removes its
+  backup settings; only another site's settings are removed after a migration.
+- A database backup deferred to run with the file backup is no longer lost
+  when the file backup cannot start: it runs on its own shortly after.
+- A destination skipped by its conditional rules (or with every account
+  disabled) no longer makes the job report that all uploads failed.
 - `wp siteguardbackup import`: no longer overwrites a different file of the
   same name, marks imported sets "always keep" (the next retention pass used
   to delete them, after `--delete-source` had removed the original), and exits

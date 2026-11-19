@@ -222,6 +222,7 @@ add_action('wp_loaded', 'sgbackup_ensure_health_cron');
 function sgbackup_register_cron_hooks() {
 	add_action('sgbackup_backup', 'sgbackup_cron_backup_files');
 	add_action('sgbackup_backup_database', 'sgbackup_cron_backup_database');
+	add_action('sgbackup_backup_database_deferred', 'sgbackup_cron_backup_database_deferred');
 	add_action('sgbackup_backup_all', 'sgbackup_cron_backup_all');
 	add_action('sgbackup_backup_resume', 'sgbackup_cron_backup_resume', 10, 2);
 	add_action('sgbackup_backup_incremental', 'sgbackup_cron_backup_incremental');
@@ -239,6 +240,12 @@ function sgbackup_cron_backup_database() {
 	sgbackup_load_classes();
 	require_once SGBACKUP_DIR . 'class-siteguardbackup.php';
 	SiteGuard_Backup::instance()->backup_database();
+}
+
+function sgbackup_cron_backup_database_deferred() {
+	sgbackup_load_classes();
+	require_once SGBACKUP_DIR . 'class-siteguardbackup.php';
+	SiteGuard_Backup::instance()->backup_database_deferred();
 }
 
 function sgbackup_cron_backup_all($options = array()) {
@@ -401,6 +408,7 @@ register_activation_hook(__FILE__, 'sgbackup_activate');
 function sgbackup_deactivate() {
 	wp_clear_scheduled_hook('sgbackup_backup');
 	wp_clear_scheduled_hook('sgbackup_backup_database');
+	wp_clear_scheduled_hook('sgbackup_backup_database_deferred');
 	wp_clear_scheduled_hook('sgbackup_backup_all');
 	wp_clear_scheduled_hook('sgbackup_backup_incremental');
 	wp_clear_scheduled_hook('sgbackup_backup_remotesend');
