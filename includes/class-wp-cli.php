@@ -2540,6 +2540,11 @@ class SiteGuard_Backup_CLI_Command extends WP_CLI_Command {
      * [--file=<path>]
      * : File path for export (output) or import (input).
      *
+     * [--include-secrets]
+     * : Export only: include passwords and keys (storage credentials, backup
+     * encryption passphrase, webhook secret, external database passwords) in
+     * plaintext, to move the settings to another site. Left out by default.
+     *
      * [--yes]
      * : Skip confirmation for destructive actions.
      *
@@ -2553,6 +2558,7 @@ class SiteGuard_Backup_CLI_Command extends WP_CLI_Command {
      *     wp siteguardbackup settings set --retain=5 --retain_db=10 --debug_mode=1
      *     wp siteguardbackup settings wipe --yes
      *     wp siteguardbackup settings export --file=/tmp/settings.json
+     *     wp siteguardbackup settings export --include-secrets --file=/root/move-settings.json
      *     wp siteguardbackup settings import /tmp/settings.json --yes
      *
      * @subcommand settings
@@ -2638,14 +2644,26 @@ class SiteGuard_Backup_CLI_Command extends WP_CLI_Command {
                 break;
 
             case 'export':
-                $result = $commands->export_settings(array());
+                $with_secrets = !empty($assoc_args['include-secrets']);
+                if ($with_secrets) {
+                    WP_CLI::warning('The export includes passwords and keys in plaintext. Anyone with it can reach the backup storage and decrypt backups. Delete it after the import.');
+                }
+                $result = $commands->export_settings(array('include_secrets' => $with_secrets));
                 if (is_wp_error($result)) {
                     WP_CLI::error($result->get_error_message());
                 }
 
                 $json = json_encode($result, JSON_PRETTY_PRINT);
                 if (!empty($assoc_args['file'])) {
-                    $written = file_put_contents($assoc_args['file'], $json);
+                    // Owner-only from the start when it carries secrets.
+                    if ($with_secrets) {
+                        $old_umask = umask(0077);
+                        $written = file_put_contents($assoc_args['file'], $json);
+                        umask($old_umask);
+                        if (false !== $written) chmod($assoc_args['file'], 0600);
+                    } else {
+                        $written = file_put_contents($assoc_args['file'], $json);
+                    }
                     if (false === $written) {
                         WP_CLI::error('Failed to write to: ' . $assoc_args['file']);
                     }
@@ -2674,6 +2692,9 @@ class SiteGuard_Backup_CLI_Command extends WP_CLI_Command {
                 $result = $commands->import_settings(array('settings' => $data['settings']));
                 if (is_wp_error($result)) {
                     WP_CLI::error($result->get_error_message());
+                }
+                if (!empty($result['skipped_secrets'])) {
+                    WP_CLI::warning($result['message']);
                 }
 
                 WP_CLI::success("Imported {$result['imported']} settings.");

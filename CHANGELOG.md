@@ -1,8 +1,44 @@
 # Changelog
 
-## Unreleased
+## 1.7.1
+
+### Security
+- Secrets are encrypted at rest by default. Storage method credentials, the
+  backup encryption passphrase and the webhook signing secret are stored
+  AES-256-GCM encrypted with a key derived from `AUTH_KEY`. Before, storage
+  credentials were only encrypted after turning on "Encrypt storage
+  credentials at rest", and the passphrase and webhook secret were always
+  stored as typed. The setting can still be turned off under Advanced Tools.
+- Updating encrypts what older versions stored in plaintext, once per site
+  (on the next wp-admin page, wp-cron run or WP-CLI command). A value is only
+  replaced by ciphertext that decrypted back to it. Without `AUTH_KEY` nothing
+  changes and it is tried again later. Plaintext values keep working.
+- A changed or missing `AUTH_KEY` no longer loses secrets silently. SiteGuard
+  stores a fingerprint of the key with the secrets, notices the change, and
+  shows an admin notice listing what cannot be decrypted and what to do. The
+  stored ciphertext is kept: a save that does not re-enter a credential, a
+  token refresh or the SFTP host key save no longer overwrite it with an
+  empty value, so restoring the old `AUTH_KEY` brings everything back. An
+  unreadable webhook secret is no longer replaced by a new one (webhooks are
+  held back instead), and an unreadable passphrase fails the backup with that
+  reason. Without `AUTH_KEY`, an encrypted value was handed to the provider
+  as the credential; it now reads as empty and is reported.
+- Settings exports leave out passwords and keys (storage credentials,
+  passphrase, webhook URL and secret, external database passwords; the settings-lock
+  hash is never exported). "Include passwords and keys" (WP-CLI:
+  `settings export --include-secrets`) adds them, decrypted so another site
+  can read them, after a warning; the CLI writes that file mode 0600.
+  Importing a file without secrets keeps this site's own; encrypted values
+  from another site's export are skipped and reported instead of stored.
+- The settings page no longer prints the webhook URL (it often carries a
+  token) or the signing secret. The URL shows only its host; the secret is
+  fetched with Show (logged in the audit log) or replaced with Regenerate.
 
 ### Fixed
+- mysqldump option file: user, password and host are quoted, so a password
+  with `#` (a comment outside quotes), quotes, backslashes or surrounding
+  spaces reaches the server intact. A password with both quote characters is
+  passed in mysqldump's environment instead.
 - Admin bar "Backup Now" only opened the page; it now opens the Backup Now
   dialog. The dialog's confirm button said "Backup started" before anything
   had started.
@@ -25,6 +61,10 @@
 - README: install, quick start, security notes, configuration reference, sync
   API routes, troubleshooting and upgrade notes; corrected WP-CLI flags and the
   migration rate limit.
+
+### Removed
+- `.github/workflows`: GitLab CI is the only CI; the GitHub repository is a
+  plain mirror.
 
 ## 1.7.0
 

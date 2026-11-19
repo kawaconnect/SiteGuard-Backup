@@ -603,7 +603,8 @@ class SiteGuard_Backup_Commands {
 				// removed tags, %XX sequences and repeated spaces, so backups were
 				// encrypted with a different passphrase than the one the admin
 				// wrote down, and could not be decrypted on another site.
-				$opts->update_option('sgbackup_encryption_key', str_replace(chr(0), '', $enc_key));
+				// Encrypted at rest like the storage credentials.
+				$opts->update_sensitive_option('encryption_key', str_replace(chr(0), '', $enc_key));
 			}
 			// Empty = keep current key (don't clear it)
 			unset($params['encryption_key']);
@@ -622,6 +623,11 @@ class SiteGuard_Backup_Commands {
 		}
 
 		// Handle webhook_url: sanitize as URL
+		require_once SGBACKUP_DIR . 'includes/class-security.php';
+		if (isset($params['webhook_url']) && SiteGuard_Backup_Security::SECRET_UNCHANGED === $params['webhook_url']) {
+			// The settings page shows a placeholder, never the URL: keep the stored one.
+			unset($params['webhook_url']);
+		}
 		if (isset($params['webhook_url'])) {
 			$webhook_url = trim($params['webhook_url']);
 			if (!empty($webhook_url)) {
@@ -653,31 +659,11 @@ class SiteGuard_Backup_Commands {
 			$params['failover_production_url'] = esc_url_raw(trim($params['failover_production_url']), array('https', 'http'));
 		}
 
-		// Handle credential encryption toggle: migrate existing credentials when first enabled
-		if (isset($params['encrypt_credentials']) && intval($params['encrypt_credentials'])) {
-			$was_enabled = $opts->get_option('sgbackup_encrypt_credentials', false);
-			if (!$was_enabled) {
-				require_once SGBACKUP_DIR . 'includes/class-security.php';
-				// Encrypt existing plaintext credentials for all storage methods
-				foreach (self::$valid_methods as $method_id) {
-					$stored = $opts->get_option(SiteGuard_Backup_Options::method_option($method_id), array());
-					if (empty($stored) || !isset($stored['settings'])) continue;
-					$changed = false;
-					foreach ($stored['settings'] as $instance_id => &$instance_settings) {
-						if (!is_array($instance_settings)) continue;
-						$encrypted = SiteGuard_Backup_Security::encrypt_method_options($method_id, $instance_settings);
-						if ($encrypted !== $instance_settings) {
-							$instance_settings = $encrypted;
-							$changed = true;
-						}
-					}
-					unset($instance_settings);
-					if ($changed) {
-						$opts->update_option(SiteGuard_Backup_Options::method_option($method_id), $stored);
-					}
-				}
-			}
-		}
+		// Turning credential encryption (back) on encrypts what is stored in
+		// plaintext; done after the settings below are saved.
+		require_once SGBACKUP_DIR . 'includes/class-security.php';
+		$encrypt_stored_after_save = isset($params['encrypt_credentials']) && intval($params['encrypt_credentials'])
+			&& !$opts->get_option('sgbackup_encrypt_credentials', false);
 
 		// A subsite administrator cannot widen what their backups read or where
 		// the site reaches: see is_subsite_restricted().
@@ -845,9 +831,12 @@ class SiteGuard_Backup_Commands {
 						$previous = isset($stored['settings'][$instance_id]) ? SiteGuard_Backup_Security::decrypt_method_options($method, $stored['settings'][$instance_id]) : array();
 						$instance_settings = SiteGuard_Backup_Security::keep_unchanged_secrets($instance_settings, $previous);
 						$instance_settings = self::keep_server_fields($method, $instance_settings, $previous);
-						// Encrypt credentials at rest if enabled
-						if ($opts->get_option('sgbackup_encrypt_credentials', false)) {
-							require_once SGBACKUP_DIR . 'includes/class-security.php';
+						// A stored credential that cannot be decrypted (AUTH_KEY changed) and
+						// was not re-entered keeps its ciphertext rather than becoming ''.
+						$instance_settings = SiteGuard_Backup_Security::keep_unreadable($method, $instance_settings,
+							isset($stored['settings'][$instance_id]) ? $stored['settings'][$instance_id] : array());
+						// Encrypt credentials at rest (on by default)
+						if (SiteGuard_Backup_Security::encryption_on()) {
 							$instance_settings = SiteGuard_Backup_Security::encrypt_method_options($method, $instance_settings);
 						}
 						$stored['settings'][$instance_id] = $instance_settings;
@@ -857,11 +846,12 @@ class SiteGuard_Backup_Commands {
 					// Legacy flat format
 					array_walk($method_data, $sanitize_method_value);
 					require_once SGBACKUP_DIR . 'includes/class-security.php';
-					$previous_flat = SiteGuard_Backup_Security::decrypt_method_options($method, (array) $opts->get_option(SiteGuard_Backup_Options::method_option($method), array()));
+					$stored_flat = (array) $opts->get_option(SiteGuard_Backup_Options::method_option($method), array());
+					$previous_flat = SiteGuard_Backup_Security::decrypt_method_options($method, $stored_flat);
 					$method_data = SiteGuard_Backup_Security::keep_unchanged_secrets($method_data, $previous_flat);
 					$method_data = self::keep_server_fields($method, $method_data, $previous_flat);
-					if ($opts->get_option('sgbackup_encrypt_credentials', false)) {
-						require_once SGBACKUP_DIR . 'includes/class-security.php';
+					$method_data = SiteGuard_Backup_Security::keep_unreadable($method, $method_data, $stored_flat);
+					if (SiteGuard_Backup_Security::encryption_on()) {
 						$method_data = SiteGuard_Backup_Security::encrypt_method_options($method, $method_data);
 					}
 					$opts->update_option(SiteGuard_Backup_Options::method_option($method), $method_data);
@@ -957,6 +947,13 @@ class SiteGuard_Backup_Commands {
 		if (isset($params['lock_admin'])) $changed[] = 'admin_lock';
 		if (isset($params['service'])) $changed[] = 'remote_storage';
 		$audit->log('settings_saved', 'Settings updated: ' . (!empty($changed) ? implode(', ', $changed) : 'general'));
+
+		if ($encrypt_stored_after_save) {
+			SiteGuard_Backup_Security::maybe_migrate(true);
+		}
+		// Clears the "secrets cannot be decrypted" notice once every stored
+		// secret decrypts again (re-entered, or the old AUTH_KEY is back).
+		SiteGuard_Backup_Security::recheck_secrets();
 
 		return array('success' => true, 'saved' => $settings_keys);
 	}
@@ -2638,27 +2635,65 @@ class SiteGuard_Backup_Commands {
 	 * Gap 42: Export all plugin settings as JSON.
 	 */
 	public function export_settings($params) {
+		require_once SGBACKUP_DIR . 'includes/class-security.php';
 		$opts = SiteGuard_Backup_Options::instance();
 		$defaults = $opts->get_defaults();
 		$settings = array();
+		// Secrets stay out unless asked for (moving settings to another site).
+		// When included they are DECRYPTED: ciphertext is useless on a site with
+		// another AUTH_KEY.
+		$include_secrets = !empty($params['include_secrets']);
 
 		foreach ($defaults as $key => $default) {
 			$settings[$key] = $opts->get_option('sgbackup_' . $key, $default);
 		}
+		// Never exported: the lock password is a hash and only valid here.
+		unset($settings['lock_admin_password']);
+		if ($include_secrets) {
+			$settings['encryption_key'] = (string) $opts->get_sensitive_option('encryption_key', '');
+			$secret = (string) $opts->get_sensitive_option('webhook_secret', '');
+			if ('' !== $secret) $settings['webhook_secret'] = $secret;
+		} else {
+			// The webhook URL often carries a token (chat webhooks).
+			unset($settings['encryption_key'], $settings['webhook_url']);
+			if (!empty($settings['extradbs']) && is_array($settings['extradbs'])) {
+				foreach ($settings['extradbs'] as $i => $extdb) {
+					if (is_array($extdb)) unset($settings['extradbs'][$i]['pass']);
+				}
+			}
+		}
 
 		foreach (self::$valid_methods as $method) {
 			$method_settings = $opts->get_option(SiteGuard_Backup_Options::method_option($method), array());
-			if (!empty($method_settings)) {
-				$settings['method_' . $method] = $method_settings;
+			if (empty($method_settings) || !is_array($method_settings)) continue;
+			$fields = SiteGuard_Backup_Security::get_sensitive_fields($method);
+			$filter = function ($instance) use ($method, $fields, $include_secrets) {
+				if (!is_array($instance)) return $instance;
+				if ($include_secrets) {
+					return SiteGuard_Backup_Security::decrypt_method_options($method, $instance);
+				}
+				foreach ($fields as $field) unset($instance[$field]);
+				return $instance;
+			};
+			if (isset($method_settings['settings']) && is_array($method_settings['settings'])) {
+				foreach ($method_settings['settings'] as $id => $instance) {
+					$method_settings['settings'][$id] = $filter($instance);
+				}
+			} else {
+				$method_settings = $filter($method_settings);
 			}
+			$settings['method_' . $method] = $method_settings;
 		}
 
 		// Audit log
 		$audit = SiteGuard_Backup_Audit_Log::instance();
-		$audit->log('settings_exported', 'Plugin settings exported.');
+		$audit->log('settings_exported', $include_secrets
+			? 'Plugin settings exported WITH passwords and keys.'
+			: 'Plugin settings exported (without passwords and keys).');
 
 		return array(
 			'settings' => $settings,
+			'secrets_included' => $include_secrets,
 			'exported' => gmdate('Y-m-d H:i:s'),
 			'site_url' => get_site_url(),
 			'version'  => SGBACKUP_VERSION,
@@ -2678,14 +2713,40 @@ class SiteGuard_Backup_Commands {
 		$imported = 0;
 
 		require_once SGBACKUP_DIR . 'includes/class-security.php';
-		$encrypt_creds = (bool) $opts->get_option('sgbackup_encrypt_credentials', false);
+		$skipped_secrets = 0;
+		$S = 'SiteGuard_Backup_Security';
 
 		foreach ($params['settings'] as $key => $value) {
 			// Sanitize key to alphanumeric and underscore only
 			if (!preg_match('/^[a-zA-Z0-9_]+$/', $key)) continue;
 
+			// Secrets: encrypted here with this site's key. Empty (an export
+			// without secrets) keeps this site's value; ciphertext from another
+			// site's export cannot be read here and is skipped, not stored.
+			if ($key === 'encryption_key' || $key === 'webhook_secret') {
+				if (!is_string($value) || '' === $value) continue;
+				if ($S::is_unreadable($value)) { $skipped_secrets++; continue; }
+				$opts->update_sensitive_option($key, $S::decrypt_option(str_replace(chr(0), '', $value)));
+				$imported++;
+				continue;
+			}
+
 			if (isset($defaults[$key])) {
 				if ($key === 'lock_admin_password') continue;
+				if ($key === 'extradbs' && is_array($value)) {
+					// Entries without a password (secret-free export) keep the stored
+					// password of the same database.
+					$current = (array) $opts->get_option('sgbackup_extradbs', array());
+					foreach ($value as $i => $extdb) {
+						if (!is_array($extdb) || (isset($extdb['pass']) && '' !== $extdb['pass'])) continue;
+						foreach ($current as $prev) {
+							if (is_array($prev) && ($prev['host'] ?? '') === ($extdb['host'] ?? '') && ($prev['user'] ?? '') === ($extdb['user'] ?? '') && ($prev['name'] ?? '') === ($extdb['name'] ?? '')) {
+								$value[$i]['pass'] = isset($prev['pass']) ? $prev['pass'] : '';
+								break;
+							}
+						}
+					}
+				}
 				if ($key === 'default_health_key_policy' && !in_array($value, array('keep', 'backup'), true)) continue;
 				// Type-check against default value
 				if (gettype($value) !== gettype($defaults[$key])) continue;
@@ -2704,6 +2765,7 @@ class SiteGuard_Backup_Commands {
 				if (!in_array($method, self::$valid_methods, true) || !is_array($value)) continue;
 
 				// Multi-instance format: array('version'=>N, 'settings'=>array(id=>fields)).
+				$current = $opts->get_option(SiteGuard_Backup_Options::method_option($method), array());
 				if (isset($value['settings']) && is_array($value['settings'])) {
 					$clean = array(
 						'version'  => isset($value['version']) ? intval($value['version']) : 1,
@@ -2711,20 +2773,19 @@ class SiteGuard_Backup_Commands {
 					);
 					foreach ($value['settings'] as $instance_id => $instance_settings) {
 						if (!is_array($instance_settings)) continue;
+						$instance_id = sanitize_text_field($instance_id);
 						$instance_settings = $this->sanitize_imported_method_fields($instance_settings);
-						if ($encrypt_creds) {
-							$instance_settings = SiteGuard_Backup_Security::encrypt_method_options($method, $instance_settings);
-						}
-						$clean['settings'][sanitize_text_field($instance_id)] = $instance_settings;
+						$have = (is_array($current) && isset($current['settings'][$instance_id]) && is_array($current['settings'][$instance_id])) ? $current['settings'][$instance_id] : array();
+						$instance_settings = $this->merge_imported_secrets($method, $instance_settings, $have, $skipped_secrets);
+						$clean['settings'][$instance_id] = $instance_settings;
 					}
 					$opts->update_option(SiteGuard_Backup_Options::method_option($method), $clean);
 					$imported++;
 				} elseif ($this->is_flat_method_settings($value)) {
 					// Legacy flat format: array(field=>scalar).
 					$clean = $this->sanitize_imported_method_fields($value);
-					if ($encrypt_creds) {
-						$clean = SiteGuard_Backup_Security::encrypt_method_options($method, $clean);
-					}
+					$have = (is_array($current) && !isset($current['settings'])) ? $current : array();
+					$clean = $this->merge_imported_secrets($method, $clean, $have, $skipped_secrets);
 					$opts->update_option(SiteGuard_Backup_Options::method_option($method), $clean);
 					$imported++;
 				} else {
@@ -2736,9 +2797,50 @@ class SiteGuard_Backup_Commands {
 
 		// Audit log
 		$audit = SiteGuard_Backup_Audit_Log::instance();
-		$audit->log('settings_imported', 'Imported ' . $imported . ' settings.');
+		$audit->log('settings_imported', 'Imported ' . $imported . ' settings.' . ($skipped_secrets ? " Skipped {$skipped_secrets} encrypted secret(s) from another site." : ''));
+		SiteGuard_Backup_Security::recheck_secrets();
 
-		return array('success' => true, 'imported' => $imported);
+		$out = array('success' => true, 'imported' => $imported);
+		if ($skipped_secrets) {
+			$out['skipped_secrets'] = $skipped_secrets;
+			$out['message'] = "{$skipped_secrets} password(s) or key(s) in the file were encrypted by another site and cannot be read here; this site's own values were kept. Export with \"Include passwords and keys\" to move them.";
+		}
+		return $out;
+	}
+
+	/**
+	 * Secret fields of one imported storage instance: a missing or empty one
+	 * (an export without secrets) keeps this site's stored value, ciphertext
+	 * from another site is dropped (counted in $skipped) and replaced by this
+	 * site's value, and plaintext is encrypted with this site's key.
+	 *
+	 * @param string $method   Storage method id.
+	 * @param array  $imported Sanitized imported fields.
+	 * @param array  $have     This site's stored instance (raw), or array().
+	 * @param int    $skipped  Counter of unreadable secrets.
+	 * @return array
+	 */
+	private function merge_imported_secrets($method, $imported, $have, &$skipped) {
+		foreach (SiteGuard_Backup_Security::get_sensitive_fields($method) as $field) {
+			$v = isset($imported[$field]) ? $imported[$field] : '';
+			if (is_string($v) && SiteGuard_Backup_Security::is_unreadable($v)) {
+				$skipped++;
+				$v = '';
+			}
+			if ('' === $v || null === $v) {
+				if (isset($have[$field]) && '' !== $have[$field]) {
+					$imported[$field] = $have[$field];
+				} else {
+					unset($imported[$field]);
+				}
+			} elseif (is_string($v)) {
+				$imported[$field] = SiteGuard_Backup_Security::decrypt_option($v);
+			}
+		}
+		if (SiteGuard_Backup_Security::encryption_on()) {
+			$imported = SiteGuard_Backup_Security::encrypt_method_options($method, $imported);
+		}
+		return $imported;
 	}
 
 	/**
@@ -2869,8 +2971,13 @@ class SiteGuard_Backup_Commands {
 	 */
 	public function test_webhook($params) {
 		$url = '';
-		if (!empty($params['url'])) {
+		if (!empty($params['url']) && is_string($params['url'])) {
 			$url = trim($params['url']);
+		}
+		// The page holds a placeholder for a stored URL: test the stored one.
+		require_once SGBACKUP_DIR . 'includes/class-security.php';
+		if (SiteGuard_Backup_Security::SECRET_UNCHANGED === $url) {
+			$url = '';
 		}
 		if (empty($url)) {
 			$opts = SiteGuard_Backup_Options::instance();
@@ -2882,6 +2989,29 @@ class SiteGuard_Backup_Commands {
 		}
 
 		return SiteGuard_Backup_Webhook::send_test($url);
+	}
+
+	/**
+	 * Webhook signing secret for the settings page: 'reveal' returns it,
+	 * 'regenerate' replaces it with a new one and returns that. The page never
+	 * carries the secret otherwise.
+	 *
+	 * @param array $params 'op' => 'reveal'|'regenerate'.
+	 */
+	public function webhook_secret($params) {
+		$op = isset($params['op']) && is_string($params['op']) ? $params['op'] : 'reveal';
+		$audit = SiteGuard_Backup_Audit_Log::instance();
+		if ('regenerate' === $op) {
+			$secret = SiteGuard_Backup_Webhook::regenerate_secret();
+			$audit->log('webhook_secret_regenerated', 'Webhook signing secret regenerated.');
+			return array('secret' => $secret);
+		}
+		$secret = SiteGuard_Backup_Webhook::reveal_secret();
+		if ('' === $secret) {
+			return new WP_Error('unreadable', 'The webhook secret cannot be decrypted (AUTH_KEY changed). Regenerate it.');
+		}
+		$audit->log('webhook_secret_viewed', 'Webhook signing secret shown on the settings page.');
+		return array('secret' => $secret);
 	}
 
 	/**

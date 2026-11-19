@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Lint every PHP file and run the standalone unit tests (delete guard,
-# encryption), the same checks as .github/workflows/tests.yml.
+# encryption, secrets at rest), the test job of .gitlab-ci.yml.
 #
 # The unit tests call real delete functions and refuse to run as root (see
 # tests/README.md). CI job containers start as root, so when this script runs

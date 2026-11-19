@@ -773,7 +773,7 @@ class SiteGuard_Backup_Options {
 			'webhook_url'        => '',
 			'webhook_events'     => array(),
 			'ip_allowlist'       => '',
-			'encrypt_credentials' => false,
+			'encrypt_credentials' => true,
 			'failover_enabled'   => false,
 			'failover_role'      => 'standalone',
 			'failover_production_url' => '',
@@ -802,15 +802,15 @@ class SiteGuard_Backup_Options {
 	}
 
 	/**
-	 * Update a sensitive option, encrypting before storage if credential encryption is enabled.
+	 * Update a sensitive option, encrypting before storage if credential encryption is enabled (the default).
 	 *
 	 * @param string $key   Option key (without sgbackup_ prefix).
 	 * @param mixed  $value Value to store.
 	 * @return bool
 	 */
 	public function update_sensitive_option($key, $value) {
-		if (is_string($value) && !empty($value) && $this->get_option('sgbackup_encrypt_credentials', false)) {
-			require_once SGBACKUP_DIR . 'includes/class-security.php';
+		require_once SGBACKUP_DIR . 'includes/class-security.php';
+		if (is_string($value) && !empty($value) && SiteGuard_Backup_Security::encryption_on()) {
 			$value = SiteGuard_Backup_Security::encrypt_option($value);
 		}
 		return $this->update_option('sgbackup_' . $key, $value);

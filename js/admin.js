@@ -3701,10 +3701,12 @@
 			$('#sgbackup-export-settings-btn').on('click', function() {
 				var $btn = $(this);
 				var $status = $('#sgbackup-export-status');
+				var withSecrets = $('#sgbackup-export-include-secrets').is(':checked');
+				if (withSecrets && !confirm('The exported file will contain your storage passwords, API keys, the backup encryption passphrase and the webhook secret in plaintext. Anyone with the file can reach your backup storage and decrypt your backups. Export anyway?')) return;
 				$btn.prop('disabled', true);
 				$status.text('Exporting...').removeClass('success error');
 
-				self.ajax('export_settings', {}, function(data) {
+				self.ajax('export_settings', { include_secrets: withSecrets ? 1 : 0 }, function(data) {
 					$btn.prop('disabled', false);
 					$status.text('').addClass('success');
 
@@ -3720,7 +3722,7 @@
 					document.body.removeChild(a);
 					URL.revokeObjectURL(url);
 
-					$status.text('Settings exported!').addClass('success');
+					$status.text(withSecrets ? 'Settings exported WITH passwords and keys. Delete the file after use.' : 'Settings exported (without passwords and keys).').addClass('success');
 				}, function(msg) {
 					$btn.prop('disabled', false);
 					$status.text('Error: ' + msg).addClass('error');
@@ -3766,8 +3768,14 @@
 
 					self.ajax('import_settings', { settings: content.settings }, function(data) {
 						$btn.prop('disabled', false);
-						$status.text('Imported ' + (data.imported || 0) + ' setting(s). Reloading...').addClass('success');
-						setTimeout(function() { location.reload(); }, 1500);
+						if (data.skipped_secrets) {
+							$status.text('Imported ' + (data.imported || 0) + ' setting(s). ' + (data.message || '')).addClass('success');
+							alert(data.message || '');
+							setTimeout(function() { location.reload(); }, 1500);
+						} else {
+							$status.text('Imported ' + (data.imported || 0) + ' setting(s). Reloading...').addClass('success');
+							setTimeout(function() { location.reload(); }, 1500);
+						}
 					}, function(msg) {
 						$btn.prop('disabled', false);
 						$status.text('Error: ' + msg).addClass('error');
@@ -3780,6 +3788,23 @@
 		// ===== Webhook Test =====
 		bindWebhook: function() {
 			var self = this;
+
+			// Signing secret: not in the page; fetched on request, or created anew.
+			$('.sgbackup-webhook-secret').on('click', function() {
+				var $btn = $(this);
+				var op = $btn.data('op');
+				var $result = $btn.siblings('.sgbackup-webhook-secret-result');
+				if (op === 'regenerate' && !confirm('Create a new signing secret? Receivers that check the old one will reject webhooks until they get the new one.')) return;
+				$btn.prop('disabled', true);
+				self.ajax('webhook_secret', { op: op }, function(data) {
+					$btn.prop('disabled', false);
+					$('#sgbackup-webhook-secret-value').text(data.secret || '');
+					$result.text(op === 'regenerate' ? 'New secret created.' : '').addClass('success').removeClass('error');
+				}, function(msg) {
+					$btn.prop('disabled', false);
+					$result.text('Error: ' + msg).addClass('error').removeClass('success');
+				});
+			});
 
 			$('.sgbackup-test-webhook').on('click', function() {
 				var url = $('input[name="webhook_url"]').val();

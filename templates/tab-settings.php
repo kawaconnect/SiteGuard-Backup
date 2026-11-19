@@ -1691,18 +1691,31 @@ $period_labels = array(
 		<tr>
 			<th><?php esc_html_e('Webhook URL', 'siteguardbackup'); ?></th>
 			<td>
-				<input type="url" name="webhook_url" value="<?php echo esc_attr(isset($settings['webhook_url']) ? $settings['webhook_url'] : ''); ?>" class="regular-text" placeholder="https://example.com/webhook" />
-				<p class="description"><?php esc_html_e('URL to receive POST notifications with JSON payload: { event, site_url, timestamp, data }. Includes X-SiteGuard-Event and X-SiteGuard-Signature headers.', 'siteguardbackup'); ?></p>
+				<?php
+				require_once SGBACKUP_DIR . 'includes/class-security.php';
+				$webhook_url_stored = isset($settings['webhook_url']) ? (string) $settings['webhook_url'] : '';
+				// The URL often carries a token (chat webhooks): only its host is shown.
+				// The field holds a placeholder; saving it unchanged keeps the URL.
+				?>
+				<?php if ('' !== $webhook_url_stored): ?>
+					<p><code><?php echo esc_html(SiteGuard_Backup_Webhook::mask_url($webhook_url_stored)); ?></code> <?php esc_html_e('Webhook URL is set.', 'siteguardbackup'); ?></p>
+				<?php endif; ?>
+				<input type="password" name="webhook_url" value="<?php echo esc_attr(SiteGuard_Backup_Security::mask_secret($webhook_url_stored)); ?>" class="regular-text" autocomplete="off" placeholder="https://example.com/webhook" />
+				<p class="description"><?php esc_html_e('URL to receive POST notifications with JSON payload: { event, site_url, timestamp, data }. Includes X-SiteGuard-Event and X-SiteGuard-Signature headers. To change it, replace the field with the new URL; empty the field to remove it.', 'siteguardbackup'); ?></p>
 			</td>
 		</tr>
 		<tr>
 			<th><?php esc_html_e('Signing Secret', 'siteguardbackup'); ?></th>
 			<td>
 				<?php
-				$webhook_secret = SiteGuard_Backup_Options::instance()->get_option('sgbackup_webhook_secret', '');
+				$webhook_secret_set = '' !== (string) SiteGuard_Backup_Options::instance()->get_option('sgbackup_webhook_secret', '');
+				// Never echoed into the page: shown on request (Show) or once after Regenerate.
 				?>
-				<input type="text" name="webhook_secret" value="<?php echo esc_attr($webhook_secret); ?>" class="regular-text" readonly />
-				<p class="description"><?php esc_html_e('Auto-generated secret used to sign webhook payloads (HMAC-SHA256). Share this with your webhook receiver to verify authenticity.', 'siteguardbackup'); ?></p>
+				<code id="sgbackup-webhook-secret-value"><?php echo $webhook_secret_set ? '********' : esc_html__('(created with the first webhook)', 'siteguardbackup'); ?></code>
+				<button type="button" class="button sgbackup-webhook-secret" data-op="reveal"><?php esc_html_e('Show', 'siteguardbackup'); ?></button>
+				<button type="button" class="button sgbackup-webhook-secret" data-op="regenerate"><?php esc_html_e('Regenerate', 'siteguardbackup'); ?></button>
+				<span class="sgbackup-webhook-secret-result sgbackup-status"></span>
+				<p class="description"><?php esc_html_e('Auto-generated secret used to sign webhook payloads (HMAC-SHA256). Share this with your webhook receiver to verify authenticity. Regenerating invalidates the old secret.', 'siteguardbackup'); ?></p>
 			</td>
 		</tr>
 		<tr>

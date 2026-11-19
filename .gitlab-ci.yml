@@ -1,7 +1,6 @@
 # GitLab CI for SiteGuard Backup (WordPress plugin).
 #
-# Ports .github/workflows/tests.yml and release.yml (GitHub Actions is
-# disabled for this repo; those files are kept but no longer run):
+# The only CI for this repo (the GitHub repository is a plain mirror):
 #   test     -> php -l on every PHP file + the standalone unit tests, on
 #               PHP 8.3 as an unprivileged user (ci/test.sh)
 #   build    -> the installable siteguardbackup-<version>.zip (ci/build-zip.sh)
