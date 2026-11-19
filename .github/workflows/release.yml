@@ -27,16 +27,8 @@ jobs:
 
       - name: Build plugin zip
         run: |
-          mkdir siteguardbackup
-          rsync -a \
-            --exclude='.git/' \
-            --exclude='.github/' \
-            --exclude='.gitignore' \
-            --exclude='.DS_Store' \
-            --exclude='docs/' \
-            --exclude='tests/' \
-            ./ siteguardbackup/
-          zip -r "siteguardbackup-${{ steps.version.outputs.version }}.zip" siteguardbackup/
+          bash ci/build-zip.sh "${{ steps.version.outputs.version }}" out
+          cp "out/siteguardbackup-${{ steps.version.outputs.version }}.zip" .
 
       - name: Create GitHub Release
         run: |
