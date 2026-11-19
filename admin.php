@@ -152,6 +152,7 @@ class SiteGuard_Backup_Admin {
 			'default_health_key_policy' => ('backup' === SiteGuard_Backup_Options::instance()->get_option('sgbackup_default_health_key_policy', 'keep')) ? 'backup' : 'keep',
 			'configured_methods' => $this->get_configured_methods(),
 			'strings'   => array(
+				'backup_now'       => __('Backup Now', 'siteguardbackup'),
 				'backup_started'   => __('Backup started...', 'siteguardbackup'),
 				'backup_complete'  => __('Backup complete!', 'siteguardbackup'),
 				'restore_started'  => __('Restore started...', 'siteguardbackup'),

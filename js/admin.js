@@ -188,7 +188,7 @@
 					width: 480,
 					buttons: [
 						{
-							text: sgbackup_settings.strings.backup_started.replace('...', ''),
+							text: sgbackup_settings.strings.backup_now || 'Backup Now',
 							class: 'button button-primary',
 							click: function() {
 								self.doBackupNow();
@@ -203,6 +203,17 @@
 					]
 				});
 			});
+
+			// The admin bar "Backup Now" link lands here with ?action=backupnow:
+			// open the dialog (the backup still needs the button press), and drop
+			// the parameter so a reload does not open it again.
+			if (/[?&]action=backupnow(&|$)/.test(window.location.search) && $('#sgbackup-backupnow-btn').length) {
+				$('#sgbackup-backupnow-btn').trigger('click');
+				if (history.replaceState) {
+					var cleaned = window.location.search.replace(/([?&])action=backupnow(&|$)/, function(m, pre, post) { return post ? pre : ''; });
+					history.replaceState(null, '', window.location.pathname + cleaned + window.location.hash);
+				}
+			}
 
 			// Toggle entity checkboxes
 			$('input[name="sgbackup_include_files"]').on('change', function() {
