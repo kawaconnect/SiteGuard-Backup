@@ -6,15 +6,32 @@ A WordPress backup, restore, and migration plugin built for multisite networks. 
 
 - **Full and incremental backups** of files and database, scheduled or on-demand
 - **Per-subsite backup and restore** from Network Admin - back up or restore individual subsites without touching the rest of the network
-- **Site-to-site migration** - pull backups directly from a remote WordPress site over an authenticated, encrypted connection (RSA+AES). No manual file downloads or uploads required
+- **Site-to-site migration** - send backups directly from one WordPress site to another over an authenticated, encrypted connection (RSA+AES)
 - **Domain remapping** - migrate between independent domains and subdomains automatically. Handles multisite blog tables, sitemeta, and serialization-aware search-replace across all subsites
-- **15 remote storage destinations**: Amazon S3 and S3-compatible services, Backblaze B2, Google Cloud Storage, Azure Blob, Google Drive, Dropbox, OneDrive, pCloud, FTP/FTPS, SFTP/SCP, WebDAV, OpenStack Swift, Email (see [Remote storage](#remote-storage))
-- **WP-CLI integration** - 45+ subcommands covering backups, restores, settings, migrations, and diagnostics
+- **14 remote storage destinations** (plus direct send to another SiteGuard site): Amazon S3 and S3-compatible services, Backblaze B2, Google Cloud Storage, Azure Blob, Google Drive, Dropbox, OneDrive, pCloud, FTP/FTPS, SFTP/SCP, WebDAV, OpenStack Swift, Email (see [Remote storage](#remote-storage))
+- **WP-CLI integration** - 55 subcommands covering backups, restores, settings, migrations, and diagnostics
 - **Resumable jobs** - long-running backups resume automatically via WP-Cron if interrupted
 - **Atomic database restores** - imports into temporary tables, then swaps all tables in a single `RENAME TABLE` operation
 - **Split archives** - large backups split at configurable thresholds (default 400 MB)
 - **Encryption** - AES-256-GCM backup encryption with PBKDF2 key derivation
 - **DB anonymisation** - strip PII from database exports (all users, non-staff only, or WooCommerce orders)
+
+## Install
+
+1. Download `siteguardbackup-<version>.zip` from the releases page (or build it with `ci/build-zip.sh`).
+2. In WordPress: Plugins > Add New > Upload Plugin, choose the zip, activate. On multisite, network-activate it.
+3. Open **SiteGuard Backup** in the admin menu. It needs `manage_options` (on multisite: `manage_network_options` for the network and main site; a subsite administrator sees only their own subsite's backups).
+4. Check the admin notices: if backups would land inside the web root, fix that first (see [Backup Storage Location](#backup-storage-location)).
+
+Nothing is scheduled and nothing leaves the server until you configure it: schedules default to manual, two backups of each kind are kept, and no remote storage is selected.
+
+## Quick Start
+
+- **Back up now:** Backup / Restore tab > Backup Now, or `wp siteguardbackup backup`.
+- **Schedule:** Settings tab, or `wp siteguardbackup schedule set --files=daily --database=daily --retain=7 --retain-db=7`. WP-Cron only runs when the site gets traffic; on quiet sites call `wp cron event run --due-now` from system cron.
+- **Remote storage:** Settings tab > pick a destination, save its credentials, press Test Connection. See [Remote storage](#remote-storage).
+- **Encrypt archives:** Settings tab > Encryption, set a passphrase. Write the passphrase down: it is not recoverable and a backup cannot be restored without it.
+- **Restore:** Backup / Restore tab > Restore on a backup row, choose what to restore, confirm. Or `wp siteguardbackup restore <timestamp>`. Uploaded archives (the upload box, or files copied into the backup directory followed by Rescan Local) restore the same way.
 
 ## Multisite Focus
 
@@ -50,31 +67,33 @@ The health monitor API key is the one setting you choose per restore: keep this 
 
 ## Site-to-Site Migration
 
-Pull backups directly from another WordPress site without manually downloading or uploading files:
+Send backups directly to another WordPress site without downloading and uploading files by hand. Both sites run SiteGuard Backup:
 
-1. Generate a key bundle on the **destination** site (Settings > Migration tab)
+1. Generate a key bundle on the **destination** site (SiteGuard Backup > Migrate / Clone tab)
 2. Paste the key bundle on the **source** site to register it as a destination
 3. Send backups from source to destination - or trigger a backup-and-send in one step
 4. Restore on the destination with automatic domain remapping
 
-The connection is authenticated with RSA key pairs and encrypted with AES. Rate-limited to 60 requests/minute per IP.
+The connection is authenticated with RSA key pairs and encrypted with AES. The receiving site accepts at most 600 requests per minute per IP. Keys can be given an expiry date; keys made before 1.7.0 are refused, create a new one.
 
 ## WP-CLI
 
 ```bash
 # Backups
-wp siteguardbackup backup [--db-only] [--files-only] [--incremental] [--label=<label>]
+wp siteguardbackup backup [--exclude-db] [--include-files=plugins,themes,uploads,others,wpcore] [--send-to-cloud]
+                          [--incremental] [--always-keep] [--label=<label>]   # local only unless --send-to-cloud
 wp siteguardbackup list [--format=table|json]
 wp siteguardbackup status
 wp siteguardbackup delete <timestamp> [--delete-remote] [--yes]
-wp siteguardbackup inspect <timestamp> [--format=table|json]
+wp siteguardbackup inspect <timestamp> [--format=text|json]
 
 # Restore
 wp siteguardbackup restore <timestamp> [--entities=<list>] [--db-restore-mode=<mode>] [--health-key=keep|backup]
 wp siteguardbackup import <dir> --restore [--entities=<list>] [--health-key=keep|backup]
 wp siteguardbackup resume_restore
 
-# Health monitor API key (for the Discord bot); never shows a key or hash except --print-hash
+# Health monitor API key (for an external monitor). The status output never shows a key or hash;
+# --regenerate prints the new key once, --print-hash prints the hash.
 wp siteguardbackup health_api_key [--format=table|json]   # fingerprint, wp-config pin, last restore
 wp siteguardbackup health_api_key --regenerate
 printf %s "$KEY" | wp siteguardbackup health_api_key --set   # use a key you already have (STDIN or hidden prompt)
@@ -109,7 +128,7 @@ Run `wp help siteguardbackup` for the full command list.
 
 ## Uptime Kuma
 
-The health monitor (HTTP and SSL checks of every site, Health tab) can send one heartbeat per run to an Uptime Kuma **Push** monitor: `up`, or `down` naming the failing sites (`2/12 failing; down: example.com (HTTP 503); ssl_expired: foo.com`). When WordPress, PHP, the database or WP-Cron stops, the heartbeats stop and Kuma alerts too. Set the push URL on the Health tab or with `wp siteguardbackup health_kuma --push-url=<push url>` (`--test`, `--clear`); set the Kuma heartbeat interval to at least two health check intervals (1320 s for the default 10 minutes). Monitor settings, message format and cron notes: [docs/uptime-kuma.md](docs/uptime-kuma.md).
+The health monitor (HTTP and SSL checks of every site, Health Monitor tab) can send one heartbeat per run to an Uptime Kuma **Push** monitor: `up`, or `down` naming the failing sites (`2/12 failing; down: example.com (HTTP 503); ssl_expired: example.org`). When WordPress, PHP, the database or WP-Cron stops, the heartbeats stop and Kuma alerts too. Set the push URL on the Health Monitor tab or with `wp siteguardbackup health_kuma --push-url=<push url>` (`--test`, `--clear`); set the Kuma heartbeat interval to at least two health check intervals (1320 s for the default 10 minutes). Monitor settings, message format and cron notes: [docs/uptime-kuma.md](docs/uptime-kuma.md).
 
 ## Low-Memory Hosts
 
@@ -128,7 +147,7 @@ wp siteguardbackup settings set --low_memory_mode=on
 wp siteguardbackup sysinfo      # shows memory_limit, system_memory, and whether the mode is active
 ```
 
-Finished backups can be downloaded as one streamed zip bundle (no temp file, constant memory) or pushed to another WordPress site in 1-2 MB encrypted chunks.
+Finished backups can be downloaded as one streamed zip bundle (no temp file, constant memory; sets over 4 GB are downloaded file by file) or pushed to another WordPress site in 1-2 MB encrypted chunks.
 
 ## Remote storage
 
@@ -177,18 +196,71 @@ define('SGBACKUP_BACKUP_DIR', '/path/outside/webroot');
 
 You can also return a path from the `sgbackup_backup_dir` filter in an mu-plugin. Subsites use `site-<id>` subdirectories under the root.
 
-If no writable directory outside the web root exists, backups fall back to `wp-content/sgbackup` and every SiteGuard admin sees an error notice. On nginx, **nothing placed in that directory protects it**: `.htaccess` is Apache-only, and nginx serves named files straight off disk. Fix the location instead of relying on stub files. Downloads from the admin always go through a capability-checked PHP endpoint.
+If no writable directory outside the web root exists, backups fall back to `wp-content/sgbackup`. On Apache and LiteSpeed that directory gets deny rules (`.htaccess` and friends). On any other server every SiteGuard admin sees an error notice, because on nginx **nothing placed in that directory protects it**: `.htaccess` is Apache-only, and nginx serves named files straight off disk. Fix the location instead of relying on stub files. Downloads from the admin always go through a capability-checked PHP endpoint.
+
+## Security Notes
+
+- **Backup archives are not encrypted unless you set a passphrase.** With one, archives are AES-256-GCM (`.crypt`), key derived with PBKDF2-SHA256. The passphrase is stored in the WordPress database so scheduled backups can use it.
+- **Storage credentials are stored in the database as entered unless you turn on "Encrypt storage credentials at rest"** (Advanced Tools tab). That setting encrypts them with a key derived from `AUTH_KEY` in `wp-config.php`; if `AUTH_KEY` changes (new host, regenerated salts) the credentials become unreadable and must be entered again.
+- **A settings export contains secrets**: storage credentials, the encryption passphrase, the webhook URL and the settings-lock password hash. Treat the file like a password store.
+- Secrets already saved are never sent back to the settings page; fields show a placeholder and keep the stored value unless you type a new one.
+- The health and sync API keys are stored hashed. `--regenerate` shows a key once; it cannot be read back later.
+- Optional hardening: an IP allowlist for the admin screens (Advanced Tools tab), a settings lock password (Settings tab), and an audit log (`wp siteguardbackup audit_log`).
+- Site health probes and the post-restore smoke test do not verify TLS certificates (they only check that the site answers and read the certificate's expiry). Storage and webhook requests verify certificates unless you switch that off under Settings > Expert / Advanced Settings.
 
 ## Safety
 
-- Every file or directory SiteGuard deletes must resolve inside an explicit, sane root (never `/`, a system directory, or a parent of WordPress); symlinks are never followed and failures are reported, not suppressed.
+- Every file or directory SiteGuard deletes must resolve inside an explicit, sane root (never `/`, a system directory, or a parent of WordPress); symlinks are never followed. This covers retention, restore, temp cleanup and uninstall.
 - Restores that fail (wrong passphrase, SQL error) change nothing and are never mistaken for finished on retry. The optional pre-restore backup is complete or the restore does not start.
 - Imported SQL cannot touch other databases on the same server or run privilege/file operations.
 - On multisite, subsite administrators can only back up, download and restore their own subsite.
-
 - The client IP (IP allowlist, rate limits, audit log) is `REMOTE_ADDR`; `CF-Connecting-IP` is used only when the connection comes from Cloudflare or loopback. `X-Forwarded-For` is never used. Behind a local proxy or tunnel in another container (cloudflared, nginx), for example a standby in Docker, list that proxy in `wp-config.php`, or all visitors share its IP: `define('SGBACKUP_TRUSTED_PROXIES', '172.19.0.0/16');` (comma-separated IPs or CIDRs). See [docs/health-api.md](docs/health-api.md#authentication).
 
 Tests live in `tests/` and must only run on disposable hosts; see `tests/README.md`.
+
+## Configuration Reference
+
+`wp-config.php` constants (all optional):
+
+| Constant | Purpose |
+|---|---|
+| `SGBACKUP_BACKUP_DIR` | Absolute path of the backup directory, outside the web root |
+| `SGBACKUP_TRUSTED_PROXIES` | Comma-separated IPs/CIDRs of reverse proxies whose `CF-Connecting-IP` header is trusted |
+| `SGBACKUP_HEALTH_ENABLED` | Pin the health monitor on or off regardless of the saved setting |
+| `SGBACKUP_HEALTH_API_KEY_HASH` | Pin a health API key by its hash (see [docs/health-api.md](docs/health-api.md)) |
+| `SGBACKUP_SYNC_API_KEY_HASH` | Pin a sync API key by its hash: `password_hash($key, PASSWORD_BCRYPT)` |
+
+Filters: `sgbackup_backup_dir`, `sgbackup_trusted_proxy_cidrs`, `sgbackup_oauth_redirect_uri`, `sgbackup_email_max_attachment_bytes` (default 25 MB), `sgbackup_low_memory`, `sgbackup_memory_limit`, `sgbackup_s3_part_size`, `sgbackup_stale_job_after` (default 6 hours).
+
+### Sync API
+
+Lets a trusted puller start a backup here and download the result. Off until a key exists (`wp siteguardbackup sync_api_key --regenerate`); every request needs `Authorization: Bearer <key>`. On multisite only the main site answers. Routes under `/wp-json/sgbackup/v1/sync`:
+
+| Route | Does |
+|---|---|
+| `GET /ping` | Checks the key; returns version and running jobs |
+| `POST /backup` | Starts a local backup (`label`, `entities[]`, `db=false`); returns the job `nonce`; `409` while another job runs |
+| `GET /jobs/<nonce>` | Job status |
+| `GET /sets[?hash=1]` | Backup sets and their files (sizes; SHA-256 with `hash=1`) |
+| `GET /sets/<nonce>/file?name=<file>` | Downloads one file; HTTP `Range` is supported |
+| `DELETE /sets/<nonce>` | Deletes a set (`409` if it is marked always-keep) |
+
+Anyone holding this key can download full backups of the site. Failed attempts are rate-limited per IP together with the health API.
+
+## Troubleshooting
+
+- **A backup seems stuck:** `wp siteguardbackup backup_progress` shows running jobs and their job id (nonce); `wp siteguardbackup get_log <nonce> --tail=50` shows the log. `wp siteguardbackup force_resume <nonce>` continues a job whose WP-Cron event was lost; `wp siteguardbackup abort <nonce>` stops it. Jobs that make no progress for 6 hours are aborted automatically.
+- **"A backup job is already running":** wait for it, or stop it with the Abort button in the job list or with `abort`.
+- **Scheduled backups do not run:** `wp siteguardbackup cron_events --sgbackup-only` shows what is queued. WP-Cron needs traffic or a system cron job.
+- **Storage upload fails:** use the Test button on the destination; `wp siteguardbackup sysinfo` lists PHP extensions and limits. SFTP accepts RSA keys only.
+- **"Stored storage credentials are unreadable":** `AUTH_KEY` changed since they were saved. Enter the credentials again.
+- **Restore stops halfway:** reopen the page and use the resume prompt, or `wp siteguardbackup resume_restore`. A failed database import leaves the live tables untouched.
+- **Locked out by the IP allowlist or the settings lock:** `wp siteguardbackup settings set --ip_allowlist= --lock_admin=0`.
+- Turn on debug mode (Settings tab > Debug) for more detail in job logs.
+
+## Upgrading
+
+Read the `CHANGELOG.md` section of the version you install. Coming from before 1.7.0: migration keys must be recreated on the destination and added again on the source; the OAuth redirect URI changed and must be registered again with Google, Dropbox, Microsoft or pCloud; on multisite the main site's page is for network administrators only and a subsite's own backups hold its database and uploads only.
 
 ## Building / Releases (GitLab CI)
 
@@ -196,7 +268,7 @@ The plugin is built and released by `.gitlab-ci.yml` on the GitLab runners (GitH
 
 | Job | Runs on | What it does |
 |---|---|---|
-| `test` | `php:8.3-cli-bookworm` on the Linux (Kubernetes) runner | `ci/test.sh`: `php -l` on every PHP file outside `vendor/`, then `tests/test-*.php` (delete guard, encryption, health API, client IP) as `nobody`, since those tests refuse root |
+| `test` | `php:8.3-cli-bookworm` on the Linux (Kubernetes) runner | `ci/test.sh`: `php -l` on every PHP file outside `vendor/`, then every `tests/test-*.php` as `nobody`, since those tests refuse root |
 | `build-zip` | `alpine:3.22` | `ci/build-zip.sh`: builds `siteguardbackup-<version>.zip` (one `siteguardbackup/` folder, without `docs/`, `tests/`, git and CI files), kept 30 days as a job artifact |
 | `release` | `alpine:3.22`, tags / `RELEASE_VERSION` only | `ci/release.sh`: uploads the zip to the project's Generic Package Registry (`siteguardbackup/<version>`) and creates or updates the GitLab release for the tag, with this version's `CHANGELOG.md` section as the notes |
 

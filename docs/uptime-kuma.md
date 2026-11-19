@@ -21,7 +21,7 @@ heartbeat arrives and Kuma alerts after the heartbeat interval.
 |---|---|
 | Every site operational | `up`, `12/12 sites operational` |
 | Warnings only: slow site (> 5 s), SSL probe failed, certificate expiring within the warning threshold (default 14 days) but more than 3 days out, site skipped by the 55 s time budget | `up`, the warnings named: `11/12 sites operational; ssl_expiring: shop.example.com (9d)` |
-| Any site down (HTTP error, timeout, refused), a certificate expired, or a certificate expiring within 3 days | `down`: `2/12 failing; down: example.com (HTTP 503); ssl_expired: foo.com` |
+| Any site down (HTTP error, timeout, refused), a certificate expired, or a certificate expiring within 3 days | `down`: `2/12 failing; down: example.com (HTTP 503); ssl_expired: example.org` |
 | The health run threw, or found no sites | `down`: `health run failed: <exception class>` / `no sites checked` |
 | WordPress, PHP, the database or WP-Cron not running | nothing is pushed; Kuma marks the monitor down when the heartbeat interval passes |
 
@@ -35,7 +35,7 @@ The message is at most 200 characters: the count, then `label: site (reason)`
 items, critical ones first. Labels: `down` (reason `HTTP <code>`, `timeout`,
 `DNS`, `refused`, `SSL`, `unreachable`), `ssl_expired`, `ssl_expiring (<n>d)`,
 `ssl_probe_failed`, `slow (<s>s)`, `skipped`. When the items do not fit the
-message ends in `+N more`; the full list is on the Health tab and in the REST
+message ends in `+N more`; the full list is on the Health Monitor tab and in the REST
 API. `ping` is the health run's duration in milliseconds, so Kuma's response
 time chart shows how long the checks take.
 
@@ -43,10 +43,10 @@ time chart shows how long the checks take.
 
 1. **Add New Monitor**
    - Monitor Type: **Push**
-   - Friendly Name: e.g. `kawa.link WordPress (SiteGuard)`
+   - Friendly Name: e.g. `example.com WordPress (SiteGuard)`
    - **Heartbeat Interval**: at least two health check intervals plus two
      minutes. For the default 10-minute health checks: **1320 seconds**
-     (anything from 1200 to 1800 works). The Health tab and
+     (anything from 1200 to 1800 works). The Health Monitor tab and
      `wp siteguardbackup health_kuma` print the value for your interval.
    - **Retries**: **0** (alert on the first missed or down heartbeat) or **1**
      (alert only when two in a row are bad).
@@ -93,9 +93,10 @@ define('DISABLE_WP_CRON', true);
 * * * * * www-data curl -s https://example.com/wp-cron.php?doing_wp_cron >/dev/null
 ```
 
-The Health tab (once a push URL is set) and `wp siteguardbackup health_kuma`
+The Health Monitor tab (once a push URL is set) and `wp siteguardbackup health_kuma`
 warn when `DISABLE_WP_CRON` is not set, and when the last health run is more
-than two intervals old. Disabling the health monitor stops the pushes, so
+than two intervals old. Disabling the health monitor stops the scheduled pushes (a manual
+`wp siteguardbackup health_check` still pushes), so
 Kuma reports the site down; pause the Kuma monitor first when that is
 intended.
 
@@ -113,7 +114,8 @@ wp siteguardbackup health_status               # includes an "Uptime Kuma push:"
 
 Anyone with the URL can push heartbeats to the monitor, so:
 
-- It is shown masked after saving (`https://kuma.example.com/api/push/****xyz9`);
+- It is shown masked after saving (`https://kuma.example.com/api/push/****xyz9`;
+  a token shorter than 12 characters shows as `****` only);
   the admin page, AJAX responses and WP-CLI never return it in full.
 - It is never logged. A failed push writes one line to the PHP error log
   (`SiteGuard Backup: Uptime Kuma push failed: <reason>`, with the URL and
@@ -130,6 +132,6 @@ Anyone with the URL can push heartbeats to the monitor, so:
 
 A push that fails (timeout after 10 seconds, DNS, TLS, or Kuma answering
 `{"ok":false,...}`, e.g. `Monitor not found or not active.` for a paused
-monitor or a wrong token) is recorded as the "Last Push" on the Health tab
+monitor or a wrong token) is recorded as the "Last Push" on the Health Monitor tab
 and never affects the health run or its results. Kuma sees no heartbeat and
 alerts on its own.

@@ -584,9 +584,9 @@
 			// Bind abort buttons
 			$('.sgbackup-abort-btn').off('click').on('click', function() {
 				var nonce = $(this).data('nonce');
-				if (!confirm('Stop this backup job? The files written so far are incomplete and will not be usable.')) return;
+				if (!confirm('Abort this backup job? The files written so far are incomplete and will not be usable.')) return;
 				self.ajax('activejobs_delete', { job_id: nonce }, function() {
-					SGB.showNotice('Backup job ' + nonce + ' stopped.', 'warning');
+					SGB.showNotice('Backup job ' + nonce + ' aborted.', 'warning');
 				});
 			});
 
