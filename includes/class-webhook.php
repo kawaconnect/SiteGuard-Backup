@@ -58,14 +58,62 @@ class SiteGuard_Backup_Webhook {
 	 */
 	private function get_secret() {
 		if (null === $this->secret) {
+			require_once SGBACKUP_DIR . 'includes/class-security.php';
 			$opts = SiteGuard_Backup_Options::instance();
-			$this->secret = (string) $opts->get_option(self::SECRET_KEY, '');
-			if (empty($this->secret)) {
+			$stored = (string) $opts->get_option(self::SECRET_KEY, '');
+			if (SiteGuard_Backup_Security::is_unreadable($stored)) {
+				// Encrypted with another AUTH_KEY. Do not replace it with a new
+				// secret (receivers would reject every payload and the old one
+				// would be lost); signing is impossible until it is readable or
+				// regenerated in the settings.
+				SiteGuard_Backup_Security::decrypt_option($stored); // flags the admin notice
+				$this->secret = '';
+				return $this->secret;
+			}
+			$this->secret = (string) SiteGuard_Backup_Security::decrypt_option($stored);
+			if ('' === $this->secret) {
 				$this->secret = wp_generate_password(40, false);
-				$opts->update_option(self::SECRET_KEY, $this->secret);
+				$opts->update_sensitive_option('webhook_secret', $this->secret);
 			}
 		}
 		return $this->secret;
+	}
+
+	/**
+	 * The signing secret for the settings page (shown on request only).
+	 *
+	 * @return string '' when it cannot be decrypted.
+	 */
+	public static function reveal_secret() {
+		return self::instance()->get_secret();
+	}
+
+	/**
+	 * Replace the signing secret with a new random one and return it.
+	 *
+	 * @return string
+	 */
+	public static function regenerate_secret() {
+		$self = self::instance();
+		$self->secret = wp_generate_password(40, false);
+		SiteGuard_Backup_Options::instance()->update_sensitive_option('webhook_secret', $self->secret);
+		return $self->secret;
+	}
+
+	/**
+	 * The webhook URL with its path and query hidden (they often carry a token).
+	 *
+	 * @param string $url
+	 * @return string e.g. "https://hooks.example.com/****", '' for no URL.
+	 */
+	public static function mask_url($url) {
+		$url = (string) $url;
+		if ('' === $url) return '';
+		$parts = function_exists('wp_parse_url') ? wp_parse_url($url) : parse_url($url);
+		if (!is_array($parts) || empty($parts['host'])) return '****';
+		$scheme = !empty($parts['scheme']) ? $parts['scheme'] . '://' : '';
+		$port = !empty($parts['port']) ? ':' . (int) $parts['port'] : '';
+		return $scheme . $parts['host'] . $port . '/****';
 	}
 
 	/**
@@ -112,7 +160,14 @@ class SiteGuard_Backup_Webhook {
 		);
 
 		$body = wp_json_encode($payload);
-		$signature = hash_hmac('sha256', $body, $self->get_secret());
+		$secret = $self->get_secret();
+		if ('' === $secret) {
+			if (class_exists('SiteGuard_Backup')) {
+				SiteGuard_Backup::instance()->log('Webhook not sent: its signing secret cannot be decrypted (AUTH_KEY changed). Regenerate it in SiteGuard Backup settings.', 'warning');
+			}
+			return false;
+		}
+		$signature = hash_hmac('sha256', $body, $secret);
 
 		wp_remote_post($url, array(
 			'timeout'  => 15,
@@ -154,7 +209,11 @@ class SiteGuard_Backup_Webhook {
 		);
 
 		$body = wp_json_encode($payload);
-		$signature = hash_hmac('sha256', $body, $self->get_secret());
+		$secret = $self->get_secret();
+		if ('' === $secret) {
+			return array('success' => false, 'message' => 'The signing secret cannot be decrypted (AUTH_KEY changed). Regenerate it first.', 'http_code' => 0);
+		}
+		$signature = hash_hmac('sha256', $body, $secret);
 
 		$response = wp_remote_post($url, array(
 			'timeout'  => 15,

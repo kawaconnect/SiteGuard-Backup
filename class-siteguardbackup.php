@@ -1352,8 +1352,15 @@ class SiteGuard_Backup {
 		if (!$encryption_done) {
 			$opts_enc = SiteGuard_Backup_Options::instance();
 			if ($opts_enc->get_option('sgbackup_encryption_enabled', false)) {
-				$enc_key = $opts_enc->get_option('sgbackup_encryption_key', '');
-				if (!is_string($enc_key) || '' === $enc_key) {
+				require_once SGBACKUP_DIR . 'includes/class-security.php';
+				$enc_raw = $opts_enc->get_option('sgbackup_encryption_key', '');
+				$enc_key = $opts_enc->get_sensitive_option('encryption_key', '');
+				if (SiteGuard_Backup_Security::is_unreadable($enc_raw)) {
+					// Stored encrypted with another AUTH_KEY: fail closed, say why.
+					$this->log("Encryption is enabled but the stored passphrase cannot be decrypted (AUTH_KEY in wp-config.php changed): refusing to store or upload unencrypted archives. Re-enter the passphrase in the settings.", 'error');
+					$this->job_failed('The backup encryption passphrase cannot be decrypted (AUTH_KEY changed); re-enter it in the settings');
+					return;
+				} elseif (!is_string($enc_key) || '' === $enc_key) {
 					// Fail closed: these archives would otherwise be uploaded to remote
 					// storage in plaintext and the job reported as a success.
 					$this->log("Encryption is enabled but no passphrase is set: refusing to store or upload unencrypted archives", 'error');

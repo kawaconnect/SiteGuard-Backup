@@ -6579,7 +6579,8 @@ class SiteGuard_Backup_Restorer {
 		require_once SGBACKUP_DIR . 'includes/class-encryption.php';
 
 		$opts = SiteGuard_Backup_Options::instance();
-		$key = $opts->get_option('sgbackup_encryption_key', '');
+		// Stored encrypted at rest; plaintext from older versions is read as it is.
+		$key = $opts->get_sensitive_option('encryption_key', '');
 
 		if (!empty($this->restore_options['encryption_key'])) {
 			$key = $this->restore_options['encryption_key'];

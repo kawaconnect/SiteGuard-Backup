@@ -150,6 +150,8 @@ abstract class SiteGuard_Backup_Module {
 		// Store in multi-instance format
 		$stored = $opts->get_option(SiteGuard_Backup_Options::method_option($this->method_id), array());
 		$instance = $this->instance_id ?: 's-0';
+		$previous = isset($stored['settings'][$instance]) ? $stored['settings'][$instance]
+			: ((is_array($stored) && !isset($stored['settings'])) ? $stored : array());
 
 		if (!isset($stored['settings'])) {
 			$stored = array('version' => 1, 'settings' => array());
@@ -158,8 +160,11 @@ abstract class SiteGuard_Backup_Module {
 		// (token refreshes and the SFTP TOFU fingerprint save used to write them in
 		// plaintext, silently defeating "encrypt credentials at rest").
 		$to_store = $options;
-		if ($opts->get_option('sgbackup_encrypt_credentials', false)) {
-			require_once SGBACKUP_DIR . 'includes/class-security.php';
+		require_once SGBACKUP_DIR . 'includes/class-security.php';
+		// A credential that could not be decrypted (AUTH_KEY changed) was handed
+		// out as ''; keep its stored ciphertext instead of saving the blank.
+		$to_store = SiteGuard_Backup_Security::keep_unreadable($this->method_id, $to_store, $previous);
+		if (SiteGuard_Backup_Security::encryption_on()) {
 			$to_store = SiteGuard_Backup_Security::encrypt_method_options($this->method_id, $to_store);
 		}
 		$stored['settings'][$instance] = $to_store;

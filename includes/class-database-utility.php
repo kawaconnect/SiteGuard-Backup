@@ -212,13 +212,32 @@ class SiteGuard_Backup_Database_Utility {
 		// Restrict permissions immediately before writing sensitive content
 		chmod($opts_file, 0600);
 
+		$env_pwd = false;
 		try {
+			// Values are quoted so '#' (a comment outside quotes), leading or
+			// trailing spaces and backslashes survive; see option_file_value().
+			// addcslashes() wrote unquoted values: a password with '#' was cut
+			// there, and \" or \' reached the server with the backslash.
 			$opts_content = "[client]\n";
-			$opts_content .= "user=" . addcslashes($user, "\\\"'\n") . "\n";
-			if (!empty($pass)) {
-				$opts_content .= "password=" . addcslashes($pass, "\\\"'\n") . "\n";
+			$q_user = self::option_file_value($user);
+			$q_host = self::option_file_value($host);
+			if (null === $q_user || null === $q_host) {
+				error_log('SiteGuard Backup: DB_USER or DB_HOST contains both quote characters; using the PHP dump instead of mysqldump.');
+				return false;
 			}
-			$opts_content .= "host=" . addcslashes($host, "\\\"'\n") . "\n";
+			$opts_content .= "user=" . $q_user . "\n";
+			if ('' !== (string) $pass) {
+				$q_pass = self::option_file_value($pass);
+				if (null !== $q_pass) {
+					$opts_content .= "password=" . $q_pass . "\n";
+				} else {
+					// Both quote characters: no option-file form keeps it intact.
+					// Hand it to this one mysqldump through its environment (not
+					// its command line, so not in the process list).
+					$env_pwd = true;
+				}
+			}
+			$opts_content .= "host=" . $q_host . "\n";
 			file_put_contents($opts_file, $opts_content);
 
 			// Capture stderr separately so warnings (e.g. MariaDB deprecation
@@ -242,7 +261,14 @@ class SiteGuard_Backup_Database_Utility {
 
 			$output = array();
 			$return = -1;
+			if ($env_pwd) {
+				putenv('MYSQL_PWD=' . $pass);
+			}
 			exec($cmd, $output, $return);
+			if ($env_pwd) {
+				putenv('MYSQL_PWD');
+				$env_pwd = false;
+			}
 
 			if (0 !== $return) {
 				$stderr = file_exists($stderr_file) ? trim(file_get_contents($stderr_file)) : '';
@@ -253,8 +279,29 @@ class SiteGuard_Backup_Database_Utility {
 			clearstatcache(true, $outfile);
 			return (0 === $return && file_exists($outfile) && filesize($outfile) > 0);
 		} finally {
+			if ($env_pwd) putenv('MYSQL_PWD');
 			@unlink($opts_file);
 		}
+	}
+
+	/**
+	 * A value for a MySQL/MariaDB option file ([client] section), quoted.
+	 *
+	 * The client library strips one pair of matching outer quotes and then
+	 * expands \\, \n, \r, \t, \b and \s; any other backslash is kept as it is.
+	 * Outside quotes '#' starts a comment and surrounding spaces are trimmed.
+	 * A quote character inside the value ends the quoted part for the comment
+	 * scan, so the value is wrapped in a quote character it does not contain.
+	 *
+	 * @param string $value
+	 * @return string|null Quoted value, or null when it contains both ' and ".
+	 */
+	public static function option_file_value($value) {
+		$value = (string) $value;
+		$escaped = strtr($value, array("\\" => "\\\\", "\n" => "\\n", "\r" => "\\r", "\t" => "\\t"));
+		if (false === strpos($value, '"')) return '"' . $escaped . '"';
+		if (false === strpos($value, "'")) return "'" . $escaped . "'";
+		return null;
 	}
 
 	/**

@@ -106,7 +106,7 @@ wp siteguardbackup health_api_key --clear-node
 # Settings
 wp siteguardbackup settings get [--key=<key>] [--format=table|json]
 wp siteguardbackup settings set --<key>=<value>
-wp siteguardbackup settings export [--file=<path>]
+wp siteguardbackup settings export [--file=<path>] [--include-secrets]
 wp siteguardbackup settings import <file>
 
 # Migration
@@ -201,8 +201,10 @@ If no writable directory outside the web root exists, backups fall back to `wp-c
 ## Security Notes
 
 - **Backup archives are not encrypted unless you set a passphrase.** With one, archives are AES-256-GCM (`.crypt`), key derived with PBKDF2-SHA256. The passphrase is stored in the WordPress database so scheduled backups can use it.
-- **Storage credentials are stored in the database as entered unless you turn on "Encrypt storage credentials at rest"** (Advanced Tools tab). That setting encrypts them with a key derived from `AUTH_KEY` in `wp-config.php`; if `AUTH_KEY` changes (new host, regenerated salts) the credentials become unreadable and must be entered again.
-- **A settings export contains secrets**: storage credentials, the encryption passphrase, the webhook URL and the settings-lock password hash. Treat the file like a password store.
+- **Secrets are encrypted at rest by default** (since 1.7.1): storage credentials, the backup passphrase and the webhook signing secret are stored AES-256-GCM encrypted with a key derived from `AUTH_KEY` in `wp-config.php`. Updating from an older version encrypts the ones stored in plaintext (wp-admin, wp-cron or WP-CLI runs it once; values are only replaced after they decrypt back). The setting is under Advanced Tools ("Encrypt storage credentials at rest") and can be turned off.
+- **If `AUTH_KEY` changes or is removed** (new host, regenerated salts, a database copied to another site) the stored secrets cannot be decrypted. SiteGuard notices it, shows an admin notice naming the affected secrets and keeps the ciphertext: putting the old `AUTH_KEY` back makes them readable again, otherwise enter them again. Until then remote uploads with those credentials fail, encrypted backups are refused and webhooks are not sent. Without `AUTH_KEY`, secrets stay in plaintext and a notice says so.
+- **Settings exports leave secrets out** (storage credentials, passphrase, webhook URL and secret, external database passwords; the settings-lock hash is never exported). Importing such a file keeps this site's own secrets. To move settings with their secrets to another site, tick "Include passwords and keys" (or `settings export --include-secrets`): the file then holds them in plaintext, so treat it like a password store and delete it after the import.
+- The webhook URL (it often carries a token) and the signing secret are not shown on the settings page; Show and Regenerate fetch the secret on request.
 - Secrets already saved are never sent back to the settings page; fields show a placeholder and keep the stored value unless you type a new one.
 - The health and sync API keys are stored hashed. `--regenerate` shows a key once; it cannot be read back later.
 - Optional hardening: an IP allowlist for the admin screens (Advanced Tools tab), a settings lock password (Settings tab), and an audit log (`wp siteguardbackup audit_log`).
@@ -253,7 +255,7 @@ Anyone holding this key can download full backups of the site. Failed attempts a
 - **"A backup job is already running":** wait for it, or stop it with the Abort button in the job list or with `abort`.
 - **Scheduled backups do not run:** `wp siteguardbackup cron_events --sgbackup-only` shows what is queued. WP-Cron needs traffic or a system cron job.
 - **Storage upload fails:** use the Test button on the destination; `wp siteguardbackup sysinfo` lists PHP extensions and limits. SFTP accepts RSA keys only.
-- **"Stored storage credentials are unreadable":** `AUTH_KEY` changed since they were saved. Enter the credentials again.
+- **"SiteGuard Backup cannot read its stored secrets":** `AUTH_KEY` changed (or is missing) since they were saved. Restore the previous `AUTH_KEY`, or enter the listed secrets again; the notice goes away once every stored secret decrypts.
 - **Restore stops halfway:** reopen the page and use the resume prompt, or `wp siteguardbackup resume_restore`. A failed database import leaves the live tables untouched.
 - **Locked out by the IP allowlist or the settings lock:** `wp siteguardbackup settings set --ip_allowlist= --lock_admin=0`.
 - Turn on debug mode (Settings tab > Debug) for more detail in job logs.
@@ -264,7 +266,7 @@ Read the `CHANGELOG.md` section of the version you install. Coming from before 1
 
 ## Building / Releases (GitLab CI)
 
-The plugin is built and released by `.gitlab-ci.yml` on the GitLab runners (GitHub Actions is disabled; the old `.github/workflows/` files are kept but no longer run). Pipelines start on a `v*` tag, when run from the GitLab UI / API, and on merge requests (test and build-zip only, nothing is published); never on plain pushes.
+The plugin is built and released by `.gitlab-ci.yml` on the GitLab runners (the GitHub repository is a plain mirror with no workflows). Pipelines start on a `v*` tag, when run from the GitLab UI / API, and on merge requests (test and build-zip only, nothing is published); never on plain pushes.
 
 | Job | Runs on | What it does |
 |---|---|---|

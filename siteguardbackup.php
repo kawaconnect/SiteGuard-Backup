@@ -2,7 +2,7 @@
 /**
  * Plugin Name: SiteGuard Backup
  * Description: Complete WordPress backup, restore, and migration solution with scheduled, incremental, and site-to-site migration support.
- * Version: 1.7.0
+ * Version: 1.7.1
  * Author: KawaConnect LLC
  * License: GPL-2.0-or-later
  * Requires at least: 5.6
@@ -13,7 +13,7 @@
 if (!defined('ABSPATH')) die('No direct access.');
 
 // Core constants
-define('SGBACKUP_VERSION', '1.7.0');
+define('SGBACKUP_VERSION', '1.7.1');
 define('SGBACKUP_DIR', plugin_dir_path(__FILE__));
 define('SGBACKUP_URL', plugin_dir_url(__FILE__));
 define('SGBACKUP_PLUGIN_SLUG', plugin_basename(__FILE__));
@@ -153,6 +153,14 @@ function sgbackup_init() {
 
 	require_once SGBACKUP_DIR . 'class-siteguardbackup.php';
 	SiteGuard_Backup::instance();
+
+	// Secrets at rest (1.7.1): encrypt what older versions stored in plaintext,
+	// and notice a changed AUTH_KEY before anything uses the secrets. Not on
+	// front-end page views; wp-cron, WP-CLI and wp-admin cover every site.
+	if (is_admin() || (defined('DOING_CRON') && DOING_CRON) || (defined('WP_CLI') && WP_CLI)) {
+		require_once SGBACKUP_DIR . 'includes/class-security.php';
+		SiteGuard_Backup_Security::maybe_migrate();
+	}
 
 	if (is_admin() || (defined('DOING_AJAX') && DOING_AJAX)) {
 		require_once SGBACKUP_DIR . 'admin.php';

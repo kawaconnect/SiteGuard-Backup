@@ -26,10 +26,10 @@ $opts = SiteGuard_Backup_Options::instance();
 	<textarea name="ip_allowlist" id="sgbackup-ip-allowlist" rows="4" class="widefat" style="max-width:400px;font-family:monospace;" placeholder="192.168.1.0/24&#10;10.0.0.1"><?php echo esc_textarea($opts->get_option('sgbackup_ip_allowlist', '')); ?></textarea>
 
 	<h3 style="margin-top:20px;"><?php esc_html_e('Credential Encryption at Rest', 'siteguardbackup'); ?></h3>
-	<p class="description"><?php esc_html_e('Encrypt storage credentials (API keys, passwords, tokens) in the database using AES-256-GCM. Uses your WordPress AUTH_KEY for key derivation. Existing plaintext credentials will be encrypted when you enable this.', 'siteguardbackup'); ?></p>
+	<p class="description"><?php esc_html_e('Encrypt storage credentials (API keys, passwords, tokens), the backup encryption passphrase and the webhook signing secret in the database using AES-256-GCM. On by default. The key is derived from AUTH_KEY in wp-config.php: if AUTH_KEY changes, re-enter the secrets (a notice says so). Existing plaintext secrets are encrypted when this is turned on.', 'siteguardbackup'); ?></p>
 	<p>
 		<label>
-			<input type="checkbox" name="encrypt_credentials" id="sgbackup-encrypt-credentials" value="1" <?php checked($opts->get_option('sgbackup_encrypt_credentials', false)); ?> />
+			<input type="checkbox" name="encrypt_credentials" id="sgbackup-encrypt-credentials" value="1" <?php checked($opts->get_option('sgbackup_encrypt_credentials', true)); ?> />
 			<?php esc_html_e('Encrypt storage credentials at rest', 'siteguardbackup'); ?>
 		</label>
 	</p>
@@ -131,6 +131,15 @@ $opts = SiteGuard_Backup_Options::instance();
 <div class="sgbackup-section">
 	<h2><?php esc_html_e('Export / Import Settings', 'siteguardbackup'); ?></h2>
 	<p><?php esc_html_e('Export your plugin settings as a JSON file, or import settings from a previously exported file.', 'siteguardbackup'); ?></p>
+	<p class="description"><?php esc_html_e('Exports leave out passwords and keys (storage credentials, backup encryption passphrase, webhook URL and secret, external database passwords). Importing such a file keeps the secrets already set on this site.', 'siteguardbackup'); ?></p>
+	<p>
+		<label>
+			<!-- No name attribute: this is an export option, not a setting. -->
+			<input type="checkbox" id="sgbackup-export-include-secrets" value="1" />
+			<?php esc_html_e('Include passwords and keys (to move these settings to another site)', 'siteguardbackup'); ?>
+		</label>
+		<br /><span class="description" style="color:#b32d2e;"><?php esc_html_e('The file then contains them in plaintext. Anyone with the file can reach your backup storage and decrypt your backups. Delete it after the import.', 'siteguardbackup'); ?></span>
+	</p>
 	<button type="button" class="button" id="sgbackup-export-settings-btn"><?php esc_html_e('Export Settings', 'siteguardbackup'); ?></button>
 	<span id="sgbackup-export-status" class="sgbackup-status"></span>
 	<br /><br />

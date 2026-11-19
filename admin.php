@@ -116,6 +116,7 @@ class SiteGuard_Backup_Admin {
 				'migrate_send'      => wp_create_nonce('sgbackup-migrate_send'),
 				'searchreplace'     => wp_create_nonce('sgbackup-searchreplace'),
 				'test_webhook'      => wp_create_nonce('sgbackup-test_webhook'),
+				'webhook_secret'    => wp_create_nonce('sgbackup-webhook_secret'),
 				'health_kuma'       => wp_create_nonce('sgbackup-health_kuma'),
 				'failover_status'   => wp_create_nonce('sgbackup-failover_status'),
 				'failover_prefailover'  => wp_create_nonce('sgbackup-failover_prefailover'),
@@ -335,7 +336,7 @@ class SiteGuard_Backup_Admin {
 			// Reach other hosts or other sites' data: outbound requests to arbitrary
 			// URLs (SSRF), sending backups elsewhere, network-wide health probes,
 			// re-running someone else's interrupted restore, importing server paths.
-			'test_webhook', 'health_check_now', 'resume_restore', 'import_foreign_backup',
+			'test_webhook', 'webhook_secret', 'health_check_now', 'resume_restore', 'import_foreign_backup',
 			'migrate_newdestination', 'ping_test', 'migrate_send', 'clone_to_site',
 			'save_remotesend_schedule', 'rescan_local',
 		);
@@ -348,6 +349,8 @@ class SiteGuard_Backup_Admin {
 			'wipe_settings'          => array('limit' => 2,  'window' => 60),   // 2 per minute
 			'searchreplace'          => array('limit' => 5,  'window' => 60),   // 5 per minute
 			'health_kuma'            => array('limit' => 10, 'window' => 60),   // 10 per minute (test pushes)
+			'webhook_secret'         => array('limit' => 5,  'window' => 60),   // 5 per minute
+			'export_settings'        => array('limit' => 5,  'window' => 60),   // 5 per minute
 			'delete_backup'          => array('limit' => 15, 'window' => 60),   // 15 per minute
 			'migrate_send'           => array('limit' => 5,  'window' => 60),   // 5 per minute
 			'import_settings'        => array('limit' => 3,  'window' => 60),   // 3 per minute
@@ -430,6 +433,7 @@ class SiteGuard_Backup_Admin {
 			'toggle_audit_log',
 			'clear_audit_log',
 			'test_webhook',
+			'webhook_secret',
 			'health_kuma',
 			'failover_status',
 			'failover_prefailover',
@@ -1651,6 +1655,57 @@ class SiteGuard_Backup_Admin {
 			}
 			echo '</ul></div>';
 		}
+
+		$this->secrets_notice();
+	}
+
+	/**
+	 * Stored secrets that cannot be decrypted (AUTH_KEY changed or missing), and
+	 * secrets that stay in plaintext because no key is available.
+	 */
+	private function secrets_notice() {
+		require_once SGBACKUP_DIR . 'includes/class-security.php';
+		$flag = get_option(SiteGuard_Backup_Security::UNREADABLE_OPTION);
+		$settings_url = esc_url((is_network_admin() ? network_admin_url('admin.php') : admin_url('admin.php')) . '?page=siteguardbackup');
+		if (!empty($flag)) {
+			$missing = is_array($flag) && isset($flag['reason']) && 'key_missing' === $flag['reason'];
+			echo '<div class="notice notice-error"><p><strong>SiteGuard Backup cannot read its stored secrets.</strong> ';
+			if ($missing) {
+				echo 'They were encrypted with <code>AUTH_KEY</code> from wp-config.php, which is no longer defined. ';
+			} else {
+				echo 'They were encrypted with a different <code>AUTH_KEY</code> (wp-config.php changed, or this database came from another site). ';
+			}
+			echo 'Nothing has been deleted: putting the previous <code>AUTH_KEY</code> back makes them readable again. Otherwise ';
+			echo '<a href="' . $settings_url . '">re-enter them in the settings</a>.</p>';
+			if (is_array($flag) && !empty($flag['items'])) {
+				$labels = array();
+				foreach ((array) $flag['items'] as $item) {
+					$labels[] = $this->secret_label((string) $item);
+				}
+				echo '<p>Affected: ' . esc_html(implode(', ', array_unique($labels))) . '.</p>';
+			}
+			echo '<p>Until then, backups to remote storage that use them fail, encrypted backups are refused and webhooks are not sent.</p></div>';
+			return;
+		}
+		if (!SiteGuard_Backup_Security::can_encrypt() && SiteGuard_Backup_Security::encryption_on()) {
+			$plain = 0;
+			foreach (SiteGuard_Backup_Security::stored_secrets() as $value) {
+				if (!SiteGuard_Backup_Security::is_encrypted($value)) $plain++;
+			}
+			if ($plain) {
+				echo '<div class="notice notice-warning"><p><strong>SiteGuard Backup:</strong> ' . (int) $plain . ' stored secret(s) (storage credentials, backup passphrase, webhook secret) are kept in plaintext because <code>AUTH_KEY</code> is not defined in wp-config.php. Define it and they are encrypted automatically.</p></div>';
+			}
+		}
+	}
+
+	/**
+	 * Human label for a stored secret key from SiteGuard_Backup_Security::stored_secrets().
+	 */
+	private function secret_label($item) {
+		if ('sgbackup_encryption_key' === $item) return 'backup encryption passphrase';
+		if ('sgbackup_webhook_secret' === $item) return 'webhook signing secret';
+		$method = strtok($item, '/');
+		return $method . ' storage credentials';
 	}
 
 	/**
