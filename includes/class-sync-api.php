@@ -114,7 +114,7 @@ class SiteGuard_Backup_Sync_API {
 			'methods' => 'DELETE', 'callback' => array($this, 'delete_set'), 'permission_callback' => $auth,
 		));
 		// The file name travels in the query string: web servers commonly deny
-		// any URI ending in .zip/.gz (this repo's nginx does), REST path or not.
+		// any URI ending in .zip/.gz, REST path or not.
 		register_rest_route($ns, '/sync/sets/(?P<nonce>[A-Za-z0-9]{4,40})/file', array(
 			'methods' => 'GET', 'callback' => array($this, 'file'), 'permission_callback' => $auth,
 			'args' => array('name' => array('required' => true, 'type' => 'string', 'pattern' => '^backup_[A-Za-z0-9._-]+$')),

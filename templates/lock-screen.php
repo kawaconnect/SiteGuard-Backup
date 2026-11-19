@@ -5,7 +5,7 @@
 		<span class="dashicons dashicons-lock" style="font-size:48px;display:block;text-align:center;margin:20px 0;"></span>
 		<p><?php esc_html_e('Settings are password protected. Enter the password to continue.', 'siteguardbackup'); ?></p>
 		<form id="sgbackup-unlock-form">
-			<input type="password" name="sgbackup_password" class="regular-text" autofocus />
+			<input type="password" name="sgbackup_password" class="regular-text" autofocus autocomplete="current-password" aria-label="<?php esc_attr_e('Settings password', 'siteguardbackup'); ?>" />
 			<button type="submit" class="button button-primary"><?php esc_html_e('Unlock', 'siteguardbackup'); ?></button>
 		</form>
 		<div id="sgbackup-unlock-error" style="display:none;color:red;margin-top:10px;"></div>

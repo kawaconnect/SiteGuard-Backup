@@ -88,14 +88,6 @@ class SiteGuard_Backup_Admin {
 			true
 		);
 
-		wp_enqueue_script(
-			'sgbackup-restore',
-			SGBACKUP_URL . 'js/restore.js',
-			array('jquery'),
-			SGBACKUP_VERSION,
-			true
-		);
-
 		// Upload support
 		wp_enqueue_script('plupload-all');
 
@@ -157,7 +149,7 @@ class SiteGuard_Backup_Admin {
 				'backup_complete'  => __('Backup complete!', 'siteguardbackup'),
 				'restore_started'  => __('Restore started...', 'siteguardbackup'),
 				'restore_complete' => __('Restore complete!', 'siteguardbackup'),
-				'confirm_delete'   => __('Are you sure you want to delete this backup?', 'siteguardbackup'),
+				'confirm_delete'   => __('Delete this backup from this server? Copies in remote storage are not removed. This cannot be undone.', 'siteguardbackup'),
 				'confirm_restore'  => __('Are you sure you want to restore this backup? This will overwrite existing data.', 'siteguardbackup'),
 				'error'            => __('An error occurred.', 'siteguardbackup'),
 				'downloading'      => __('Downloading...', 'siteguardbackup'),

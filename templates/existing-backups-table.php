@@ -6,13 +6,18 @@ $total_backups = count($history);
 $page_size = 20;
 
 if (empty($history)): ?>
-	<p><em><?php esc_html_e('No backups found.', 'siteguardbackup'); ?></em></p>
+	<p><em><?php esc_html_e('No backups yet. Click Backup Now, upload a backup below, or rescan to pick up files already in the backup directory or in remote storage.', 'siteguardbackup'); ?></em></p>
+	<div class="sgbackup-rescan-buttons" style="margin-top:10px;">
+		<button type="button" class="button button-small" id="sgbackup-rescan-local"><?php esc_html_e('Rescan Local', 'siteguardbackup'); ?></button>
+		<button type="button" class="button button-small" id="sgbackup-rescan-remote"><?php esc_html_e('Rescan Remote', 'siteguardbackup'); ?></button>
+		<span id="sgbackup-rescan-status" class="sgbackup-status"></span>
+	</div>
 <?php return; endif; ?>
 
 <table class="widefat sgbackup-backups-table">
 	<thead>
 		<tr>
-			<th class="sgbackup-check-col"><input type="checkbox" id="sgbackup-select-all" title="<?php esc_attr_e('Select all', 'siteguardbackup'); ?>" /></th>
+			<th class="sgbackup-check-col"><input type="checkbox" id="sgbackup-select-all" title="<?php esc_attr_e('Select all', 'siteguardbackup'); ?>" aria-label="<?php esc_attr_e('Select all backups', 'siteguardbackup'); ?>" /></th>
 			<th><?php esc_html_e('Date', 'siteguardbackup'); ?></th>
 			<th><?php esc_html_e('Database', 'siteguardbackup'); ?></th>
 			<th><?php esc_html_e('Plugins', 'siteguardbackup'); ?></th>
