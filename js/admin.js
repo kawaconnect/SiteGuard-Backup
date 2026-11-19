@@ -138,7 +138,20 @@
 					}
 				},
 				error: function(xhr) {
+					// Say what failed: an expired session, a timeout and a server
+					// error need different next steps.
 					var msg = sgbackup_settings.strings.error;
+					if (xhr && xhr.status === 403) {
+						msg = 'Your session has expired or the request was blocked (HTTP 403). Reload the page and try again.';
+					} else if (xhr && xhr.statusText === 'timeout') {
+						msg = 'The server did not answer in time. Check the job list before trying again.';
+					} else if (xhr && xhr.status >= 500) {
+						msg = 'The server returned an error (HTTP ' + xhr.status + '). Check the PHP error log.';
+					} else if (xhr && xhr.status === 0) {
+						msg = 'Could not reach the server. Check your connection and try again.';
+					} else if (xhr && xhr.status) {
+						msg += ' (HTTP ' + xhr.status + ')';
+					}
 					if (errorCallback) errorCallback(msg);
 					else alert(msg);
 				}
@@ -188,7 +201,7 @@
 					width: 480,
 					buttons: [
 						{
-							text: sgbackup_settings.strings.backup_started.replace('...', ''),
+							text: sgbackup_settings.strings.backup_now || 'Backup Now',
 							class: 'button button-primary',
 							click: function() {
 								self.doBackupNow();
@@ -203,6 +216,17 @@
 					]
 				});
 			});
+
+			// The admin bar "Backup Now" link lands here with ?action=backupnow:
+			// open the dialog (the backup still needs the button press), and drop
+			// the parameter so a reload does not open it again.
+			if (/[?&]action=backupnow(&|$)/.test(window.location.search) && $('#sgbackup-backupnow-btn').length) {
+				$('#sgbackup-backupnow-btn').trigger('click');
+				if (history.replaceState) {
+					var cleaned = window.location.search.replace(/([?&])action=backupnow(&|$)/, function(m, pre, post) { return post ? pre : ''; });
+					history.replaceState(null, '', window.location.pathname + cleaned + window.location.hash);
+				}
+			}
 
 			// Toggle entity checkboxes
 			$('input[name="sgbackup_include_files"]').on('change', function() {
@@ -293,8 +317,8 @@
 
 			this.ajax('backupnow', params, function(data) {
 				$('#sgbackup-backup-status').html(
-					sgbackup_settings.strings.backup_started +
-					' <span class="sgbackup-spinner"></span> Job: ' + data.nonce
+					SGB.esc(sgbackup_settings.strings.backup_started) +
+					' <span class="sgbackup-spinner"></span> Job: ' + SGB.esc(data.nonce)
 				);
 			}, function(msg) {
 				// Launch failed - abandon the grace period and stop the poller so
@@ -560,7 +584,10 @@
 			// Bind abort buttons
 			$('.sgbackup-abort-btn').off('click').on('click', function() {
 				var nonce = $(this).data('nonce');
-				self.ajax('activejobs_delete', { job_id: nonce });
+				if (!confirm('Abort this backup job? The files written so far are incomplete and will not be usable.')) return;
+				self.ajax('activejobs_delete', { job_id: nonce }, function() {
+					SGB.showNotice('Backup job ' + nonce + ' aborted.', 'warning');
+				});
 			});
 
 			// Bind view-log buttons - opens the separate log panel below
@@ -3274,7 +3301,7 @@
 
 			// Wipe settings
 			$('#sgbackup-wipe-settings-btn').on('click', function() {
-				if (!confirm('Reset all SiteGuard Backup settings to defaults?')) return;
+				if (!confirm('Reset ALL SiteGuard Backup settings to defaults?\n\nThis removes storage credentials, migration destinations, the backup encryption passphrase, the settings lock password and every schedule. Backups encrypted with the passphrase cannot be restored without it, so make sure you have it written down.\n\nExisting backup files are kept. This cannot be undone.')) return;
 				self.ajax('wipe_settings', {}, function() {
 					alert('Settings reset. Reloading...');
 					location.reload();
@@ -3314,7 +3341,7 @@
 					return;
 				}
 
-				if (!confirm('Delete ' + checked.length + ' selected backup(s)?')) return;
+				if (!confirm('Delete ' + checked.length + ' selected backup(s) from this server? Copies in remote storage are not removed. This cannot be undone.')) return;
 
 				var timestamps = [];
 				checked.each(function() {
@@ -3334,7 +3361,8 @@
 							$btn.prop('disabled', false).text('Delete Selected');
 							$('#sgbackup-select-all').prop('checked', false);
 						}
-					}, function() {
+					}, function(msg) {
+						SGB.showNotice('Could not delete the backup from ' + new Date(ts * 1000).toLocaleString() + ': ' + msg, 'error');
 						completed++;
 						if (completed >= total) {
 							$btn.prop('disabled', false).text('Delete Selected');
@@ -3458,16 +3486,18 @@
 								$dialog.find('#sgbackup-upload-remote-status').text('Uploading...').removeClass('error success');
 								self.ajax('upload_to_remote', { timestamp: timestamp, services: selected }, function(data) {
 									var msgs = [];
+									var anyFailed = false;
 									if (data.results) {
 										$.each(data.results, function(svc, res) {
 											if (res.success) {
 												msgs.push(svc + ': ' + res.uploaded + ' file(s) uploaded');
 											} else {
+												anyFailed = true;
 												msgs.push(svc + ': FAILED - ' + (res.errors ? res.errors.join('; ') : res.error));
 											}
 										});
 									}
-									$dialog.find('#sgbackup-upload-remote-status').text(msgs.join('\n')).addClass('success');
+									$dialog.find('#sgbackup-upload-remote-status').text(msgs.join('\n')).removeClass('success error').addClass(anyFailed ? 'error' : 'success');
 								}, function(msg) {
 									$dialog.find('#sgbackup-upload-remote-status').text('Error: ' + msg).addClass('error');
 								});
@@ -3487,7 +3517,9 @@
 		bindRescan: function() {
 			var self = this;
 
-			$('#sgbackup-rescan-local').on('click', function() {
+			// Delegated: the buttons live inside the backups list, which is replaced
+			// after every backup; direct handlers were lost with it.
+			$(document).on('click', '#sgbackup-rescan-local', function() {
 				var $btn = $(this);
 				var $status = $('#sgbackup-rescan-status');
 				$btn.prop('disabled', true);
@@ -3505,7 +3537,7 @@
 				});
 			});
 
-			$('#sgbackup-rescan-remote').on('click', function() {
+			$(document).on('click', '#sgbackup-rescan-remote', function() {
 				var $btn = $(this);
 				var $status = $('#sgbackup-rescan-status');
 				$btn.prop('disabled', true);
@@ -4525,7 +4557,7 @@
 
 				html += '<tr>';
 				html += '<td><span class="sgbackup-health-status ' + statusClass + '">' + this.esc(statusLabel) + '</span></td>';
-				html += '<td><a href="' + this.esc(s.url) + '" target="_blank">' + this.esc(s.domain || s.url) + '</a></td>';
+				html += '<td>' + (/^https?:\/\//i.test(s.url || '') ? '<a href="' + this.esc(s.url) + '" target="_blank" rel="noopener noreferrer">' + this.esc(s.domain || s.url) + '</a>' : this.esc(s.domain || s.url)) + '</td>';
 				html += '<td>' + this.esc(s.http_code || '-') + '</td>';
 				html += '<td>' + responseMs + ' ms</td>';
 				html += '<td' + sslClass + '>' + sslText + (s.ssl_issuer ? ' (' + this.esc(s.ssl_issuer) + ')' : '') + '</td>';

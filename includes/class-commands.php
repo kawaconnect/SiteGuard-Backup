@@ -325,9 +325,8 @@ class SiteGuard_Backup_Commands {
 		$sgbackup = SiteGuard_Backup::instance();
 		$log = $sgbackup->get_log($nonce);
 
-		// Defensive tail cap: never hand back more than 256KB even if the underlying
-		// reader loaded a very large file. NOTE (coordinator): SiteGuard_Backup::get_log()
-		// in class-siteguardbackup.php should also tail-cap at the source to avoid OOM there.
+		// Never hand back more than 256KB (SiteGuard_Backup::get_log() already
+		// reads only the last 512KB of the file).
 		$max_log_bytes = 262144;
 		if (is_string($log) && strlen($log) > $max_log_bytes) {
 			$log = "[log truncated]\n" . substr($log, -$max_log_bytes);

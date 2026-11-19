@@ -1,5 +1,31 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+- Admin bar "Backup Now" only opened the page; it now opens the Backup Now
+  dialog. The dialog's confirm button said "Backup started" before anything
+  had started.
+- "Rescan Local" and "Rescan Remote" stopped responding once the backup list
+  had refreshed after a backup. They are also shown when there are no backups
+  yet.
+- "Upload to remote storage" showed a failed destination in green. Bulk delete
+  dropped failures without a message.
+- Request failures said only "An error occurred"; they now say whether the
+  session expired, the server timed out, returned an error or was unreachable.
+
+### Changed
+- Aborting a backup job asks for confirmation. The delete, bulk delete and
+  reset-settings confirmations say what is removed (reset also removes storage
+  credentials, the encryption passphrase and the lock password; delete leaves
+  remote copies in place).
+- Health Monitor table links are only rendered for http(s) URLs.
+- Removed `js/restore.js` (unused) and two finished planning documents from
+  `docs/`.
+- README: install, quick start, security notes, configuration reference, sync
+  API routes, troubleshooting and upgrade notes; corrected WP-CLI flags and the
+  migration rate limit.
+
 ## 1.7.0
 
 Every storage destination was tested end to end against a real server or a

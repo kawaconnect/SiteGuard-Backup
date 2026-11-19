@@ -59,7 +59,7 @@ $next_check = wp_next_scheduled('sgbackup_health_check');
 		<span id="sgbackup-health-save-status" style="margin-left:10px;"></span>
 	</p>
 	<?php if ($health_enabled && $next_check): ?>
-	<p class="description"><?php printf(esc_html__('Next scheduled check: %s', 'siteguardbackup'), date_i18n(get_option('date_format') . ' ' . get_option('time_format'), $next_check)); ?></p>
+	<p class="description"><?php printf(esc_html__('Next scheduled check: %s', 'siteguardbackup'), esc_html(date_i18n(get_option('date_format') . ' ' . get_option('time_format'), $next_check))); ?></p>
 	<?php endif; ?>
 </div>
 

@@ -96,5 +96,6 @@ tests/integration/health-key.sh   $WPD/scripts/instance.sh <src-single> <dst-sin
 tests/integration/upgrade.sh      $WPD/scripts/instance.sh old-release.zip new-release.zip
 ```
 
-The PHP tests refuse to run as root or from a web request. `tests/` is excluded
+The PHP tests refuse to run from a web request, and all but
+`test-method-registry.php` (which deletes nothing) refuse to run as root. `tests/` is excluded
 from the release zip.
