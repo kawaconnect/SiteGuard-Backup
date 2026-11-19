@@ -822,6 +822,16 @@ class SiteGuard_Backup_CLI_Command extends WP_CLI_Command {
 
                 $src = $source . $f;
                 $dest = $backup_dir . $f;
+                if (file_exists($dest)) {
+                    // Never overwrite an archive that is already here.
+                    if (filesize($dest) === filesize($src) && md5_file($dest) === md5_file($src)) {
+                        $imported_files[] = $f;
+                        WP_CLI::log("Already present: {$f}");
+                    } else {
+                        WP_CLI::warning("Skipped {$f}: a different file with this name is already in the backup directory.");
+                    }
+                    continue;
+                }
                 if (copy($src, $dest)) {
                     $imported_files[] = $f;
                     WP_CLI::log("Imported: {$f}");
@@ -832,6 +842,12 @@ class SiteGuard_Backup_CLI_Command extends WP_CLI_Command {
         } elseif (is_file($source)) {
             $f = basename($source);
             $dest = $backup_dir . $f;
+            if (!preg_match('/^backup_.*\.(zip|gz|sql|crypt|json|txt)$/', $f)) {
+                WP_CLI::error("Not a SiteGuard backup file name: {$f}");
+            }
+            if (file_exists($dest) && realpath($dest) !== realpath($source)) {
+                WP_CLI::error("A file named {$f} is already in the backup directory; not overwriting it.");
+            }
             if (copy($source, $dest)) {
                 $imported_files[] = $f;
                 WP_CLI::log("Imported: {$f}");
@@ -861,6 +877,10 @@ class SiteGuard_Backup_CLI_Command extends WP_CLI_Command {
                         'timestamp' => $timestamp ?: time(),
                         'nonce'     => $nonce,
                         'service'   => array('none'),
+                        // An imported set carries its old date: without this, the
+                        // next backup's retention pass deleted it straight away
+                        // (and --delete-source had already removed the original).
+                        'always_keep' => true,
                     );
                 }
 
@@ -937,6 +957,11 @@ class SiteGuard_Backup_CLI_Command extends WP_CLI_Command {
                 }
                 foreach ($result['errors'] as $err) {
                     WP_CLI::warning("  Error: {$err}");
+                }
+                if (!$result['success']) {
+                    // Exit non-zero: a script must be able to tell a failed restore
+                    // from a good one (this used to end with "Success" and exit 0).
+                    WP_CLI::error('Imported ' . count($imported_files) . ' files, but the restore failed.');
                 }
             }
         }

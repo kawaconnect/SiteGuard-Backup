@@ -60,7 +60,9 @@ if (!function_exists('sgbackup_oauth_rows')) {
 		</tr>
 		<tr>
 			<td colspan="2">
-				<?php if (!empty($iopts['token']['access_token']) || ('pcloud' === $method && !empty($iopts['access_token']))): ?>
+				<?php // An encrypted token set is a string (sgenc:...), a plain one an array.
+				$sg_signed_in = isset($iopts['token']) && (is_array($iopts['token']) ? !empty($iopts['token']['access_token']) : (is_string($iopts['token']) && '' !== $iopts['token']));
+				if ($sg_signed_in || ('pcloud' === $method && !empty($iopts['access_token']))): ?>
 					<span class="sgbackup-auth-status sgbackup-status success"><?php esc_html_e('Signed in', 'siteguardbackup'); ?></span>
 					<button type="button" class="button sgbackup-auth-btn" data-method="<?php echo esc_attr($method); ?>" data-instance="<?php echo esc_attr($iid); ?>"><?php esc_html_e('Sign in again', 'siteguardbackup'); ?></button>
 				<?php else: ?>
@@ -1584,17 +1586,13 @@ $period_labels = array(
 				<?php
 				$enc_key_stored = !empty($settings['encryption_key']);
 				if ($enc_key_stored) {
-					$enc_key_raw = $settings['encryption_key'];
-					$enc_key_len = strlen($enc_key_raw);
-					if ($enc_key_len > 8) {
-						$enc_key_masked = substr($enc_key_raw, 0, 4) . str_repeat('*', $enc_key_len - 8) . substr($enc_key_raw, -4);
-					} else {
-						$enc_key_masked = str_repeat('*', $enc_key_len);
-					}
+					// No part of the passphrase, and not its length: the first and last
+					// four characters of a short passphrase are most of it.
+					$enc_key_masked = '********';
 				}
 				?>
 				<?php if ($enc_key_stored): ?>
-					<p><code><?php echo esc_html($enc_key_masked); ?></code> - <?php esc_html_e('Encryption key is set.', 'siteguardbackup'); ?></p>
+					<p><code><?php echo esc_html($enc_key_masked); ?></code> <?php esc_html_e('Encryption key is set.', 'siteguardbackup'); ?></p>
 					<input type="password" name="encryption_key" value="" class="regular-text" autocomplete="off" placeholder="<?php esc_attr_e('Enter new key to change, or leave empty to keep', 'siteguardbackup'); ?>" />
 				<?php else: ?>
 					<input type="password" name="encryption_key" value="" class="regular-text" autocomplete="off" />

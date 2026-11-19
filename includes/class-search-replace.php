@@ -414,9 +414,39 @@ class SiteGuard_Backup_Search_Replace {
 			if (isset($binary_cols[$col])) continue;
 
 			// Perform search-replace
+			// Pairs overlap (the full URL, then the bare domain): applied one after
+			// the other, a later pair rewrote an earlier pair's OUTPUT, turning
+			// example.com -> staging.example.com into staging.staging.example.com.
+			// So: every search string becomes a neutral token first (longest search
+			// first), then every token becomes its replacement. Nothing a pair wrote
+			// is ever matched by another pair.
 			$new_value = $old_value;
-			for ($i = 0; $i < count($search); $i++) {
-				$new_value = $this->recursive_unserialize_replace($search[$i], $replace[$i], $new_value);
+			$pair_count = count($search);
+			if ($pair_count > 1) {
+				if (null === $this->pair_tokens || count($this->pair_tokens) !== $pair_count) {
+					$salt = bin2hex(random_bytes(8));
+					$this->pair_tokens = array();
+					for ($i = 0; $i < $pair_count; $i++) {
+						$this->pair_tokens[$i] = 'sgsrtok' . $salt . 'x' . $i . 'x';
+					}
+					$this->pair_order = range(0, $pair_count - 1);
+					usort($this->pair_order, function ($a, $b) use ($search) {
+						return strlen((string) $search[$b]) - strlen((string) $search[$a]);
+					});
+				}
+				foreach ($this->pair_order as $i) {
+					if ('' === (string) $search[$i]) continue;
+					$new_value = $this->recursive_unserialize_replace($search[$i], $this->pair_tokens[$i], $new_value);
+				}
+				if ($new_value !== $old_value) {
+					foreach ($this->pair_order as $i) {
+						$new_value = $this->recursive_unserialize_replace($this->pair_tokens[$i], $replace[$i], $new_value);
+					}
+				}
+			} else {
+				for ($i = 0; $i < $pair_count; $i++) {
+					$new_value = $this->recursive_unserialize_replace($search[$i], $replace[$i], $new_value);
+				}
 			}
 
 			if ($new_value !== $old_value) {
@@ -467,6 +497,10 @@ class SiteGuard_Backup_Search_Replace {
 			}
 		}
 	}
+
+	/** Neutral tokens and order for multi-pair runs (see the replace loop). */
+	private $pair_tokens = null;
+	private $pair_order = array();
 
 	/**
 	 * Recursively search-replace in a value, handling serialized data.

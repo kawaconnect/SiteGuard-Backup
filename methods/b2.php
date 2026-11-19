@@ -44,9 +44,10 @@ class SiteGuard_Backup_Method_B2 extends SiteGuard_Backup_Method_S3 {
 		if (!empty($options['endpoint'])) {
 			$endpoint = rtrim($options['endpoint'], '/');
 			// Enforce HTTPS to prevent credential exposure (same as parent S3 method)
-			if (strpos($endpoint, 'https://') !== 0) {
-				error_log('SiteGuard Backup: B2 custom endpoint must use HTTPS. Got: ' . $endpoint);
-				$endpoint = str_replace('http://', 'https://', $endpoint);
+			// Case-insensitive ("HTTP://host" stayed cleartext), and a bare host
+			// gets the scheme added instead of failing every request.
+			if (0 !== stripos($endpoint, 'https://')) {
+				$endpoint = 'https://' . preg_replace('#^[a-z][a-z0-9+.-]*://#i', '', $endpoint);
 			}
 			return $endpoint;
 		}

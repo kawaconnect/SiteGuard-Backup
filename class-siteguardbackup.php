@@ -700,13 +700,27 @@ class SiteGuard_Backup {
 	 * Cron entry: backup files only.
 	 */
 	public function backup_files() {
-		$this->boot_backup(true, false);
+		// Both schedules share one time of day. Only one job can run at a time, so
+		// the second of the two used to be refused, every time, with no retry: with
+		// daily files and daily database, the database was never backed up on
+		// schedule. When both are due together, run one job that does both.
+		$db_next = wp_next_scheduled('sgbackup_backup_database');
+		$db_due = ($db_next && $db_next <= time() + 120) || get_transient('sgbackup_db_backup_deferred');
+		delete_transient('sgbackup_db_backup_deferred');
+		$this->boot_backup(true, (bool) $db_due);
 	}
 
 	/**
 	 * Cron entry: backup database only.
 	 */
 	public function backup_database() {
+		// See backup_files(): if the file backup is due in this same cron run, it
+		// takes the database with it.
+		$files_next = wp_next_scheduled('sgbackup_backup');
+		if ($files_next && $files_next <= time() + 120) {
+			set_transient('sgbackup_db_backup_deferred', 1, 10 * MINUTE_IN_SECONDS);
+			return;
+		}
 		$this->boot_backup(false, true);
 	}
 
@@ -771,6 +785,9 @@ class SiteGuard_Backup {
 		$this->boot_backup(true, false, $options);
 	}
 
+	/** The running job's lock (SiteGuard_Backup_Semaphore), kept alive while the job makes progress. */
+	public $job_semaphore = null;
+
 	/**
 	 * Initialize a backup job. Does NOT execute the backup - schedules first resumption.
 	 *
@@ -834,10 +851,31 @@ class SiteGuard_Backup {
 			if (!empty($options['entities'])) {
 				$include = $options['entities'];
 			}
+			// A subsite's own backups (scheduled, or started by its administrator)
+			// hold its uploads only. Plugins, themes, core (wp-config.php) and the
+			// rest of wp-content are shared by the network; a network administrator
+			// can include them explicitly (network_scope), and such a set is then
+			// not downloadable by the subsite's administrator.
+			$subsite_own = is_multisite() && get_current_blog_id() > 1 && empty($options['network_scope'])
+				&& !(defined('WP_CLI') && WP_CLI);
+			if ($subsite_own) {
+				$include = array_intersect((array) $include, array('uploads'));
+			}
 			foreach ($include as $entity) {
 				$entities[$entity] = array('index' => 0, 'status' => 'pending');
 			}
+			// "Extra directories" from the settings: they were resolved by the
+			// engine but never added to a job, so they were never backed up.
+			if (!$subsite_own && empty($options['entities'])) {
+				foreach (array_keys($this->get_backup_entities_with_extras()) as $extra_key) {
+					if (0 === strpos($extra_key, 'extradir_') && !isset($entities[$extra_key])) {
+						$entities[$extra_key] = array('index' => 0, 'status' => 'pending');
+					}
+				}
+			}
 		}
+		$subsite_own_job = is_multisite() && get_current_blog_id() > 1 && empty($options['network_scope'])
+			&& !(defined('WP_CLI') && WP_CLI);
 
 		// Get services
 		$services = $opts->get_option('sgbackup_service', array('none'));
@@ -892,14 +930,14 @@ class SiteGuard_Backup {
 		}
 
 		// M3: External databases
-		$extradbs = $opts->get_option('sgbackup_extradbs', array());
+		$extradbs = $subsite_own_job ? array() : $opts->get_option('sgbackup_extradbs', array());
 		if (!empty($extradbs)) {
 			$initial_jobdata['extradbs'] = $extradbs;
 		}
 
 		// M4: Non-WordPress tables
 		$backupdb_nonwp = $opts->get_option('sgbackup_backupdb_nonwp', false);
-		if ($backupdb_nonwp || !empty($options['include_nonwp_tables'])) {
+		if (!$subsite_own_job && ($backupdb_nonwp || !empty($options['include_nonwp_tables']))) {
 			$initial_jobdata['backupdb_nonwp'] = true;
 		}
 
@@ -934,6 +972,7 @@ class SiteGuard_Backup {
 			$blog_id = get_current_blog_id();
 			$blog_details = get_blog_details($blog_id);
 			$initial_jobdata['is_subsite_backup'] = true;
+			$initial_jobdata['network_scope'] = !$subsite_own_job;
 			$initial_jobdata['subsite_blog_id'] = $blog_id;
 			$initial_jobdata['subsite_domain'] = $blog_details ? $blog_details->domain : '';
 			$initial_jobdata['subsite_path'] = $blog_details ? $blog_details->path : '/';
@@ -1121,6 +1160,8 @@ class SiteGuard_Backup {
 			$this->logfile_close();
 			return;
 		}
+		// Refreshed on progress: see Job_Scheduler::something_useful_happened().
+		$this->job_semaphore = $semaphore;
 
 		// Update job status
 		$this->jobdata_set('jobstatus', 'running');
@@ -1150,6 +1191,7 @@ class SiteGuard_Backup {
 				'nonce'   => $this->nonce,
 				'message' => $e->getMessage(),
 			));
+			try { $this->send_email_report(); } catch (\Throwable $mail_e) { /* the log has the failure */ }
 			SiteGuard_Backup_Job_Scheduler::clear_scheduled_events($bnonce);
 			$semaphore->unlock();
 			$this->logfile_close();
@@ -1218,8 +1260,7 @@ class SiteGuard_Backup {
 				$this->log("Aborting backup: disk space critically low (" .
 					SiteGuard_Backup_Filesystem::format_bytes($available_bytes) . " available). " .
 					"Less than 20MB free - backup cannot proceed safely.", 'error');
-				$this->jobdata_set('jobstatus', 'error');
-				SiteGuard_Backup_Job_Scheduler::clear_scheduled_events($this->nonce);
+				$this->job_failed('Not enough free disk space for the backup');
 				return;
 			} elseif ($available_bytes < 104857600) { // < 100MB
 				$this->log("Warning: disk space is low (" .
@@ -1245,7 +1286,7 @@ class SiteGuard_Backup {
 					return;
 				} else {
 					$this->log("File backup failed: " . print_r($result, true), 'error');
-					$this->jobdata_set('jobstatus', 'error');
+					$this->job_failed('File backup failed');
 					return;
 				}
 			}
@@ -1269,7 +1310,7 @@ class SiteGuard_Backup {
 					return;
 				} else {
 					$this->log("Database backup failed: " . print_r($result, true), 'error');
-					$this->jobdata_set('jobstatus', 'error');
+					$this->job_failed('Database backup failed');
 					return;
 				}
 			}
@@ -1281,9 +1322,13 @@ class SiteGuard_Backup {
 			$opts_enc = SiteGuard_Backup_Options::instance();
 			if ($opts_enc->get_option('sgbackup_encryption_enabled', false)) {
 				$enc_key = $opts_enc->get_option('sgbackup_encryption_key', '');
-				if (empty($enc_key)) {
-					$this->log("WARNING: Encryption is enabled but no encryption key is set - backup will NOT be encrypted", 'warning');
-				} elseif (!empty($enc_key)) {
+				if (!is_string($enc_key) || '' === $enc_key) {
+					// Fail closed: these archives would otherwise be uploaded to remote
+					// storage in plaintext and the job reported as a success.
+					$this->log("Encryption is enabled but no passphrase is set: refusing to store or upload unencrypted archives", 'error');
+					$this->job_failed('Encryption is enabled but no passphrase is set');
+					return;
+				} else {
 					$this->log("Starting encryption phase");
 					require_once SGBACKUP_DIR . 'includes/class-encryption.php';
 
@@ -1322,8 +1367,11 @@ class SiteGuard_Backup {
 								@unlink($filepath);
 								$this->log("Encrypted: {$file} -> {$encrypted_name}");
 							} else {
-								// Keep the plaintext name in the array (file stays usable)
+								// Fail closed: the plaintext file stays on this server, but
+								// the job stops before the upload phase.
 								$this->log("Encryption failed for: {$file}", 'error');
+								$this->job_failed('Encryption failed for ' . $file . ': nothing was uploaded');
+								return;
 							}
 							SiteGuard_Backup_Job_Scheduler::something_useful_happened();
 						}
@@ -1381,8 +1429,7 @@ class SiteGuard_Backup {
 				$this->log("Backup produced no output files despite requesting " .
 					($wanted_files ? 'files' : '') . ($wanted_files && $wanted_db ? '+' : '') .
 					($wanted_db ? 'database' : '') . " - marking as failed", 'error');
-				$this->jobdata_set('jobstatus', 'error');
-				SiteGuard_Backup_Job_Scheduler::clear_scheduled_events($this->nonce);
+				$this->job_failed('The backup produced no files');
 				return;
 			}
 		}
@@ -1391,6 +1438,16 @@ class SiteGuard_Backup {
 		// to be skipped (unzippable + too large for the PclZip fallback) count too:
 		// the archive is missing data and must not be reported as fully complete.
 		$failed_entities = $this->jobdata_get('failed_entities', array());
+		// Tables that could not be dumped: the set is incomplete, not "complete".
+		// (It used to finish as a success and count toward retention, pushing out
+		// the last full dump.)
+		$db_failed = array_values(array_unique(array_filter((array) $this->jobdata_get('db_failed_tables', array()), 'is_string')));
+		if ($backup_database && !empty($db_failed)) {
+			$failed_entities = (array) $failed_entities;
+			$label = 'database tables: ' . implode(', ', array_slice($db_failed, 0, 10)) . (count($db_failed) > 10 ? ', ...' : '');
+			if (!in_array($label, $failed_entities, true)) $failed_entities[] = $label;
+			$this->jobdata_set('failed_entities', $failed_entities);
+		}
 		$skipped_files = $this->jobdata_get('zip_skipped_files', array());
 		$has_entity_failures = !empty($failed_entities) || !empty($skipped_files);
 		if (!empty($skipped_files)) {
@@ -1420,10 +1477,30 @@ class SiteGuard_Backup {
 		$uploaded_files = $this->jobdata_get('uploaded_files', array());
 		if (!is_array($uploaded_files)) $uploaded_files = array();
 
+		// A storage method stands for each of its enabled accounts (s-0, s-1, ...).
+		// The first account keeps the bare method name as its checkpoint key.
+		require_once SGBACKUP_DIR . 'methods/backup-module.php';
+		$expanded = array();
 		foreach ($services as $service) {
-			if ('none' === $service) continue;
+			if ('none' === $service || !is_string($service) || '' === $service) continue;
+			if (false !== strpos($service, '/') || 'remotesend' === $service || !array_key_exists($service, $this->backup_methods)) {
+				$expanded[] = $service;
+				continue;
+			}
+			$instances = SiteGuard_Backup_Module::instances_of($service);
+			if (empty($instances)) {
+				$this->log("Skipping {$service}: every account of this storage method is disabled");
+				continue;
+			}
+			foreach ($instances as $iid) {
+				$expanded[] = (null === $iid || 's-0' === $iid) ? $service : $service . '/' . $iid;
+			}
+		}
+		$failed_services = array();
+		$attempted_services = 0;
 
-			// Parse service name (handle remotesend/{site_id} format)
+		foreach ($expanded as $service) {
+			// Parse service name (method/instance, e.g. remotesend/{site_id}, s3/s-1)
 			$method_name = $service;
 			$service_instance = null;
 			if (strpos($service, '/') !== false) {
@@ -1463,6 +1540,7 @@ class SiteGuard_Backup {
 			}
 
 			$this->log("Uploading to {$service}");
+			$attempted_services++;
 
 			$service_all_ok = true;
 			$upload_index = 0;
@@ -1479,6 +1557,7 @@ class SiteGuard_Backup {
 				// Prevent path traversal via tainted jobdata filenames
 				if (basename($file) !== $file || strpos($file, '..') !== false) {
 					$this->log("Rejected unsafe filename in upload: {$file}", 'error');
+					$service_all_ok = false;
 					continue;
 				}
 				$filepath = $backup_dir . $file;
@@ -1490,8 +1569,8 @@ class SiteGuard_Backup {
 
 				try {
 					$result = $method->backup($filepath);
-					if (is_wp_error($result)) {
-						$this->log("Upload error ({$service}): " . $result->get_error_message(), 'error');
+					if (is_wp_error($result) || false === $result) {
+						$this->log("Upload error ({$service}): " . (is_wp_error($result) ? $result->get_error_message() : 'the storage module reported a failure'), 'error');
 						$service_all_ok = false;
 					} else {
 						$this->log("Uploaded {$file} to {$service}");
@@ -1500,7 +1579,7 @@ class SiteGuard_Backup {
 						$uploaded_files[$service][] = $file;
 						$this->jobdata_set('uploaded_files', $uploaded_files);
 					}
-				} catch (Exception $e) {
+				} catch (\Throwable $e) {
 					$this->log("Upload exception ({$service}): " . $e->getMessage(), 'error');
 					$service_all_ok = false;
 				}
@@ -1514,10 +1593,17 @@ class SiteGuard_Backup {
 				if ($method_name === 'remotesend') {
 					$this->send_remotesend_metadata($service_instance);
 				}
+			} else {
+				$failed_services[] = $service;
 			}
 		}
 
-		$this->jobdata_set('remote_upload_succeeded', $any_service_succeeded);
+		// "Succeeded" means every destination that was tried has every file. One
+		// good destination out of two used to count: the job was reported complete
+		// and, with "delete local copies" on, the only other copy was removed.
+		$this->jobdata_set('remote_upload_succeeded', $any_service_succeeded && empty($failed_services));
+		$this->jobdata_set('remote_upload_any_succeeded', $any_service_succeeded);
+		$this->jobdata_set('remote_upload_failed_services', $failed_services);
 		return true;
 	}
 
@@ -1600,6 +1686,33 @@ class SiteGuard_Backup {
 	 * @param bool $force_abort       Whether this is an abort.
 	 * @param bool $has_entity_errors Whether any file entities failed.
 	 */
+	/**
+	 * End the job as failed and tell someone.
+	 *
+	 * The hard-failure paths used to set jobstatus and return: no email (so an
+	 * "errors only" recipient never heard), no webhook, external database
+	 * passwords left in the job data.
+	 */
+	private function job_failed($reason) {
+		$this->jobdata_set('jobstatus', 'error');
+		$this->jobdata_set('fail_reason', $reason);
+		SiteGuard_Backup_Job_Scheduler::clear_scheduled_events($this->nonce);
+		$extradbs = $this->jobdata_get('extradbs', array());
+		if (!empty($extradbs) && is_array($extradbs)) {
+			foreach ($extradbs as &$extdb) {
+				if (is_array($extdb)) unset($extdb['pass']);
+			}
+			unset($extdb);
+			$this->jobdata_set('extradbs', $extradbs);
+		}
+		try {
+			SiteGuard_Backup_Webhook::fire('backup_failed', array('nonce' => $this->nonce, 'message' => $reason));
+			$this->send_email_report();
+		} catch (\Throwable $e) {
+			$this->log('Could not send the failure notification: ' . $e->getMessage(), 'warning');
+		}
+	}
+
 	public function backup_finish($do_cleanup, $allow_email, $force_abort = false, $has_entity_errors = false) {
 		if ($force_abort) {
 			$this->jobdata_set('jobstatus', 'aborted');
@@ -1616,9 +1729,10 @@ class SiteGuard_Backup {
 					break;
 				}
 			}
+			$failed_services = (array) $this->jobdata_get('remote_upload_failed_services', array());
 			$remote_all_failed = $has_remote_services
 				&& $this->jobdata_get('upload_phase_complete', false)
-				&& !$this->jobdata_get('remote_upload_succeeded', false);
+				&& !$this->jobdata_get('remote_upload_any_succeeded', $this->jobdata_get('remote_upload_succeeded', false));
 
 			if ($has_entity_errors) {
 				$failed = $this->jobdata_get('failed_entities', array());
@@ -1629,6 +1743,10 @@ class SiteGuard_Backup {
 				$this->log("Backup files were created, but ALL configured remote uploads failed (" .
 					implode(', ', array_filter((array) $services, function($s) { return 'none' !== $s; })) .
 					"). Local copies have been kept.", 'error');
+			} elseif (!empty($failed_services)) {
+				$this->jobdata_set('jobstatus', 'warning');
+				$this->log("Backup files were created, but the upload to " . implode(', ', $failed_services) .
+					" failed. Local copies have been kept.", 'error');
 			} else {
 				$this->jobdata_set('jobstatus', 'complete');
 				$this->log("Backup complete");
@@ -1851,6 +1969,7 @@ class SiteGuard_Backup {
 		// Per-subsite backup metadata
 		if ($this->jobdata_get('is_subsite_backup', false)) {
 			$backup_data['is_subsite_backup'] = true;
+			if ($this->jobdata_get('network_scope', false)) $backup_data['network_scope'] = true;
 			$backup_data['subsite_blog_id'] = $this->jobdata_get('subsite_blog_id', 0);
 			$backup_data['subsite_domain'] = $this->jobdata_get('subsite_domain', '');
 			$backup_data['subsite_path'] = $this->jobdata_get('subsite_path', '/');

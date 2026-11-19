@@ -143,7 +143,13 @@ class SiteGuard_Backup_Method_Webdav extends SiteGuard_Backup_Module {
         curl_setopt($ch, CURLOPT_USERPWD, $options['user'] . ':' . $options['pass']);
         curl_setopt($ch, CURLOPT_HTTPHEADER, array('Content-Type: application/octet-stream'));
         curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-        curl_setopt($ch, CURLOPT_TIMEOUT, 600);
+        // No fixed limit for the whole file (600 s failed every upload of a
+        // default 400 MB archive below about 5 Mbit/s): give up only when the
+        // transfer stalls.
+        curl_setopt($ch, CURLOPT_TIMEOUT, 0);
+        curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 30);
+        curl_setopt($ch, CURLOPT_LOW_SPEED_LIMIT, 1024);
+        curl_setopt($ch, CURLOPT_LOW_SPEED_TIME, 120);
 
         $result = curl_exec($ch);
         $curl_error = curl_error($ch);
@@ -191,7 +197,7 @@ class SiteGuard_Backup_Method_Webdav extends SiteGuard_Backup_Module {
             return new WP_Error('webdav_download', "WebDAV download failed (HTTP {$code})");
         }
 
-        return true;
+        return $this->verify_download($local_path, $this->expected_length($response), 'WebDAV');
     }
 
     public function delete($files) {

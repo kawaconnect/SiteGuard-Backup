@@ -167,12 +167,18 @@ class SiteGuard_Backup_History {
 			$services = is_array($backup['service']) ? $backup['service'] : array($backup['service']);
 			foreach ($services as $service) {
 				if ('none' === $service) continue;
-				$method = self::get_storage_method($service);
-				if ($method && method_exists($method, 'delete')) {
+				// Every account of the method (also disabled ones: the set may have
+				// been uploaded while the account was on).
+				foreach (self::service_instances($service) as $iid) {
+					$method = self::get_storage_method($service, $iid);
+					if (!$method || !method_exists($method, 'delete')) continue;
 					try {
-						$method->delete($files);
-					} catch (Exception $e) {
-						// Log but don't fail
+						$del = $method->delete($files);
+						if (is_wp_error($del)) {
+							SiteGuard_Backup::instance()->log('Could not delete backup ' . $timestamp . ' from ' . $service . (null !== $iid ? '/' . $iid : '') . ': ' . $del->get_error_message() . '. The files are still on that storage and are no longer tracked.', 'error');
+						}
+					} catch (\Throwable $e) {
+						SiteGuard_Backup::instance()->log('Could not delete backup ' . $timestamp . ' from ' . $service . ': ' . $e->getMessage(), 'error');
 					}
 				}
 			}
@@ -326,10 +332,16 @@ class SiteGuard_Backup_History {
 			// For full pruning, only count sets that have files
 			if ($type === 'full' && empty(self::file_entity_keys($backup))) continue;
 
-			$count++;
-			if ($count > $retain) {
+			// An incomplete set (an entity failed, or tables could not be dumped) is
+			// not one of the N copies to keep: two bad runs in a row used to push out
+			// the last complete backup. It is still removed once N complete sets are
+			// newer than it.
+			$incomplete = !empty($backup['failed_entities']) || ($type === 'db' && !empty($backup['db_failed_tables']));
+			if ($count >= $retain) {
 				$to_delete[] = $timestamp;
+				continue;
 			}
+			if (!$incomplete) $count++;
 		}
 
 		// Delete only the pruned TYPE's files. Deleting the whole set made the two
@@ -394,9 +406,17 @@ class SiteGuard_Backup_History {
 			$services = is_array($backup['service']) ? $backup['service'] : array($backup['service']);
 			foreach ($services as $service) {
 				if ('none' === $service) continue;
-				$method = self::get_storage_method($service);
-				if ($method && method_exists($method, 'delete')) {
-					try { $method->delete($files); } catch (Exception $e) { /* log-only */ }
+				foreach (self::service_instances($service) as $iid) {
+					$method = self::get_storage_method($service, $iid);
+					if (!$method || !method_exists($method, 'delete')) continue;
+					try {
+						$del = $method->delete($files);
+						if (is_wp_error($del)) {
+							SiteGuard_Backup::instance()->log('Could not delete pruned files of backup ' . $timestamp . ' from ' . $service . ': ' . $del->get_error_message(), 'error');
+						}
+					} catch (\Throwable $e) {
+						SiteGuard_Backup::instance()->log('Could not delete pruned files from ' . $service . ': ' . $e->getMessage(), 'error');
+					}
 				}
 			}
 		}
@@ -460,7 +480,23 @@ class SiteGuard_Backup_History {
 	/**
 	 * Get storage method instance.
 	 */
-	private static function get_storage_method($service) {
+	/** Accounts of a recorded service: "s3" is every account, "s3/s-1" or "remotesend/3" just that one. */
+	private static function service_instances($service) {
+		if (!is_string($service)) return array();
+		if (false !== strpos($service, '/')) {
+			$parts = explode('/', $service, 2);
+			return array(preg_replace('/[^a-zA-Z0-9_-]/', '', $parts[1]));
+		}
+		if ('remotesend' === $service) return array(null);
+		require_once SGBACKUP_DIR . 'methods/backup-module.php';
+		return SiteGuard_Backup_Module::instances_of(preg_replace('/[^a-zA-Z0-9_-]/', '', $service), true);
+	}
+
+	private static function get_storage_method($service, $instance = null) {
+		// "method/instance" names the method before the slash.
+		if (is_string($service) && false !== strpos($service, '/')) {
+			$service = explode('/', $service, 2)[0];
+		}
 		// Sanitize service name to prevent path traversal
 		$service = preg_replace('/[^a-zA-Z0-9_-]/', '', $service);
 
@@ -478,6 +514,8 @@ class SiteGuard_Backup_History {
 		$class_name = 'SiteGuard_Backup_Method_' . ucfirst($service);
 		if (!class_exists($class_name)) return false;
 
-		return new $class_name();
+		$module = new $class_name();
+		if (null !== $instance && '' !== $instance) $module->set_instance_id($instance);
+		return $module;
 	}
 }

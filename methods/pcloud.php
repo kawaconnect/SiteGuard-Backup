@@ -284,6 +284,12 @@ class SiteGuard_Backup_Method_Pcloud extends SiteGuard_Backup_Module {
 		}
 		fclose($fh);
 
+		// A read error ends the loop early: saving now would commit a truncated
+		// archive and report it as uploaded.
+		if ($offset !== (int) $total_size) {
+			return new WP_Error('pcloud_read', sprintf('Could only read %d of %d bytes of the file; nothing was saved to pCloud.', $offset, $total_size));
+		}
+
 		// Save (commit) the upload
 		$save = $this->api_request('/upload_save', array(
 			'uploadid' => $upload_id,
@@ -340,7 +346,7 @@ class SiteGuard_Backup_Method_Pcloud extends SiteGuard_Backup_Module {
 			return new WP_Error('pcloud_download', "pCloud download failed (HTTP {$code})");
 		}
 
-		return true;
+		return $this->verify_download($local_path, $this->expected_length($response), 'pCloud');
 	}
 
 	/**

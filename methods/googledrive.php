@@ -269,6 +269,11 @@ class SiteGuard_Backup_Method_Googledrive extends SiteGuard_Backup_Module {
 		}
 
 		fclose($fh);
+		// 308 after the last chunk means Drive still expects more data: the file
+		// was not created.
+		if (isset($upload_code) && 308 === $upload_code) {
+			return new WP_Error('gdrive_incomplete', 'Google Drive did not confirm the upload as complete.');
+		}
 		return true;
 	}
 
@@ -317,7 +322,7 @@ class SiteGuard_Backup_Method_Googledrive extends SiteGuard_Backup_Module {
 			@unlink($local_path);
 			return new WP_Error('gdrive_download_failed', "Google Drive download failed with HTTP {$code}");
 		}
-		return true;
+		return $this->verify_download($local_path, $this->expected_length($dl_response), 'Google Drive');
 	}
 
 	public function delete($files) {

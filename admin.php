@@ -247,6 +247,11 @@ class SiteGuard_Backup_Admin {
 			wp_send_json_error(array('message' => 'Invalid nonce'));
 		}
 
+		require_once SGBACKUP_DIR . 'includes/class-security.php';
+		if (!SiteGuard_Backup_Security::check_ip_allowlist()) {
+			wp_send_json_error(array('message' => 'Access denied: your IP is not in the allowlist.'));
+		}
+
 		// Rate limiting: max 5 attempts per minute per user
 		$user_id = get_current_user_id();
 		$transient_key = 'sgbackup_unlock_attempts_' . $user_id;
@@ -256,8 +261,10 @@ class SiteGuard_Backup_Admin {
 		}
 		set_transient($transient_key, $attempts + 1, 60);
 
-		$password = isset($_POST['password']) ? $_POST['password'] : '';
-		if (empty($password)) {
+		// WordPress adds slashes to $_POST; the hash was made from the plain value,
+		// so a password with a quote or backslash could never unlock.
+		$password = isset($_POST['password']) && is_string($_POST['password']) ? wp_unslash($_POST['password']) : '';
+		if ('' === $password) {
 			wp_send_json_error(array('message' => 'Password is required'));
 		}
 
@@ -332,6 +339,12 @@ class SiteGuard_Backup_Admin {
 			'migrate_key_create', 'get_migrator_keys', 'delete_migrator_key',
 			'failover_prefailover', 'failover_postfailover', 'clear_audit_log', 'toggle_audit_log',
 			'regenerate_health_api_key', 'health_adopt_restored_key', 'test_extdb',
+			// Reach other hosts or other sites' data: outbound requests to arbitrary
+			// URLs (SSRF), sending backups elsewhere, network-wide health probes,
+			// re-running someone else's interrupted restore, importing server paths.
+			'test_webhook', 'health_check_now', 'resume_restore', 'import_foreign_backup',
+			'migrate_newdestination', 'ping_test', 'migrate_send', 'clone_to_site',
+			'save_remotesend_schedule', 'rescan_local',
 		);
 		if (is_multisite() && !current_user_can('manage_network_options') && in_array($subaction, $network_admin_only, true)) {
 			wp_send_json_error(array('message' => __('Only a network administrator can do this.', 'siteguardbackup')));
@@ -447,15 +460,22 @@ class SiteGuard_Backup_Admin {
 		}
 
 		$params = isset($_POST['data']) ? $_POST['data'] : array();
+		$params_unslashed = false;
 		if (is_string($params)) {
 			$decoded = json_decode(stripslashes($params), true);
-			if (is_array($decoded)) $params = $decoded;
+			if (is_array($decoded)) {
+				$params = $decoded;
+				// The JSON string was unslashed as a whole just now. Unslashing its
+				// values again removed real backslashes from passwords, search/replace
+				// strings and exclusion patterns.
+				$params_unslashed = true;
+			}
 		}
 
 		// Unslash all string values; per-field sanitization is handled by each command handler.
 		// Do NOT apply sanitize_text_field() here - it strips newlines needed by SSH keys,
 		// file exclusion patterns, and other multiline fields.
-		if (is_array($params)) {
+		if (is_array($params) && !$params_unslashed) {
 			array_walk_recursive($params, function(&$val) {
 				if (is_string($val)) {
 					$val = wp_unslash($val);
@@ -508,10 +528,18 @@ class SiteGuard_Backup_Admin {
 		if (!preg_match('/\.(zip|gz|sql|crypt|json|txt)$/', $file)) wp_die('Invalid file type');
 
 		// A file belonging to a network-wide backup is for network administrators only.
+		$in_allowed_set = false;
 		foreach (SiteGuard_Backup_History::get_history() as $entry) {
-			if (in_array($file, SiteGuard_Backup_History::get_all_files($entry), true) && !$this->may_download_backup($entry)) {
+			if (!in_array($file, SiteGuard_Backup_History::get_all_files($entry), true)) continue;
+			if (!$this->may_download_backup($entry)) {
 				wp_die(esc_html__('Only a network administrator can download a network-wide backup.', 'siteguardbackup'), 403);
 			}
+			$in_allowed_set = true;
+		}
+		// Files outside any backup set (archives of a running job, logs, leftovers)
+		// are for network administrators only.
+		if (!$in_allowed_set && is_multisite() && !current_user_can('manage_network_options')) {
+			wp_die(esc_html__('Only a network administrator can download this file.', 'siteguardbackup'), 403);
 		}
 
 		// Audit log
@@ -1475,8 +1503,18 @@ class SiteGuard_Backup_Admin {
 			foreach ($backup_data as $k => $v) {
 				if ((in_array($k, $file_keys, true) || strpos($k, 'extradir_') === 0) && !empty($v)) { $has_files = true; break; }
 			}
+			// network_scope is set by this site's own jobs, never by an uploaded file.
+			unset($backup_data['network_scope']);
 			if ($has_files) {
-				SiteGuard_Backup_History::add_backup(intval($manifest['timestamp']), $backup_data);
+				$bundle_ts = intval($manifest['timestamp']);
+				if (is_multisite() && !current_user_can('manage_network_options')) {
+					// add_backup() merges into an entry with the same timestamp: a subsite
+					// administrator must not be able to graft files or flags onto a set
+					// they did not upload.
+					$existing = SiteGuard_Backup_History::get_history_raw();
+					while (isset($existing[$bundle_ts])) $bundle_ts++;
+				}
+				SiteGuard_Backup_History::add_backup($bundle_ts, $backup_data);
 				$registered = true;
 			}
 		}
@@ -1675,6 +1713,9 @@ class SiteGuard_Backup_Admin {
 	 */
 	private function may_download_backup($entry) {
 		if (!is_multisite() || current_user_can('manage_network_options')) return true;
+		// A set made by a network administrator on this subsite may hold shared
+		// code, wp-config.php or other databases (network_scope).
+		if (!empty($entry['network_scope'])) return false;
 		return !empty($entry['is_subsite_backup']) && (int) ($entry['subsite_blog_id'] ?? 0) === (int) get_current_blog_id();
 	}
 
@@ -1684,7 +1725,10 @@ class SiteGuard_Backup_Admin {
 	private function user_can_manage() {
 		if (is_multisite()) {
 			if (current_user_can('manage_network_options')) return true;
-			if (!is_network_admin() && current_user_can('manage_options')) return true;
+			// The main site's SiteGuard holds the network-wide backups and settings:
+			// only a network administrator manages it. A subsite administrator
+			// manages their own subsite's backups (database and uploads).
+			if (!is_network_admin() && !is_main_site() && current_user_can('manage_options')) return true;
 			return false;
 		}
 		return current_user_can('manage_options');

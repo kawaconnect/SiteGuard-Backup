@@ -10,6 +10,19 @@ if (!defined('ABSPATH')) die('No direct access.');
 class SiteGuard_Backup_Commands {
 
 	/** @var array Allowed backup entities */
+	/**
+	 * Storage fields that hold a secret: stored as typed. sanitize_text_field()
+	 * removes %XX sequences (every Azure SAS token has them), tags and repeated
+	 * spaces; wp_strip_all_tags() cuts a password at "<".
+	 */
+	private static $opaque_fields = array('key', 'pass', 'secret', 'token', 'private_key', 'client_secret', 'access_token',
+		'refresh_token', 'secret_key', 'account_key', 'sas_token', 'app_secret', 'password', 'api_key');
+
+	/** Clean a secret without changing it: NUL bytes out, line ends trimmed (keys keep inner newlines). */
+	private static function clean_opaque($val) {
+		return trim(str_replace(chr(0), '', (string) $val), "\r\n");
+	}
+
 	private static $valid_entities = array('plugins', 'themes', 'uploads', 'others', 'wpcore');
 
 	/** @var array Allowed storage methods */
@@ -51,12 +64,30 @@ class SiteGuard_Backup_Commands {
 	}
 
 	/**
+	 * A subsite administrator on a network (not a network administrator, not
+	 * WP-CLI). They manage their own subsite's database and uploads only: shared
+	 * code, wp-config.php, server paths and other databases are out of reach.
+	 */
+	public static function is_subsite_restricted() {
+		if (!is_multisite() || get_current_blog_id() <= 1) return false;
+		if (defined('WP_CLI') && WP_CLI) return false;
+		return !current_user_can('manage_network_options');
+	}
+
+	/**
 	 * Trigger a backup now.
 	 */
 	public function backupnow($params) {
 		$sgbackup = SiteGuard_Backup::instance();
 
 		$options = array();
+		if (self::is_subsite_restricted()) {
+			unset($params['onlythisfileentity'], $params['include_nonwp_tables']);
+			$params['entities'] = array('uploads');
+		} elseif (is_multisite() && get_current_blog_id() > 1) {
+			// Started by a network administrator on a subsite: may hold shared code.
+			$options['network_scope'] = true;
+		}
 		if (!empty($params['onlythisfileentity'])) {
 			$entity = sanitize_text_field($params['onlythisfileentity']);
 			if (in_array($entity, self::$valid_entities, true)) {
@@ -569,7 +600,11 @@ class SiteGuard_Backup_Commands {
 		if (isset($params['encryption_key'])) {
 			$enc_key = $params['encryption_key'];
 			if (!empty($enc_key)) {
-				$opts->update_option('sgbackup_encryption_key', sanitize_text_field($enc_key));
+				// Stored exactly as typed (NUL bytes aside). sanitize_text_field()
+				// removed tags, %XX sequences and repeated spaces, so backups were
+				// encrypted with a different passphrase than the one the admin
+				// wrote down, and could not be decrypted on another site.
+				$opts->update_option('sgbackup_encryption_key', str_replace(chr(0), '', $enc_key));
 			}
 			// Empty = keep current key (don't clear it)
 			unset($params['encryption_key']);
@@ -645,9 +680,23 @@ class SiteGuard_Backup_Commands {
 			}
 		}
 
-		// Checkbox arrays: default to empty when absent from POST (unchecked = not submitted)
-		if (!isset($params['include_entities'])) {
+		// A subsite administrator cannot widen what their backups read or where
+		// the site reaches: see is_subsite_restricted().
+		if (self::is_subsite_restricted()) {
+			foreach (array('include_entities', 'extra_dirs', 'extradbs', 'backupdb_nonwp', 'webhook_url', 'webhook_events',
+				'failover_enabled', 'failover_role', 'failover_production_url', 'auto_update',
+				'health_enabled', 'health_interval', 'health_timeout', 'health_ssl_warn_days') as $network_key) {
+				unset($params[$network_key]);
+			}
+		} elseif (!isset($params['include_entities']) && isset($params['retain_extrarules'])) {
+			// Checkbox array: absent from the main settings form means every box is
+			// unchecked. Only that form sends retain_extrarules; a partial save (the
+			// Health tab, `wp siteguardbackup settings set`) must not clear the list.
 			$params['include_entities'] = array();
+		}
+		if (isset($params['include_entities'])) {
+			$params['include_entities'] = array_values(array_intersect(
+				array_map('strval', (array) $params['include_entities']), self::$valid_entities));
 		}
 
 		foreach ($settings_keys as $key) {
@@ -764,7 +813,7 @@ class SiteGuard_Backup_Commands {
 		// Save storage method settings (whitelist method names)
 		// Fields that may contain multi-line data (SSH keys, tokens) - use wp_kses
 		// instead of sanitize_text_field which strips newlines
-		$multiline_fields = array('key', 'pass', 'secret', 'token', 'private_key', 'client_secret', 'access_token', 'refresh_token');
+		$multiline_fields = self::$opaque_fields;
 		if (!empty($params['method_settings']) && is_array($params['method_settings'])) {
 			foreach ($params['method_settings'] as $method => $method_data) {
 				$method = sanitize_text_field($method);
@@ -774,10 +823,10 @@ class SiteGuard_Backup_Commands {
 				$sanitize_method_value = function(&$val, $key) use ($multiline_fields) {
 					if (!is_string($val)) return;
 					if (in_array($key, $multiline_fields, true)) {
-						// Preserve newlines but strip tags and null bytes
-						$val = wp_check_invalid_utf8($val);
-						$val = wp_strip_all_tags($val);
-						$val = str_replace(chr(0), '', $val);
+						$val = self::clean_opaque($val);
+					} elseif (in_array($key, array('url', 'endpoint'), true)) {
+						// URLs keep their percent-encoding (user%40example.com).
+						$val = preg_replace('/[\x00-\x20\x7f<>"\']/', '', $val);
 					} else {
 						$val = sanitize_text_field($val);
 					}
@@ -977,6 +1026,13 @@ class SiteGuard_Backup_Commands {
 		}
 		if (!empty($settings['lock_admin_password'])) {
 			$settings['lock_admin_password'] = '***';
+		}
+		// External database passwords (this command is readable while the settings
+		// lock is on).
+		if (!empty($settings['extradbs']) && is_array($settings['extradbs'])) {
+			foreach ($settings['extradbs'] as $i => $extdb) {
+				if (is_array($extdb) && !empty($extdb['pass'])) $settings['extradbs'][$i]['pass'] = '***';
+			}
 		}
 		return $settings;
 	}
@@ -1382,8 +1438,17 @@ class SiteGuard_Backup_Commands {
 			return new WP_Error('missing_param', 'Missing search string');
 		}
 
-		$search = array(sanitize_text_field($params['search']));
-		$replace = array(sanitize_text_field(isset($params['replace']) ? $params['replace'] : ''));
+		// Verbatim: sanitize_text_field() removed tags, %XX sequences and repeated
+		// spaces, so the replace ran on a different string than the one typed (a
+		// search for "<br>" became empty).
+		if (!is_string($params['search']) || (isset($params['replace']) && !is_string($params['replace']))) {
+			return new WP_Error('invalid_param', 'Search and replace must be text');
+		}
+		$search = array(str_replace(chr(0), '', $params['search']));
+		$replace = array(str_replace(chr(0), '', isset($params['replace']) ? $params['replace'] : ''));
+		if ('' === $search[0]) {
+			return new WP_Error('missing_param', 'Missing search string');
+		}
 		$dry_run = !empty($params['dry_run']);
 
 		require_once SGBACKUP_DIR . 'includes/class-search-replace.php';
@@ -1418,10 +1483,27 @@ class SiteGuard_Backup_Commands {
 			$opts->delete_option('sgbackup_' . $key);
 		}
 
+		// Storage credentials and remote sites are settings too: a "reset" used to
+		// leave cloud keys in the database and scheduled remote sends running.
+		foreach (self::$valid_methods as $method_id) {
+			$opts->delete_option(SiteGuard_Backup_Options::method_option($method_id));
+		}
+		$opts->delete_option('sgbackup_remotesites');
+		global $wpdb;
+		$remotesend_rows = $wpdb->get_col($wpdb->prepare(
+			"SELECT option_name FROM {$wpdb->options} WHERE option_name LIKE %s",
+			$wpdb->esc_like('sgbackup_remotesend_') . '%'
+		));
+		foreach ((array) $remotesend_rows as $row_name) {
+			delete_option($row_name);
+		}
+
 		// Also clear schedules
 		wp_clear_scheduled_hook('sgbackup_backup');
 		wp_clear_scheduled_hook('sgbackup_backup_database');
 		wp_clear_scheduled_hook('sgbackup_backup_incremental');
+		wp_clear_scheduled_hook('sgbackup_backup_remotesend');
+		wp_clear_scheduled_hook('sgbackup_health_check');
 
 		return array('success' => true);
 	}
@@ -2098,6 +2180,9 @@ class SiteGuard_Backup_Commands {
 		}
 
 		$backup_set = $history[$timestamp];
+		if (self::is_subsite_restricted() && !empty($backup_set['network_scope'])) {
+			return new WP_Error('forbidden', 'Only a network administrator can send this backup elsewhere.');
+		}
 		$opts = SiteGuard_Backup_Options::instance();
 		$backup_dir = $opts->get_backup_dir();
 
@@ -2665,7 +2750,7 @@ class SiteGuard_Backup_Commands {
 	 * @return array Sanitized field map.
 	 */
 	private function sanitize_imported_method_fields($fields) {
-		$multiline_fields = array('key', 'pass', 'secret', 'token', 'private_key', 'client_secret', 'access_token', 'refresh_token');
+		$multiline_fields = self::$opaque_fields;
 		$clean = array();
 		foreach ($fields as $fkey => $val) {
 			$fkey = sanitize_text_field($fkey);
@@ -2675,9 +2760,9 @@ class SiteGuard_Backup_Commands {
 				continue;
 			}
 			if (in_array($fkey, $multiline_fields, true)) {
-				$val = wp_check_invalid_utf8($val);
-				$val = wp_strip_all_tags($val);
-				$val = str_replace(chr(0), '', $val);
+				$val = self::clean_opaque($val);
+			} elseif (in_array($fkey, array('url', 'endpoint'), true)) {
+				$val = preg_replace('/[\x00-\x20\x7f<>"\']/', '', $val);
 			} else {
 				$val = sanitize_text_field($val);
 			}

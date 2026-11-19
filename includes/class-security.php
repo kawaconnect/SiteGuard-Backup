@@ -12,6 +12,8 @@ class SiteGuard_Backup_Security {
 
 	/** @var string Prefix for encrypted option values */
 	const ENCRYPTED_PREFIX = 'sgenc:';
+	/** Marks an encrypted value that decrypts to a JSON array (OAuth token sets). */
+	const JSON_PREFIX = "sgjson:";
 
 	/**
 	 * Credential field names per storage method that should be encrypted at rest.
@@ -216,7 +218,15 @@ class SiteGuard_Backup_Security {
 		}
 
 		foreach ($fields as $field) {
-			if (isset($options[$field]) && !empty($options[$field]) && !self::is_encrypted($options[$field])) {
+			if (!isset($options[$field]) || empty($options[$field])) continue;
+			// OAuth tokens are arrays (access_token, refresh_token, expiry): they
+			// used to pass through unencrypted. Stored as encrypted JSON.
+			if (is_array($options[$field])) {
+				$enc = self::encrypt_option(self::JSON_PREFIX . wp_json_encode($options[$field]));
+				if (self::is_encrypted($enc)) $options[$field] = $enc;
+				continue;
+			}
+			if (!self::is_encrypted($options[$field])) {
 				$options[$field] = self::encrypt_option($options[$field]);
 			}
 		}
@@ -238,8 +248,13 @@ class SiteGuard_Backup_Security {
 		}
 
 		foreach ($fields as $field) {
-			if (isset($options[$field]) && self::is_encrypted($options[$field])) {
-				$options[$field] = self::decrypt_option($options[$field]);
+			if (isset($options[$field]) && is_string($options[$field]) && self::is_encrypted($options[$field])) {
+				$plain = self::decrypt_option($options[$field]);
+				if (is_string($plain) && 0 === strpos($plain, self::JSON_PREFIX)) {
+					$decoded = json_decode(substr($plain, strlen(self::JSON_PREFIX)), true);
+					$plain = is_array($decoded) ? $decoded : array();
+				}
+				$options[$field] = $plain;
 			}
 		}
 

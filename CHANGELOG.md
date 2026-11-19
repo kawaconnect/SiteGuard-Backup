@@ -7,6 +7,171 @@ protocol fake written from the provider's API documentation
 (tests/integration/storage.sh), and a backup job was run to several
 destinations at once. What did not work is fixed below.
 
+### Security
+A full audit of the plugin (unauthenticated endpoints, admin screens, restore,
+backup engine, storage modules) found the following. The first four let a
+**subsite administrator on a multisite network** reach beyond their own site;
+single-site installs were not affected by them.
+
+- **A subsite administrator could download `wp-config.php` and any readable
+  directory.** "Backup Now" accepted any file entity (WordPress core, which
+  includes `wp-config.php` for local backups) and "Extra directories" accepted
+  any server path; the resulting set was theirs to download. A subsite's own
+  backups (scheduled, or started by its administrator) now hold its database
+  and uploads only. Extra directories, extra databases, non-WordPress tables,
+  the entity list, the webhook and the failover and health settings can only be
+  changed by a network administrator. A set a network administrator makes on a
+  subsite (which may include shared code) is marked and is not downloadable or
+  sendable by the subsite's administrator.
+- **A subsite administrator could run SQL against the whole network** by
+  uploading a backup and importing it into their own site. The import filter
+  only recognised backticked `DROP`/`CREATE`/`INSERT INTO` statements and ran
+  everything else as written (`INSERT INTO wp_sitemeta ...`, `INSERT ... SELECT
+  ... FROM wp_users`, multi-table `DROP TABLE`, `UPDATE`, `RENAME`). Subsite
+  imports now run a strict allowlist: a single-table `DROP TABLE`, `CREATE
+  TABLE` without `SELECT` or file paths, and `INSERT INTO ... VALUES` whose
+  rows are literals, each on a table under the target site's prefix. Everything
+  else is refused (tests/test-sql-import-filter.php).
+- **A subsite administrator could plant PHP in the uploads directory** through
+  an uploads restore. Executable and server-config files (`.php`, `.phtml`,
+  `.phar`, double extensions such as `x.php.jpg`, `.htaccess`, `.user.ini`,
+  ...) are left out of an uploads import unless a network administrator or
+  WP-CLI runs it.
+- **A main-site administrator who is not a network administrator** could send
+  the network-wide backups to their own storage or delete them. The main site's
+  SiteGuard page and commands are now for network administrators only.
+- A subsite no longer inherits settings stored at network level by old
+  versions (storage credentials, encryption passphrase, lock hash).
+- A subsite administrator can no longer use "Test webhook", the migration
+  destination ping or the health check to make the server request internal
+  addresses or probe every site of the network.
+- Every restore path: `INSERT`/`REPLACE` statements must hold literal rows (no
+  subqueries, no `LOAD_FILE()`, no `ON DUPLICATE KEY UPDATE`), `CREATE TABLE
+  ... SELECT` and `DATA DIRECTORY` are refused, and a `DROP`/`RENAME TABLE`
+  naming a table in another database is refused wherever it appears in the
+  statement. Data unserialized from a backup during restore never instantiates
+  objects.
+- **Encryption failed open.** With encryption enabled but no passphrase set,
+  or when encrypting a file failed, the plaintext archive was uploaded to
+  remote storage and the job reported as a success. The job now fails before
+  the upload phase.
+- OAuth tokens (Google Drive, Dropbox, OneDrive) were stored in plaintext even
+  with "encrypt credentials" on. They are encrypted now (on the next token
+  refresh or settings save).
+- Turning "encrypt credentials" off left the stored ciphertext in place and
+  sent it to the storage provider as the secret. Encrypted values are always
+  decrypted when read.
+- The settings page showed the first and last four characters of the
+  encryption passphrase, and `get_settings` returned external database
+  passwords. Neither is shown now.
+- The decryption passphrase typed for a restore was kept in the restore
+  progress record in the database for 24 hours.
+- OneDrive downloads no longer send the Graph access token to the host the
+  download is redirected to.
+- S3-compatible and B2 custom endpoints: `HTTP://host` (upper case) was left as
+  cleartext; a host without a scheme now gets `https://`.
+- The unlock form now honours the IP allowlist.
+- The file-list cache written during a backup no longer has a `.php`
+  extension.
+
+### Fixed (found by the same audit)
+- **The scheduled database backup never ran when it shared its time of day
+  with the file backup** (the default): only one job runs at a time and the
+  second was refused without a retry. When both are due together, one job does
+  both.
+- **Saving the Health tab, or `wp siteguardbackup settings set`, emptied the
+  list of file entities to back up**, so later scheduled file backups had
+  nothing to do.
+- **Importing a backup into an existing subsite with only "Uploads" ticked
+  dropped all of that subsite's tables** and imported nothing.
+- **Only the first account of a storage method received backups.** A second
+  account (and "Enable this instance" unticked on the first) was ignored.
+  Backups now go to every enabled account; deletes and restores look at all of
+  them.
+- With several destinations, one success counted as success for all: the job
+  was "complete" and, with "delete local copies" on, the local files were
+  removed although a destination had failed. Any failed destination now makes
+  the job a warning and keeps the local copies.
+- Hard failures (database dump failed, disk full, no files produced) sent no
+  email and no webhook, so "errors only" recipients never heard about them.
+- **The encryption passphrase was altered on save** (`sanitize_text_field`
+  removed tags, `%XX` sequences and repeated spaces), so backups were encrypted
+  with a different passphrase than the one written down. It is stored as typed.
+  A restore that fails with the typed passphrase also tries the form older
+  versions would have stored.
+- Storage secrets were altered the same way: an Azure SAS token (always
+  contains `%XX`) could not work, and a password containing `<` was cut short.
+  Secret fields and URLs are stored as typed.
+- Values sent by the settings page lost their backslashes (unslashed twice):
+  passwords, search/replace strings, exclusion patterns.
+- A lock password containing a quote or backslash could never unlock.
+- "Verify" always showed "Some checks failed", also for an intact backup.
+- Restoring a file entity split over several archives with "Back up existing"
+  kept only the last archive's files; with "Skip existing" it skipped the rest
+  of any directory the first archive had created.
+- Retention counted incomplete sets (an entity failed) as good ones, so two
+  bad runs could push out the last complete backup.
+- "Wipe settings" left storage credentials and remote sites in the database
+  and scheduled remote sends running.
+- pCloud committed a truncated file as a successful upload after a read error;
+  Google Drive and OneDrive did not check that the last chunk completed the
+  upload.
+- A failed delete on remote storage is now logged instead of ignored.
+- A finished restore did not clear its progress record, so restoring the same
+  set again could skip phases.
+- **"Extra directories" were never backed up.** They are now part of every
+  scheduled and manual backup of the site they are configured on.
+- A long step (a large upload, encryption) could outlive the job lock's 15
+  minutes: a second process then took the "expired" lock and worked on the
+  same files. The lock is kept alive while the job makes progress.
+- A database dump with tables that could not be dumped finished as
+  "complete". It is now a warning, the missing tables are named, and the set
+  does not count toward retention. An empty table list (a failed query) fails
+  the job instead of finishing without a database.
+- **Exclusions matched by prefix and substring**, so the "others" archive
+  silently left out `languages/plugins/*.mo`, `mu-plugins/x/cache-manager.php`
+  and any nested `cache` directory. Excludes now match whole path segments,
+  and the built-in list applies at the top of wp-content only
+  (tests/test-exclude-match.php).
+- A tables-only or selected-table restore on a network deleted every subsite
+  that was unticked (its `wp_blogs` row and its live tables), although nothing
+  of it had been imported.
+- **Restoring another site's backup kept that site's backup settings** when
+  this site had none of its own: storage credentials, destinations, schedule,
+  passphrase, remote sites. A fresh staging site restored from production then
+  backed up to, and pruned, production's storage. Those settings are removed
+  unless this site had them before the restore.
+- Search and replace across several pairs rewrote its own output
+  (`example.com` to `staging.example.com` became
+  `staging.staging.example.com`). Pairs are now applied in a single pass.
+- The search and replace tool changed the text typed into it (tags, `%XX`
+  sequences, repeated spaces) before running.
+- A subsite import that failed to restore uploads, or hit validation errors,
+  was reported as complete.
+- S3-compatible storage: unfinished multipart uploads left by a killed or
+  timed-out attempt are aborted (at shutdown, and before the next attempt)
+  instead of being billed forever.
+- Restores from remote storage and WebDAV uploads had a fixed time limit for
+  the whole file (5 and 10 minutes), which failed on slower links. Transfers
+  are now given up only when they stall.
+- Dropbox, Google Drive, OneDrive, pCloud and WebDAV reported a download cut
+  short (full disk, dropped connection) as complete. Downloads are now checked
+  against the size the server announced.
+- Database anonymisation left every `usermeta` value as it was (names,
+  billing and shipping addresses, login session tokens, application
+  passwords) and missed the order address index and customer IP.
+- `wp siteguardbackup import`: no longer overwrites a different file of the
+  same name, marks imported sets "always keep" (the next retention pass used
+  to delete them, after `--delete-source` had removed the original), and exits
+  non-zero when `--restore` fails.
+
+### Changed
+- On a multisite network the main site's SiteGuard is for network
+  administrators. Subsite administrators keep their own site's page.
+- A subsite's scheduled backups contain its database and uploads. Shared
+  plugins and themes belong in the network backup (or run the backup as a
+  network administrator or with WP-CLI).
+
 ### Fixed
 - **OAuth sign-in (Google Drive, Dropbox, OneDrive) never completed.** The
   redirect URI pointed at `admin-ajax.php?action=sgbackup_ajax&subaction=...`,

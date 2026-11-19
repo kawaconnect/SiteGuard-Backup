@@ -569,6 +569,10 @@ class SiteGuard_Backup_Method_S3 extends SiteGuard_Backup_Module {
 		// CreateMultipartUpload; they apply to the assembled object.
 		$storage_headers = array_merge($this->get_storage_headers(), $this->get_object_lock_headers());
 
+		// Parts left by an earlier attempt that died (killed process, timeout) are
+		// invisible and billed until aborted. Clear them before starting again.
+		$this->abort_stale_multipart_uploads($key);
+
 		$init = $this->request_with_retries(function () use ($key, $storage_headers) {
 			return $this->request('POST', $key . '?uploads', '', array_merge(array(
 				'Content-Type' => 'application/octet-stream',
@@ -585,13 +589,60 @@ class SiteGuard_Backup_Method_S3 extends SiteGuard_Backup_Module {
 
 		// Any failure after a successful CreateMultipartUpload must abort the
 		// upload, otherwise orphaned parts accrue storage charges indefinitely.
+		// That includes PHP ending the request (execution time limit, memory):
+		// shutdown functions still run then.
+		$pending = (object) array('open' => true);
+		$self = $this;
+		register_shutdown_function(function () use ($pending, $self, $key, $upload_id) {
+			if ($pending->open) {
+				$pending->open = false;
+				$self->abort_multipart_upload_on_shutdown($key, $upload_id);
+			}
+		});
 		$result = $this->upload_parts_and_complete($file, $key, $upload_id);
+		$pending->open = false;
 		if (is_wp_error($result)) {
 			$this->abort_multipart_upload($key, $upload_id);
 			return $result;
 		}
 
 		return true;
+	}
+
+	/** Shutdown hook entry (must be public to be callable from the closure's scope on old PHP). */
+	public function abort_multipart_upload_on_shutdown($key, $upload_id) {
+		try {
+			$this->abort_multipart_upload($key, $upload_id);
+		} catch (\Throwable $e) {
+			// Nothing more can be done at shutdown.
+		}
+	}
+
+	/**
+	 * Abort unfinished multipart uploads of exactly this object (best effort: a
+	 * server without ListMultipartUploads just returns an error we ignore).
+	 */
+	protected function abort_stale_multipart_uploads($key) {
+		try {
+			$options = $this->get_options();
+			$full_key = (!empty($options['path']) ? trim($options['path'], '/') . '/' : '') . $key;
+			$list = $this->request('GET', '?uploads&prefix=' . rawurlencode($full_key), '', array(), true);
+			if (is_wp_error($list) || 200 !== (int) wp_remote_retrieve_response_code($list)) return;
+			$body = wp_remote_retrieve_body($list);
+			if (!preg_match_all('#<Upload>(.*?)</Upload>#s', $body, $uploads)) return;
+			$aborted = 0;
+			foreach ($uploads[1] as $u) {
+				if (!preg_match('#<Key>([^<]*)</Key>#', $u, $k) || !preg_match('#<UploadId>([^<]+)</UploadId>#', $u, $i)) continue;
+				if (html_entity_decode($k[1], ENT_QUOTES | ENT_XML1) !== $full_key) continue; // exact object only
+				$this->abort_multipart_upload($key, html_entity_decode($i[1], ENT_QUOTES | ENT_XML1));
+				if (++$aborted >= 20) break;
+			}
+			if ($aborted && class_exists('SiteGuard_Backup')) {
+				SiteGuard_Backup::instance()->log("S3: aborted {$aborted} unfinished multipart upload(s) of {$key} left by an earlier attempt");
+			}
+		} catch (\Throwable $e) {
+			// Cleanup only: never block the upload.
+		}
 	}
 
 	/**

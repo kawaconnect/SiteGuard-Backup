@@ -174,7 +174,12 @@ foreach (array_keys($files) as $name) {
 		if (is_file("{$work}/{$d}/{$name}")) unlink("{$work}/{$d}/{$name}");
 	}
 }
-foreach (array('up', 'down') as $d) @rmdir($work . '/' . $d);
+// Remove the work tree, files included: leftovers in the container's small
+// /tmp (a tmpfs) used to make the next run's large downloads come up short.
+foreach (array('up', 'down') as $d) {
+	foreach ((array) glob($work . '/' . $d . '/*') as $f) { if (is_file($f)) @unlink($f); }
+	@rmdir($work . '/' . $d);
+}
 @rmdir($work);
 
 echo $fails ? "{$fails} failure(s)\n" : "all passed\n";

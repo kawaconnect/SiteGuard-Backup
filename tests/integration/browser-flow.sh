@@ -296,6 +296,7 @@ flow_recover_encrypted() {
 flow_subsite_admin_limits() {
 	local N=bf-perm-net; create "$N" multisite || { bad "create"; return; }
 	seed "$N" "http://$N.test/sub2" victim
+	seed "$N" "http://$N.test/sub1" mine
 	wp "$N" siteguardbackup backup >/dev/null                       # a network-wide backup (main site history)
 	local net_ts; net_ts="$(history_ts "$N")"
 	local pw; pw="$(openssl rand -hex 12)"
@@ -307,32 +308,112 @@ flow_subsite_admin_limits() {
 	curl -s -o /dev/null -c "$jar" -b "wordpress_test_cookie=WP%20Cookie%20check" -H "Host: $N.test" \
 		--data-urlencode "log=subadmin" --data-urlencode "pwd=$pw" --data "testcookie=1&redirect_to=/sub1/wp-admin/" "$(base "$N")/wp-login.php"
 	check "subsite admin can log in" grep -q wordpress_logged_in "$jar"
+	# The main site's SiteGuard holds the network-wide backups and settings: a
+	# main-site administrator who is not a network administrator gets nothing.
 	local main; main="$(curl -s -b "$jar" -H "Host: $N.test" "$(base "$N")/wp-admin/admin.php?page=siteguardbackup" | grep -oE 'var sgbackup_settings = \{.*\};' | head -1 | sed -E 's/^var sgbackup_settings = //; s/;$//')"
-	check "main-site SiteGuard page reachable for a main-site admin" test -n "$main"
+	check "main-site SiteGuard page is not served to a main-site admin" test -z "$main"
+	local sub; sub="$(curl -s -b "$jar" -H "Host: $N.test" "$(base "$N")/sub1/wp-admin/admin.php?page=siteguardbackup" | grep -oE 'var sgbackup_settings = \{.*\};' | head -1 | sed -E 's/^var sgbackup_settings = //; s/;$//')"
+	check "their own subsite's SiteGuard page is served" test -n "$sub"
+	# Nonces are per user, not per site: replay the subsite's against the main site.
 	local code; code="$(curl -s -o "$WORK/net-dl.zip" -w '%{http_code}' -b "$jar" -H "Host: $N.test" \
-		"$(base "$N")/wp-admin/admin-ajax.php?action=sgbackup_download_bundle&timestamp=$net_ts&_wpnonce=$(jq -r '.nonces.download' <<<"$main")")"
-	check "cannot download the network-wide backup (HTTP $code)" test "$code" = 403
+		"$(base "$N")/wp-admin/admin-ajax.php?action=sgbackup_download_bundle&timestamp=$net_ts&_wpnonce=$(jq -r '.nonces.download' <<<"$sub")")"
+	# (wp_die() in an AJAX request answers 200 with an empty body: judge by what came back.)
+	check "cannot download the network-wide backup (HTTP $code, $(stat -c %s "$WORK/net-dl.zip" 2>/dev/null || echo 0) bytes)" bash -c '! unzip -tq "$1" >/dev/null 2>&1 && [ "$(stat -c %s "$1" 2>/dev/null || echo 0)" -lt 1024 ]' _ "$WORK/net-dl.zip"
 	local r; r="$(curl -s -b "$jar" -H "Host: $N.test" "$(base "$N")/wp-admin/admin-ajax.php" \
-		--data-urlencode action=sgbackup_ajax --data-urlencode subaction=searchreplace --data-urlencode "nonce=$(jq -r '.nonces.searchreplace' <<<"$main")" \
+		--data-urlencode action=sgbackup_ajax --data-urlencode subaction=searchreplace --data-urlencode "nonce=$(jq -r '.nonces.searchreplace' <<<"$sub")" \
 		--data-urlencode 'data={"search":"victim","replace":"pwned","dry_run":0}')"
 	check "network-wide search-replace refused" jq -e '.success == false' <<<"$r"
+	r="$(curl -s -b "$jar" -H "Host: $N.test" "$(base "$N")/wp-admin/admin-ajax.php" \
+		--data-urlencode action=sgbackup_ajax --data-urlencode subaction=backupnow --data-urlencode "nonce=$(jq -r '.nonces.backupnow' <<<"$sub")" --data-urlencode 'data={}')"
+	check "main-site backup refused" jq -e '.success == false' <<<"$r"
+	r="$(curl -s -b "$jar" -H "Host: $N.test" "$(base "$N")/wp-admin/admin-ajax.php" \
+		--data-urlencode action=sgbackup_ajax --data-urlencode subaction=delete_backup --data-urlencode "nonce=$(jq -r '.nonce' <<<"$sub")" \
+		--data-urlencode "data={\"timestamp\":$net_ts,\"delete_remote\":1}")"
+	check "deleting the network backup refused" test -n "$(wp "$N" eval '$h = SiteGuard_Backup_History::get_history_raw(); echo isset($h['"$net_ts"']) ? "kept" : "";')"
 	check "sub2 content untouched" eq "$(wp "$N" --url="http://$N.test/sub2/" option get sgx_marker)" victim
 	local out; out="$(curl -s -N -b "$jar" -H "Host: $N.test" "$(base "$N")/wp-admin/admin-ajax.php" \
-		-F action=sgbackup_restore -F "nonce=$(jq -r '.nonce' <<<"$main")" -F "timestamp=$net_ts" -F sgbackup_restore_db=1 -F db_restore_mode=0)"
+		-F action=sgbackup_restore -F "nonce=$(jq -r '.nonce' <<<"$sub")" -F "timestamp=$net_ts" -F sgbackup_restore_db=1 -F db_restore_mode=0)"
 	check "restoring the network backup refused" bash -c '! grep RINFO: <<<"$1" | sed "s/^.*RINFO://" | jq -s -e "map(select(.type == \"complete\")) | last | .success == true" >/dev/null' _ "$out"
-	# Their own subsite: back up and download is allowed.
-	local sub; sub="$(curl -s -b "$jar" -H "Host: $N.test" "$(base "$N")/sub1/wp-admin/admin.php?page=siteguardbackup" | grep -oE 'var sgbackup_settings = \{.*\};' | head -1 | sed -E 's/^var sgbackup_settings = //; s/;$//')"
-	r="$(curl -s -b "$jar" -H "Host: $N.test" "$(base "$N")/sub1/wp-admin/admin-ajax.php" --data-urlencode action=sgbackup_ajax \
-		--data-urlencode subaction=backupnow --data-urlencode "nonce=$(jq -r '.nonces.backupnow' <<<"$sub")" --data-urlencode 'data={}')"
+
+	# Their own subsite: back up and download is allowed, but only its own data.
+	local SUB=(--url="http://$N.test/sub1/") sajax
+	sajax() { curl -s -b "$jar" -H "Host: $N.test" "$(base "$N")/sub1/wp-admin/admin-ajax.php" --data-urlencode action=sgbackup_ajax \
+		--data-urlencode "subaction=$1" --data-urlencode "nonce=$(jq -r ".nonces.$1 // .nonce" <<<"$sub")" --data-urlencode "data=$2"; }
+	local bid; bid="$(wp "$N" "${SUB[@]}" eval 'echo get_current_blog_id();')"
+	r="$(sajax savesettings '{"extra_dirs":["/etc"],"include_entities":["wpcore","plugins"],"backupdb_nonwp":1,"retain_extrarules":{"files":[],"db":[]}}')"
+	check "extra directories cannot be set by a subsite admin" eq "$(wp "$N" "${SUB[@]}" eval 'echo json_encode((array) SiteGuard_Backup_Options::instance()->get_option("sgbackup_extra_dirs", array()));')" '[]'
+	check "non-WordPress tables cannot be switched on by a subsite admin" eq "$(wp "$N" "${SUB[@]}" eval 'echo (int) SiteGuard_Backup_Options::instance()->get_option("sgbackup_backupdb_nonwp", 0);')" 0
+	# Ask for WordPress core (wp-config.php) and the shared plugins.
+	r="$(sajax backupnow '{"entities":["wpcore","plugins","uploads"],"service":["none"]}')"
 	check "subsite admin can back up their own site" jq -e '.success == true' <<<"$r"
 	local sts=""
 	for _ in $(seq 1 40); do
-		sts="$(wp "$N" --url="http://$N.test/sub1/" eval '$h = SiteGuard_Backup_History::get_history_raw(); krsort($h); foreach ($h as $t => $b) { if (!empty($b["is_subsite_backup"])) { echo $t; break; } }')"
-		[ -n "$sts" ] && break; wp "$N" --url="http://$N.test/sub1/" cron event run --due-now >/dev/null 2>&1; sleep 2
+		sts="$(wp "$N" "${SUB[@]}" eval '$h = SiteGuard_Backup_History::get_history_raw(); krsort($h); foreach ($h as $t => $b) { if (!empty($b["is_subsite_backup"]) && SiteGuard_Backup_History::get_all_files($b) && !SiteGuard_Backup_Job_Scheduler::get_active_jobs()) { echo $t; break; } }')"
+		[ -n "$sts" ] && break; wp "$N" "${SUB[@]}" cron event run --due-now >/dev/null 2>&1; sleep 2
 	done
+	check "the set holds no core, plugins, themes or others archive" eq "$(wp "$N" "${SUB[@]}" eval '$h = SiteGuard_Backup_History::get_history_raw(); $b = $h['"${sts:-0}"']; echo implode(",", array_intersect(array_keys($b), array("wpcore", "plugins", "themes", "others")));')" ""
 	code="$(curl -s -o "$WORK/own.zip" -w '%{http_code}' -b "$jar" -H "Host: $N.test" \
 		"$(base "$N")/sub1/wp-admin/admin-ajax.php?action=sgbackup_download_bundle&timestamp=$sts&_wpnonce=$(jq -r '.nonces.download' <<<"$sub")")"
 	check "subsite admin can download their own backup (HTTP $code)" test "$code" = 200 -a -s "$WORK/own.zip"
+	check "no wp-config.php anywhere in the download" bash -c 'd="$1/own"; rm -rf "$d"; mkdir "$d" && cd "$d" && unzip -q ../own.zip && for z in *.zip; do [ -e "$z" ] || continue; unzip -l "$z" | grep -q "wp-config.php" && exit 1; done; exit 0' _ "$WORK"
+
+	# A set made by a network administrator on this subsite (may hold shared code)
+	# is not theirs to download or send elsewhere.
+	wp "$N" "${SUB[@]}" siteguardbackup backup >/dev/null
+	local nts; nts="$(wp "$N" "${SUB[@]}" eval '$h = SiteGuard_Backup_History::get_history_raw(); krsort($h); foreach ($h as $t => $b) { if (!empty($b["network_scope"])) { echo $t; break; } }')"
+	check "a network administrator's subsite set is marked network_scope" test -n "$nts"
+	code="$(curl -s -o "$WORK/nscope.zip" -w '%{http_code}' -b "$jar" -H "Host: $N.test" \
+		"$(base "$N")/sub1/wp-admin/admin-ajax.php?action=sgbackup_download_bundle&timestamp=${nts:-1}&_wpnonce=$(jq -r '.nonces.download' <<<"$sub")")"
+	check "subsite admin cannot download it (HTTP $code)" test "$code" = 403
+
+	# A hostile backup, uploaded and restored by the subsite admin: SQL that
+	# reaches outside the subsite, and PHP in the uploads archive.
+	wp "$N" db query "CREATE TABLE IF NOT EXISTS wp_sgx_canary (a int); INSERT INTO wp_sgx_canary VALUES (1);" >/dev/null
+	local admins_before; admins_before="$(wp "$N" eval 'echo md5(serialize(get_site_option("site_admins")));')"
+	local E="$WORK/evil"; rm -rf "$E"; mkdir "$E"; ( cd "$E" && unzip -q "$WORK/own.zip" )
+	local oldn; oldn="$(jq -r '.backup.nonce' "$E/_sgbackup_bundle.json")"
+	local newn=evil00evil00 dbf upf
+	dbf="$(cd "$E" && ls | grep -- '-db\.gz$' | head -1)"; upf="$(cd "$E" && ls | grep -- '-uploads\.zip$' | head -1)"
+	check "the downloaded set has a database dump and an uploads archive" test -n "$dbf" -a -n "$upf" -a -n "$oldn"
+	{
+		gzip -dc "$E/$dbf"
+		cat <<-SQL
+		INSERT INTO wp_sitemeta (site_id, meta_key, meta_value) VALUES (1,'sgx_pwned','1');
+		INSERT INTO wp_usermeta (user_id, meta_key, meta_value) VALUES (1,'sgx_pwned','1');
+		INSERT INTO \`wp_${bid}_options\` (option_name, option_value, autoload) SELECT 'sgx_leak', user_pass, 'no' FROM wp_users LIMIT 1;
+		INSERT INTO \`wp_${bid}_options\` (\`option_name\`, \`option_value\`, \`autoload\`) VALUES ('sgx_leak2', (SELECT user_pass FROM wp_users LIMIT 1), 'no');
+		DROP TABLE IF EXISTS \`wp_${bid}_sgx_none\`, \`wp_sgx_canary\`;
+		DROP TABLE wp_sgx_canary;
+		UPDATE \`wp_users\` SET display_name='sgx-pwned';
+		RENAME TABLE \`wp_sgx_canary\` TO \`wp_sgx_gone\`;
+		SQL
+	} | gzip > "$E/db.new" && mv "$E/db.new" "$E/$dbf"
+	( cd "$E" && mkdir -p "x/sites/$bid" && echo '<?php echo "sgx-shell";' > "x/sites/$bid/sgx-shell.php" && cp "x/sites/$bid/sgx-shell.php" "x/sites/$bid/sgx.php.jpg" \
+		&& echo 'AddType application/x-httpd-php .jpg' > "x/sites/$bid/.htaccess" && echo ok > "x/sites/$bid/sgx-ok.txt" \
+		&& cp "x/sites/$bid/sgx-shell.php" x/sgx-shell.php && cd x && zip -qr "../$upf" . && cd .. && rm -rf x )
+	( cd "$E" && for f in *"$oldn"*; do mv "$f" "${f//$oldn/$newn}"; done \
+		&& mf="$(jq -r '.backup.manifest // empty | if type == "array" then .[] else . end' _sgbackup_bundle.json | sed "s/$oldn/$newn/")" \
+		&& sed -i "s/$oldn/$newn/g" _sgbackup_bundle.json && jq 'del(.backup.manifest)' _sgbackup_bundle.json > j && mv j _sgbackup_bundle.json \
+		&& for m in $mf; do rm -f -- "$m"; done; zip -q "$WORK/evil.zip" ./* ./_sgbackup_bundle.json 2>/dev/null || zip -q "$WORK/evil.zip" ./* )
+	r="$(curl -s -b "$jar" -H "Host: $N.test" "$(base "$N")/sub1/wp-admin/admin-ajax.php" \
+		-F "action=sgbackup_upload" -F "nonce=$(jq -r '.nonces.upload' <<<"$sub")" -F "sgbackup_file=@$WORK/evil.zip")"
+	check "the hostile bundle uploads" jq -e '.success == true' <<<"$r"
+	local ets; ets="$(wp "$N" "${SUB[@]}" eval '$h = SiteGuard_Backup_History::get_history_raw(); foreach ($h as $t => $b) { if (isset($b["nonce"]) && "evil00evil00" === $b["nonce"]) { echo $t; break; } }')"
+	check "...and is registered as its own set" test -n "$ets" -a "$ets" != "$sts"
+	out="$(curl -s -N -b "$jar" -H "Host: $N.test" "$(base "$N")/sub1/wp-admin/admin-ajax.php" \
+		-F action=sgbackup_restore -F "nonce=$(jq -r '.nonce' <<<"$sub")" -F "timestamp=${ets:-1}" -F sgbackup_restore_db=1 -F sgbackup_restore_uploads=1 -F db_restore_mode=0 -F move_in_mode=0)"
+	check "the restore ran" grep -q 'RINFO:' <<<"$out"
+	check "network super admins unchanged" eq "$(wp "$N" eval 'echo md5(serialize(get_site_option("site_admins")));')" "$admins_before"
+	check "no row written to wp_sitemeta" eq "$(wp "$N" db query "SELECT COUNT(*) FROM wp_sitemeta WHERE meta_key='sgx_pwned'" --skip-column-names | tr -d '[:space:]')" 0
+	check "no row written to wp_usermeta" eq "$(wp "$N" db query "SELECT COUNT(*) FROM wp_usermeta WHERE meta_key='sgx_pwned'" --skip-column-names | tr -d '[:space:]')" 0
+	check "no password hash copied into the subsite" eq "$(wp "$N" db query "SELECT COUNT(*) FROM wp_${bid}_options WHERE option_name LIKE 'sgx_leak%'" --skip-column-names | tr -d '[:space:]')" 0
+	check "a table outside the subsite was not dropped or renamed" eq "$(wp "$N" db query "SELECT COUNT(*) FROM wp_sgx_canary" --skip-column-names | tr -d '[:space:]')" 1
+	check "wp_users not modified" eq "$(wp "$N" db query "SELECT COUNT(*) FROM wp_users WHERE display_name='sgx-pwned'" --skip-column-names | tr -d '[:space:]')" 0
+	check "the subsite's own data was restored" eq "$(wp "$N" "${SUB[@]}" option get sgx_marker 2>/dev/null)" mine
+	check "the subsite still answers" eq "$(curl -s -o /dev/null -w '%{http_code}' -H "Host: $N.test" "$(base "$N")/sub1/")" 200
+	check "harmless uploaded file restored" bash -c "$(printf %q "$IM") compose $N exec -T cli sh -c 'test -f wp-content/uploads/sites/$bid/sgx-ok.txt'"
+	check "no PHP, double-extension or .htaccess file in the uploads tree" bash -c "! $(printf %q "$IM") compose $N exec -T cli sh -c 'find wp-content/uploads \\( -name \"sgx-shell.php\" -o -name \"sgx.php.jpg\" -o -name .htaccess \\) | grep -q .'"
+	check "sub2 still untouched" eq "$(wp "$N" --url="http://$N.test/sub2/" option get sgx_marker)" victim
 	finish "$N"
 }
 

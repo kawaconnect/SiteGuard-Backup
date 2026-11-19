@@ -300,7 +300,7 @@ class SiteGuard_Backup_Method_Dropbox extends SiteGuard_Backup_Module {
 			return new WP_Error('dropbox_download', "Dropbox download failed (HTTP {$code})");
 		}
 
-		return true;
+		return $this->verify_download($local_path, $this->expected_length($response), 'Dropbox');
 	}
 
 	public function delete($files) {

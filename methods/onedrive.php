@@ -283,6 +283,10 @@ class SiteGuard_Backup_Method_Onedrive extends SiteGuard_Backup_Module {
         }
 
         fclose($fh);
+        // 202 after the last chunk means OneDrive still expects more data.
+        if (isset($code) && 202 === $code) {
+            return new WP_Error('onedrive_incomplete', 'OneDrive did not confirm the upload as complete.');
+        }
         return true;
     }
 
@@ -295,12 +299,34 @@ class SiteGuard_Backup_Method_Onedrive extends SiteGuard_Backup_Module {
         $path = '/me/drive/root:/' . rawurlencode($folder_name) . '/' . rawurlencode($file) . ':/content';
         $local_path = trailingslashit($dest_dir) . $file;
 
-        $response = wp_remote_get($this->graph_url . $path, array(
-            'headers'  => array('Authorization' => "Bearer {$token}"),
-            'timeout'  => 300,
-            'stream'   => true,
-            'filename' => $local_path,
+        // Graph answers 302 to a pre-authenticated URL on another host. Follow it
+        // by hand so the bearer token is never sent to that host.
+        $first = wp_remote_get($this->graph_url . $path, array(
+            'headers'     => array('Authorization' => "Bearer {$token}"),
+            'timeout'     => 60,
+            'redirection' => 0,
         ));
+        if (is_wp_error($first)) return $first;
+        $first_code = wp_remote_retrieve_response_code($first);
+        $location = wp_remote_retrieve_header($first, 'location');
+        if ($first_code >= 300 && $first_code < 400 && is_string($location) && 0 === stripos($location, 'https://')) {
+            $response = wp_remote_get($location, array(
+                'timeout'  => 300,
+                'stream'   => true,
+                'filename' => $local_path,
+            ));
+        } elseif ($first_code >= 400) {
+            return new WP_Error('onedrive_download', "OneDrive download failed (HTTP {$first_code})");
+        } else {
+            // Content served directly (no redirect): fetch it again as a stream.
+            $response = wp_remote_get($this->graph_url . $path, array(
+                'headers'     => array('Authorization' => "Bearer {$token}"),
+                'timeout'     => 300,
+                'stream'      => true,
+                'filename'    => $local_path,
+                'redirection' => 0,
+            ));
+        }
 
         if (is_wp_error($response)) {
             @unlink($local_path);
@@ -313,7 +339,7 @@ class SiteGuard_Backup_Method_Onedrive extends SiteGuard_Backup_Module {
             return new WP_Error('onedrive_download', "OneDrive download failed (HTTP {$code})");
         }
 
-        return true;
+        return $this->verify_download($local_path, $this->expected_length($response), 'OneDrive');
     }
 
     public function delete($files) {

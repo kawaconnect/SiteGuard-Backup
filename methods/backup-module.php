@@ -25,6 +25,39 @@ abstract class SiteGuard_Backup_Module {
 		// Derive method_id from class name: SiteGuard_Backup_Method_S3 -> s3
 		$class = get_class($this);
 		$this->method_id = strtolower(str_replace('SiteGuard_Backup_Method_', '', $class));
+		self::register_transfer_timeouts();
+	}
+
+	/** @var bool */
+	private static $transfer_timeouts_registered = false;
+
+	/**
+	 * Streamed downloads of archives (restores from remote storage) had a fixed
+	 * 300 second limit for the whole file: a 400 MB archive needed about
+	 * 11 Mbit/s sustained or every attempt failed. For a request that streams
+	 * into the backup directory, the total limit becomes one hour per file and
+	 * the transfer is given up only when it stalls (under 1 KB/s for 2 minutes).
+	 */
+	private static function register_transfer_timeouts() {
+		if (self::$transfer_timeouts_registered || !function_exists('add_filter')) return;
+		self::$transfer_timeouts_registered = true;
+		$is_archive_stream = function ($args) {
+			if (empty($args['stream']) || empty($args['filename']) || !is_string($args['filename'])) return false;
+			$dir = SiteGuard_Backup_Options::instance()->get_backup_dir();
+			return is_string($dir) && '' !== $dir && 0 === strpos(wp_normalize_path($args['filename']), wp_normalize_path($dir));
+		};
+		add_filter('http_request_args', function ($args) use ($is_archive_stream) {
+			if ($is_archive_stream($args) && (!isset($args['timeout']) || $args['timeout'] < 3600)) {
+				$args['timeout'] = 3600;
+			}
+			return $args;
+		}, 20);
+		add_action('http_api_curl', function ($handle, $args) use ($is_archive_stream) {
+			if ($is_archive_stream($args) && defined('CURLOPT_LOW_SPEED_LIMIT')) {
+				curl_setopt($handle, CURLOPT_LOW_SPEED_LIMIT, 1024);
+				curl_setopt($handle, CURLOPT_LOW_SPEED_TIME, 120);
+			}
+		}, 20, 2);
 	}
 
 	/**
@@ -47,6 +80,32 @@ abstract class SiteGuard_Backup_Module {
 	/**
 	 * Set instance ID for multi-instance configurations.
 	 */
+	/**
+	 * The accounts ("instances") of a storage method that are switched on.
+	 *
+	 * The settings page lets an admin add several accounts per method (s-0, s-1,
+	 * ...) and untick "Enable this instance". Backups used to go to s-0 only,
+	 * enabled or not: a second account passed Test Connection and never received
+	 * a file.
+	 *
+	 * @param string $method_id
+	 * @param bool   $include_disabled Deletes and restores look at every account.
+	 * @return array Instance ids; array(null) for a method stored in the flat format.
+	 */
+	public static function instances_of($method_id, $include_disabled = false) {
+		$stored = SiteGuard_Backup_Options::instance()->get_option(SiteGuard_Backup_Options::method_option($method_id), array());
+		if (!is_array($stored) || !isset($stored['settings']) || !is_array($stored['settings']) || empty($stored['settings'])) {
+			return array(null);
+		}
+		$ids = array();
+		foreach ($stored['settings'] as $iid => $iopts) {
+			if (!is_string($iid) || !preg_match('/^[A-Za-z0-9_-]{1,40}$/', $iid)) continue;
+			$enabled = !is_array($iopts) || !isset($iopts['instance_enabled']) || '0' !== (string) $iopts['instance_enabled'];
+			if ($enabled || $include_disabled) $ids[] = $iid;
+		}
+		return $ids;
+	}
+
 	public function set_instance_id($id) {
 		$this->instance_id = $id;
 		$this->options = null; // Reset cached options
@@ -72,11 +131,11 @@ abstract class SiteGuard_Backup_Module {
 			$this->options = wp_parse_args($stored, $this->get_default_options());
 		}
 
-		// Transparently decrypt any encrypted credential fields
-		if ($opts->get_option('sgbackup_encrypt_credentials', false)) {
-			require_once SGBACKUP_DIR . 'includes/class-security.php';
-			$this->options = SiteGuard_Backup_Security::decrypt_method_options($this->method_id, $this->options);
-		}
+		// Transparently decrypt any encrypted credential fields. Always, not only
+		// while "encrypt credentials" is on: after the setting was turned off the
+		// stored ciphertext was handed to the storage provider as the secret.
+		require_once SGBACKUP_DIR . 'includes/class-security.php';
+		$this->options = SiteGuard_Backup_Security::decrypt_method_options($this->method_id, $this->options);
 
 		return $this->options;
 	}
@@ -206,6 +265,24 @@ abstract class SiteGuard_Backup_Module {
 	 * @param int|null $expected Content-Length announced by the server, if any.
 	 * @param string   $label    Provider name for messages.
 	 * @return true|WP_Error
+	 */
+	/**
+	 * Expected size of a streamed download, from its Content-Length (null when
+	 * absent or when the body was compressed in transit).
+	 */
+	protected function expected_length($response) {
+		$enc = wp_remote_retrieve_header($response, 'content-encoding');
+		if (is_string($enc) && '' !== $enc && 'identity' !== strtolower($enc)) return null;
+		$len = wp_remote_retrieve_header($response, 'content-length');
+		if (is_array($len)) $len = end($len);
+		return (is_string($len) || is_int($len)) && '' !== (string) $len && ctype_digit((string) $len) ? (int) $len : null;
+	}
+
+	/**
+	 * A streamed download is checked against the size the server announced: a
+	 * full disk or a dropped connection used to leave a short file that Dropbox,
+	 * Google Drive, OneDrive, pCloud and WebDAV reported as downloaded, and a
+	 * restore then failed on a corrupt archive (or worse, restored part of it).
 	 */
 	protected function verify_download($path, $expected, $label) {
 		clearstatcache(true, $path);

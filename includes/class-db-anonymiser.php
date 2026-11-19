@@ -129,6 +129,27 @@ class SiteGuard_Backup_DB_Anonymiser {
 				}
 				return $row;
 
+			case '_usermeta':
+				// PII sits in meta_value, addressed by meta_key. Dispatching on the
+				// column name left every usermeta value as it was: names, billing and
+				// shipping addresses, and login session tokens were dumped verbatim.
+				$meta_key = isset($row['meta_key']) ? (string) $row['meta_key'] : '';
+				if (!isset($row['meta_value']) || null === $row['meta_value'] || '' === $row['meta_value']) return $row;
+				if (in_array($meta_key, array('first_name', 'last_name'), true)) {
+					$row['meta_value'] = 'Anon_' . $this->anon_hash($row['meta_value'], 6);
+				} elseif ('nickname' === $meta_key) {
+					$row['meta_value'] = 'user_' . $this->anon_hash($row['meta_value'], 8);
+				} elseif ('description' === $meta_key) {
+					$row['meta_value'] = '';
+				} elseif ('session_tokens' === $meta_key) {
+					$row['meta_value'] = 'a:0:{}';
+				} elseif (preg_match('/^(billing|shipping)_(first_name|last_name|company|email|phone|address_1|address_2|city|state|postcode)$/', $meta_key, $um)) {
+					$row['meta_value'] = $this->anonymise_wc_address_field($um[2], $row['meta_value']);
+				} elseif (in_array($meta_key, array('_application_passwords', 'last_login_ip', '_woocommerce_persistent_cart_1', 'community-events-location'), true)) {
+					$row['meta_value'] = ('_application_passwords' === $meta_key) ? 'a:0:{}' : '';
+				}
+				return $row;
+
 			case '_wc_order_addresses':
 				// HPOS address columns are bare (first_name, email, address_1, …).
 				foreach (array('first_name','last_name','company','email','phone','address_1','address_2','city','state','postcode') as $c) {
@@ -209,6 +230,12 @@ class SiteGuard_Backup_DB_Anonymiser {
 			case '_billing_phone':
 			case 'billing_phone':
 				return '555-' . str_pad(abs(crc32($value)) % 10000, 4, '0', STR_PAD_LEFT);
+			case '_billing_address_index':
+			case '_shipping_address_index':
+			case '_customer_user_agent':
+				return '';
+			case '_customer_ip_address':
+				return '0.0.0.0';
 			case '_billing_first_name':
 			case '_shipping_first_name':
 			case 'billing_first_name':
@@ -302,6 +329,7 @@ class SiteGuard_Backup_DB_Anonymiser {
 			'_shipping_first_name', '_shipping_last_name', '_shipping_company',
 			'_shipping_address_1', '_shipping_address_2', '_shipping_city',
 			'_shipping_state', '_shipping_postcode',
+			'_billing_address_index', '_shipping_address_index', '_customer_ip_address', '_customer_user_agent',
 		);
 		return in_array($meta_key, $pii_keys, true);
 	}

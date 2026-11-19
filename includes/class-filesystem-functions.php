@@ -40,7 +40,30 @@ class SiteGuard_Backup_Filesystem {
 	 * Get "others" directory - wp-content excluding plugins, themes, uploads, and cache dirs.
 	 */
 	public static function wp_others_excludes() {
-		return array('plugins', 'themes', 'uploads', 'upgrade', 'cache', 'sgbackup', 'updraft', 'wflogs');
+		// Leading "/": only at the top of wp-content. Unanchored, "plugins" also
+		// dropped languages/plugins/*.mo, and "cache" any nested cache directory.
+		return array('/plugins', '/themes', '/uploads', '/upgrade', '/cache', '/sgbackup', '/updraft', '/wflogs');
+	}
+
+	/**
+	 * Does $relative (path below the entity root) fall under $exclude?
+	 *
+	 * Whole path segments only: "cache" matches cache/x and a/cache/x, not
+	 * cache-manager.php (the old prefix/substring test dropped such files
+	 * silently). A leading "/" anchors the exclude at the entity root.
+	 */
+	public static function path_matches_exclude($relative, $exclude) {
+		$relative = trim(str_replace('\\', '/', (string) $relative), '/');
+		$exclude = str_replace('\\', '/', (string) $exclude);
+		$anchored = ('' !== $exclude && '/' === $exclude[0]);
+		$exclude = trim($exclude, '/');
+		if ('' === $exclude || '' === $relative) return false;
+		if ($relative === $exclude || 0 === strpos($relative, $exclude . '/')) return true;
+		if ($anchored) return false;
+		$needle = '/' . $exclude;
+		$pos = strpos($relative, $needle . '/');
+		if (false !== $pos) return true;
+		return substr($relative, -strlen($needle)) === $needle;
 	}
 
 	/**
@@ -71,7 +94,7 @@ class SiteGuard_Backup_Filesystem {
 				// wp-config.php IS included by design: for full disaster recovery you need the DB
 				// credentials, salts, and any custom constants it defines. Operators must treat
 				// the backup archive as sensitive and secure its storage location accordingly.
-				'excludes' => array('wp-content'),
+				'excludes' => array('/wp-content'),
 			),
 		);
 	}
@@ -183,7 +206,7 @@ class SiteGuard_Backup_Filesystem {
 							$skip = true;
 							break;
 						}
-					} elseif (0 === strpos($relative, $exclude) || false !== strpos($relative, DIRECTORY_SEPARATOR . $exclude)) {
+					} elseif (self::path_matches_exclude($relative, $exclude)) {
 						$skip = true;
 						break;
 					}

@@ -129,6 +129,36 @@ class SiteGuard_Backup_Semaphore {
 	 *
 	 * @return bool
 	 */
+	/** When this lock's timestamp was last pushed forward (throttles refresh()). */
+	private $refreshed_at = 0;
+
+	/**
+	 * Push the lock's timestamp forward while its holder is still working.
+	 *
+	 * The timestamp was only written when the lock was taken, so a job step that
+	 * ran longer than the timeout (a large upload, encryption) looked abandoned:
+	 * a second resumption took the "expired" lock and both processes worked on
+	 * the same files. Only the holder (same lock value) can refresh. At most one
+	 * query per minute.
+	 *
+	 * @return bool False when this process no longer holds the lock.
+	 */
+	public function refresh() {
+		if (!$this->locked) return false;
+		$now = time();
+		if ($now - $this->refreshed_at < 60) return true;
+		global $wpdb;
+		$wpdb->query($wpdb->prepare(
+			"UPDATE {$wpdb->options} SET option_value = %s WHERE option_name = %s AND option_value LIKE %s",
+			$this->lock_value . '|' . $now . '|' . $this->lock_timeout,
+			$this->lock_name,
+			$wpdb->esc_like($this->lock_value) . '|%'
+		));
+		wp_cache_delete($this->lock_name, 'options');
+		$this->refreshed_at = $now;
+		return true;
+	}
+
 	public function unlock() {
 		if (!$this->locked) return false;
 		global $wpdb;

@@ -1466,6 +1466,116 @@ class SiteGuard_Backup_Database_Utility {
 	 * @param string $query The SQL statement.
 	 * @return bool True if the statement should be blocked.
 	 */
+	/**
+	 * Is the row data of an INSERT/REPLACE made of literals only?
+	 *
+	 * $values is everything after the VALUES keyword. A dump holds quoted strings,
+	 * numbers, hex blobs and NULL; anything else (a subquery, a function call such
+	 * as LOAD_FILE(), ON DUPLICATE KEY UPDATE, a second statement) lets an
+	 * attacker-supplied dump read or change data outside the row being inserted.
+	 * Linear scan, no regex over the (possibly multi-MB) blob.
+	 */
+	public static function insert_values_are_literals($values) {
+		// The executors hand over statements with their terminating ";" still on.
+		$values = rtrim($values, "; \t\r\n");
+		$len = strlen($values);
+		$i = 0;
+		$seen_row = false;
+		while ($i < $len) {
+			$i += strspn($values, " \t\r\n(),", $i);
+			if ($i >= $len) break;
+			$ch = $values[$i];
+			if ("'" === $ch || '"' === $ch) {
+				$j = $i + 1;
+				$closed = false;
+				while ($j < $len) {
+					$j += strcspn($values, '\\' . $ch, $j);
+					if ($j >= $len) break;
+					if ('\\' === $values[$j]) { $j += 2; continue; }
+					if ($j + 1 < $len && $values[$j + 1] === $ch) { $j += 2; continue; }
+					$closed = true;
+					break;
+				}
+				if (!$closed) return false;
+				$i = $j + 1;
+				$seen_row = true;
+				continue;
+			}
+			$n = strspn($values, 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.+-', $i);
+			if (0 === $n) return false; // ; @ ` = * / and anything else
+			$tok = substr($values, $i, $n);
+			$i += $n;
+			$next = $i < $len ? $values[$i] : '';
+			if (preg_match('/^(?:NULL|TRUE|FALSE|DEFAULT|[+-]?(?:[0-9]+\.?[0-9]*|\.[0-9]+)(?:[eE][+-]?[0-9]+)?|0x[0-9A-Fa-f]*)$/i', $tok)) {
+				$seen_row = true;
+				continue;
+			}
+			// Charset introducer or hex/bit/national prefix, directly before a string.
+			if (("'" === $next || '"' === $next || ' ' === $next) && preg_match('/^(?:_[A-Za-z0-9]+|[xXbBnN])$/', $tok)) {
+				continue;
+			}
+			return false;
+		}
+		return $seen_row;
+	}
+
+	/**
+	 * Remove quoted strings, backticked identifiers and comments from a (short)
+	 * statement so keywords can be looked for in what is left.
+	 */
+	private static function strip_sql_literals($query) {
+		$out = preg_replace(
+			array("/'(?:[^'\\\\]|\\\\.|'')*'/s", '/"(?:[^"\\\\]|\\\\.|"")*"/s', '/`[^`]*`/', '#/\*.*?\*/#s'),
+			array("''", '""', '`i`', ' '),
+			$query
+		);
+		return null === $out ? $query : $out;
+	}
+
+	/**
+	 * Strict allowlist for a subsite import. Only these may run, and only on a
+	 * table under one of $allowed_prefixes:
+	 *
+	 *   DROP TABLE [IF EXISTS] `t`
+	 *   CREATE TABLE [IF NOT EXISTS] `t` ( ... )        no AS SELECT, no file paths
+	 *   INSERT INTO `t` [(`c`, ...)] VALUES literals
+	 *   SET session variables
+	 *
+	 * The dump is attacker-controlled input (a subsite administrator may upload
+	 * one): every other statement shape, an unquoted table name, a second table,
+	 * a subquery or an expression is refused. The old filter recognised only the
+	 * backticked forms and ran anything else verbatim against the live network.
+	 *
+	 * @return bool
+	 */
+	public static function subsite_import_statement_allowed($query, $allowed_prefixes) {
+		// The executors hand over statements with their terminating ";" still on.
+		$query = rtrim(ltrim($query), "; \t\r\n");
+		$head = substr($query, 0, 4096);
+		$table = null;
+		if (preg_match('/^(?:START\s+TRANSACTION|BEGIN|COMMIT)\s*$/i', $query)) return true;
+		if (preg_match('/^SET\s/i', $head)) {
+			return strlen($query) < 1024 && !preg_match('/\b(?:GLOBAL|PERSIST|PERSIST_ONLY|PASSWORD)\b|[;()]/i', self::strip_sql_literals($query));
+		}
+		if (preg_match('/^DROP\s+TABLE\s+(?:IF\s+EXISTS\s+)?`([^`]+)`\s*$/i', $query, $m)) {
+			$table = $m[1];
+		} elseif (preg_match('/^CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?`([^`]+)`\s*\(/i', $head, $m)) {
+			$table = $m[1];
+			if (strlen($query) > 1048576) return false;
+			if (preg_match('/\b(?:SELECT|UNION|DIRECTORY|CONNECTION|TABLESPACE)\b|;/i', self::strip_sql_literals($query))) return false;
+		} elseif (preg_match('/^INSERT\s+INTO\s+`([^`]+)`\s*(?:\(\s*`[^`]+`(?:\s*,\s*`[^`]+`)*\s*\)\s*)?VALUES\b/i', $head, $m)) {
+			$table = $m[1];
+			if (!self::insert_values_are_literals(substr($query, strlen($m[0])))) return false;
+		} else {
+			return false;
+		}
+		if (!preg_match('/^[A-Za-z0-9_$]+$/', $table)) return false;
+		foreach ((array) $allowed_prefixes as $prefix) {
+			if ('' !== $prefix && 0 === strpos($table, $prefix)) return true;
+		}
+		return false;
+	}
+
 	private static function is_dangerous_sql($query) {
 		// Any statement aimed at a table in ANOTHER database (`db`.`table` or
 		// db.table) is refused first, before the data/DDL shortcuts below.
@@ -1480,14 +1590,34 @@ class SiteGuard_Backup_Database_Utility {
 		// that merely contains the phrase (e.g. Elementor JSON with the words
 		// "Load data"), silently dropping a whole batch of legitimate rows.
 		if (preg_match('/^\s*(?:INSERT|REPLACE)\b/i', $query)) {
-			return false;
+			// ...but the rows must be literals: INSERT ... SELECT copies any table
+			// the MySQL account can read (another site's users), a (SELECT ...) or
+			// LOAD_FILE() value does the same, ON DUPLICATE KEY UPDATE rewrites rows.
+			if (!preg_match('/^\s*(?:INSERT|REPLACE)(?:\s+(?:LOW_PRIORITY|DELAYED|HIGH_PRIORITY|IGNORE))*\s+(?:INTO\s+)?(?:`[^`]+`|\w+)\s*(?:\([^()]*\)\s*)?VALUES?\b/i', substr($query, 0, 8192), $im)) {
+				return true;
+			}
+			return !self::insert_values_are_literals(substr($query, strlen($im[0])));
+		}
+		// One table per DROP / RENAME, in this database: a second, qualified name
+		// (DROP TABLE `a`, `otherdb`.`b`) reached another site's tables.
+		if (preg_match('/^\s*(?:DROP\s+TABLE|RENAME\s+TABLE)\b/i', $query) && false !== strpos(self::strip_sql_literals($query), '.')) {
+			return true;
+		}
+		// Multi-table UPDATE / DELETE (JOIN or a table list) is never in a dump.
+		if (preg_match('/^\s*(?:UPDATE|DELETE)\b/i', $query)) {
+			$bare = self::strip_sql_literals(substr($query, 0, 8192));
+			if (preg_match('/\bJOIN\b|\bUSING\b|^\s*UPDATE\s+[^=]*,[^=]*\bSET\b|\bSELECT\b/i', $bare)) return true;
 		}
 		// Likewise CREATE/ALTER TABLE: column comments and defaults are free text
 		// ("used to load data into cache") and a table definition cannot contain a
 		// file or privilege operation. Matching them here dropped the live table's
 		// replacement and failed atomic restores.
 		if (preg_match('/^\s*(?:CREATE|ALTER)\s+TABLE\b/i', $query)) {
-			return false;
+			// ...but CREATE TABLE ... SELECT reads other tables, and DATA/INDEX
+			// DIRECTORY writes outside the data directory. Keywords are looked for
+			// with strings, identifiers and comments removed.
+			if (strlen($query) > 1048576) return true;
+			return (bool) preg_match('/\b(?:SELECT|UNION)\b|\b(?:DATA|INDEX)\s+DIRECTORY\b/i', self::strip_sql_literals($query));
 		}
 
 		$dangerous_patterns = array(
@@ -1685,8 +1815,8 @@ class SiteGuard_Backup_Database_Utility {
 				// NULL, silently dropping the statement (data loss).
 				$query = self::remap_leading_table_prefix($query, $source_prefix, $target_prefix);
 
-				if (self::is_dangerous_sql($query)) {
-					$result['errors'][] = "Blocked dangerous SQL on line {$line_count}";
+				if (self::is_dangerous_sql($query) || !self::subsite_import_statement_allowed($query, array($target_prefix))) {
+					$result['errors'][] = "Refused a statement that is not a plain table drop/create/insert for this site (line {$line_count})";
 					continue;
 				}
 
@@ -1732,7 +1862,7 @@ class SiteGuard_Backup_Database_Utility {
 			$query = trim(rtrim($buffer, ';'));
 			if (!empty($query) && !$skipping_table) {
 				$query = self::remap_leading_table_prefix($query, $source_prefix, $target_prefix);
-				if (!self::is_dangerous_sql($query)) {
+				if (!self::is_dangerous_sql($query) && self::subsite_import_statement_allowed($query, array($target_prefix))) {
 					$dbh_before = $wpdb->dbh;
 					$wpdb->check_connection(false);
 					if ($wpdb->dbh !== $dbh_before) self::apply_import_session_state();
@@ -1898,8 +2028,8 @@ class SiteGuard_Backup_Database_Utility {
 					$query = self::remap_leading_table_prefix($query, $current_remap_src, $current_remap_dst);
 				}
 
-				if (self::is_dangerous_sql($query)) {
-					$result['errors'][] = "Blocked dangerous SQL on line {$line_count}";
+				if (self::is_dangerous_sql($query) || !self::subsite_import_statement_allowed($query, array_values($prefix_map))) {
+					$result['errors'][] = "Refused a statement that is not a plain table drop/create/insert for a mapped site (line {$line_count})";
 					continue;
 				}
 
@@ -1944,6 +2074,11 @@ class SiteGuard_Backup_Database_Utility {
 		// Flush remaining buffer
 		if (!empty(trim($buffer)) && $current_action !== 'skip') {
 			$query = trim(rtrim($buffer, ';'));
+			if (!empty($query) && !self::subsite_import_statement_allowed(
+				(!empty($current_remap_src) && !empty($current_remap_dst)) ? self::remap_leading_table_prefix($query, $current_remap_src, $current_remap_dst) : $query,
+				array_values($prefix_map))) {
+				$query = '';
+			}
 			if (!empty($query)) {
 				if (!empty($current_remap_src) && !empty($current_remap_dst)) {
 					$query = self::remap_leading_table_prefix($query, $current_remap_src, $current_remap_dst);

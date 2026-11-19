@@ -74,7 +74,10 @@ class SiteGuard_Backup_Options {
 				// leak to a subsite: it would append its own backups to the main
 				// site's history copy and then prune (and remotely delete) the main
 				// site's sets against its own retention.
-				if (!is_main_site() && self::is_site_scoped_state($key)) {
+				// Nothing is inherited by a subsite: the network's storage credentials,
+				// encryption key, lock hash and webhook secret would be readable by
+				// (and used on behalf of) every subsite administrator.
+				if (!is_main_site()) {
 					return $default;
 				}
 				$network = get_site_option($key, $sentinel);

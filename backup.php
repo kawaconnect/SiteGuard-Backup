@@ -332,7 +332,7 @@ class SiteGuard_Backup_Engine {
 				}
 			}
 			if ($has_remote) {
-				$excludes[] = 'wp-config.php';
+				$excludes[] = '/wp-config.php';
 				$this->sgbackup->log('wpcore: excluding wp-config.php - backup is destined for remote upload (' . implode(', ', $services) . '), will not ship credentials off-server');
 			} else {
 				$this->sgbackup->log('wpcore: including wp-config.php - local-only backup (disaster-recovery ready). Store the archive in a private location.');
@@ -344,7 +344,7 @@ class SiteGuard_Backup_Engine {
 		// The cache is newline-delimited JSON (one entry per line) so resumptions
 		// can stream it lazily instead of loading the whole list into memory.
 		$last_index = $this->sgbackup->jobdata_get("entity_{$entity}_last_file_index", 0);
-		$cache_file = $this->backup_dir . 'filecache_' . $this->sgbackup->nonce . '_' . $entity . '.php';
+		$cache_file = $this->backup_dir . 'filecache_' . $this->sgbackup->nonce . '_' . $entity . '.list';
 
 		$files = null;
 		if ($last_index > 0 && file_exists($cache_file)) {
@@ -1053,8 +1053,11 @@ class SiteGuard_Backup_Engine {
 			: SiteGuard_Backup_Database_Utility::get_tables($table_prefix);
 
 		if (empty($tables)) {
-			$this->sgbackup->log("No tables found" . ($include_nonwp ? '' : " with prefix {$table_prefix}"), 'warning');
-			return true;
+			// A WordPress site always has tables: an empty list is a failed query,
+			// not a database with nothing in it. Returning true here finished the
+			// job as a success without any database dump.
+			$this->sgbackup->log("No tables found" . ($include_nonwp ? '' : " with prefix {$table_prefix}") . ": the database was not backed up", 'error');
+			return false;
 		}
 
 		// H6: Filter tables based on include/exclude selections

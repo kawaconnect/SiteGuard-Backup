@@ -33,6 +33,10 @@ class SiteGuard_Backup_Job_Scheduler {
 	public static function something_useful_happened() {
 		$sgbackup = SiteGuard_Backup::instance();
 		$sgbackup->something_useful_happened = true;
+		// Progress means the job is alive: keep its lock from looking expired.
+		if (!empty($sgbackup->job_semaphore) && is_object($sgbackup->job_semaphore)) {
+			$sgbackup->job_semaphore->refresh();
+		}
 
 		$resumption = $sgbackup->current_resumption;
 		$nonce = $sgbackup->nonce;

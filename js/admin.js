@@ -2076,16 +2076,21 @@
 					$btn.prop('disabled', false).text('Verify');
 					var html = '<div class="sgbackup-verify-result">';
 					html += '<h3>Verification Result</h3>';
-					if (data.passed) {
-						html += '<p class="sgbackup-verify-pass">All checks passed.</p>';
+					// The server answers {success, verified, failed, missing, details:[{file, status}]}.
+					// This used to read "passed"/"checks", which do not exist, so every
+					// verification (also of an intact backup) showed "Some checks failed."
+					if (data.success) {
+						html += '<p class="sgbackup-verify-pass">All ' + (parseInt(data.verified, 10) || 0) + ' file(s) verified.</p>';
 					} else {
-						html += '<p class="sgbackup-verify-fail">Some checks failed.</p>';
+						html += '<p class="sgbackup-verify-fail">' + (parseInt(data.failed, 10) || 0) + ' file(s) failed, ' + (parseInt(data.missing, 10) || 0) + ' missing.</p>';
 					}
-					if (data.checks && data.checks.length) {
+					var details = data.details || [];
+					if (details.length) {
 						html += '<ul>';
-						for (var i = 0; i < data.checks.length; i++) {
-							var cls = data.checks[i].pass ? 'sgbackup-verify-item-pass' : 'sgbackup-verify-item-fail';
-							html += '<li class="' + cls + '">' + SGB.esc(data.checks[i].label) + ': ' + SGB.esc(data.checks[i].status) + '</li>';
+						for (var i = 0; i < details.length; i++) {
+							var okStatus = details[i].status === 'ok' || details[i].status === 'verified';
+							var cls = okStatus ? 'sgbackup-verify-item-pass' : 'sgbackup-verify-item-fail';
+							html += '<li class="' + cls + '">' + SGB.esc(details[i].file || '') + ': ' + SGB.esc(details[i].status || '') + '</li>';
 						}
 						html += '</ul>';
 					}
