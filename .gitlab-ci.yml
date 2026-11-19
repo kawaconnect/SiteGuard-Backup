@@ -47,7 +47,7 @@ variables:
 test:
   extends: .linux
   stage: test
-  image: php:8.3-cli-bookworm
+  image: php:8.6-cli-bookworm
   script:
     - *version
     # A manual RELEASE_VERSION run must be started on that tag; refuse before
@@ -67,7 +67,7 @@ test:
 build-zip:
   extends: .linux
   stage: build
-  image: alpine:3.22
+  image: alpine:3.24
   needs: [test]
   script:
     - apk add --no-cache bash rsync zip unzip >/dev/null
@@ -86,7 +86,7 @@ build-zip:
 release:
   extends: .linux
   stage: release
-  image: alpine:3.22
+  image: alpine:3.24
   needs: [build-zip]
   rules:
     - if: $CI_COMMIT_TAG =~ /^v/
