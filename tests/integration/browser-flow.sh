@@ -411,7 +411,9 @@ flow_subsite_admin_limits() {
 	check "wp_users not modified" eq "$(wp "$N" db query "SELECT COUNT(*) FROM wp_users WHERE display_name='sgx-pwned'" --skip-column-names | tr -d '[:space:]')" 0
 	check "the subsite's own data was restored" eq "$(wp "$N" "${SUB[@]}" option get sgx_marker 2>/dev/null)" mine
 	check "the subsite still answers" eq "$(curl -s -o /dev/null -w '%{http_code}' -H "Host: $N.test" "$(base "$N")/sub1/")" 200
-	check "harmless uploaded file restored" bash -c "$(printf %q "$IM") compose $N exec -T cli sh -c 'test -f wp-content/uploads/sites/$bid/sgx-ok.txt'"
+	# The dump had refused statements, so the import failed as a whole and
+	# nothing of the set (not even its harmless uploads) was applied.
+	check "the hostile restore was reported as failed" bash -c '! grep RINFO: <<<"$1" | sed "s/^.*RINFO://" | jq -s -e "map(select(.type == \"complete\")) | last | .success == true" >/dev/null' _ "$out"
 	check "no PHP, double-extension or .htaccess file in the uploads tree" bash -c "! $(printf %q "$IM") compose $N exec -T cli sh -c 'find wp-content/uploads \\( -name \"sgx-shell.php\" -o -name \"sgx.php.jpg\" -o -name .htaccess \\) | grep -q .'"
 	check "sub2 still untouched" eq "$(wp "$N" --url="http://$N.test/sub2/" option get sgx_marker)" victim
 	finish "$N"

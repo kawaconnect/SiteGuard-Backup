@@ -1665,14 +1665,26 @@ class SiteGuard_Backup_Database_Utility {
 			// Only the session settings a dump needs. sql_mode is limited too:
 			// NO_BACKSLASH_ESCAPES or ANSI_QUOTES would make MySQL read quotes
 			// differently from this filter, and hide statements from it.
-			if (strlen($query) >= 1024 || preg_match('/\b(?:GLOBAL|PERSIST|PERSIST_ONLY|PASSWORD)\b|[;()@]/i', self::strip_sql_literals($query))) return false;
-			if (preg_match('/^SET\s+(?:SESSION\s+)?(\w+)\s*=/i', $query, $sv)) {
-				$var = strtolower($sv[1]);
-				if (in_array($var, array('foreign_key_checks', 'unique_checks', 'time_zone', 'autocommit', 'character_set_client'), true)) return true;
-				if ('sql_mode' === $var) return self::sql_mode_is_safe($query);
-				return false;
+			if (strlen($query) >= 1024 || preg_match('/\b(?:GLOBAL|PERSIST|PERSIST_ONLY|PASSWORD)\b|[;()]/i', self::strip_sql_literals($query))) return false;
+			if (preg_match('/^SET\s+NAMES\s+[\'"]?\w+[\'"]?(?:\s+COLLATE\s+[\'"]?\w+[\'"]?)?$/i', $query)) return true;
+			// Comma-separated assignments, each one of the forms mysqldump writes:
+			//   SET @OLD_AUTOCOMMIT=@@AUTOCOMMIT, @@AUTOCOMMIT=0
+			//   SET AUTOCOMMIT=@OLD_AUTOCOMMIT, FOREIGN_KEY_CHECKS=0, SQL_MODE='...'
+			// i.e. a user variable saving a system variable, or one of a few
+			// session variables set to a literal or a user variable.
+			$allowed_vars = array('foreign_key_checks', 'unique_checks', 'time_zone', 'autocommit', 'character_set_client',
+				'character_set_results', 'collation_connection', 'sql_notes', 'sql_mode', 'names');
+			$body = preg_replace('/^SET\s+(?:SESSION\s+)?/i', '', $query);
+			foreach (preg_split('/\s*,\s*(?=(?:[^\'"]*[\'"][^\'"]*[\'"])*[^\'"]*$)/', $body) as $assign) {
+				if (preg_match('/^@[A-Za-z_][A-Za-z0-9_]*\s*:?=\s*@@(?:SESSION\.)?[A-Za-z_]+$/i', $assign)) continue;
+				if (!preg_match('/^(?:@@(?:SESSION\.)?)?([A-Za-z_]+)\s*:?=\s*(.+)$/is', $assign, $am)) return false;
+				$var = strtolower($am[1]);
+				$val = trim($am[2]);
+				if (!in_array($var, $allowed_vars, true)) return false;
+				if (!preg_match('/^(?:\'[^\'\\\\]*\'|"[^"\\\\]*"|[A-Za-z0-9_+:.-]+|@[A-Za-z_][A-Za-z0-9_]*)$/', $val)) return false;
+				if ('sql_mode' === $var && !self::sql_mode_is_safe($val)) return false;
 			}
-			return (bool) preg_match('/^SET\s+NAMES\s+[\'"]?\w+[\'"]?(?:\s+COLLATE\s+[\'"]?\w+[\'"]?)?$/i', $query);
+			return true;
 		}
 		if (preg_match('/^DROP\s+TABLE\s+(?:IF\s+EXISTS\s+)?`([^`]+)`\s*$/i', $query, $m)) {
 			$table = $m[1];

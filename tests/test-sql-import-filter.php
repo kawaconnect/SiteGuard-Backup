@@ -148,6 +148,27 @@ check('restore refuses "--" + CR hiding a quote', true === $dangerous("CREATE TA
 check('subsite import refuses SET sql_mode NO_BACKSLASH_ESCAPES', false === $allowed("SET SESSION sql_mode='NO_BACKSLASH_ESCAPES'"));
 check('subsite import refuses SET sql_mode ANSI_QUOTES', false === $allowed("SET sql_mode = 'ANSI_QUOTES'"));
 check('subsite import allows the dumper\'s SET SQL_MODE', true === $allowed("SET SQL_MODE = 'NO_AUTO_VALUE_ON_ZERO';"));
+foreach (array(
+	"SET @OLD_AUTOCOMMIT=@@AUTOCOMMIT, @@AUTOCOMMIT=0;",
+	"SET AUTOCOMMIT=@OLD_AUTOCOMMIT;",
+	"SET @OLD_UNIQUE_CHECKS=@@UNIQUE_CHECKS, UNIQUE_CHECKS=0",
+	"SET FOREIGN_KEY_CHECKS=@OLD_FOREIGN_KEY_CHECKS",
+	"SET @OLD_SQL_MODE=@@SQL_MODE, SQL_MODE='NO_AUTO_VALUE_ON_ZERO'",
+	"SET SQL_MODE=@OLD_SQL_MODE",
+	"SET TIME_ZONE='+00:00'",
+	"SET NAMES utf8mb4 COLLATE utf8mb4_unicode_ci",
+) as $q) {
+	check('subsite import allows mysqldump session line: ' . $q, true === $allowed($q));
+}
+foreach (array(
+	"SET @a = (SELECT user_pass FROM wp_users LIMIT 1)",
+	"SET @a = 1",
+	"SET @OLD_SQL_MODE=@@SQL_MODE, SQL_MODE='NO_BACKSLASH_ESCAPES'",
+	"SET @@GLOBAL.general_log = 1",
+	"SET autocommit = 0, max_execution_time = 1",
+) as $q) {
+	check('subsite import refuses session line: ' . $q, false === $allowed($q));
+}
 check('subsite import refuses an unknown session variable', false === $allowed("SET max_execution_time = 1"));
 check('subsite import refuses a user variable', false === $allowed("SET @a = 1"));
 check('restore refuses SET sql_mode NO_BACKSLASH_ESCAPES', true === $dangerous("SET SESSION sql_mode='NO_BACKSLASH_ESCAPES'"));

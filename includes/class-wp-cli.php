@@ -551,6 +551,11 @@ class SiteGuard_Backup_CLI_Command extends WP_CLI_Command {
         foreach ($result['errors'] as $err) {
             WP_CLI::warning("  Error: {$err}");
         }
+        if (!$result['success']) {
+            // Non-zero exit: scripts (and the test suites) must see a failed
+            // restore as failed. It used to exit 0 with a warning.
+            WP_CLI::halt(1);
+        }
     }
 
     /**

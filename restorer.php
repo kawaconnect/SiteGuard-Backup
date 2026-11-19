@@ -2481,6 +2481,9 @@ class SiteGuard_Backup_Restorer {
 				foreach ($cols as $col) {
 					$type = strtolower($col['Type']);
 					if (!preg_match('/text|longtext|mediumtext|varchar/i', $type)) continue;
+					// GUIDs are deliberately never rewritten (WordPress: a GUID is a
+					// permanent identifier, not a link), so an old path there is expected.
+					if ($tbl === $target_prefix . 'posts' && 'guid' === $col['Field']) continue;
 					$colname = str_replace('`', '``', $col['Field']);
 					$n = (int) $wpdb->get_var($wpdb->prepare("SELECT COUNT(*) FROM `{$safe}` WHERE `{$colname}` LIKE %s", '%' . $wpdb->esc_like($src_path) . '%'));
 					if ($n > 0) {

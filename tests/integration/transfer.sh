@@ -139,11 +139,14 @@ transport() { # method src src_url dst
 				require_once SGBACKUP_DIR . "includes/class-remote-communications.php";
 				$legacy = (new SiteGuard_Backup_Remote_Communications())->decode_portable_bundle(base64_encode(json_encode(array("url" => "https://x.test", "public_key" => "k", "name_hash" => "abcdef123456"))));
 				echo (false !== strpos($a, "Authentication failed") ? "1" : "0"), (false !== strpos($b, "Authentication failed") ? "1" : "0"), (is_wp_error($legacy) && "legacy_bundle" === $legacy->get_error_code() ? "1" : "0"), (0 === strpos((string) $s["secret"], "sgenc:") ? "1" : "0");'
+			# This function's stdout is the destination timestamp: report on stderr,
+			# and fail the transport if any check fails.
 			local kc; kc="$(wp "$src" --url="$su/" eval "$probe" 2>/dev/null)"
-			check "migration key: a request with a wrong MAC is refused"       eq "${kc:0:1}" 1
-			check "migration key: a request without a MAC is refused"          eq "${kc:1:1}" 1
-			check "migration key: a bundle without a secret is refused"        eq "${kc:2:1}" 1
-			check "migration key: the sender stores the secret encrypted"      eq "${kc:3:1}" 1
+			if [ "$kc" != 1111 ]; then
+				echo "migration key checks failed (wrong MAC, no MAC, no secret, secret encrypted): $kc" >&2
+				return 1
+			fi
+			echo "migration key checks passed (wrong MAC, no MAC and secret-less bundle refused; secret stored encrypted)" >&2
 		fi
 		local before; before="$(wp "$src" --url="$su/" eval 'echo count(SiteGuard_Backup_History::get_history_raw());')"
 		wp "$src" --url="$su/" siteguardbackup migrate_send "$sts" "$did" >/dev/null || { echo "migrate_send failed" >&2; return 1; }
