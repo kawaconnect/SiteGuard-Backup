@@ -871,7 +871,7 @@ class SiteGuard_Backup_Restorer {
 		// Leftovers of an earlier run that was killed (restores hold a lock, so
 		// none is running): staged copies never swapped in, and old copies of
 		// tables that were already replaced by the single RENAME.
-		foreach (array('_sgbs', '_sgbo') as $leftover_prefix) {
+		foreach (array('_sgs', '_sgbs', '_sgbo') as $leftover_prefix) {
 			foreach (SiteGuard_Backup_Database_Utility::get_tables($leftover_prefix) as $t) {
 				$safe = SiteGuard_Backup_Database_Utility::sanitize_table_name($t);
 				if ($safe && $safe === $t) $wpdb->query("DROP TABLE IF EXISTS `{$safe}`");
@@ -881,7 +881,8 @@ class SiteGuard_Backup_Restorer {
 		$stage = array();
 		$i = 0;
 		foreach ($prefix_map as $src => $dst) {
-			$stage[$src] = '_sgbs' . $tag . ($i++) . '_';
+			// Short (8 characters): a staged name must stay within MySQL's 64.
+			$stage[$src] = '_sgs' . substr($tag, 0, 2) . base_convert((string) ($i++), 10, 36) . '_';
 		}
 		$cb = function ($lines_done) {
 			@set_time_limit(SGBACKUP_SET_TIME_LIMIT);
@@ -1723,6 +1724,10 @@ class SiteGuard_Backup_Restorer {
 					return $result; // live tables unchanged: nothing to merge or fix up
 				}
 			}
+
+			// Nothing was imported (a file could not be decrypted, or the import
+			// failed): do not merge users or rewrite anything on the live target.
+			if (!$result['success']) return $result;
 
 			// Step 3: Merge users - match by email
 			$this->merge_subsite_users($source_id, $target_id, $backup_dir, $resolved_db_paths);
@@ -2914,6 +2919,8 @@ class SiteGuard_Backup_Restorer {
 					return $result; // live tables unchanged
 				}
 			}
+
+			if (!$result['success']) return $result; // live tables unchanged
 
 			// Step 3: User merge for each subsite
 			foreach ($target_map as $source_id => $target_id) {

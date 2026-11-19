@@ -609,7 +609,12 @@ class SiteGuard_Backup_Method_S3 extends SiteGuard_Backup_Module {
 			if (!is_array($st) || empty($st['updated']) || (time() - (int) $st['updated']) < self::MPU_STATE_TTL) continue;
 			if (!isset($st['method'], $st['instance'], $st['key'], $st['upload_id'])) { unset($all[$k]); $changed = true; continue; }
 			if ($st['method'] !== $this->get_id() || (string) $st['instance'] !== (string) $this->instance_id) continue;
-			$this->abort_multipart_upload($st['key'], $st['upload_id']);
+			// Only against the bucket and folder it was made in: after a settings
+			// change the abort would go to the wrong bucket (drop the record only).
+			$o = $this->get_options();
+			if ((isset($st['bucket']) ? $st['bucket'] : '') === (isset($o['bucket']) ? $o['bucket'] : '') && (isset($st['path']) ? $st['path'] : '') === (isset($o['path']) ? $o['path'] : '')) {
+				$this->abort_multipart_upload($st['key'], $st['upload_id']);
+			}
 			unset($all[$k]);
 			$changed = true;
 		}
@@ -628,7 +633,11 @@ class SiteGuard_Backup_Method_S3 extends SiteGuard_Backup_Module {
 		for ($page = 0; $page < 20; $page++) {
 			$q = $key . '?uploadId=' . rawurlencode($upload_id) . ($marker ? '&part-number-marker=' . $marker : '');
 			$r = $this->request('GET', $q);
-			if (is_wp_error($r)) return null;
+			if (is_wp_error($r)) {
+				// Gone (aborted, expired): start again. Anything else (a network
+				// error, a 5xx) is passed back so the record and the parts survive.
+				return (false !== stripos($r->get_error_message(), 'NoSuchUpload') || false !== strpos($r->get_error_message(), 'HTTP 404')) ? null : $r;
+			}
 			$body = wp_remote_retrieve_body($r);
 			if (!preg_match_all('#<Part>(.*?)</Part>#s', $body, $pm)) break;
 			foreach ($pm[1] as $p) {
@@ -674,6 +683,9 @@ class SiteGuard_Backup_Method_S3 extends SiteGuard_Backup_Module {
 		if ($state && isset($state['upload_id'], $state['size'], $state['mtime'], $state['part_size'])
 			&& (int) $state['size'] === $filesize && (int) $state['mtime'] === $mtime) {
 			$listed = $this->list_uploaded_parts($key, $state['upload_id']);
+			if (is_wp_error($listed)) {
+				return new WP_Error('s3_resume', 'Could not check the unfinished upload of ' . $key . ' (it is kept for the next attempt): ' . $listed->get_error_message());
+			}
 			if (is_array($listed)) {
 				$upload_id = (string) $state['upload_id'];
 				$part_size = (int) $state['part_size'];
@@ -717,8 +729,10 @@ class SiteGuard_Backup_Method_S3 extends SiteGuard_Backup_Module {
 		}
 
 		// Record before the first part, so a kill at any point can be resumed.
+		$opts_now = $this->get_options();
 		$record = array(
 			'method' => $this->get_id(), 'instance' => (string) $this->instance_id, 'key' => $key,
+			'bucket' => isset($opts_now['bucket']) ? $opts_now['bucket'] : '', 'path' => isset($opts_now['path']) ? $opts_now['path'] : '',
 			'upload_id' => $upload_id, 'size' => $filesize, 'mtime' => $mtime, 'part_size' => $part_size,
 			'updated' => time(),
 		);

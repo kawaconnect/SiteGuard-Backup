@@ -95,6 +95,16 @@ single-site installs were not affected by them.
   (`/*! ... */`) or by mixing quote types in a `CREATE TABLE`; the statement is
   now read in one pass the way MySQL reads it, and table definitions in a
   subsite import may not contain comments.
+- A second review of the import filter closed more ways around it: `--`
+  followed by a control character (MySQL treats it as a comment), an
+  unterminated quote, MariaDB `/*M! */` executable comments, and `SET sql_mode`
+  values (`NO_BACKSLASH_ESCAPES`, `ANSI_QUOTES`) that make MySQL read quotes
+  differently. Subsite imports accept only the session settings a dump needs.
+  Versioned `PARTITION` clauses in table definitions are accepted again.
+- Staged subsite imports keep foreign keys working (WooCommerce's named
+  constraints collided with the live table's), use a shorter staging prefix
+  so long table names stay within MySQL's 64 characters, and stop before
+  merging users when nothing was imported.
 - A failed job no longer attaches its archives to the report email (with
   encryption on and no passphrase, those were the plaintext files the job had
   refused to upload).

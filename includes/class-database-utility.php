@@ -1559,6 +1559,7 @@ class SiteGuard_Backup_Database_Utility {
 					}
 					$j++;
 				}
+				if ($j >= $len) return null; // unterminated
 				$out .= ('`' === $c) ? '`i`' : $c . $c;
 				$i = $j + 1;
 				continue;
@@ -1567,6 +1568,11 @@ class SiteGuard_Backup_Database_Utility {
 			$i++;
 		}
 		return $out;
+	}
+
+	/** A SET sql_mode value that keeps MySQL's quoting the way the filters read it. */
+	private static function sql_mode_is_safe($query) {
+		return !preg_match('/NO_BACKSLASH_ESCAPES|ANSI_QUOTES|\bANSI\b|\bDB2\b|\bMAXDB\b|\bMSSQL\b|\bORACLE\b|\bPOSTGRESQL\b/i', $query);
 	}
 
 	private static function strip_sql_literals($query) {
@@ -1591,14 +1597,21 @@ class SiteGuard_Backup_Database_Utility {
 					}
 					$j++;
 				}
+				if ($j >= $len) {
+					// Unterminated quote: the statement cannot be read the way MySQL
+					// reads it. Make every keyword check refuse it.
+					return $out . ' SELECT UNION ';
+				}
 				$out .= ('`' === $c) ? '`i`' : $c . $c;
 				$i = $j + 1;
 				continue;
 			}
 			if ('/' === $c && $i + 1 < $len && '*' === $q[$i + 1]) {
-				if ($i + 2 < $len && '!' === $q[$i + 2]) {
-					// Versioned comment: drop the markers and the version number only.
-					$i += 3;
+				$vlen = ($i + 2 < $len && '!' === $q[$i + 2]) ? 3 : (($i + 3 < $len && 'M' === $q[$i + 2] && '!' === $q[$i + 3]) ? 4 : 0);
+				if ($vlen) {
+					// Versioned comment (MySQL /*! , MariaDB /*M! ): the server runs
+					// the content. Drop the markers and the version number only.
+					$i += $vlen;
 					$i += strspn($q, '0123456789', $i);
 					$out .= ' ';
 					continue;
@@ -1613,7 +1626,8 @@ class SiteGuard_Backup_Database_Utility {
 				$out .= ' ';
 				continue;
 			}
-			if ('#' === $c || ('-' === $c && $i + 2 < $len && '-' === $q[$i + 1] && (' ' === $q[$i + 2] || "\t" === $q[$i + 2] || "\n" === $q[$i + 2]))) {
+			// "-- " comment: MySQL accepts any space or control character after it.
+			if ('#' === $c || ('-' === $c && $i + 1 < $len && '-' === $q[$i + 1] && ($i + 2 >= $len || ord($q[$i + 2]) <= 0x20))) {
 				$end = strpos($q, "\n", $i);
 				$i = (false === $end) ? $len : $end + 1;
 				$out .= ' ';
@@ -1648,7 +1662,17 @@ class SiteGuard_Backup_Database_Utility {
 		$table = null;
 		if (preg_match('/^(?:START\s+TRANSACTION|BEGIN|COMMIT)\s*$/i', $query)) return true;
 		if (preg_match('/^SET\s/i', $head)) {
-			return strlen($query) < 1024 && !preg_match('/\b(?:GLOBAL|PERSIST|PERSIST_ONLY|PASSWORD)\b|[;()]/i', self::strip_sql_literals($query));
+			// Only the session settings a dump needs. sql_mode is limited too:
+			// NO_BACKSLASH_ESCAPES or ANSI_QUOTES would make MySQL read quotes
+			// differently from this filter, and hide statements from it.
+			if (strlen($query) >= 1024 || preg_match('/\b(?:GLOBAL|PERSIST|PERSIST_ONLY|PASSWORD)\b|[;()@]/i', self::strip_sql_literals($query))) return false;
+			if (preg_match('/^SET\s+(?:SESSION\s+)?(\w+)\s*=/i', $query, $sv)) {
+				$var = strtolower($sv[1]);
+				if (in_array($var, array('foreign_key_checks', 'unique_checks', 'time_zone', 'autocommit', 'character_set_client'), true)) return true;
+				if ('sql_mode' === $var) return self::sql_mode_is_safe($query);
+				return false;
+			}
+			return (bool) preg_match('/^SET\s+NAMES\s+[\'"]?\w+[\'"]?(?:\s+COLLATE\s+[\'"]?\w+[\'"]?)?$/i', $query);
 		}
 		if (preg_match('/^DROP\s+TABLE\s+(?:IF\s+EXISTS\s+)?`([^`]+)`\s*$/i', $query, $m)) {
 			$table = $m[1];
@@ -1658,8 +1682,12 @@ class SiteGuard_Backup_Database_Utility {
 			// No comments of any kind in a table definition from a subsite import
 			// (a versioned comment is executed by MySQL). Neither dumper writes them
 			// inside CREATE TABLE.
+			// Versioned comments (/*!50100 PARTITION BY ... */) are allowed: their
+			// content is kept by strip_sql_literals() and checked below.
 			$bare_for_comments = self::strip_sql_literals_keep_comments($query);
-			if (false !== strpos($bare_for_comments, '/*') || false !== strpos($bare_for_comments, '#') || preg_match('/--\s/', $bare_for_comments)) return false;
+			if (null === $bare_for_comments) return false; // unterminated quote
+			$no_versioned = preg_replace('#/\*M?!\d*#', '', $bare_for_comments);
+			if (false !== strpos($no_versioned, '/*') || false !== strpos($bare_for_comments, '#') || preg_match('/--(?:[\x00-\x20]|$)/', $bare_for_comments)) return false;
 			if (preg_match('/\b(?:SELECT|UNION|DIRECTORY|CONNECTION|TABLESPACE)\b|;/i', self::strip_sql_literals($query))) return false;
 		} elseif (preg_match('/^INSERT\s+INTO\s+`([^`]+)`\s*(?:\(\s*`[^`]+`(?:\s*,\s*`[^`]+`)*\s*\)\s*)?VALUES\b/i', substr($query, 0, 262144), $m)) {
 			$table = $m[1];
@@ -1735,6 +1763,8 @@ class SiteGuard_Backup_Database_Utility {
 			// mysqldump emits CREATE DEFINER=`u`@`h` TRIGGER …; also OR REPLACE forms
 			'/^\s*CREATE\s+(?:OR\s+REPLACE\s+)?(?:DEFINER\s*=\s*\S+(?:\s*@\s*\S+)?\s+)?(?:TRIGGER|EVENT)\b/i',
 			'/\bSET\s+(?:@@)?(?:GLOBAL|PERSIST(?:_ONLY)?)\b/i',
+			// A dump never needs these, and they change how quotes are read.
+			'/\bsql_mode\b.*(?:NO_BACKSLASH_ESCAPES|ANSI_QUOTES|\bANSI\b)/is',
 			'/^\s*CALL\s/i',
 			'/^\s*EXECUTE\s/i',
 			// Never leave the site's own database: `mysqldump --databases` emits
@@ -1912,6 +1942,7 @@ class SiteGuard_Backup_Database_Utility {
 				// copies the whole string and can hit pcre.backtrack_limit and return
 				// NULL, silently dropping the statement (data loss).
 				$query = self::remap_leading_table_prefix($query, $source_prefix, $target_prefix);
+				$query = self::remap_foreign_keys($query, array($source_prefix => $target_prefix));
 
 				if (self::is_dangerous_sql($query) || !self::subsite_import_statement_allowed($query, array($target_prefix))) {
 					$result['errors'][] = "Refused a statement that is not a plain table drop/create/insert for this site (line {$line_count})";
@@ -2125,6 +2156,7 @@ class SiteGuard_Backup_Database_Utility {
 				if (!empty($current_remap_src) && !empty($current_remap_dst)) {
 					$query = self::remap_leading_table_prefix($query, $current_remap_src, $current_remap_dst);
 				}
+				$query = self::remap_foreign_keys($query, $prefix_map);
 
 				if (self::is_dangerous_sql($query) || !self::subsite_import_statement_allowed($query, array_values($prefix_map))) {
 					$result['errors'][] = "Refused a statement that is not a plain table drop/create/insert for a mapped site (line {$line_count})";
@@ -2226,6 +2258,26 @@ class SiteGuard_Backup_Database_Utility {
 	 * @param string $target_prefix Replacement prefix (e.g. 'wp_11_').
 	 * @return string
 	 */
+	/**
+	 * In a CREATE TABLE being imported under another prefix: drop foreign key
+	 * constraint labels (InnoDB requires them unique per database, so a staged
+	 * copy next to the live table collided, e.g. WooCommerce's
+	 * fk_wp_2_wc_download_log_permission_id) and point REFERENCES at the remapped
+	 * parent. InnoDB names the constraints itself.
+	 */
+	private static function remap_foreign_keys($query, array $prefix_map) {
+		if (!preg_match('/^CREATE\s+TABLE\b/i', $query) || false === stripos($query, 'FOREIGN KEY') || strlen($query) > 1048576) return $query;
+		$out = preg_replace('/CONSTRAINT\s+`[^`]+`\s+FOREIGN\s+KEY/i', 'FOREIGN KEY', $query);
+		if (null === $out) return $query;
+		$out = preg_replace_callback('/(REFERENCES\s+)`([^`]+)`/i', function ($m) use ($prefix_map) {
+			foreach ($prefix_map as $src => $dst) {
+				if ('' !== $src && 0 === strpos($m[2], $src)) return $m[1] . '`' . $dst . substr($m[2], strlen($src)) . '`';
+			}
+			return $m[0];
+		}, $out);
+		return null === $out ? $query : $out;
+	}
+
 	private static function remap_leading_table_prefix($query, $source_prefix, $target_prefix) {
 		$escaped_source = preg_quote($source_prefix, '/');
 		$out = preg_replace(

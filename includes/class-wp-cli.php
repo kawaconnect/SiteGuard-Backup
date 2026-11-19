@@ -811,6 +811,7 @@ class SiteGuard_Backup_CLI_Command extends WP_CLI_Command {
         $health_key = isset($assoc_args['health-key']) ? $this->health_key_arg($assoc_args['health-key']) : null;
 
         $imported_files = array();
+        $in_place = array();
 
         if (is_dir($source)) {
             // Import all backup files from directory
@@ -822,6 +823,13 @@ class SiteGuard_Backup_CLI_Command extends WP_CLI_Command {
 
                 $src = $source . $f;
                 $dest = $backup_dir . $f;
+                if (file_exists($dest) && realpath($dest) === realpath($src)) {
+                    // The source IS the backup directory: register in place, and
+                    // never delete it with --delete-source.
+                    $imported_files[] = $f;
+                    $in_place[$f] = true;
+                    continue;
+                }
                 if (file_exists($dest)) {
                     // Never overwrite an archive that is already here.
                     if (filesize($dest) === filesize($src) && md5_file($dest) === md5_file($src)) {
@@ -848,7 +856,11 @@ class SiteGuard_Backup_CLI_Command extends WP_CLI_Command {
             if (file_exists($dest) && realpath($dest) !== realpath($source)) {
                 WP_CLI::error("A file named {$f} is already in the backup directory; not overwriting it.");
             }
-            if (copy($source, $dest)) {
+            if (file_exists($dest) && realpath($dest) === realpath($source)) {
+                $imported_files[] = $f;
+                $in_place[$f] = true;
+                WP_CLI::log("Already in the backup directory: {$f}");
+            } elseif (copy($source, $dest)) {
                 $imported_files[] = $f;
                 WP_CLI::log("Imported: {$f}");
             } else {
@@ -909,9 +921,10 @@ class SiteGuard_Backup_CLI_Command extends WP_CLI_Command {
         if (isset($assoc_args['delete-source']) && !empty($imported_files)) {
             if (is_dir($source)) {
                 foreach ($imported_files as $f) {
+                    if (isset($in_place[$f])) continue; // the only copy
                     @unlink(trailingslashit($source) . $f);
                 }
-            } elseif (is_file($source)) {
+            } elseif (is_file($source) && empty($in_place)) {
                 @unlink($source);
             }
             WP_CLI::log("Source files deleted.");

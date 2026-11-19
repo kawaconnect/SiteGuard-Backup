@@ -344,15 +344,19 @@ class SiteGuard_Backup_History {
 			foreach ($failed as $f) { if (0 === strpos($f, 'database')) { $db_failed = true; break; } }
 			$file_failed = count($failed) > ($db_failed ? 1 : 0);
 			$incomplete = ($type === 'db') ? $db_failed : $file_failed;
-			$seen++;
-			// Hard cap: incomplete sets are kept only while fewer than N complete
-			// ones exist, and never beyond 2 x N sets in all, so an entity that
-			// fails on every run cannot stop retention and fill the disk.
-			if ($count >= $retain || $seen > 2 * $retain) {
+			// N complete sets are kept. Incomplete sets are kept only while fewer
+			// than N complete ones are newer, and at most N of them, so an entity
+			// that fails on every run cannot stop retention; a complete set is
+			// never deleted to make room for incomplete ones.
+			if ($count >= $retain || ($incomplete && $seen >= $retain)) {
 				$to_delete[] = $timestamp;
 				continue;
 			}
-			if (!$incomplete) $count++;
+			if ($incomplete) {
+				$seen++;
+			} else {
+				$count++;
+			}
 		}
 
 		// Delete only the pruned TYPE's files. Deleting the whole set made the two

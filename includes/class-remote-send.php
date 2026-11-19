@@ -101,6 +101,9 @@ class SiteGuard_Backup_Remote_Send {
 
 		require_once SGBACKUP_DIR . 'includes/class-remote-communications.php';
 		$secret = SiteGuard_Backup_Remote_Communications::key_secret(isset($key_data['secret']) ? $key_data['secret'] : '');
+		if (null === $secret) {
+			$fail(); // stored but unreadable (AUTH_KEY changed): never treat as a legacy key
+		}
 		if ('' !== $secret) {
 			$expected = SiteGuard_Backup_Remote_Communications::mac($secret, array('request', $name_hash, $encrypted, $enc_key));
 			if ('' === $mac || !hash_equals($expected, $mac)) {
@@ -129,7 +132,7 @@ class SiteGuard_Backup_Remote_Send {
 
 		$result = $this->dispatch_command($command, $data, $name_hash, $key_data);
 		if (is_wp_error($result)) {
-			wp_send_json_error(array('message' => $result->get_error_message()));
+			wp_send_json_error(array('message' => $result->get_error_message(), 'code' => (string) $result->get_error_code()));
 		}
 
 		if ('' !== $secret) {

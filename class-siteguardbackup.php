@@ -827,6 +827,7 @@ class SiteGuard_Backup {
 	 */
 	private function boot_backup($backup_files, $backup_database, $options = array()) {
 		@set_time_limit(SGBACKUP_SET_TIME_LIMIT);
+		$this->boot_error = ''; // a failure of an earlier boot in this request is not this one's
 
 		// Check if another backup job is already running
 		require_once SGBACKUP_DIR . 'includes/class-job-scheduler.php';
@@ -1539,12 +1540,14 @@ class SiteGuard_Backup {
 
 			if (!array_key_exists($method_name, $this->backup_methods)) {
 				$this->log("Unknown storage method: {$method_name}", 'warning');
+				$failed_services[] = $service;
 				continue;
 			}
 
 			$method_file = SGBACKUP_DIR . 'methods/' . $method_name . '.php';
 			if (!file_exists($method_file)) {
 				$this->log("Storage method file not found: {$method_name}", 'warning');
+				$failed_services[] = $service;
 				continue;
 			}
 
@@ -1554,6 +1557,7 @@ class SiteGuard_Backup {
 			$class = 'SiteGuard_Backup_Method_' . ucfirst($method_name);
 			if (!class_exists($class)) {
 				$this->log("Storage method class not found: {$class}", 'warning');
+				$failed_services[] = $service;
 				continue;
 			}
 

@@ -142,6 +142,20 @@ check('subsite import refuses SELECT hidden by a quote in a double-quoted string
 check('restore refuses SELECT inside a versioned comment', true === $dangerous("CREATE TABLE `wp_x` (`a` text) /*!50000 SELECT user_pass AS a FROM wp_users */"));
 check('restore refuses SELECT hidden by mixed quoting', true === $dangerous("CREATE TABLE `wp_x` (`a'b` int) SELECT user_pass FROM wp_users WHERE 'x'='x'"));
 check('restore accepts a quote inside a column comment', false === $dangerous("CREATE TABLE `wp_x` (`a` int COMMENT 'it''s a \"select\"') ENGINE=InnoDB"));
+// Second review: "--" plus a control character, sql_mode, unterminated quotes, MariaDB comments.
+check('subsite import refuses "--" + control character in CREATE TABLE', false === $allowed("CREATE TABLE `wp_7_x` (`a` text) --\x01 '\nSELECT user_pass AS a FROM wp_users"));
+check('restore refuses "--" + CR hiding a quote', true === $dangerous("CREATE TABLE `wp_x` (`a` text) --\r '\nSELECT user_pass AS a FROM wp_users"));
+check('subsite import refuses SET sql_mode NO_BACKSLASH_ESCAPES', false === $allowed("SET SESSION sql_mode='NO_BACKSLASH_ESCAPES'"));
+check('subsite import refuses SET sql_mode ANSI_QUOTES', false === $allowed("SET sql_mode = 'ANSI_QUOTES'"));
+check('subsite import allows the dumper\'s SET SQL_MODE', true === $allowed("SET SQL_MODE = 'NO_AUTO_VALUE_ON_ZERO';"));
+check('subsite import refuses an unknown session variable', false === $allowed("SET max_execution_time = 1"));
+check('subsite import refuses a user variable', false === $allowed("SET @a = 1"));
+check('restore refuses SET sql_mode NO_BACKSLASH_ESCAPES', true === $dangerous("SET SESSION sql_mode='NO_BACKSLASH_ESCAPES'"));
+check('subsite import refuses an unterminated quote in CREATE TABLE', false === $allowed("CREATE TABLE `wp_7_x` (`a` text COMMENT 'x) SELECT user_pass FROM wp_users"));
+check('restore refuses an unterminated quote in CREATE TABLE', true === $dangerous("CREATE TABLE `wp_x` (`a` text COMMENT 'x) ENGINE=InnoDB"));
+check('restore refuses SELECT in a MariaDB executable comment', true === $dangerous("CREATE TABLE `wp_x` (`a` text) /*M!100100 SELECT user_pass AS a FROM wp_users */"));
+check('subsite import allows a versioned PARTITION clause', true === $allowed("CREATE TABLE `wp_7_x` (\n  `id` int NOT NULL\n) ENGINE=InnoDB\n/*!50100 PARTITION BY HASH (`id`) PARTITIONS 4 */"));
+check('subsite import refuses SELECT in a versioned comment', false === $allowed("CREATE TABLE `wp_7_x` (`a` text) /*!50000 SELECT user_pass AS a FROM wp_users */"));
 $wide = "INSERT INTO `wp_7_wide` (" . implode(', ', array_map(function ($i) { return "`column_with_a_long_name_$i`"; }, range(1, 300))) . ") VALUES (" . implode(',', range(1, 300)) . ")";
 check('subsite import allows an INSERT with a very long column list', true === $allowed($wide));
 check('a table under another mapped prefix is allowed', true === $allowed("DROP TABLE `wp_9_posts`", array('wp_7_', 'wp_9_')));

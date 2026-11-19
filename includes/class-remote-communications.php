@@ -41,11 +41,16 @@ class SiteGuard_Backup_Remote_Communications {
 	}
 
 	/** A key's stored (encrypted) secret, in plain text; '' for a pre-1.7.0 key. */
+	/**
+	 * @return string|null The secret; '' for a pre-1.7.0 key without one; null
+	 *                     when it is stored but cannot be decrypted (AUTH_KEY in
+	 *                     wp-config.php changed).
+	 */
 	public static function key_secret($stored) {
 		if (!is_string($stored) || '' === $stored) return '';
 		require_once SGBACKUP_DIR . 'includes/class-security.php';
 		$plain = SiteGuard_Backup_Security::decrypt_option($stored);
-		return (is_string($plain) && !SiteGuard_Backup_Security::is_encrypted($plain)) ? $plain : '';
+		return (is_string($plain) && '' !== $plain && !SiteGuard_Backup_Security::is_encrypted($plain)) ? $plain : null;
 	}
 
 	/** Are keys and bundles without a secret (made before 1.7.0) accepted? */
@@ -238,6 +243,9 @@ class SiteGuard_Backup_Remote_Communications {
 		$name_hash = isset($site['name_hash']) ? $site['name_hash'] : '';
 		$endpoint = trailingslashit($site['url']) . 'wp-admin/admin-ajax.php';
 		$secret = self::key_secret(isset($site['secret']) ? $site['secret'] : '');
+		if (null === $secret) {
+			return new WP_Error('secret_unreadable', 'The migration key secret of this destination cannot be decrypted (the AUTH_KEY in wp-config.php changed?). Create a new key on the receiving site and add the destination again.');
+		}
 		if ('' === $secret && !self::legacy_keys_allowed()) {
 			return new WP_Error('legacy_bundle', 'This destination was added with a key bundle from before SiteGuard Backup 1.7.0, which cannot authenticate its messages. Create a new key on the receiving site and add the destination again.');
 		}
@@ -289,7 +297,10 @@ class SiteGuard_Backup_Remote_Communications {
 		if (isset($result['success']) && !$result['success']) {
 			$msg = isset($result['data']['message']) ? $result['data']['message'] : 'RPC error';
 			error_log("SiteGuard Backup RPC: Remote error for '{$command}': {$msg}");
-			return new WP_Error('rpc_remote_error', $msg);
+			// The receiver's error code, so the sender can react (out_of_sequence
+			// re-syncs the offset instead of burning its retries).
+			$code = isset($result['data']['code']) && is_string($result['data']['code']) && preg_match('/^[a-z0-9_]{1,40}$/', $result['data']['code']) ? $result['data']['code'] : 'rpc_remote_error';
+			return new WP_Error($code, $msg);
 		}
 
 		if ('' !== $secret) {
